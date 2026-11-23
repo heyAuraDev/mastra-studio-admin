@@ -1,3 +1,5 @@
+> **adex fork:** this repository is a fork of mastra-ai/mastra that ships only the Studio UI. Before syncing with upstream or changing fork files, read [`FORK.md`](FORK.md).
+
 # Repository guidance
 
 Unless asked, don't inspect reference or modify examples.

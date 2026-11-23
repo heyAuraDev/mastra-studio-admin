@@ -7,6 +7,8 @@ import ts from 'typescript';
 import type { Plugin, PluginOption, UserConfig } from 'vite';
 import { defineConfig } from 'vite';
 
+// [adex fork] Options object instead of upstream's (targetPort, targetHost); the plugin also runs on
+// production builds (see the end of this file). Keep its .replace list in step with index.html. See FORK.md.
 interface StudioPluginOptions {
   targetPort: string;
   targetHost: string;
@@ -324,7 +326,8 @@ export default defineConfig(({ mode }) => {
     };
   }
 
-  // Production build: replace all placeholders from .env values
+  // [adex fork] Production build: bake every placeholder from env vars (static gh-pages / Docker hosting).
+  // Turbo hides these env vars unless the build runs with --env-mode=loose. See FORK.md.
   const targetHost = process.env.MASTRA_SERVER_HOST || 'localhost';
   const targetPort = process.env.MASTRA_SERVER_PORT || '4111';
   const targetProtocol = process.env.MASTRA_SERVER_PROTOCOL || 'http';
