@@ -1,13 +1,14 @@
 import {
-  Button,
   Dialog,
+  DialogAction,
+  DialogCancel,
   DialogContent,
   DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  toast,
-} from '@mastra/playground-ui';
+} from '@mastra/playground-ui/components/Dialog';
+import { toast } from '@mastra/playground-ui/utils/toast';
 import { useState } from 'react';
 import type { ReactNode } from 'react';
 
@@ -29,6 +30,10 @@ export interface UseVisibilityChangeDialogArgs<V extends string> {
   mutate: (visibility: V) => Promise<unknown>;
   onSuccess: (visibility: V) => void;
   testIds: VisibilityDialogTestIds;
+  /** Optional extra content rendered inside the dialog, given the pending target visibility. */
+  renderExtraContent?: (pending: V) => ReactNode;
+  /** Optional extra condition that disables the confirm button (e.g. while a dependents lookup is loading). */
+  confirmDisabled?: (pending: V) => boolean;
 }
 
 export interface UseVisibilityChangeDialogResult<V extends string> {
@@ -42,6 +47,8 @@ export function useVisibilityChangeDialog<V extends string>({
   mutate,
   onSuccess,
   testIds,
+  renderExtraContent,
+  confirmDisabled,
 }: UseVisibilityChangeDialogArgs<V>): UseVisibilityChangeDialogResult<V> {
   const [pending, setPending] = useState<V | null>(null);
   const isOpen = pending !== null;
@@ -65,7 +72,7 @@ export function useVisibilityChangeDialog<V extends string>({
   const dialogCopy = pending ? copy[pending] : null;
 
   const dialog = (
-    <Dialog open={isOpen} onOpenChange={open => !open && handleCancel()}>
+    <Dialog open={isOpen} onOpenChange={open => !open && handleCancel()} pending={isPending}>
       <DialogContent data-testid={testIds.dialog}>
         {pending && dialogCopy && (
           <>
@@ -73,18 +80,16 @@ export function useVisibilityChangeDialog<V extends string>({
               <DialogTitle>{dialogCopy.title}</DialogTitle>
               <DialogDescription>{dialogCopy.description}</DialogDescription>
             </DialogHeader>
+            {renderExtraContent?.(pending)}
             <DialogFooter>
-              <Button variant="ghost" onClick={handleCancel} disabled={isPending} data-testid={testIds.cancel}>
-                Cancel
-              </Button>
-              <Button
-                variant="default"
-                onClick={confirmFor(pending)}
-                disabled={isPending}
+              <DialogCancel data-testid={testIds.cancel}>Cancel</DialogCancel>
+              <DialogAction
+                onConfirm={confirmFor(pending)}
+                disabled={confirmDisabled?.(pending) ?? false}
                 data-testid={testIds.confirm}
               >
                 Confirm
-              </Button>
+              </DialogAction>
             </DialogFooter>
           </>
         )}

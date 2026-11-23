@@ -1,5 +1,7 @@
 import { Txt } from '../Txt';
 import { Icon } from '@/ds/icons';
+import { raisedSurfaceStyle } from '@/ds/primitives/raised-surface';
+import { textStyle } from '@/ds/primitives/text';
 import { cn } from '@/lib/utils';
 
 export interface EntityProps {
@@ -21,8 +23,9 @@ export const Entity = ({ children, className, onClick }: EntityProps) => {
         }
       }}
       className={cn(
-        'flex gap-3 group/entity bg-surface3 rounded-xl border border-border1 py-3 px-4',
-        onClick && 'cursor-pointer hover:bg-surface4 transition-all',
+        raisedSurfaceStyle,
+        'group/entity flex gap-3 rounded-xl px-3 py-2',
+        onClick && 'cursor-pointer transition-all hover:bg-fill-subtle',
         className,
       )}
       onClick={onClick}
@@ -34,7 +37,7 @@ export const Entity = ({ children, className, onClick }: EntityProps) => {
 
 export const EntityIcon = ({ children, className, style }: EntityProps) => {
   return (
-    <Icon size="lg" className={cn('text-neutral3 mt-1 shrink-0', className)} style={style}>
+    <Icon size="lg" className={cn('mt-1 shrink-0 text-muted-foreground', className)} style={style}>
       {children}
     </Icon>
   );
@@ -42,20 +45,16 @@ export const EntityIcon = ({ children, className, style }: EntityProps) => {
 
 export const EntityName = ({ children, className }: EntityProps) => {
   return (
-    <Txt as="p" variant="ui-lg" className={cn('text-neutral6 font-medium', className)}>
+    <Txt as="p" variant="heading" tone="ink" className={className}>
       {children}
     </Txt>
   );
 };
 
 export const EntityDescription = ({ children, className }: EntityProps) => {
-  return (
-    <Txt as="div" variant="ui-sm" className={cn('text-neutral3', className)}>
-      {children}
-    </Txt>
-  );
+  return <div className={cn(textStyle({ variant: 'caption', tone: 'muted' }), className)}>{children}</div>;
 };
 
 export const EntityContent = ({ children, className }: EntityProps) => {
-  return <div className={cn('flex-1 w-full', className)}>{children}</div>;
+  return <div className={cn('w-full flex-1', className)}>{children}</div>;
 };

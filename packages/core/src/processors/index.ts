@@ -1,19 +1,31 @@
 import type { LanguageModelV2, LanguageModelV2CallWarning, LanguageModelV2Prompt } from '@ai-sdk/provider-v5';
 import type { CoreMessage as CoreMessageV4 } from '@internal/ai-sdk-v4';
-import type { CallSettings, StepResult, ToolChoice } from '@internal/ai-sdk-v5';
+import type { StepResult, ToolChoice } from '@internal/ai-sdk-v5';
+import type { Agent } from '../agent';
 import type { MessageList, MastraDBMessage } from '../agent/message-list';
-import type { AgentSignalInput, CreatedAgentSignal } from '../agent/signals';
+import type { AgentSignalInput, AgentStateSignalInput, CreatedAgentSignal } from '../agent/signals';
+import type { ApplyStateSignalResult } from '../agent/state-signals';
 import type { TripWireOptions } from '../agent/trip-wire';
-import type { ModelRouterModelId } from '../llm/model';
+import type { ModelRouterModelId, MastraModelSettings } from '../llm/model';
 import type { MastraLanguageModel, OpenAICompatibleConfig, SharedProviderOptions } from '../llm/model/shared.types';
 import type { Mastra } from '../mastra';
-import type { ObservabilityContext } from '../observability';
+import type { MastraMemory } from '../memory/memory';
+import type {
+  ObservabilityContext,
+  ProcessorSpanPhase as ObservabilityProcessorSpanPhase,
+  ProcessorSpanType,
+  SpanTypeMap,
+  TracingContext,
+} from '../observability';
 import type { RequestContext } from '../request-context';
 import type { InferStandardSchemaOutput, StandardSchemaWithJSON } from '../schema';
 import type { ChunkType } from '../stream';
-import type { DataChunkType, LanguageModelUsage, LLMStepResult } from '../stream/types';
+import type { DataChunkType, LanguageModelUsage, LLMStepResult, ProviderMetadata } from '../stream/types';
 import type { Workflow } from '../workflows';
+import type { OutputWriter } from '../workflows/types';
+import type { AnyWorkspace } from '../workspace/workspace';
 import type { StructuredOutputOptions } from './processors';
+import type { ProcessorState } from './runner';
 import type { ProcessorStepOutput } from './step-schema';
 
 /**
@@ -56,13 +68,20 @@ export interface ProcessorContext<TTripwireMetadata = unknown> extends Partial<O
   abort: (reason?: string, options?: TripWireOptions<TTripwireMetadata>) => never;
   /** Optional runtime context with execution metadata */
   requestContext?: RequestContext;
+  /** Real agent instance when processors are running inside an agent execution. Processor-only workflow contexts may omit it. */
+  agent?: Agent<any, any, any, any>;
   /**
    * Add a signal to the message list, rotate the response message id when supported,
    * and emit the signal as a data-* stream part when a writer is available.
-   *
-   * @experimental Agent signals are experimental and may change in a future release.
    */
   sendSignal?: (signal: AgentSignalInput) => Promise<CreatedAgentSignal>;
+  /**
+   * Add a named state signal to the message list, stream it when possible, and update
+   * thread-level state tracking metadata.
+   */
+  sendStateSignal?: (
+    signal: AgentStateSignalInput | (Omit<AgentStateSignalInput, 'id'> & { id?: string }),
+  ) => Promise<CreatedAgentSignal | ApplyStateSignalResult>;
   /**
    * Number of times processors have triggered retry for this generation.
    * Use this to implement retry limits within your processor.
@@ -93,7 +112,8 @@ export interface ProcessorMessageContext<TTripwireMetadata = unknown> extends Pr
 }
 
 /**
- * Return type for processInput that includes modified system messages
+ * Return type for processInput that includes modified untagged system messages.
+ * Tagged system messages owned by other processors are preserved.
  */
 export interface ProcessInputResultWithSystemMessages {
   messages: MastraDBMessage[];
@@ -116,7 +136,7 @@ export type ProcessInputResult = MessageList | MastraDBMessage[] | ProcessInputR
  * Arguments for processInput method
  */
 export interface ProcessInputArgs<TTripwireMetadata = unknown> extends ProcessorMessageContext<TTripwireMetadata> {
-  /** All system messages (agent instructions, user-provided, memory) for read/modify access */
+  /** Untagged system messages for read/modify access. Tagged processor-owned messages remain on messageList. */
   systemMessages: CoreMessageV4[];
   /** Per-processor state that persists across all method calls within this request */
   state: Record<string, unknown>;
@@ -135,6 +155,10 @@ export interface OutputResult {
   finishReason: string;
   /** All LLM step results (each contains text, toolCalls, toolResults, usage, sources, files, reasoning, etc.) */
   steps: LLMStepResult[];
+  /**
+   * @deprecated No longer set. `MessageHistory` no longer drops failed turns it receives; check `finishReason === 'error'` to detect failed runs.
+   */
+  inputAccepted?: boolean;
 }
 
 /**
@@ -157,6 +181,8 @@ export interface ProcessOutputResultArgs<
  * The actual schema type is only known at the generate()/stream() call site.
  */
 export interface ProcessInputStepArgs<TTripwireMetadata = unknown> extends ProcessorMessageContext<TTripwireMetadata> {
+  /** The active agent run ID, when this processor is running inside an agent loop */
+  runId?: string;
   /** The current step number (0-indexed) */
   stepNumber: number;
   steps: Array<StepResult<any>>;
@@ -165,10 +191,17 @@ export interface ProcessInputStepArgs<TTripwireMetadata = unknown> extends Proce
   /** Mark the current assistant response message ID as complete and rotate to a fresh one, when supported by the caller */
   rotateResponseMessageId?: () => string;
 
-  /** All system messages (agent instructions, user-provided, memory) for read/modify access */
+  /** Untagged system messages for read/modify access. Tagged processor-owned messages remain on messageList. */
   systemMessages: CoreMessageV4[];
   /** Per-processor state that persists across all method calls within this request */
   state: Record<string, unknown>;
+  /**
+   * When true, this processor will also have processLLMRequest called after
+   * processInputStep. Processors that implement both methods can skip
+   * pre-conversion trimming here and defer it to the prompt stage, where it
+   * accounts for earlier prompt processors (e.g. ToolCallFilter).
+   */
+  llmRequestStage?: boolean;
 
   /**
    * Current model for this step.
@@ -181,7 +214,7 @@ export interface ProcessInputStepArgs<TTripwireMetadata = unknown> extends Proce
   activeTools?: string[];
 
   providerOptions?: SharedProviderOptions;
-  modelSettings?: Omit<CallSettings, 'abortSignal'>;
+  modelSettings?: MastraModelSettings;
   /**
    * Structured output configuration. The schema type is StandardSchemaWithJSON (not the specific OUTPUT)
    * because processors can modify it, and the actual type is only known at runtime.
@@ -201,6 +234,15 @@ export type RunProcessInputStepArgs = Omit<
   messageId?: string;
   rotateResponseMessageId?: () => string;
   retryCount?: number;
+  memory?: MastraMemory;
+  resourceId?: string;
+  threadId?: string;
+  /**
+   * IDs of processors whose processLLMRequest will run for this step.
+   * The runner sets llmRequestStage for these processors, including when they
+   * run inside a processor workflow.
+   */
+  llmRequestProcessorIds?: ReadonlySet<string>;
 };
 
 /**
@@ -220,10 +262,13 @@ export type ProcessInputStepResult = {
 
   messages?: MastraDBMessage[];
   messageList?: MessageList;
-  /** Replace all system messages with these */
+  /**
+   * Replace untagged system messages with these while preserving tagged system messages
+   * owned by other processors.
+   */
   systemMessages?: CoreMessageV4[];
   providerOptions?: SharedProviderOptions;
-  modelSettings?: Omit<CallSettings, 'abortSignal'>;
+  modelSettings?: MastraModelSettings;
   /**
    * Structured output configuration. The schema type is StandardSchemaWithJSON (not the specific OUTPUT)
    * because processors can modify it, and the actual type is only known at runtime.
@@ -248,11 +293,88 @@ export type RunProcessInputStepResult = Omit<ProcessInputStepResult, 'model'> & 
  * tool-result formats, etc. can be rewritten transiently without losing data
  * in memory, UI, or future model swaps.
  */
+export type ProcessorStateSignal = Omit<AgentStateSignalInput, 'id'> & {
+  id?: string;
+};
+
+export type ProcessorActiveStateSignal = CreatedAgentSignal & {
+  type: 'state';
+  metadata?: Record<string, unknown> & {
+    state?: {
+      id?: string;
+      threadId?: string;
+      cacheKey?: string;
+      version?: number;
+      mode?: 'snapshot' | 'delta';
+    };
+  };
+};
+
+/**
+ * Arguments for computeStateSignal method.
+ *
+ * Called once per model input step after normal per-step input processing and
+ * before the LLM request is finalized. State signals require memory-backed
+ * threads so the runtime can track versions on thread metadata.
+ */
+export interface ComputeStateSignalArgs<
+  TTripwireMetadata = unknown,
+> extends ProcessorMessageContext<TTripwireMetadata> {
+  /** The current step number (0-indexed) */
+  stepNumber: number;
+  /** All completed steps so far. */
+  steps: Array<StepResult<any>>;
+  /** Per-processor state that persists across all method calls within this request */
+  state: Record<string, unknown>;
+  /** Memory resource id for the active thread. */
+  resourceId: string;
+  /** Memory thread id that scopes this processor's state signal identity. */
+  threadId: string;
+  /** Active state signal copies for this processor/thread currently known to the runtime. */
+  activeStateSignals: ProcessorActiveStateSignal[];
+  /** Facts derived from the active message context window for this processor/thread. */
+  contextWindow: {
+    /** Whether the active message window already contains a snapshot for this processor/thread. */
+    hasSnapshot: boolean;
+  };
+  /** Latest snapshot signal for this processor/thread, resolved from message history when needed. */
+  lastSnapshot?: ProcessorActiveStateSignal;
+  /** Delta signals accepted after the latest snapshot for this processor/thread. */
+  deltasSinceSnapshot: ProcessorActiveStateSignal[];
+  /** Last persisted tracking metadata for this processor/thread. */
+  tracking?: ProcessorStateSignalTracking;
+}
+
+/**
+ * Thread metadata stored under metadata.mastra.stateSignals[stateId].
+ */
+export type ProcessorStateSignalTracking = {
+  currentCacheKey?: string;
+  currentMode?: 'snapshot' | 'delta';
+  version?: number;
+  lastSignalId?: string;
+  lastSnapshotSignalId?: string;
+  updatedAt?: string;
+  activeCopies?: Array<{ id: string; cacheKey?: string; mode?: 'snapshot' | 'delta'; version?: number }>;
+};
+
+export type ComputeStateSignalResult = ProcessorStateSignal | undefined | void;
+
 export interface ProcessLLMRequestArgs<TTripwireMetadata = unknown> extends ProcessorContext<TTripwireMetadata> {
   /** The LLM request prompt that will be sent to the provider on this call. Processors may return a modified copy. */
   prompt: LanguageModelV2Prompt;
   /** The model the prompt is being sent to. Use to scope provider-specific rewrites. */
   model: MastraLanguageModel;
+  /**
+   * Provider id of the API the prompt is sent to, e.g. `openai.chat`, `groq.chat` or `openai.responses`.
+   * Unlike `model.provider`, router models (`'groq/...'`) report the model they resolve to, so a
+   * processor can tell a Chat Completions endpoint from a Responses one. Undefined when it couldn't be resolved.
+   */
+  apiProviderId?: string;
+  /** The message list the prompt was built from, for provenance that the converted prompt no longer carries (e.g. per-message metadata stamps). */
+  messageList?: MessageList;
+  /** The workspace of this step, the one the agent's tools use. Undefined when the agent has none. */
+  workspace?: AnyWorkspace;
   /** The current step number (0-indexed) within the agentic loop. */
   stepNumber: number;
   /** All completed steps so far. */
@@ -399,17 +521,68 @@ export interface ProcessOutputStepArgs<TTripwireMetadata = unknown> extends Proc
   stepNumber: number;
   /** The finish reason from the LLM (stop, tool-use, length, etc.) */
   finishReason?: string;
+  /**
+   * Provider-specific metadata for the step that just finished (e.g. AWS
+   * Bedrock guardrail trace under `providerMetadata.bedrock.trace.guardrail`).
+   * Present whenever the underlying model step produced it — including
+   * `content-filter` blocks, for which `steps` is empty.
+   */
+  providerMetadata?: ProviderMetadata;
   /** Tool calls made in this step (if any) */
   toolCalls?: ToolCallInfo[];
   /** Generated text from this step */
   text?: string;
   /** Token usage for the current step (input tokens, output tokens, etc.) */
   usage: LanguageModelUsage;
-  /** All system messages */
+  /** Untagged system messages. Tagged processor-owned messages remain on messageList. */
   systemMessages: CoreMessageV4[];
   /** All completed steps so far (including the current step) */
   steps: Array<StepResult<any>>;
   /** Mutable state object that persists across steps */
+  state: Record<string, unknown>;
+}
+
+/**
+ * Arguments for processToolResult method.
+ * Called after each tool's execute() returns successfully and before the
+ * result is appended to the message list / fed to the next LLM call.
+ * Symmetric with processOutputStep, which fires before tool execution.
+ */
+export interface ProcessToolResultArgs<TTripwireMetadata = unknown> extends ProcessorMessageContext<TTripwireMetadata> {
+  /** The current step number (0-indexed) */
+  stepNumber: number;
+  /** Name of the tool that was executed */
+  toolName: string;
+  /** Unique identifier for this specific tool call */
+  toolCallId: string;
+  /** Arguments the LLM passed to the tool */
+  args: unknown;
+  /**
+   * Value returned by the tool. For client-executed tools this is the output of
+   * `tool.execute()` after it has passed through `ensureSerializable`. For
+   * provider-executed tools (e.g. Anthropic `web_search`) it is the raw result
+   * from the provider stream, which is not run through `ensureSerializable`.
+   */
+  result: unknown;
+  /**
+   * The tool's `toModelOutput` mapping of `result`: what the next model call
+   * and stored history read in place of the raw result. `undefined` when the
+   * tool has no `toModelOutput` or it returned nothing.
+   *
+   * To replace it (e.g. resize or remove images), commit a `result`-state
+   * part with `messageList.updateToolInvocation` that carries the new value in
+   * `providerMetadata.mastra.modelOutput`; `null` there drops the mapping so
+   * the model reads the raw result. Replacing only `result` re-runs
+   * `toModelOutput` on the new value.
+   */
+  modelOutput?: unknown;
+  /** Whether this result came from a provider-executed tool (e.g. Anthropic web_search) */
+  providerExecuted?: boolean;
+  /** All system messages */
+  systemMessages: CoreMessageV4[];
+  /** All completed steps so far */
+  steps: Array<StepResult<any>>;
+  /** Per-processor state that persists across all method calls within this request */
   state: Record<string, unknown>;
 }
 
@@ -462,6 +635,16 @@ export interface ProcessorViolation<TDetail = unknown> {
   detail: TDetail;
 }
 
+/**
+ * Pipeline phase a processor span is created for. One value per site where the
+ * processor runner creates a span, so a processor that runs in more than one
+ * phase can name and describe each of them differently.
+ *
+ * Defined in the observability types because `ProcessorPipelineAttributes`
+ * records it on the span; re-exported here as the name processors use.
+ */
+export type ProcessorSpanPhase = ObservabilityProcessorSpanPhase;
+
 export interface Processor<TId extends string = string, TTripwireMetadata = unknown> {
   readonly id: TId;
   readonly name?: string;
@@ -471,6 +654,51 @@ export interface Processor<TId extends string = string, TTripwireMetadata = unkn
    * Agents use this to avoid adding eager skill context and overlapping skill tools.
    */
   readonly providesSkillDiscovery?: 'on-demand';
+  /**
+   * Span type the runner should use for this processor's span, instead of the
+   * default `PROCESSOR_RUN`.
+   *
+   * Processors Mastra derives from agent config (skills, workspace
+   * instructions, memory, task state) are an implementation detail of how a
+   * subsystem injects context — the user never wrote the word "processor". A
+   * declared span type labels the span with the subsystem it came from, so the
+   * trace shows where it originated instead of an anonymous processor entry.
+   *
+   * The runner keeps setting `entityType` and the `ProcessorPipelineAttributes`
+   * fields either way — including `processorPhase`, which is what a reader
+   * narrows the span's payloads on — so retyping never loses the processor's
+   * position in the chain, its mutation log, or the readable view of its
+   * input and output.
+   */
+  readonly spanType?: ProcessorSpanType;
+  /**
+   * Span name for this processor's span, instead of the runner's default
+   * `<phase> processor: <id>`. Pair this with `spanType` so the name matches
+   * the subsystem the span is labelled as.
+   *
+   * Pass a function to name each phase separately. A processor that runs in
+   * more than one phase usually does something different in each — the
+   * observational memory processor recalls context on the input step and
+   * persists observations on the output result — and one static name would
+   * describe both wrongly.
+   */
+  readonly spanName?: string | ((phase: ProcessorSpanPhase) => string);
+  /**
+   * Attributes the runner sets when it creates this processor's span.
+   *
+   * Needed because a declared `spanType` may have required attributes of its
+   * own — `WORKSPACE_ACTION.category`, `SKILL_ACTION.operation` — that only the
+   * processor knows. Setting them here means the span carries them from
+   * creation rather than being patched in later by the processor body.
+   *
+   * Note the pairing with `spanType` is not enforced by the type system: this
+   * accepts a partial of any processor-declarable attributes, so declaring
+   * `WORKSPACE_ACTION` alongside a `SKILL_ACTION` field will not be caught at
+   * compile time.
+   */
+  readonly spanAttributes?:
+    | Partial<SpanTypeMap[ProcessorSpanType]>
+    | ((phase: ProcessorSpanPhase) => Partial<SpanTypeMap[ProcessorSpanType]>);
   /** Index of this processor in the workflow (set at runtime when combining processors) */
   processorIndex?: number;
 
@@ -531,6 +759,22 @@ export interface Processor<TId extends string = string, TTripwireMetadata = unkn
     | undefined;
 
   /**
+   * State lane id used for `computeStateSignal` history and tracking. Defaults to the processor id.
+   */
+  stateId?: string;
+
+  /**
+   * Compute this processor's thread-scoped state signal for the current model input step.
+   *
+   * Called after this processor's `processInputStep` hook and before the model request is finalized.
+   * The runtime persists version/cache-key tracking on memory thread metadata keyed by state id.
+   * Returning `undefined` means the state has not changed for this step.
+   */
+  computeStateSignal?(
+    args: ComputeStateSignalArgs<TTripwireMetadata>,
+  ): Promise<ComputeStateSignalResult> | ComputeStateSignalResult;
+
+  /**
    * Process the LLM-shaped prompt after `MessageList` has been converted to
    * `LanguageModelV2Prompt` and immediately before it is forwarded to the
    * provider on this call.
@@ -589,6 +833,32 @@ export interface Processor<TId extends string = string, TTripwireMetadata = unkn
    *  - MastraDBMessage[]: Transformed messages array (for simple transformations)
    */
   processOutputStep?(args: ProcessOutputStepArgs<TTripwireMetadata>): ProcessorMessageResult;
+
+  /**
+   * Process a tool's result after tool.execute() returns successfully and before
+   * the result is added to the message list or fed to the next LLM call.
+   *
+   * Symmetric with processOutputStep (which runs before tool execution). Use this
+   * hook to scan tool output for prompt injection / sensitive data, redact fields,
+   * or abort the run with abort({ retry: true }).
+   *
+   * To replace the tool's result, mutate messageList in place via
+   * messageList.updateToolInvocation. The runtime re-reads the post-processor
+   * result from the message list and overwrites the downstream tool-result
+   * stream chunk before it's enqueued, so streaming clients see the processed
+   * value, not the raw one.
+   *
+   * Note: this hook does not fire when tool.execute() throws — it is called only
+   * for successful tool executions where a result is available.
+   *
+   * @returns Either:
+   *  - MessageList: The same messageList instance passed in (indicates you've mutated it)
+   *  - MastraDBMessage[]: Transformed messages array (for simple transformations)
+   *  - undefined/void: No changes (passthrough)
+   */
+  processToolResult?(
+    args: ProcessToolResultArgs<TTripwireMetadata>,
+  ): Promise<MessageList | MastraDBMessage[] | undefined | void> | MessageList | MastraDBMessage[] | void | undefined;
 
   /**
    * Process an LLM API rejection error before it's surfaced as a final error.
@@ -656,23 +926,28 @@ export abstract class BaseProcessor<TId extends string = string, TTripwireMetada
 
 type WithRequired<T, K extends keyof T> = T & { [P in K]-?: NonNullable<T[P]> };
 
-// InputProcessor requires processInput, processInputStep, processLLMRequest, or processLLMResponse (or any combination)
+// InputProcessor requires processInput, processInputStep, computeStateSignal, processLLMRequest, or processLLMResponse (or any combination)
 export type InputProcessor<TTripwireMetadata = unknown> =
   | (WithRequired<Processor<string, TTripwireMetadata>, 'id' | 'processInput'> & Processor<string, TTripwireMetadata>)
   | (WithRequired<Processor<string, TTripwireMetadata>, 'id' | 'processInputStep'> &
+      Processor<string, TTripwireMetadata>)
+  | (WithRequired<Processor<string, TTripwireMetadata>, 'id' | 'computeStateSignal'> &
       Processor<string, TTripwireMetadata>)
   | (WithRequired<Processor<string, TTripwireMetadata>, 'id' | 'processLLMRequest'> &
       Processor<string, TTripwireMetadata>)
   | (WithRequired<Processor<string, TTripwireMetadata>, 'id' | 'processLLMResponse'> &
       Processor<string, TTripwireMetadata>);
 
-// OutputProcessor requires either processOutputStream OR processOutputResult OR processOutputStep (or any combination)
+// OutputProcessor requires processOutputStream OR processOutputResult OR processOutputStep
+// OR processToolResult (or any combination)
 export type OutputProcessor<TTripwireMetadata = unknown> =
   | (WithRequired<Processor<string, TTripwireMetadata>, 'id' | 'processOutputStream'> &
       Processor<string, TTripwireMetadata>)
   | (WithRequired<Processor<string, TTripwireMetadata>, 'id' | 'processOutputResult'> &
       Processor<string, TTripwireMetadata>)
   | (WithRequired<Processor<string, TTripwireMetadata>, 'id' | 'processOutputStep'> &
+      Processor<string, TTripwireMetadata>)
+  | (WithRequired<Processor<string, TTripwireMetadata>, 'id' | 'processToolResult'> &
       Processor<string, TTripwireMetadata>);
 
 // ErrorProcessor requires processAPIError
@@ -687,11 +962,56 @@ export type ProcessorTypes<TTripwireMetadata = unknown> =
   | OutputProcessor<TTripwireMetadata>
   | ErrorProcessor<TTripwireMetadata>;
 
+/** @internal Context consumed by processor step adapters, without workflow engine machinery. */
+export type ProcessorStepExecutor<TInput = ProcessorStepOutput> = (args: {
+  inputData: TInput;
+  requestContext?: RequestContext;
+  tracingContext?: TracingContext;
+  outputWriter?: OutputWriter;
+}) => Promise<ProcessorStepOutput>;
+
 /**
  * A Workflow that can be used as a processor.
  * The workflow must accept ProcessorStepInput and return ProcessorStepOutput.
  */
-export type ProcessorWorkflow = Workflow<any, any, string, any, ProcessorStepOutput, ProcessorStepOutput, any>;
+export type ProcessorWorkflow = Workflow<any, any, string, any, ProcessorStepOutput, ProcessorStepOutput, any> & {
+  /** @internal Processors in a combined workflow that compute state signals after input-step execution. */
+  __stateSignalProcessors?: Processor[];
+  /** @internal Whether a framework-generated workflow needs per-chunk execution. Unknown workflows always execute. */
+  __processOutputStream?: boolean;
+  /**
+   * @internal Whether any wrapped processor runs after the model stream ends
+   * (`processOutputStep` / `processLLMResponse`). Processors are wrapped into a
+   * workflow before they reach the loop, so the wrapper is the only place that
+   * still knows this. Unknown workflows leave it undefined and are treated as
+   * post-stream, because callers use this to decide what is safe to start early.
+   *
+   * Only meaningful on output chains. The same wrapper builds input chains, which
+   * carry the flag without it meaning anything there.
+   */
+  __processOutputStep?: boolean;
+  /**
+   * @internal Whether any wrapped processor implements `processToolResult`. That hook
+   * runs *inside* the model stream and can abort the turn before the post-stream pass,
+   * so it is a separate question from `__processOutputStep`. Recorded here for the same
+   * reason: the wrapper is the only place that still knows. Unknown workflows leave it
+   * undefined and are treated as implementing it.
+   */
+  __processToolResult?: boolean;
+  /** @internal Direct adapter execution, only for framework-generated plain processor chains. */
+  __executeOutputStream?: ProcessorStepExecutor;
+  /**
+   * @internal End-of-stream counterpart of `__executeOutputStream`: releases the parts the
+   * chained processors still hold, each pushed through the processors after its holder.
+   */
+  __flushOutputStream?: (args: Parameters<ProcessorStepExecutor>[0]) => Promise<ChunkType[]>;
+  /**
+   * @internal Failure counterpart of `__flushOutputStream`: drops what the chained processors
+   * hold without emitting their content or running any further checks, returning the held
+   * control parts (oldest first).
+   */
+  __discardOutputStream?: (processorStates?: Map<string, ProcessorState>) => Promise<ChunkType[]>;
+};
 
 /**
  * Input processor config: can be a Processor or a Workflow.
@@ -714,41 +1034,54 @@ export type OutputProcessorOrWorkflow<TTripwireMetadata = unknown> =
 export type ErrorProcessorOrWorkflow<TTripwireMetadata = unknown> = ErrorProcessor<TTripwireMetadata>;
 
 /**
- * Type guard to check if an object is a Workflow that can be used as a processor.
- * A ProcessorWorkflow must have 'id', 'inputSchema', 'outputSchema', and 'execute' properties.
+ * Processor config accepted by the provider-boundary LLM request lane.
+ *
+ * The lane carries input processors plus error processors, so an error-lane processor that implements
+ * `processLLMRequest` still gets its hook. Entries without that method are inert there.
  */
-export function isProcessorWorkflow(obj: unknown): obj is ProcessorWorkflow {
-  return (
-    obj !== null &&
-    typeof obj === 'object' &&
-    'id' in obj &&
-    typeof (obj as any).id === 'string' &&
-    'inputSchema' in obj &&
-    'outputSchema' in obj &&
-    'execute' in obj &&
-    typeof (obj as any).execute === 'function' &&
-    // Must NOT have processor-specific methods (to distinguish from Processor)
-    !('processInput' in obj) &&
-    !('processInputStep' in obj) &&
-    !('processOutputStream' in obj) &&
-    !('processOutputResult' in obj) &&
-    !('processOutputStep' in obj) &&
-    !('processLLMRequest' in obj) &&
-    !('processAPIError' in obj)
-  );
-}
+export type LLMRequestProcessorOrWorkflow<TTripwireMetadata = unknown> =
+  | InputProcessorOrWorkflow<TTripwireMetadata>
+  | ErrorProcessorOrWorkflow<TTripwireMetadata>;
+
+export { isProcessorWorkflow } from './is-processor-workflow';
+
+export {
+  defaultStabilityErrorProcessors,
+  isMalformedFunctionCallError,
+  STABILITY_ERROR_PROCESSOR_IDS,
+} from './stability-defaults';
 
 export * from './processors';
+export { CyberRefusalHandler } from './cyber-refusal-handler';
 export { PrefillErrorHandler } from './prefill-error-handler';
-export { ProviderHistoryCompat, anthropicToolIdFormat, cerebrasStripReasoningContent } from './provider-history-compat';
+export { UnsupportedFileHandler } from './unsupported-file-handler';
 export {
+  ProviderHistoryCompat,
+  anthropicToolIdFormat,
+  cerebrasStripReasoningContent,
+  openaiOrphanItemId,
+} from './provider-history-compat';
+export {
+  isBadRequestError,
   isRetryableOpenAIResponsesStreamError,
   StreamErrorRetryProcessor,
+  type StreamErrorRetryDelayMs,
   type StreamErrorRetryMatcher,
+  type StreamErrorRetryMatcherConfig,
+  type StreamErrorRetryMatcherEntry,
   type StreamErrorRetryProcessorOptions,
 } from './stream-error-retry-processor';
 export type { CompatRule } from './provider-history-compat';
-export { ProcessorState, ProcessorRunner, createProcessorSendSignal } from './runner';
+export { ProcessorState, ProcessorRunner } from './runner';
+export { REPROCESS_PART_KEY } from './stream-reprocess';
+export { createProcessorSendSignal } from './send-signal';
+export { createBackgroundWorkSignalProcessor } from './background-work-signals';
+export type {
+  BackgroundWorkDisposition,
+  BackgroundWorkInvocationKind,
+  BackgroundWorkLifecyclePayload,
+  BackgroundWorkTerminalStatus,
+} from './background-work-signals';
 export * from './memory';
 export type { TripWireOptions } from '../agent/trip-wire';
 export {

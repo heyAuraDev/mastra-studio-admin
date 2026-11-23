@@ -1,0 +1,568 @@
+/**
+ * Core programmatic runner for MastraCode headless runs.
+ *
+ * `runMC` is a pure async runner: it takes an already-built `controller` +
+ * `session` (from `createMastraCode(...)`), resolves run config, subscribes to
+ * the session, applies a {@link ResolutionPolicy} for approvals/suspensions,
+ * sends the prompt, and aggregates events into a {@link RunMCResult}.
+ *
+ * It never touches `process.*` and never calls `process.exit`. The returned
+ * {@link MCRun} is async-iterable over controller events and also resolves to a
+ * final result via `result`.
+ */
+import { isSessionStartupCancelledError } from '@mastra/core/agent-controller';
+import type { AgentControllerEvent, Session } from '@mastra/core/agent-controller';
+
+import { MODEL_FALLBACK_STATE_KEY } from '../auth/account-rotation-processor.js';
+import { GoalManager } from '../goal-manager.js';
+import { createGoalReminderSignal } from '../goal-signal.js';
+import { THREAD_ACTIVE_MODEL_PACK_ID_KEY } from '../onboarding/settings.js';
+
+import { autoApprovePolicy } from './policy.js';
+import type { MCRun, ResolutionPolicy, RunMCOptions, RunMCResult, RunMCStatus } from './types.js';
+
+function exitCodeForStatus(status: RunMCStatus): number {
+  switch (status) {
+    case 'completed':
+    case 'done':
+      return 0;
+    case 'timeout':
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+interface MutableResult {
+  text: string;
+  finishReason?: string;
+  usage?: RunMCResult['usage'];
+  toolCalls: RunMCResult['toolCalls'];
+  toolResults: RunMCResult['toolResults'];
+  error?: RunMCResult['error'];
+  threadId?: string;
+  activeAssistantMessageId?: string;
+}
+
+function aggregate(event: AgentControllerEvent, acc: MutableResult): void {
+  switch (event.type) {
+    case 'message_start':
+      if (event.message.role === 'assistant') acc.activeAssistantMessageId = event.message.id;
+      break;
+    case 'message_update':
+      if (event.event.type === 'text-delta' && event.id === acc.activeAssistantMessageId) {
+        acc.text += event.event.delta;
+      }
+      break;
+    case 'message_end':
+      if (event.id === acc.activeAssistantMessageId) acc.activeAssistantMessageId = undefined;
+      break;
+    case 'tool_start':
+      acc.toolCalls.push({ id: event.toolCallId, name: event.toolName, args: event.args });
+      break;
+    case 'tool_end': {
+      const matching = acc.toolCalls.find(c => c.id === event.toolCallId);
+      acc.toolResults.push({
+        id: event.toolCallId,
+        name: matching?.name ?? '',
+        result: event.result,
+        isError: event.isError,
+      });
+      break;
+    }
+    case 'usage_update':
+      acc.usage = {
+        inputTokens: (acc.usage?.inputTokens ?? 0) + event.usage.promptTokens,
+        outputTokens: (acc.usage?.outputTokens ?? 0) + event.usage.completionTokens,
+        totalTokens: (acc.usage?.totalTokens ?? 0) + event.usage.totalTokens,
+      };
+      break;
+    case 'error':
+      acc.error = {
+        name: event.error.name,
+        message: event.error.message,
+        stack: event.error.stack,
+      };
+      break;
+  }
+}
+
+/** Resolve a thread by its exact ID. Titles are not unique, so we don't match on them. */
+async function resolveThread<TState extends Record<string, unknown>>(
+  session: Session<TState>,
+  threadId: string,
+  resourceId?: string,
+): Promise<{ threadId: string } | { error: string }> {
+  const threads = await session.thread.list(resourceId ? { allResources: true } : undefined);
+
+  const byId = threads.find(thread => thread.id === threadId && (!resourceId || thread.resourceId === resourceId));
+  if (byId) return { threadId: byId.id };
+
+  return { error: `No thread found with ID "${threadId}"` };
+}
+
+/**
+ * A simple back-pressured async queue. Events are pushed in; consumers pull via
+ * the async iterator. `close()` ends iteration after draining buffered events.
+ *
+ * Buffered events are bounded by `maxBuffer`: if a consumer never iterates (the
+ * result-only path, `await run.result` without `for await (...)`) — or simply
+ * falls far behind — the oldest buffered events are dropped instead of growing
+ * without limit. The aggregated {@link RunMCResult} is built independently of
+ * this queue, so dropping buffered events never affects the final result.
+ */
+class EventQueue<T> {
+  #buffer: T[] = [];
+  #resolvers: Array<(r: IteratorResult<T>) => void> = [];
+  #closed = false;
+  readonly #maxBuffer: number;
+
+  constructor(maxBuffer = 10_000) {
+    this.#maxBuffer = maxBuffer;
+  }
+
+  push(value: T): void {
+    if (this.#closed) return;
+    const resolve = this.#resolvers.shift();
+    if (resolve) {
+      resolve({ value, done: false });
+      return;
+    }
+    this.#buffer.push(value);
+    if (this.#buffer.length > this.#maxBuffer) {
+      // Bound memory: drop the oldest event once over the cap.
+      this.#buffer.shift();
+    }
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    for (const resolve of this.#resolvers.splice(0)) {
+      resolve({ value: undefined as unknown as T, done: true });
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<T> {
+    return {
+      next: (): Promise<IteratorResult<T>> => {
+        if (this.#buffer.length > 0) {
+          return Promise.resolve({ value: this.#buffer.shift()!, done: false });
+        }
+        if (this.#closed) {
+          return Promise.resolve({ value: undefined as unknown as T, done: true });
+        }
+        return new Promise<IteratorResult<T>>(resolve => this.#resolvers.push(resolve));
+      },
+    };
+  }
+}
+
+/**
+ * Run a headless MastraCode turn. Returns an {@link MCRun} handle that is
+ * async-iterable over controller events and resolves to a {@link RunMCResult}.
+ */
+export function runMC<TState extends Record<string, unknown>>(options: RunMCOptions<TState>): MCRun {
+  const { controller, session } = options;
+  const goal = options.goal;
+  const policy: ResolutionPolicy = options.policy ?? autoApprovePolicy;
+
+  const queue = new EventQueue<AgentControllerEvent>();
+  const acc: MutableResult = { text: '', toolCalls: [], toolResults: [] };
+
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  let aborted = false;
+  let maxTurnsExceeded = false;
+  let assistantTurns = 0;
+  let activeAssistantMessageId: string | undefined;
+  let settled = false;
+  let agentStarts = 0;
+  let unsubscribe: (() => void) | undefined;
+  let resolveResult!: (r: RunMCResult) => void;
+
+  const result = new Promise<RunMCResult>(resolve => {
+    resolveResult = resolve;
+  });
+
+  function finish(status: RunMCStatus, data: Partial<RunMCResult> = {}): void {
+    if (settled) return;
+    settled = true;
+    if (timeoutId) clearTimeout(timeoutId);
+    unsubscribe?.();
+    queue.close();
+    resolveResult({
+      status,
+      text: acc.text,
+      finishReason: acc.finishReason,
+      usage: acc.usage,
+      toolCalls: acc.toolCalls,
+      toolResults: acc.toolResults,
+      threadId: acc.threadId ?? session.thread.getId() ?? undefined,
+      error: acc.error,
+      exitCode: exitCodeForStatus(status),
+      ...data,
+    });
+  }
+
+  function fail(message: string, name = 'Error'): void {
+    if (!acc.error) acc.error = { name, message };
+    finish('error');
+  }
+
+  function failUnresolvedSuspension(toolName?: string): void {
+    fail(`Run ended with an unresolved ${toolName ? `${toolName} suspension` : 'tool suspension'}.`);
+  }
+
+  /**
+   * Ask the policy for the next parked tool. The session starts a fresh
+   * run for it, so this run stays open until that run ends. Returns false when
+   * nothing is left to resume.
+   */
+  function resumeNextSuspension(): boolean {
+    const next = session.displayState.get().pendingSuspensions.values().next();
+    if (next.done) return false;
+    const { toolCallId, toolName } = next.value;
+    let outcome: ReturnType<ResolutionPolicy['onSuspension']>;
+    try {
+      outcome = policy.onSuspension({ type: 'tool_suspended', ...next.value });
+    } catch (err) {
+      fail(`Resolution policy failed: ${(err as Error).message}`);
+      return true;
+    }
+    if ('abort' in outcome) {
+      abort();
+      // This run has already ended suspended, so no further agent_end is due.
+      finish('aborted');
+      return true;
+    }
+    const { resumeData } = outcome;
+    // The session clears the ending run's state right after emitting
+    // agent_end, so resume on a later task, as an interactive client would.
+    setTimeout(() => {
+      if (settled) return;
+      if (timedOut) return finish('timeout');
+      if (aborted) return finish('aborted');
+      const startsBeforeResume = agentStarts;
+      session.respondToToolSuspension({ toolCallId, resumeData }).then(
+        () => {
+          // The session returns without starting a run when the suspension is
+          // no longer parked; nothing else would end this run then.
+          if (!settled && agentStarts === startsBeforeResume) failUnresolvedSuspension(toolName);
+        },
+        (err: unknown) => fail(`Failed to resume ${toolName}: ${(err as Error).message}`),
+      );
+    }, 0);
+    return true;
+  }
+
+  function abort(): void {
+    if (settled) return;
+    aborted = true;
+    session.abort();
+  }
+
+  if (options.signal) {
+    if (options.signal.aborted) {
+      // Defer so the caller can attach iteration / result handlers first.
+      queueMicrotask(() => abort());
+    } else {
+      options.signal.addEventListener('abort', () => abort(), { once: true });
+    }
+  }
+
+  function armTimeout(): void {
+    if (!options.timeoutMs || settled) return;
+    if (timeoutId) clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      session.abort();
+      if (goal) finish('timeout');
+    }, options.timeoutMs);
+  }
+
+  // Kick off the run asynchronously so the MCRun handle is returned synchronously.
+  void (async () => {
+    armTimeout();
+
+    // --- Subscribe ---
+    unsubscribe = session.subscribe(event => {
+      if (settled) return;
+      if (event.type === 'agent_start') agentStarts += 1;
+      if (goal) armTimeout();
+
+      if (event.type === 'tool_approval_required') {
+        let decision: 'approve' | 'deny';
+        try {
+          decision = policy.onToolApproval(event);
+        } catch (err) {
+          fail(`Resolution policy failed: ${(err as Error).message}`);
+          return;
+        }
+        session.respondToToolApproval({
+          decision: decision === 'approve' ? 'approve' : 'decline',
+          toolCallId: event.toolCallId,
+        });
+        queue.push(event);
+        return;
+      }
+
+      if (event.type === 'message_start' && event.message.role === 'assistant') {
+        activeAssistantMessageId = event.message.id;
+      }
+
+      aggregate(event, acc);
+      queue.push(event);
+
+      if (event.type === 'error' && goal) {
+        finish('error');
+        return;
+      }
+
+      // Count agentic turns (one assistant response = one turn). When the cap is
+      // reached, abort the run; agent_end then resolves as 'max_turns'.
+      if (event.type === 'message_end' && event.id === activeAssistantMessageId && options.maxTurns !== undefined) {
+        activeAssistantMessageId = undefined;
+        assistantTurns += 1;
+        if (assistantTurns >= options.maxTurns && !maxTurnsExceeded) {
+          maxTurnsExceeded = true;
+          abort();
+        }
+      }
+
+      if (event.type === 'goal_evaluation' && goal && !event.payload.pending) {
+        if (event.payload.status === 'done' || event.payload.status === 'paused') {
+          finish(event.payload.status, {
+            objective: goal.objective,
+            goalEvent: event,
+            reason: event.payload.reason ?? event.payload.results?.[0]?.reason,
+            iterations: event.payload.iteration,
+            maxRuns: event.payload.maxRuns,
+          });
+        }
+        return;
+      }
+
+      if (event.type === 'agent_end') {
+        acc.finishReason = event.reason;
+        // A suspended run is parked, not finished: nothing more arrives until a
+        // parked tool is answered, including goal evaluations.
+        if (event.reason === 'suspended' && !timedOut && !aborted) {
+          if (!resumeNextSuspension()) failUnresolvedSuspension();
+          return;
+        }
+        // Goal evaluations can arrive after the agent stream ends, so goal runs
+        // remain active until a terminal goal_evaluation is emitted.
+        if (goal) return;
+        if (timedOut) {
+          finish('timeout');
+        } else if (event.reason === 'error') {
+          finish('error');
+        } else if (maxTurnsExceeded && event.reason !== 'complete') {
+          // The cap forced an abort while the agent still had work to do.
+          finish('max_turns');
+        } else if ((event.reason === 'aborted' || aborted) && !maxTurnsExceeded) {
+          finish('aborted');
+        } else {
+          finish('completed');
+        }
+      }
+    });
+
+    // --- Thread resolution (read-only) ---
+    const thread = options.thread;
+    const targetResourceId = options.resourceId ?? session.identity.getResourceId();
+    let restoredThreadId: string | undefined;
+    try {
+      if (thread?.id) {
+        const resolved = await resolveThread(session, thread.id, targetResourceId);
+        if ('error' in resolved) return fail(resolved.error);
+        restoredThreadId = resolved.threadId;
+      } else if (thread?.continueLatest) {
+        const threads = await session.thread.list(targetResourceId ? { allResources: true } : undefined);
+        const resourceThreads = targetResourceId
+          ? threads.filter(candidate => candidate.resourceId === targetResourceId)
+          : threads;
+        if (resourceThreads.length > 0) {
+          restoredThreadId = [...resourceThreads].sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())[0]!.id;
+        }
+      }
+    } catch (err) {
+      return fail(`Failed to resolve thread: ${(err as Error).message}`);
+    }
+
+    // --- Config validation (read-only) ---
+    const restoredThreadSelection = Boolean(restoredThreadId || thread?.clone);
+    const modeIdForModel = options.mode ?? (options.modeDefaults ? session.mode.get() : undefined);
+    const configuredDefaultModelId = modeIdForModel ? options.modeDefaults?.[modeIdForModel] : undefined;
+    // A pack's model is not resolved here: a resumed thread restores its
+    // persisted mode during thread selection, and the pack selection depends
+    // on that mode. It is resolved and validated during config application.
+    const modelIdToApply = options.pack
+      ? options.model
+      : (options.model ?? (options.mode || !restoredThreadSelection ? configuredDefaultModelId : undefined));
+    // Where modelIdToApply came from, so validation errors name the right source.
+    const modelSource = options.model ? 'flag' : 'mode';
+    try {
+      if (options.mode && !controller.listModes().some(mode => mode.id === options.mode)) {
+        return fail(`Unknown mode: "${options.mode}"`);
+      }
+
+      if (modelIdToApply) {
+        const available = await controller.listAvailableModels();
+        const match = available.find(model => model.id === modelIdToApply);
+        if (!match) {
+          if (modelSource === 'flag') return fail(`Unknown model: "${modelIdToApply}"`);
+          return fail(`Unknown model "${modelIdToApply}" configured for mode "${modeIdForModel}"`);
+        }
+        if (!match.hasApiKey) {
+          const keyHint = match.apiKeyEnvVar ? ` Set ${match.apiKeyEnvVar} to use this model.` : '';
+          if (modelSource === 'flag') return fail(`Model "${modelIdToApply}" has no API key configured.${keyHint}`);
+          return fail(`Model "${modelIdToApply}" (mode: ${modeIdForModel}) has no API key configured.${keyHint}`);
+        }
+      }
+    } catch (err) {
+      return fail(`Failed to resolve run config: ${(err as Error).message}`);
+    }
+
+    // --- Resource id ---
+    try {
+      if (options.resourceId) {
+        await controller.setResourceId(session, { resourceId: options.resourceId });
+      }
+    } catch (err) {
+      return fail(`Failed to set resource id: ${(err as Error).message}`);
+    }
+
+    // --- Thread selection ---
+    try {
+      if (restoredThreadId) {
+        await session.thread.switch({ threadId: restoredThreadId });
+      } else if (!thread?.clone) {
+        await session.thread.create();
+      }
+    } catch (err) {
+      return fail(`Failed to select thread: ${(err as Error).message}`);
+    }
+
+    // --- Clone ---
+    if (thread?.clone) {
+      try {
+        await session.thread.clone();
+      } catch (err) {
+        return fail(`Failed to clone thread: ${(err as Error).message}`);
+      }
+    }
+
+    // --- Config application ---
+    try {
+      if (options.mode) {
+        await session.mode.switch({ modeId: options.mode });
+      }
+      let packModelId: string | undefined;
+      if (options.pack) {
+        // Resolve the selection against the mode in effect now — thread
+        // selection above may have restored a resumed thread's persisted mode.
+        const packModeId = options.mode ?? session.mode.get();
+        const packSelection = options.pack.resolve(packModeId);
+        if (!packSelection) {
+          return fail(`Model pack "${options.pack.id}" has no model for ${packModeId} mode`);
+        }
+        const available = await controller.listAvailableModels();
+        const match = available.find(model => model.id === packSelection.modelId);
+        if (!match) {
+          return fail(`Unknown model "${packSelection.modelId}" from pack "${options.pack.id}"`);
+        }
+        if (!match.hasApiKey) {
+          const keyHint = match.apiKeyEnvVar ? ` Set ${match.apiKeyEnvVar} to use this model.` : '';
+          return fail(
+            `Model "${packSelection.modelId}" (pack: ${options.pack.id}) has no API key configured.${keyHint}`,
+          );
+        }
+        packModelId = packSelection.modelId;
+        // Mirror /models → Activate on the session: sticky thread pack id,
+        // subagent models, and the fallback route. Clears any pending fallback
+        // from a continued thread so the pack's own route starts clean.
+        await session.thread.setSetting({ key: THREAD_ACTIVE_MODEL_PACK_ID_KEY, value: options.pack.id });
+        await session.thread.setSetting({ key: MODEL_FALLBACK_STATE_KEY, value: undefined });
+        for (const [agentType, modelId] of Object.entries(packSelection.subagentModels ?? {})) {
+          await session.subagents.model.set({ modelId, agentType });
+        }
+        await session.state.set({
+          modelRoute: packSelection.modelRoute,
+          [MODEL_FALLBACK_STATE_KEY]: null,
+        } as unknown as Partial<TState>);
+      }
+      const sessionModelId = modelIdToApply ?? packModelId;
+      if (sessionModelId) {
+        await session.model.switch(sessionModelId);
+      }
+      // Persist the pack activation (global default) only once the pack has
+      // fully taken effect on the session — a failed model switch above must
+      // not leave the global default changed.
+      options.pack?.onApplied?.();
+      if (options.thinkingLevel) {
+        await session.state.set({ thinkingLevel: options.thinkingLevel } as unknown as Partial<TState>);
+      }
+    } catch (err) {
+      return fail(`Failed to apply run config: ${(err as Error).message}`);
+    }
+
+    // --- Title ---
+    if (options.title) {
+      try {
+        await session.thread.rename({ title: options.title });
+      } catch (err) {
+        return fail(`Failed to set thread title: ${(err as Error).message}`);
+      }
+    }
+
+    // --- Start ---
+    try {
+      if (goal) {
+        const threadId = session.thread.getId();
+        if (!threadId || !(await session.thread.getById({ threadId }))) {
+          await session.thread.create();
+        }
+
+        const goalManager = goal.goalManager ?? new GoalManager();
+        const state = {
+          controller,
+          session,
+          goalManager,
+          pendingNewThread: false,
+        } as any;
+        const objective = await goalManager.setGoal(state, goal.objective, goal.judgeModelId, goal.maxRuns);
+        if (!objective) return fail('Failed to set goal.');
+
+        const agent = controller.getCurrentAgent(session);
+        const persisted = await agent.getObjective({ threadId: session.thread.getId()! });
+        if (!persisted || persisted.id !== objective.id) {
+          return fail('Failed to persist goal objective before sending goal signal.');
+        }
+
+        await goalManager.saveToThread(state);
+        if (!settled) await session.sendSignal(createGoalReminderSignal(objective)).accepted;
+      } else {
+        if (!options.prompt) return fail('A prompt or goal is required.');
+        await session.sendMessage({ content: options.prompt });
+      }
+    } catch (err) {
+      if (
+        isSessionStartupCancelledError(err) ||
+        (err instanceof Error && err.name === 'AbortError' && (aborted || timedOut || options.signal?.aborted))
+      ) {
+        return finish(timedOut ? 'timeout' : maxTurnsExceeded ? 'max_turns' : 'aborted');
+      }
+      return fail(`Failed to start run: ${(err as Error).message}`);
+    }
+  })();
+
+  return {
+    result,
+    abort,
+    [Symbol.asyncIterator](): AsyncIterator<AgentControllerEvent> {
+      return queue[Symbol.asyncIterator]();
+    },
+  };
+}

@@ -1,0 +1,73 @@
+import { Button } from '@mastra/playground-ui/components/Button';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { AgentIcon } from '@mastra/playground-ui/icons/AgentIcon';
+import { IconEyeOpen } from '@mastra/playground-ui/icons/central/IconEyeOpen';
+import { useEffect, useRef } from 'react';
+import { useNavigate, useParams } from 'react-router';
+import { AgentStepContainer } from './agent-step-container';
+import { useWizard } from '@/domains/agent-builder/contexts/wizard-context';
+import { startViewTransition } from '@/lib/routing';
+
+export const AgentProfileReadyStep = () => {
+  const { next } = useWizard();
+  const navigate = useNavigate();
+  const { id: agentId } = useParams<{ id: string }>();
+  const sweepRef = useRef<HTMLSpanElement | null>(null);
+
+  // Play the specular sweep exactly once via the Web Animations API. A CSS
+  // animation would replay whenever the layout flips into split mode and the
+  // view transition repaints this subtree, causing a visible double sweep.
+  useEffect(() => {
+    const el = sweepRef.current;
+    if (!el || typeof el.animate !== 'function') return;
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return;
+
+    el.animate(
+      [
+        { backgroundPosition: '180% 0', opacity: 0 },
+        { opacity: 1, offset: 0.12 },
+        { opacity: 1, offset: 0.88 },
+        { backgroundPosition: '-80% 0', opacity: 0 },
+      ],
+      { duration: 2400, delay: 120, easing: 'cubic-bezier(0.22, 0.61, 0.36, 1)', fill: 'both' },
+    );
+  }, []);
+
+  const handleReview = () => {
+    startViewTransition(() => {
+      next();
+    });
+  };
+
+  const handleTry = () => {
+    void navigate(`/agent-builder/agents/${agentId}/view`, { viewTransition: true });
+  };
+
+  return (
+    <AgentStepContainer
+      panelClassName="ready-stage"
+      panelOverlay={<span ref={sweepRef} className="ready-stage-sweep" aria-hidden="true" />}
+      cta={
+        <div className="relative z-[2] flex items-center justify-center gap-3">
+          <Button icon={<IconEyeOpen />} onClick={handleReview} data-testid="agent-builder-ready-review">
+            Review my agent
+          </Button>
+          <Button icon={<AgentIcon />} variant="primary" onClick={handleTry} data-testid="agent-builder-ready-try">
+            Try my agent
+          </Button>
+        </div>
+      }
+    >
+      <div className="flex h-full w-full flex-col items-center justify-center px-4 py-4 text-center">
+        <div className="ready-stage-content flex flex-col items-center gap-4">
+          <Txt as="h2" variant="display" tone="ink" data-testid="agent-builder-ready-heading">
+            Your agent is ready
+          </Txt>
+          <Txt variant="heading" tone="muted" className="max-w-md">
+            You can review and fine-tune everything, or jump straight in and try it out.
+          </Txt>
+        </div>
+      </div>
+    </AgentStepContainer>
+  );
+};

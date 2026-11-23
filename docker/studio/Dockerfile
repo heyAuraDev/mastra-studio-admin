@@ -1,7 +1,7 @@
-FROM node:22-slim AS builder
+FROM node:24-slim AS builder
 
 # Install pnpm
-ENV PNPM_VERSION=10.29.3
+ENV PNPM_VERSION=11.21.0
 RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
 
 WORKDIR /app

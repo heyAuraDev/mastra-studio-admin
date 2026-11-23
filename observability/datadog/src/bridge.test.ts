@@ -12,9 +12,11 @@ import type {
   TracingEvent,
   AnyExportedSpan,
   CreateSpanOptions,
+  ScoreEvent,
   SpanType as SpanTypeGeneric,
 } from '@mastra/core/observability';
-import { SpanType, TracingEventType } from '@mastra/core/observability';
+import { SamplingStrategyType, SpanType, TracingEventType } from '@mastra/core/observability';
+import { DefaultObservabilityInstance } from '@mastra/observability';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
@@ -30,6 +32,7 @@ const {
   mockScopeActivate,
   mockScopeActive,
   mockStartSpan,
+  mockSubmitEvaluation,
   mockTrace,
 } = vi.hoisted(() => {
   let currentScopeSpan: any = undefined;
@@ -65,9 +68,10 @@ const {
       _options: options,
       finish: vi.fn(),
       setTag: vi.fn(),
+      addLinks: vi.fn(),
       context: vi.fn(() => ({
-        toSpanId: (_hex?: boolean) => spanHex,
-        toTraceId: (_hex?: boolean) => traceHex,
+        toSpanId: (hex?: boolean) => (hex ? spanHex : BigInt(`0x${spanHex}`).toString(10)),
+        toTraceId: (hex?: boolean) => (hex ? traceHex : BigInt(`0x${traceHex.slice(-16)}`).toString(10)),
       })),
     };
 
@@ -88,6 +92,7 @@ const {
     mockScopeActivate: activate,
     mockScopeActive: active,
     mockStartSpan: startSpan,
+    mockSubmitEvaluation: vi.fn(),
     mockTrace: vi.fn(),
   };
 });
@@ -111,6 +116,7 @@ vi.mock('dd-trace', () => {
         annotate: mockAnnotate,
         flush: mockFlush,
         trace: mockTrace,
+        submitEvaluation: mockSubmitEvaluation,
       },
       _tracer: {
         started: false,
@@ -118,6 +124,7 @@ vi.mock('dd-trace', () => {
           flush: mockExporterFlush,
         },
       },
+      extract: (_format: string, carrier: { traceparent: string }) => ({ fromTraceparent: carrier.traceparent }),
       scope: () => ({
         activate: mockScopeActivate,
         active: mockScopeActive,
@@ -145,6 +152,22 @@ function createMockSpan(overrides: Partial<AnyExportedSpan> = {}): AnyExportedSp
 
 function createTracingEvent(type: TracingEventType, span: AnyExportedSpan): TracingEvent {
   return { type, exportedSpan: span } as TracingEvent;
+}
+
+function createScoreEvent(overrides: Partial<ScoreEvent['score']> = {}): ScoreEvent {
+  return {
+    type: 'score',
+    score: {
+      id: 'score-1',
+      traceId: '00000000000000000000000000000001',
+      spanId: '0000000000000001',
+      scorerId: 'scorer-1',
+      scorerName: 'Quality scorer',
+      score: 0.75,
+      timestamp: new Date('2024-01-01T00:00:02Z'),
+      ...overrides,
+    },
+  } as ScoreEvent;
 }
 
 function createMockSpanOptions(
@@ -210,7 +233,7 @@ describe('DatadogBridge', () => {
 
   describe('createSpan', () => {
     it('creates a single eager APM span and returns dd-trace ids', () => {
-      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false });
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false, flushGraceMs: 0 });
 
       const result = bridge.createSpan(createMockSpanOptions({ name: 'my-agent' }));
 
@@ -220,6 +243,173 @@ describe('DatadogBridge', () => {
         traceId: '00000000000000000000000000000001',
         parentSpanId: undefined,
       });
+    });
+
+    it('preserves a resumed Mastra parent instead of marking it as external', async () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false, flushGraceMs: 0 });
+      const tracing = new DefaultObservabilityInstance({
+        serviceName: 'resume-parent',
+        name: 'resume-parent-instance',
+        sampling: { type: SamplingStrategyType.ALWAYS },
+        bridge,
+      });
+
+      const span = tracing.startSpan({
+        type: SpanType.GENERIC,
+        name: 'resumed-agent',
+        parentSpanId: '1234567890abcdef',
+      })!;
+
+      expect(span.exportSpan().parentSpanId).toBe('1234567890abcdef');
+      expect(span.exportSpan().externalParentSpanId).toBeUndefined();
+
+      span.end();
+      await tracing.flush();
+      await bridge.shutdown();
+    });
+
+    it('keeps a resumed Mastra parent instead of adopting the active dd-trace scope', async () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false, flushGraceMs: 0 });
+      const tracing = new DefaultObservabilityInstance({
+        serviceName: 'resume-under-ambient',
+        name: 'resume-under-ambient-instance',
+        sampling: { type: SamplingStrategyType.ALWAYS },
+        bridge,
+      });
+
+      const requestSpan = {
+        context: () => ({
+          toSpanId: () => 'aaaaaaaaaaaaaaaa',
+          toTraceId: () => 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        }),
+      };
+      mockScopeActive.mockReturnValueOnce(requestSpan);
+
+      const span = tracing.startSpan({
+        type: SpanType.GENERIC,
+        name: 'resumed-agent',
+        parentSpanId: '1234567890abcdef',
+      })!;
+
+      expect(span.exportSpan().parentSpanId).toBe('1234567890abcdef');
+      expect(span.exportSpan().externalParentSpanId).toBe('aaaaaaaaaaaaaaaa');
+
+      span.end();
+      await tracing.flush();
+      await bridge.shutdown();
+    });
+
+    it('marks a bridged root external when it inherits the active dd-trace scope', async () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false, flushGraceMs: 0 });
+      const tracing = new DefaultObservabilityInstance({
+        serviceName: 'bridged-root',
+        name: 'bridged-root-instance',
+        sampling: { type: SamplingStrategyType.ALWAYS },
+        bridge,
+      });
+
+      const requestSpan = {
+        context: () => ({
+          toSpanId: () => 'aaaaaaaaaaaaaaaa',
+          toTraceId: () => 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        }),
+      };
+      mockScopeActive.mockReturnValueOnce(requestSpan);
+
+      const span = tracing.startSpan({
+        type: SpanType.GENERIC,
+        name: 'bridged-root-agent',
+      })!;
+
+      expect(span.exportSpan().parentSpanId).toBeUndefined();
+      expect(span.exportSpan().externalParentSpanId).toBe('aaaaaaaaaaaaaaaa');
+
+      span.end();
+      await tracing.flush();
+      await bridge.shutdown();
+    });
+
+    it('does not start a dd span for types dropped by excludeSpanTypes, so the trace still finishes', async () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false, flushGraceMs: 0 });
+      const tracing = new DefaultObservabilityInstance({
+        serviceName: 'exclude-chunks',
+        name: 'exclude-chunks-instance',
+        sampling: { type: SamplingStrategyType.ALWAYS },
+        bridge,
+        excludeSpanTypes: [SpanType.MODEL_CHUNK],
+      });
+
+      const agentRun = tracing.startSpan({ type: SpanType.AGENT_RUN, name: 'agent run' })!;
+      const generation = agentRun.createChildSpan({ type: SpanType.MODEL_GENERATION, name: 'llm' });
+      for (let i = 0; i < 3; i++) {
+        generation.createChildSpan({ type: SpanType.MODEL_CHUNK, name: 'chunk' }).end();
+      }
+      generation.end();
+      agentRun.end();
+      await tracing.flush();
+
+      // dd-trace only exports a trace once every started span has finished.
+      expect(capturedApmSpans.map(span => span._name)).toEqual(['agent run', 'llm']);
+      for (const apmSpan of capturedApmSpans) {
+        expect(apmSpan.finish).toHaveBeenCalledTimes(1);
+      }
+      expect(bridge['ddSpanMap'].size).toBe(0);
+      await bridge.shutdown();
+    });
+
+    it('parents children of an excluded span to the nearest exported dd span', async () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false, flushGraceMs: 0 });
+      const tracing = new DefaultObservabilityInstance({
+        serviceName: 'exclude-middle',
+        name: 'exclude-middle-instance',
+        sampling: { type: SamplingStrategyType.ALWAYS },
+        bridge,
+        excludeSpanTypes: [SpanType.MODEL_GENERATION],
+      });
+
+      const agentRun = tracing.startSpan({ type: SpanType.AGENT_RUN, name: 'agent run' })!;
+      const generation = agentRun.createChildSpan({ type: SpanType.MODEL_GENERATION, name: 'llm' });
+      const tool = generation.createChildSpan({ type: SpanType.TOOL_CALL, name: 'tool' });
+
+      expect(generation.traceId).toBe(agentRun.traceId);
+      expect(tool.traceId).toBe(agentRun.traceId);
+      expect(tool.exportSpan().parentSpanId).toBe(agentRun.id);
+      expect(capturedApmSpans.map(span => span._name)).toEqual(['agent run', 'tool']);
+      expect(capturedApmSpans[1]._options).toEqual({ childOf: capturedApmSpans[0] });
+
+      tool.end();
+      generation.end();
+      agentRun.end();
+      await tracing.flush();
+      await bridge.shutdown();
+    });
+
+    it('runs code inside an excluded span in the nearest exported dd span', async () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false, flushGraceMs: 0 });
+      const tracing = new DefaultObservabilityInstance({
+        serviceName: 'exclude-tool',
+        name: 'exclude-tool-instance',
+        sampling: { type: SamplingStrategyType.ALWAYS },
+        bridge,
+        excludeSpanTypes: [SpanType.TOOL_CALL],
+      });
+
+      const agentRun = tracing.startSpan({ type: SpanType.AGENT_RUN, name: 'agent run' })!;
+      const tool = agentRun.createChildSpan({ type: SpanType.TOOL_CALL, name: 'tool' });
+      const agentRunApmSpan = capturedApmSpans[0];
+
+      await tool.executeInContext(async () => {});
+      tool.executeInContextSync(() => {});
+
+      expect(capturedApmSpans).toHaveLength(1);
+      expect(mockScopeActivate).toHaveBeenCalledTimes(2);
+      expect(mockScopeActivate).toHaveBeenNthCalledWith(1, agentRunApmSpan, expect.any(Function));
+      expect(mockScopeActivate).toHaveBeenNthCalledWith(2, agentRunApmSpan, expect.any(Function));
+
+      tool.end();
+      agentRun.end();
+      await tracing.flush();
+      await bridge.shutdown();
     });
 
     it('registers the eager span with the LLMObs tagger', () => {
@@ -307,7 +497,8 @@ describe('DatadogBridge', () => {
       const result = bridge.createSpan(createMockSpanOptions())!;
 
       expect(mockStartSpan).toHaveBeenCalledWith('test-span', { childOf: requestSpan });
-      expect(result.parentSpanId).toBe('aaaaaaaaaaaaaaaa');
+      expect(result.parentSpanId).toBeUndefined();
+      expect(result.externalParentSpanId).toBe('aaaaaaaaaaaaaaaa');
       expect(result.traceId).toBe('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
       expect(llmobsRegistrations[0]?.options.parent).toBeUndefined();
     });
@@ -336,7 +527,8 @@ describe('DatadogBridge', () => {
       )!;
 
       expect(mockStartSpan).toHaveBeenCalledWith('test-span', { childOf: requestSpan });
-      expect(result.parentSpanId).toBe('aaaaaaaaaaaaaaaa');
+      expect(result.parentSpanId).toBeUndefined();
+      expect(result.externalParentSpanId).toBe('aaaaaaaaaaaaaaaa');
       expect(result.traceId).toBe('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
       expect(llmobsRegistrations[0]?.options.parent).toBe(requestSpan);
     });
@@ -419,6 +611,40 @@ describe('DatadogBridge', () => {
         modelName: 'gpt-5.4',
         modelProvider: 'openai',
       });
+    });
+  });
+
+  describe('span links', () => {
+    const startLink = { traceId: '0af7651916cd43dd8448eb211c80319c', spanId: 'b7ad6b7169203331' };
+    const lateLink = { traceId: '1af7651916cd43dd8448eb211c80319c', spanId: 'c7ad6b7169203331' };
+
+    it('starts the APM span with links resolved from W3C traceparents', () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false });
+
+      bridge.createSpan(createMockSpanOptions({ links: [startLink, { traceId: 'xyz', spanId: 'xyz' }] }));
+
+      expect(capturedApmSpans[0]._options.links).toEqual([
+        { context: { fromTraceparent: `00-${startLink.traceId}-${startLink.spanId}-01` } },
+      ]);
+    });
+
+    it('adds links set after the span started before it finishes', async () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false });
+      const spanResult = bridge.createSpan(createMockSpanOptions({ links: [startLink] }))!;
+      const apmSpan = capturedApmSpans[0];
+
+      await bridge.exportTracingEvent(
+        createTracingEvent(
+          TracingEventType.SPAN_ENDED,
+          createMockSpan({ id: spanResult.spanId, traceId: spanResult.traceId, links: [startLink, lateLink] } as any),
+        ),
+      );
+
+      expect(apmSpan.addLinks).toHaveBeenCalledTimes(1);
+      expect(apmSpan.addLinks).toHaveBeenCalledWith([
+        { context: { fromTraceparent: `00-${lateLink.traceId}-${lateLink.spanId}-01` } },
+      ]);
+      expect(apmSpan.finish).toHaveBeenCalled();
     });
   });
 
@@ -638,6 +864,59 @@ describe('DatadogBridge', () => {
       );
     });
 
+    it('forwards score events directly with Datadog decimal span ids', async () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false });
+      const spanResult = bridge.createSpan(createMockSpanOptions())!;
+
+      const datadogSpanId = BigInt(`0x${spanResult.spanId}`).toString(10);
+
+      await bridge.onScoreEvent(
+        createScoreEvent({
+          traceId: spanResult.traceId,
+          spanId: spanResult.spanId,
+          metadata: { source: 'unit-test' },
+          reason: 'looks good',
+        }),
+      );
+
+      expect(mockSubmitEvaluation).toHaveBeenCalledWith(
+        {
+          traceId: spanResult.traceId,
+          spanId: datadogSpanId,
+        },
+        {
+          label: 'Quality scorer',
+          value: 0.75,
+          metricType: 'score',
+          mlApp: 'test',
+          timestampMs: new Date('2024-01-01T00:00:02Z').getTime(),
+          reasoning: 'looks good',
+          metadata: { source: 'unit-test' },
+        },
+      );
+    });
+
+    it('forwards score events without local finished span context', async () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false });
+
+      await bridge.onScoreEvent(
+        createScoreEvent({
+          traceId: 'remote-trace-id',
+          spanId: '000000000000000f',
+        }),
+      );
+
+      expect(mockSubmitEvaluation).toHaveBeenCalledWith(
+        { traceId: 'remote-trace-id', spanId: '15' },
+        expect.objectContaining({
+          label: 'Quality scorer',
+          value: 0.75,
+          metricType: 'score',
+          mlApp: 'test',
+        }),
+      );
+    });
+
     it('releases stored trace context after the last span in a trace finishes', async () => {
       const bridge = new DatadogBridge({ mlApp: 'test', agentless: false });
 
@@ -666,9 +945,139 @@ describe('DatadogBridge', () => {
     });
   });
 
+  describe('flush grace wait', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    async function settled(promise: Promise<void>): Promise<boolean> {
+      let done = false;
+      void promise.then(() => {
+        done = true;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      return done;
+    }
+
+    it('waits the grace period after a span was finished, then flushes the APM exporter', async () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false, flushGraceMs: 500 });
+      const spanResult = bridge.createSpan(createMockSpanOptions())!;
+      const span = createMockSpan({ id: spanResult.spanId, traceId: spanResult.traceId });
+      await bridge.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_ENDED, span));
+
+      const flushing = bridge.flush();
+      expect(mockFlush).toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(499);
+      expect(await settled(flushing)).toBe(false);
+      expect(mockExporterFlush).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await settled(flushing)).toBe(true);
+      expect(mockExporterFlush).toHaveBeenCalled();
+    });
+
+    it('does not wait when nothing new was sent since the last flush', async () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false, flushGraceMs: 500 });
+      const spanResult = bridge.createSpan(createMockSpanOptions())!;
+      const span = createMockSpan({ id: spanResult.spanId, traceId: spanResult.traceId });
+      await bridge.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_ENDED, span));
+
+      const first = bridge.flush();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(await settled(first)).toBe(true);
+
+      expect(await settled(bridge.flush())).toBe(true);
+    });
+
+    it('makes an overlapping flush join the running grace wait before flushing the APM exporter', async () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false, flushGraceMs: 500 });
+      const spanResult = bridge.createSpan(createMockSpanOptions())!;
+      const span = createMockSpan({ id: spanResult.spanId, traceId: spanResult.traceId });
+      await bridge.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_ENDED, span));
+
+      const first = bridge.flush();
+      await vi.advanceTimersByTimeAsync(100);
+      const second = bridge.flush();
+      await vi.advanceTimersByTimeAsync(399);
+      expect(await settled(second)).toBe(false);
+      expect(mockExporterFlush).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await settled(first)).toBe(true);
+      expect(await settled(second)).toBe(true);
+      expect(mockExporterFlush).toHaveBeenCalled();
+    });
+  });
+
+  describe('releaseSpan', () => {
+    it('drops the span map entry and trace state without finishing the dd span', () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false });
+      const spanResult = bridge.createSpan(createMockSpanOptions({ metadata: { userId: 'user-123' } }))!;
+      const apmSpan = capturedApmSpans[0];
+
+      bridge.releaseSpan(spanResult.spanId, spanResult.traceId);
+
+      expect(apmSpan.finish).not.toHaveBeenCalled();
+      expect(bridge['ddSpanMap'].size).toBe(0);
+      expect(bridge['openSpanCounts'].size).toBe(0);
+      expect(bridge['traceContext'].size).toBe(0);
+    });
+
+    it('keeps trace state while other spans in the trace remain open', () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false });
+      const rootResult = bridge.createSpan(createMockSpanOptions({ name: 'root', metadata: { userId: 'user-123' } }))!;
+      const childResult = bridge.createSpan(
+        createMockSpanOptions({
+          name: 'child',
+          parent: {
+            id: rootResult.spanId,
+            traceId: rootResult.traceId,
+            isInternal: false,
+            metadata: {},
+            getParentSpanId: () => undefined,
+          } as any,
+        }),
+      )!;
+
+      bridge.releaseSpan(childResult.spanId, childResult.traceId);
+
+      expect(bridge['ddSpanMap'].size).toBe(1);
+      expect(bridge['openSpanCounts'].get(rootResult.traceId)).toBe(1);
+      expect(bridge['traceContext'].size).toBe(1);
+    });
+
+    it('does not double-decrement the open-span count on repeated release', () => {
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false, flushGraceMs: 0 });
+      const rootResult = bridge.createSpan(createMockSpanOptions({ name: 'root', metadata: { userId: 'user-123' } }))!;
+      const childResult = bridge.createSpan(
+        createMockSpanOptions({
+          name: 'child',
+          parent: {
+            id: rootResult.spanId,
+            traceId: rootResult.traceId,
+            isInternal: false,
+            metadata: {},
+            getParentSpanId: () => undefined,
+          } as any,
+        }),
+      )!;
+
+      bridge.releaseSpan(childResult.spanId, childResult.traceId);
+      bridge.releaseSpan(childResult.spanId, childResult.traceId);
+      bridge.releaseSpan('ffffffffffffffff', childResult.traceId);
+
+      expect(bridge['openSpanCounts'].get(rootResult.traceId)).toBe(1);
+      expect(bridge['traceContext'].size).toBe(1);
+    });
+  });
+
   describe('shutdown', () => {
     it('force-finishes remaining spans on shutdown', async () => {
-      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false });
+      const bridge = new DatadogBridge({ mlApp: 'test', agentless: false, flushGraceMs: 0 });
 
       bridge.createSpan(createMockSpanOptions({ name: 'orphan-1' }));
       bridge.createSpan(createMockSpanOptions({ name: 'orphan-2' }));

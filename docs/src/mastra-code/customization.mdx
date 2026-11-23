@@ -7,7 +7,7 @@ packages:
 
 # Customization
 
-Mastra Code is designed as a composable library. The [`createMastraCode()`](/reference) factory function accepts configuration overrides, and the returned [`Harness`](https://mastra.ai/reference/harness/harness-class) can drive any frontend, not just the built-in TUI.
+Mastra Code is designed as a composable library. The [`createMastraCode()`](/reference) factory function accepts configuration overrides, and the returned [`AgentController`](https://mastra.ai/reference/agent-controller/agent-controller-class) can drive any frontend, not only the built-in TUI.
 
 ## Programmatic usage
 
@@ -16,65 +16,57 @@ Import `createMastraCode` to bootstrap Mastra Code in your own application:
 ```typescript title="src/custom-agent.ts"
 import { createMastraCode } from 'mastracode'
 
-const { harness, mcpManager, authStorage } = await createMastraCode({
+const { controller, session, mcpManager, authStorage } = await createMastraCode({
   cwd: '/path/to/project',
   initialState: {
     yolo: false,
   },
 })
 
-await harness.init()
-await harness.selectOrCreateThread()
-
-harness.subscribe(event => {
-  if (event.type === 'message_update') {
-    console.log(event.message.content)
+session.subscribe(event => {
+  if (event.type === 'message_update' && event.event.type === 'text-delta') {
+    process.stdout.write(event.event.delta)
   }
 })
 
-await harness.sendMessage({ content: 'Explain the auth module' })
+await session.sendMessage({ content: 'Explain the auth module' })
 ```
 
-The `harness` object is a standard `Harness` instance. You can subscribe to events, switch modes, manage threads, and send messages through its API.
+`createMastraCode` boots the `controller` and returns a ready-to-use `session`. Subscribe to events and send messages on the `session`; use the `controller` to switch modes, configure tools, and manage shared resources.
 
 ## Custom modes
 
-Override the default Build/Plan/Fast modes by passing a `modes` array:
+Override the default Build/Plan/Explore modes by passing a `modes` array:
 
 ```typescript title="src/custom-modes.ts"
 import { createMastraCode } from 'mastracode'
-import { Agent } from '@mastra/core/agent'
 
-const reviewAgent = new Agent({
-  id: 'review-agent',
-  name: 'Review Agent',
-  instructions:
-    'You are a code review specialist. Analyze code for bugs, security issues, and best practices.',
-  model: 'anthropic/claude-sonnet-4-6',
-})
-
-const { harness } = await createMastraCode({
+const { controller } = await createMastraCode({
   modes: [
     {
       id: 'review',
       name: 'Review',
-      default: true,
       defaultModelId: 'anthropic/claude-sonnet-4-6',
-      color: '#f59e0b',
-      agent: reviewAgent,
+      metadata: {
+        default: true,
+        color: '#f59e0b',
+      },
     },
     {
       id: 'build',
       name: 'Build',
-      defaultModelId: 'anthropic/claude-opus-4-7',
-      color: '#7c3aed',
-      agent: reviewAgent,
+      defaultModelId: 'anthropic/claude-opus-4-6',
+      metadata: {
+        color: '#7c3aed',
+      },
     },
   ],
 })
 ```
 
-Each mode requires an `id` and an `agent`. The `name`, `defaultModelId`, and `color` fields control how the mode appears in the TUI.
+Each mode requires an `id`. The `name` and `defaultModelId` fields control the mode's label and starting model. Put TUI display options such as `color` and the default-mode marker in `metadata`. All modes share the backing agent.
+
+Passing `modes: false` runs every session as a single Build agent with no mode switching.
 
 ## Extra tools
 
@@ -96,7 +88,7 @@ const deployTool = createTool({
   },
 })
 
-const { harness } = await createMastraCode({
+const { controller } = await createMastraCode({
   extraTools: { deploy: deployTool },
 })
 ```
@@ -105,21 +97,14 @@ Extra tools are merged with the dynamic tool set and are available to the agent 
 
 ## Custom subagents
 
-Override the default Explore/Plan/Execute subagents. Each subagent receives its own set of tools, scoping what it can do:
+Mastra Code registers no subagents by default. Pass the subagents you want with `subagents`. Spread `builtinSubagents` to keep the built-in Explore, Plan and Execute subagents alongside your own. Each subagent receives its own set of tools, scoping what it can do:
 
 ```typescript title="src/custom-subagents.ts"
-import { createMastraCode } from 'mastracode'
-import { createTool } from '@mastra/core/tools'
+import { builtinSubagents, createMastraCode } from 'mastracode'
 
-const { harness } = await createMastraCode({
+const { controller } = await createMastraCode({
   subagents: [
-    {
-      id: 'explore',
-      name: 'Explore',
-      description: 'Read-only codebase exploration',
-      instructions:
-        'You are an expert code explorer. Use read-only tools to answer questions about the codebase.',
-    },
+    ...builtinSubagents,
     {
       id: 'test-writer',
       name: 'Test Writer',
@@ -138,7 +123,7 @@ Connect to a remote database instead of the default local SQLite:
 ```typescript title="src/custom-storage.ts"
 import { createMastraCode } from 'mastracode'
 
-const { harness } = await createMastraCode({
+const { controller } = await createMastraCode({
   storage: {
     url: 'libsql://my-db.turso.io',
     authToken: 'my-auth-token',
@@ -148,15 +133,15 @@ const { harness } = await createMastraCode({
 
 This is equivalent to setting `.mastracode/database.json` but allows configuration at the code level.
 
-## Custom heartbeat handlers
+## Custom interval handlers
 
 Replace or extend the default background tasks:
 
-```typescript title="src/custom-heartbeats.ts"
+```typescript title="src/custom-intervals.ts"
 import { createMastraCode } from 'mastracode'
 
-const { harness } = await createMastraCode({
-  heartbeatHandlers: [
+const { controller } = await createMastraCode({
+  intervalHandlers: [
     {
       id: 'sync-config',
       intervalMs: 60_000,
@@ -168,20 +153,21 @@ const { harness } = await createMastraCode({
 })
 ```
 
-Heartbeat handlers run on a fixed interval. They start when `harness.init()` is called and stop when `harness.destroy()` is called.
+Interval handlers run on a fixed interval. They start when `controller.init()` is called and stop when `controller.destroy()` is called.
 
 ## Building a custom TUI
 
-Mastra Code exports the `MastraTUI` class from `mastracode/tui` for building custom terminal interfaces. The TUI is driven by the Harness event system:
+Mastra Code exports the `MastraTUI` class from `mastracode/tui` for building custom terminal interfaces. The TUI is driven by the AgentController event system:
 
 ```typescript title="src/custom-tui.ts"
 import { createMastraCode } from 'mastracode'
 import { MastraTUI } from 'mastracode/tui'
 
-const { harness, mcpManager, hookManager, authStorage } = createMastraCode()
+const { controller, session, mcpManager, hookManager, authStorage } = await createMastraCode()
 
 const tui = new MastraTUI({
-  harness,
+  controller,
+  session,
   hookManager,
   authStorage,
   mcpManager,
@@ -192,7 +178,7 @@ const tui = new MastraTUI({
 tui.run()
 ```
 
-The TUI subscribes to harness events and renders messages, tool calls, approvals, and status information in real time.
+The TUI subscribes to controller events and renders messages, tool calls, approvals, and status information in real time.
 
 ## Initial state overrides
 
@@ -201,7 +187,7 @@ Control default behavior through `initialState`:
 ```typescript title="src/custom-state.ts"
 import { createMastraCode } from 'mastracode'
 
-const { harness } = await createMastraCode({
+const { controller } = await createMastraCode({
   initialState: {
     yolo: false,
     thinkingLevel: 'high',
@@ -222,14 +208,18 @@ const { harness } = await createMastraCode({
 
 ### Available state fields
 
+`OMModel` accepts `"auto"` or a concrete model ID.
+
 | Field | Type | Default | Description |
 | - | - | - | - |
 | `yolo` | `boolean` | `true` | Auto-approve all tool calls |
-| `thinkingLevel` | `string` | `"off"` | Extended thinking depth for Anthropic models |
+| `thinkingLevel` | `string` | - | Session override for model reasoning effort. When unset, Mastra Code uses a host-provided default (such as a Factory default) if one exists, then the per-mode setting, then the global preference |
 | `smartEditing` | `boolean` | `true` | Use AST-based analysis for code edits |
 | `notifications` | `"bell" \| "system" \| "both" \| "off"` | `"off"` | Alert when the TUI needs attention |
 | `permissionRules` | `object` | Default policies | Per-category and per-tool approval policies |
-| `observerModelId` | `string` | `"google/gemini-2.5-flash"` | Model for observational memory observer |
-| `reflectorModelId` | `string` | `"google/gemini-2.5-flash"` | Model for observational memory reflector |
+| `observerModelId` | `string` | - | Legacy concrete model for the observational memory observer |
+| `reflectorModelId` | `string` | - | Legacy concrete model for the observational memory reflector |
+| `observerModelSelection` | `OMModel` | `"auto"` | Automatic or explicit observer model selection |
+| `reflectorModelSelection` | `OMModel` | `"auto"` | Automatic or explicit reflector model selection |
 | `observationThreshold` | `number` | `30000` | Token count triggering observation pass |
 | `reflectionThreshold` | `number` | `40000` | Token count triggering reflection pass |

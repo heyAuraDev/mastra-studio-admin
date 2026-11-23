@@ -22,9 +22,10 @@ import type {
   ListScorerDefinitionVersionsInput,
   ListScorerDefinitionVersionsOutput,
 } from '@mastra/core/storage/domains/scorer-definitions';
-import { parseSqlIdentifier } from '@mastra/core/utils';
+import { schemaNamePrefix } from '../../../shared/schema-name';
 import { PgDB, resolvePgConfig, generateTableSQL, generateIndexSQL } from '../../db';
-import type { PgDomainConfig } from '../../db';
+import type { DbClient, PgDomainConfig } from '../../db';
+import { toPgJson } from '../../db/sanitize-json';
 import { getTableName, getSchemaName, parseJsonResilient } from '../utils';
 
 const SNAPSHOT_FIELDS = [
@@ -48,8 +49,8 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
 
   constructor(config: PgDomainConfig) {
     super();
-    const { client, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
-    this.#db = new PgDB({ client, schemaName, skipDefaultIndexes });
+    const { client, readClient, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
+    this.#db = new PgDB({ client, readClient, schemaName, skipDefaultIndexes });
     this.#schema = schemaName || 'public';
     this.#skipDefaultIndexes = skipDefaultIndexes;
     this.#indexes = indexes?.filter(idx =>
@@ -78,7 +79,7 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
    */
   static getExportDDL(schemaName?: string): string[] {
     const statements: string[] = [];
-    const parsedSchema = schemaName ? parseSqlIdentifier(schemaName, 'schema name') : '';
+    const parsedSchema = schemaName ? schemaNamePrefix(schemaName) : '';
     const schemaPrefix = parsedSchema && parsedSchema !== 'public' ? `${parsedSchema}_` : '';
 
     // Tables
@@ -102,7 +103,7 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
   }
 
   getDefaultIndexDefinitions(): CreateIndexOptions[] {
-    const schemaPrefix = this.#schema !== 'public' ? `${this.#schema}_` : '';
+    const schemaPrefix = this.#schema !== 'public' ? `${schemaNamePrefix(this.#schema)}_` : '';
     return ScorerDefinitionsPG.getDefaultIndexDefs(schemaPrefix);
   }
 
@@ -123,6 +124,12 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
     await this.#db.createTable({
       tableName: TABLE_SCORER_DEFINITIONS,
       schema: TABLE_SCHEMAS[TABLE_SCORER_DEFINITIONS],
+    });
+    // Add tenancy columns for backwards compatibility (pre-tenancy installs)
+    await this.#db.alterTable({
+      tableName: TABLE_SCORER_DEFINITIONS,
+      schema: TABLE_SCHEMAS[TABLE_SCORER_DEFINITIONS],
+      ifNotExists: ['organizationId', 'projectId'],
     });
     await this.#db.createTable({
       tableName: TABLE_SCORER_DEFINITION_VERSIONS,
@@ -155,9 +162,17 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
   // ==========================================================================
 
   async getById(id: string): Promise<StorageScorerDefinitionType | null> {
+    return this.#getById(this.#db.readClient, id);
+  }
+
+  /**
+   * Same lookup against an explicit client. Mutation paths pass the writer so a
+   * lagging read replica cannot yield stale or missing rows mid-update.
+   */
+  async #getById(client: DbClient, id: string): Promise<StorageScorerDefinitionType | null> {
     try {
       const tableName = getTableName({ indexName: TABLE_SCORER_DEFINITIONS, schemaName: getSchemaName(this.#schema) });
-      const result = await this.#db.client.oneOrNone(`SELECT * FROM ${tableName} WHERE id = $1`, [id]);
+      const result = await client.oneOrNone(`SELECT * FROM ${tableName} WHERE id = $1`, [id]);
 
       if (!result) {
         return null;
@@ -180,6 +195,7 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
 
   async create(input: { scorerDefinition: StorageCreateScorerDefinitionInput }): Promise<StorageScorerDefinitionType> {
     const { scorerDefinition } = input;
+    let draftInserted = false;
     try {
       const tableName = getTableName({ indexName: TABLE_SCORER_DEFINITIONS, schemaName: getSchemaName(this.#schema) });
       const now = new Date();
@@ -188,24 +204,34 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
       // 1. Create the thin scorer definition record
       await this.#db.client.none(
         `INSERT INTO ${tableName} (
-          id, status, "activeVersionId", "authorId", metadata,
+          id, status, "activeVersionId", "authorId", "organizationId", "projectId", metadata,
           "createdAt", "createdAtZ", "updatedAt", "updatedAtZ"
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [
           scorerDefinition.id,
           'draft',
           null,
           scorerDefinition.authorId ?? null,
-          scorerDefinition.metadata ? JSON.stringify(scorerDefinition.metadata) : null,
+          scorerDefinition.organizationId ?? null,
+          scorerDefinition.projectId ?? null,
+          scorerDefinition.metadata ? toPgJson(scorerDefinition.metadata) : null,
           nowIso,
           nowIso,
           nowIso,
           nowIso,
         ],
       );
+      draftInserted = true;
 
       // 2. Extract snapshot fields and create version 1
-      const { id: _id, authorId: _authorId, metadata: _metadata, ...snapshotConfig } = scorerDefinition;
+      const {
+        id: _id,
+        authorId: _authorId,
+        organizationId: _organizationId,
+        projectId: _projectId,
+        metadata: _metadata,
+        ...snapshotConfig
+      } = scorerDefinition;
       const versionId = crypto.randomUUID();
       await this.createVersion({
         id: versionId,
@@ -221,23 +247,28 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
         status: 'draft',
         activeVersionId: undefined,
         authorId: scorerDefinition.authorId,
+        organizationId: scorerDefinition.organizationId,
+        projectId: scorerDefinition.projectId,
         metadata: scorerDefinition.metadata,
         createdAt: now,
         updatedAt: now,
       };
     } catch (error) {
-      // Best-effort cleanup
-      try {
-        const tableName = getTableName({
-          indexName: TABLE_SCORER_DEFINITIONS,
-          schemaName: getSchemaName(this.#schema),
-        });
-        await this.#db.client.none(
-          `DELETE FROM ${tableName} WHERE id = $1 AND status = 'draft' AND "activeVersionId" IS NULL`,
-          [scorerDefinition.id],
-        );
-      } catch {
-        // Ignore cleanup errors
+      // Best-effort cleanup, only for a draft this call inserted. If our INSERT failed
+      // (e.g. duplicate id), the row belongs to a concurrent creator and must be kept.
+      if (draftInserted) {
+        try {
+          const tableName = getTableName({
+            indexName: TABLE_SCORER_DEFINITIONS,
+            schemaName: getSchemaName(this.#schema),
+          });
+          await this.#db.client.none(
+            `DELETE FROM ${tableName} WHERE id = $1 AND status = 'draft' AND "activeVersionId" IS NULL`,
+            [scorerDefinition.id],
+          );
+        } catch {
+          // Ignore cleanup errors
+        }
       }
 
       if (error instanceof MastraError) throw error;
@@ -258,7 +289,7 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
     try {
       const tableName = getTableName({ indexName: TABLE_SCORER_DEFINITIONS, schemaName: getSchemaName(this.#schema) });
 
-      const existingScorer = await this.getById(id);
+      const existingScorer = await this.#getById(this.#db.client, id);
       if (!existingScorer) {
         throw new MastraError({
           id: createStorageErrorId('PG', 'UPDATE_SCORER_DEFINITION', 'NOT_FOUND'),
@@ -294,7 +325,7 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
       if (metadata !== undefined) {
         const mergedMetadata = { ...(existingScorer.metadata || {}), ...metadata };
         setClauses.push(`metadata = $${paramIndex++}`);
-        values.push(JSON.stringify(mergedMetadata));
+        values.push(toPgJson(mergedMetadata));
       }
 
       // Always update timestamps
@@ -309,7 +340,7 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
       // Always update the record (at minimum updatedAt/updatedAtZ are set)
       await this.#db.client.none(`UPDATE ${tableName} SET ${setClauses.join(', ')} WHERE id = $${paramIndex}`, values);
 
-      const updatedScorer = await this.getById(id);
+      const updatedScorer = await this.#getById(this.#db.client, id);
       if (!updatedScorer) {
         throw new MastraError({
           id: createStorageErrorId('PG', 'UPDATE_SCORER_DEFINITION', 'NOT_FOUND_AFTER_UPDATE'),
@@ -354,7 +385,16 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
   }
 
   async list(args?: StorageListScorerDefinitionsInput): Promise<StorageListScorerDefinitionsOutput> {
-    const { page = 0, perPage: perPageInput, orderBy, authorId, metadata, status } = args || {};
+    const {
+      page = 0,
+      perPage: perPageInput,
+      orderBy,
+      authorId,
+      organizationId,
+      projectId,
+      metadata,
+      status,
+    } = args || {};
     const { field, direction } = this.parseOrderBy(orderBy);
 
     if (page < 0) {
@@ -390,15 +430,25 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
         queryParams.push(authorId);
       }
 
+      if (organizationId !== undefined) {
+        conditions.push(`"organizationId" = $${paramIdx++}`);
+        queryParams.push(organizationId);
+      }
+
+      if (projectId !== undefined) {
+        conditions.push(`"projectId" = $${paramIdx++}`);
+        queryParams.push(projectId);
+      }
+
       if (metadata && Object.keys(metadata).length > 0) {
         conditions.push(`metadata @> $${paramIdx++}::jsonb`);
-        queryParams.push(JSON.stringify(metadata));
+        queryParams.push(toPgJson(metadata));
       }
 
       const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
       // Get total count
-      const countResult = await this.#db.client.one(
+      const countResult = await this.#db.readClient.one(
         `SELECT COUNT(*) as count FROM ${tableName} ${whereClause}`,
         queryParams,
       );
@@ -415,7 +465,7 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
       }
 
       const limitValue = perPageInput === false ? total : perPage;
-      const dataResult = await this.#db.client.manyOrNone(
+      const dataResult = await this.#db.readClient.manyOrNone(
         `SELECT * FROM ${tableName} ${whereClause} ORDER BY "${field}" ${direction} LIMIT $${paramIdx++} OFFSET $${paramIdx++}`,
         [...queryParams, limitValue, offset],
       );
@@ -476,12 +526,12 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
           input.name,
           input.description ?? null,
           input.type,
-          input.model ? JSON.stringify(input.model) : null,
+          input.model ? toPgJson(input.model) : null,
           input.instructions ?? null,
-          input.scoreRange ? JSON.stringify(input.scoreRange) : null,
-          input.presetConfig ? JSON.stringify(input.presetConfig) : null,
-          input.defaultSampling ? JSON.stringify(input.defaultSampling) : null,
-          input.changedFields ? JSON.stringify(input.changedFields) : null,
+          input.scoreRange ? toPgJson(input.scoreRange) : null,
+          input.presetConfig ? toPgJson(input.presetConfig) : null,
+          input.defaultSampling ? toPgJson(input.defaultSampling) : null,
+          input.changedFields ? toPgJson(input.changedFields) : null,
           input.changeMessage ?? null,
           nowIso,
           nowIso,
@@ -512,7 +562,7 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
         indexName: TABLE_SCORER_DEFINITION_VERSIONS,
         schemaName: getSchemaName(this.#schema),
       });
-      const result = await this.#db.client.oneOrNone(`SELECT * FROM ${tableName} WHERE id = $1`, [id]);
+      const result = await this.#db.readClient.oneOrNone(`SELECT * FROM ${tableName} WHERE id = $1`, [id]);
 
       if (!result) {
         return null;
@@ -539,7 +589,7 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
         indexName: TABLE_SCORER_DEFINITION_VERSIONS,
         schemaName: getSchemaName(this.#schema),
       });
-      const result = await this.#db.client.oneOrNone(
+      const result = await this.#db.readClient.oneOrNone(
         `SELECT * FROM ${tableName} WHERE "scorerDefinitionId" = $1 AND "versionNumber" = $2`,
         [scorerDefinitionId, versionNumber],
       );
@@ -569,7 +619,7 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
         indexName: TABLE_SCORER_DEFINITION_VERSIONS,
         schemaName: getSchemaName(this.#schema),
       });
-      const result = await this.#db.client.oneOrNone(
+      const result = await this.#db.readClient.oneOrNone(
         `SELECT * FROM ${tableName} WHERE "scorerDefinitionId" = $1 ORDER BY "versionNumber" DESC LIMIT 1`,
         [scorerDefinitionId],
       );
@@ -618,7 +668,7 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
         schemaName: getSchemaName(this.#schema),
       });
 
-      const countResult = await this.#db.client.one(
+      const countResult = await this.#db.readClient.one(
         `SELECT COUNT(*) as count FROM ${tableName} WHERE "scorerDefinitionId" = $1`,
         [scorerDefinitionId],
       );
@@ -635,7 +685,7 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
       }
 
       const limitValue = perPageInput === false ? total : perPage;
-      const dataResult = await this.#db.client.manyOrNone(
+      const dataResult = await this.#db.readClient.manyOrNone(
         `SELECT * FROM ${tableName} WHERE "scorerDefinitionId" = $1 ORDER BY "${field}" ${direction} LIMIT $2 OFFSET $3`,
         [scorerDefinitionId, limitValue, offset],
       );
@@ -721,7 +771,7 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
         indexName: TABLE_SCORER_DEFINITION_VERSIONS,
         schemaName: getSchemaName(this.#schema),
       });
-      const result = await this.#db.client.one(
+      const result = await this.#db.readClient.one(
         `SELECT COUNT(*) as count FROM ${tableName} WHERE "scorerDefinitionId" = $1`,
         [scorerDefinitionId],
       );
@@ -750,6 +800,8 @@ export class ScorerDefinitionsPG extends ScorerDefinitionsStorage {
       status: row.status as StorageScorerDefinitionType['status'],
       activeVersionId: row.activeVersionId as string | undefined,
       authorId: row.authorId as string | undefined,
+      organizationId: row.organizationId as string | undefined,
+      projectId: row.projectId as string | undefined,
       metadata: parseJsonResilient(row.metadata, 'metadata'),
       createdAt: new Date(row.createdAtZ || row.createdAt),
       updatedAt: new Date(row.updatedAtZ || row.updatedAt),

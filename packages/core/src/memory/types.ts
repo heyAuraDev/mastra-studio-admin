@@ -8,10 +8,11 @@ import type { ModelRouterModelId } from '../llm/model/provider-registry.js';
 import type { MastraLanguageModel, MastraModelConfig } from '../llm/model/shared.types';
 import type { RequestContext } from '../request-context';
 import type { PublicSchema } from '../schema';
-import type { MastraCompositeStore } from '../storage';
+import type { MastraCompositeStore, ObservationalMemoryRecord } from '../storage';
 import type { DynamicArgument } from '../types';
 import type { MastraEmbeddingModel, MastraEmbeddingOptions, MastraVector } from '../vector';
 import type { VectorFilter } from '../vector/filter/base';
+import type { MemoryRunStateAccessor } from './run-state';
 import type { MemoryProcessor } from '.';
 
 export type { Message as AiMessageType } from '@internal/ai-sdk-v4';
@@ -57,6 +58,8 @@ export type ThreadOMMetadata = {
   suggestedResponse?: string;
   /** Observer-generated thread title */
   threadTitle?: string;
+  /** Extracted Observational Memory values keyed by extractor slug */
+  extracted?: Record<string, unknown>;
   /** Timestamp of the last observed message in this thread (ISO string for JSON serialization) */
   lastObservedAt?: string;
   /** Cursor pointing at the last observed message (for replay pruning fallback) */
@@ -74,6 +77,21 @@ export type ThreadMastraMetadata = {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Thread metadata flag marking the title as user-pinned. Set by
+ * `session.thread.rename()` so Observational Memory's title extractor never
+ * overwrites a manual rename, and cleared (set to `false`) when the user
+ * explicitly regenerates the title via `generateThreadTitle()`.
+ */
+export const TITLE_PINNED_THREAD_METADATA_KEY = 'titlePinned';
+
+/**
+ * Whether the thread's title is pinned against automatic updates.
+ */
+export function isThreadTitlePinned(threadMetadata?: Record<string, unknown>): boolean {
+  return threadMetadata?.[TITLE_PINNED_THREAD_METADATA_KEY] === true;
 }
 
 /**
@@ -123,6 +141,8 @@ export type MemoryRequestContext = {
   thread?: Partial<StorageThreadType> & { id: string };
   resourceId?: string;
   memoryConfig?: MemoryConfigInternal;
+  /** Internal accessor for non-serializable state shared within one agent run. */
+  runState?: MemoryRunStateAccessor;
 };
 
 /**
@@ -182,15 +202,42 @@ type BaseWorkingMemory = {
    * @default 'resource'
    */
   scope?: 'thread' | 'resource';
+  /**
+   * Experimental: deliver working memory to the model as a state signal instead of folding
+   * it into the system message. Storage is unchanged. When `true`, `Memory` auto-attaches
+   * a state-signal processor that emits snapshots or deltas with dedup via `cacheKey`, and
+   * registers the working-memory tool as `setWorkingMemory` instead of `updateWorkingMemory`.
+   *
+   * Not supported with template working memory `version: 'vnext'`.
+   *
+   * @default false
+   * @see docs/src/content/en/docs/agents/signals.mdx
+   */
+  useStateSignals?: boolean;
+  /**
+   * Whether the main agent manages working memory directly through tool/instruction injection.
+   * Set to false when another path, such as Observational Memory extractors,
+   * owns working memory updates.
+   *
+   * @default true
+   */
+  agentManaged?: boolean;
   /** @deprecated The `use` option has been removed. Working memory always uses tool-call mode. */
   use?: never;
 };
 
-type TemplateWorkingMemory = BaseWorkingMemory & {
-  template: string;
-  schema?: never;
-  version?: 'stable' | 'vnext';
-};
+type TemplateWorkingMemory =
+  | (BaseWorkingMemory & {
+      template: string;
+      schema?: never;
+      version?: 'stable';
+    })
+  | (Omit<BaseWorkingMemory, 'useStateSignals'> & {
+      template: string;
+      schema?: never;
+      version: 'vnext';
+      useStateSignals?: false;
+    });
 
 type SchemaWorkingMemory = BaseWorkingMemory & {
   schema: PublicSchema;
@@ -389,6 +436,27 @@ export type SemanticRecall = {
    * ```
    */
   indexName?: string;
+
+  /**
+   * Largest number of characters of message text sent to the embedder in one input. Longer
+   * messages are split into chunks, each stored as its own vector row.
+   *
+   * Measured in characters because no single tokenizer matches every embedder. The default of
+   * 16,384 is about 4096 English tokens. Chinese, Japanese and Korean text, and code, use more
+   * tokens per character, so lower it when your embedder's input limit is close. When unset and
+   * the embedder declares `maxInputTokens` (as `@mastra/fastembed` models do), the limit is
+   * derived from that instead.
+   *
+   * Only read from the options passed to the `Memory` constructor. Memory options given per
+   * request (for example through `agent.stream(..., { memory: { options } })`) don't change it.
+   *
+   * @default 16384
+   * @example
+   * ```typescript
+   * maxChunkChars: 6000 // Mostly Japanese text with an 8192-token embedder
+   * ```
+   */
+  maxChunkChars?: number;
 };
 
 /**
@@ -397,7 +465,28 @@ export type SemanticRecall = {
  */
 export type ObservationalMemoryModelSettings = AgentExecutionOptions['modelSettings'];
 
-export type ObservationalMemoryActivationTTL = number | string | 'auto' | false;
+/**
+ * A single idle activation TTL: milliseconds, a duration string like `"5m"` or `"1hr"`,
+ * `"auto"` for a provider-aware TTL, or `false` to disable idle activation.
+ */
+export type ObservationalMemoryActivationTTLValue = number | string | 'auto' | false;
+
+/**
+ * Per-provider idle activation TTLs. Keys are provider names (e.g. `anthropic`, `openai`),
+ * matched case-insensitively against the part of the actor model's provider before the
+ * first `.` (so `anthropic` matches `anthropic.messages`). `default` applies to every
+ * provider without its own key; without `default`, unmatched providers don't idle-activate.
+ *
+ * @example { default: 'auto', anthropic: '1h' }
+ */
+export type ObservationalMemoryActivationTTLByProvider = {
+  default?: ObservationalMemoryActivationTTLValue;
+  [provider: string]: ObservationalMemoryActivationTTLValue | undefined;
+};
+
+export type ObservationalMemoryActivationTTL =
+  | ObservationalMemoryActivationTTLValue
+  | ObservationalMemoryActivationTTLByProvider;
 
 /**
  * Configuration for the observation step in Observational Memory.
@@ -411,9 +500,28 @@ export interface ObservationalMemoryObservationConfig {
    *
    * Cannot be set if a top-level `model` is also provided.
    *
-   * @default 'google/gemini-2.5-flash'
+   * @default the top-level `model`, else `reflection.model`, else `'auto'` — Google's low-cost Gemini
+   * model when Google is usable (`canUseProvider('google')`, or `GOOGLE_GENERATIVE_AI_API_KEY`
+   * when no callback is configured), otherwise a low-cost model from the main model's provider,
+   * otherwise the main model itself.
    */
   model?: AgentConfig['model'];
+
+  /** Number of retries after the initial Observer model call. @default 8 */
+  maxRetries?: number;
+
+  /** Terminal policy after Observer model retries are exhausted. @default 'abort' */
+  failurePolicy?: 'abort' | 'continue';
+
+  /**
+   * Manage working memory through Observational Memory extraction.
+   * When enabled alongside `workingMemory.enabled`, Memory supplies defaults that
+   * disable main-agent working memory management and add the WorkingMemoryExtractor.
+   * Set `workingMemory.agentManaged: true` to keep main-agent tools/instructions enabled.
+   *
+   * @default false
+   */
+  manageWorkingMemory?: boolean;
 
   /**
    * Token count of unobserved messages that triggers observation.
@@ -524,17 +632,25 @@ export interface ObservationalMemoryObservationConfig {
   activateOnProviderChange?: boolean;
 
   /**
-   * Token threshold above which synchronous (blocking) observation is forced.
-   * When set, the system will never block for observation between `messageTokens`
-   * and `blockAfter` — only async buffering and activation are used in that range.
-   * Once unobserved tokens exceed `blockAfter`, a synchronous observation runs as a
-   * last resort to prevent context window overflow.
+   * Token threshold at which a synchronous (blocking) observation is allowed.
+   * Between `messageTokens` and `blockAfter`, only async buffering and activation run:
+   * reaching `messageTokens` without a buffered chunk to activate starts background
+   * buffering, and the resulting chunk activates on a later step. A synchronous
+   * observation runs if pending tokens still reach `blockAfter` after buffered activation.
+   * Unobserved messages can therefore grow up to `blockAfter` before an agent step blocks
+   * on the Observer. Set `blockAfter: 1` to observe synchronously at `messageTokens`.
+   *
+   * Above `blockAfter`, activation may also overshoot the retention target: it uses the
+   * smallest set of buffered chunks that reaches the target, even when that overshoots it
+   * by more than the usual safeguard allows. This changes the result only when the
+   * retention floor is above roughly 20,000 tokens.
    *
    * Accepts either:
-   * - A **multiplier** (1 < value < 2): multiplied by `messageTokens`.
-   *   e.g. `blockAfter: 1.5` with `messageTokens: 20_000` → blocks at 30,000 tokens.
-   * - An **absolute token count** (≥ 2): must be greater than `messageTokens`.
-   *   e.g. `blockAfter: 80_000` → blocks at 80,000 tokens.
+   * - A **multiplier** (1 ≤ value < 100): multiplied by `messageTokens` (including a
+   *   per-thread `messageTokens` override).
+   *   e.g. `blockAfter: 1.5` with `messageTokens: 20_000` → resolves to 30,000 tokens.
+   * - An **absolute token count** (≥ 100): must be greater than `messageTokens`.
+   *   e.g. `blockAfter: 80_000` → resolves to 80,000 tokens.
    *
    * Only relevant when `bufferTokens` is set. When `bufferTokens` is not set,
    * synchronous observation is used directly at `messageTokens` and this setting has no effect.
@@ -566,7 +682,7 @@ export interface ObservationalMemoryObservationConfig {
    * buffered reflections replace the raw observations they summarized.
    * Set to `0` for full truncation (omit previous observations entirely), or `false` to disable.
    *
-   * @default undefined (disabled)
+   * @default false (previous observations are sent in full)
    */
   previousObserverTokens?: number | false;
 
@@ -593,13 +709,15 @@ export interface ObservationalMemoryObservationConfig {
 
   /**
    * Whether image/file attachment parts are forwarded to the Observer LLM.
-   * - `true` forwards attachments
+   * - `true` forwards every attachment
    * - `false` drops attachments and leaves placeholder text
    * - `'auto'` checks model capabilities to decide
+   * - a `string[]` forwards only attachments whose MIME type matches an entry; entries may be
+   *   exact (`'application/pdf'`) or a wildcard (`'image/*'`)
    *
-   * @default true
+   * @default ['image/*', 'application/pdf']
    */
-  observeAttachments?: 'auto' | boolean;
+  observeAttachments?: 'auto' | boolean | string[];
 }
 
 /**
@@ -614,9 +732,18 @@ export interface ObservationalMemoryReflectionConfig {
    *
    * Cannot be set if a top-level `model` is also provided.
    *
-   * @default 'google/gemini-2.5-flash'
+   * @default the top-level `model`, else `observation.model`, else `'auto'` — Google's low-cost Gemini
+   * model when Google is usable (`canUseProvider('google')`, or `GOOGLE_GENERATIVE_AI_API_KEY`
+   * when no callback is configured), otherwise a low-cost model from the main model's provider,
+   * otherwise the main model itself.
    */
   model?: AgentConfig['model'];
+
+  /** Number of retries after the initial Reflector model call. @default 8 */
+  maxRetries?: number;
+
+  /** Terminal policy after Reflector model retries are exhausted. @default 'abort' */
+  failurePolicy?: 'abort' | 'continue';
 
   /**
    * Token count of observations that triggers reflection.
@@ -735,7 +862,6 @@ export interface ObservationalMemoryReflectionConfig {
  *
  * // Custom configuration
  * observationalMemory: {
- *   scope: 'resource',
  *   model: 'google/gemini-2.5-flash',
  *   observation: {
  *     messageTokens: 20_000,
@@ -761,7 +887,9 @@ export interface ObservationalMemoryOptions {
    * Sets the model for both agents at once. Cannot be used together with
    * `observation.model` or `reflection.model` — an error will be thrown.
    *
-   * @default 'google/gemini-2.5-flash'
+   * @default 'auto' — Google's low-cost Gemini model when Google is usable (`canUseProvider('google')`,
+   * or `GOOGLE_GENERATIVE_AI_API_KEY` when no callback is configured), otherwise a low-cost model
+   * from the main model's provider, otherwise the main model itself.
    */
   model?: AgentConfig['model'];
 
@@ -781,6 +909,11 @@ export interface ObservationalMemoryOptions {
    * - 'thread': Observations are per-thread (default)
    *
    * @default 'thread'
+   * @deprecated The `scope` option is deprecated. `'resource'` will be removed in a future release because it
+   * works much worse than thread scope for prompt caching and agent understanding, leaving `'thread'` (already
+   * the default) as the only scope. Omit this option to use thread scope. For cross-thread recall, enable
+   * `retrieval`; for durable facts across threads, use resource-scoped working memory. A new knowledge and
+   * subconscious memory primitive will replace resource scope.
    */
   scope?: 'resource' | 'thread';
 
@@ -792,6 +925,10 @@ export interface ObservationalMemoryOptions {
    * exceeds this value, buffered observations activate regardless of whether the
    * token threshold has been reached. Useful to align with prompt cache TTLs.
    *
+   * Pass an object to set a TTL per provider, with `default` for every other provider.
+   * Use this when your requests set a prompt cache TTL that Mastra can't detect, such as
+   * Anthropic's per-message `cacheControl: { ttl: '1h' }`.
+   *
    * Reflections do not inherit this setting. Use `reflection.activateAfterIdle` to
    * opt reflections into idle activation.
    *
@@ -799,6 +936,7 @@ export interface ObservationalMemoryOptions {
    * @example "5m"
    * @example "1hr"
    * @example "auto"
+   * @example { default: 'auto', anthropic: '1h' }
    */
   activateAfterIdle?: ObservationalMemoryActivationTTL;
 
@@ -833,7 +971,7 @@ export interface ObservationalMemoryOptions {
   temporalMarkers?: boolean;
 
   /**
-   * **Experimental.** Enable retrieval-mode observation groups as durable pointers
+   * Enable retrieval-mode observation groups as durable pointers
    * to raw message history. When enabled, observation groups keep `_range`
    * metadata visible in context and a `recall` tool is registered so the actor
    * can inspect raw messages behind a stored observation summary.
@@ -842,14 +980,15 @@ export interface ObservationalMemoryOptions {
    * - `{ vector: true }` — also enables semantic search using Memory-level vector/embedder
    * - `{ scope: 'thread' }` — restricts the recall tool to the current thread only
    * - `{ vector: true, scope: 'thread' }` — current-thread browsing + semantic search
+   * - `{ instructions: '...' }` — appends application-specific recall guidance after
+   *   Mastra's built-in retrieval instructions (never replaces them)
    *
    * `scope` defaults to `'resource'` (cross-thread browsing, thread listing, and search).
    * Set to `'thread'` to restrict to the current thread only.
    *
-   * @experimental
    * @default false
    */
-  retrieval?: boolean | { vector?: boolean; scope?: 'thread' | 'resource' };
+  retrieval?: boolean | { vector?: boolean; scope?: 'thread' | 'resource'; instructions?: string };
 }
 
 /**
@@ -902,8 +1041,24 @@ type BaseMemoryConfig = {
    * lastMessages: 5 // Include last 5 messages
    * lastMessages: false // Disable conversation history
    * ```
+   * @deprecated Counting messages is a poor proxy for context size. Prefer `messageHistory`
+   * to bound history by a token budget. `lastMessages: false` still disables history.
    */
   lastMessages?: number | false;
+
+  /**
+   * Token budget for conversation history. When set, remembered messages are trimmed
+   * oldest-first until the context fits; system instructions and the current turn are never removed.
+   * Trimmed history stays in storage but is excluded from context on later turns.
+   * When set without a numeric `lastMessages`, history is limited by tokens only.
+   *
+   * @example
+   * ```typescript
+   * messageHistory: { maxTokens: 8000 } // frees 25% of the budget when exceeded
+   * messageHistory: { maxTokens: 8000, atMaxRemoveTokens: 1000 }
+   * ```
+   */
+  messageHistory?: import('./message-history-config').MessageHistoryConfig;
 
   /**
    * Semantic recall configuration for RAG-based retrieval of relevant past messages.
@@ -979,7 +1134,9 @@ type BaseMemoryConfig = {
   /**
    * Automatically generate descriptive thread titles based on the first user message.
    * Can be a boolean to enable with defaults, or an object to customize the model and instructions.
-   * Title generation runs asynchronously and doesn't affect response time.
+   * Title generation runs asynchronously and doesn't affect response time — unless
+   * `emitEvent` is set on a stream run, in which case the final `finish` chunk is held
+   * until the title is generated and persisted.
    *
    * @default false
    * @example
@@ -998,13 +1155,35 @@ type BaseMemoryConfig = {
          * Language model to use for title generation.
          * Can be static or a function that receives request context for dynamic selection.
          * Accepts both Mastra models and standard AI SDK LanguageModelV1/V2.
+         * Defaults to the agent's own model when omitted.
          */
-        model: DynamicArgument<MastraModelConfig>;
+        model?: DynamicArgument<MastraModelConfig>;
         /**
          * Custom instructions for title generation.
          * Can be static or a function that receives request context for dynamic customization.
          */
         instructions?: DynamicArgument<string>;
+        /**
+         * Minimum number of messages in the thread (user + assistant) before
+         * a title is generated.
+         * @default 1
+         */
+        minMessages?: number;
+        /**
+         * Emit the generated title as a transient `data-thread-title` chunk
+         * (`{ threadId, title }`) on the run's stream immediately before the
+         * `finish` chunk, so HTTP/stream consumers receive it on the same run.
+         * Only applies to `stream()` runs; `generate()` and durable/evented agents
+         * keep persist-only behavior.
+         *
+         * Trade-off: the `finish` chunk (and therefore the response's completion)
+         * is delayed until the title is generated and persisted. If the run is
+         * aborted during that wait, `finish` is released immediately and title
+         * generation continues in the background.
+         *
+         * @default false
+         */
+        emitEvent?: boolean;
       };
 
   /**
@@ -1015,8 +1194,8 @@ type BaseMemoryConfig = {
    * Set to false to allow the agent to see suspended tool calls in context.
    * This is useful for suspend/resume patterns where the agent should be aware of pending interactions.
    *
-   * Note: Some providers (e.g. OpenAI) may return errors when incomplete tool calls are included.
-   * Anthropic handles incomplete tool calls without issues.
+   * Note: providers reject a tool call that has no matching tool result, so a suspended call kept
+   * in context is paired with a `{ status: 'pending' }` placeholder result before the prompt is sent.
    *
    * @default true
    * @example
@@ -1025,6 +1204,30 @@ type BaseMemoryConfig = {
    * ```
    */
   filterIncompleteToolCalls?: boolean;
+
+  /**
+   * Whether the request input is processed in full instead of being trimmed to the part
+   * stored history does not already cover.
+   *
+   * By default, when memory loads thread history, only the new messages in the input are
+   * used: the input is trimmed back to the last assistant message (or, when the input ends
+   * with an assistant message, to that message's trailing tool results), and the stored
+   * history is layered underneath. Set this to true when the caller assembled the input
+   * itself and needs the exact message sequence preserved — for example a nested
+   * `useAgent` structuring pass that deliberately replays the parent request so its prompt
+   * keeps the parent's message prefix.
+   *
+   * This controls trimming only. When a memory-sourced message and an input message share
+   * an id, the stored copy stays authoritative: only tool outcomes for calls it still has
+   * pending are taken from the input. Input text, reasoning, and metadata are ignored.
+   *
+   * @default false
+   * @example
+   * ```typescript
+   * retainFullInput: true // Process the request input exactly as supplied
+   * ```
+   */
+  retainFullInput?: boolean;
 
   /**
    * Thread management configuration.
@@ -1174,6 +1377,20 @@ export type SharedMemoryConfig = {
   embedderOptions?: MastraEmbeddingOptions;
 
   /**
+   * Output dimension of the embedder, if known. When set, Memory uses it to name the semantic
+   * recall index instead of embedding a probe string on first use, which saves one embedding
+   * call per Memory instance and removes the startup dependency on the embedding provider.
+   * Must be a positive integer that matches the vectors the embedder returns.
+   *
+   * @example
+   * ```typescript
+   * embedder: 'openai/text-embedding-3-small',
+   * embeddingDimension: 1536
+   * ```
+   */
+  embeddingDimension?: number;
+
+  /**
    * @deprecated This option is deprecated and will throw an error if used.
    * Use the new Input/Output processor system instead.
    *
@@ -1228,6 +1445,9 @@ export type SerializedMemoryConfig = {
     /** Number of recent messages to include, or false to disable */
     lastMessages?: number | false;
 
+    /** Token budget for conversation history */
+    messageHistory?: import('./message-history-config').MessageHistoryConfig;
+
     /** Semantic recall configuration */
     semanticRecall?: boolean | SemanticRecall;
 
@@ -1235,10 +1455,14 @@ export type SerializedMemoryConfig = {
     generateTitle?:
       | boolean
       | {
-          /** Model ID in format provider/model-name */
-          model: ModelRouterModelId;
+          /** Model ID in format provider/model-name; omitted to use the agent's own model */
+          model?: ModelRouterModelId;
           /** Custom instructions for title generation */
           instructions?: string;
+          /** Minimum number of messages in the thread before a title is generated */
+          minMessages?: number;
+          /** Emit a transient `data-thread-title` chunk before `finish` on stream runs */
+          emitEvent?: boolean;
         };
   };
 
@@ -1270,7 +1494,11 @@ export type SerializedObservationalMemoryConfig = {
   /** Model ID for both Observer and Reflector (e.g., "google/gemini-2.5-flash") */
   model?: string;
 
-  /** Memory scope: 'resource' or 'thread' */
+  /**
+   * Memory scope: 'resource' or 'thread'
+   * @deprecated The `scope` option is deprecated. `'resource'` will be removed in a future release, leaving
+   * `'thread'` (already the default) as the only scope. Omit this option to use thread scope.
+   */
   scope?: 'resource' | 'thread';
 
   /** Inactivity TTL before forcing buffered observation activation */
@@ -1286,10 +1514,9 @@ export type SerializedObservationalMemoryConfig = {
   temporalMarkers?: boolean;
 
   /**
-   * **Experimental.** Enable retrieval-mode observation groups as durable pointers to raw message history.
-   * @experimental
+   * Enable retrieval-mode observation groups as durable pointers to raw message history.
    */
-  retrieval?: boolean | { vector?: boolean; scope?: 'thread' | 'resource' };
+  retrieval?: boolean | { vector?: boolean; scope?: 'thread' | 'resource'; instructions?: string };
 
   /** Observation step configuration */
   observation?: SerializedObservationalMemoryObservationConfig;
@@ -1302,6 +1529,13 @@ export type SerializedObservationalMemoryConfig = {
 export type SerializedObservationalMemoryObservationConfig = {
   /** Observer model ID */
   model?: string;
+  /** Number of retries after the initial Observer model call */
+  maxRetries?: number;
+  /** Terminal policy after Observer model retries are exhausted */
+  failurePolicy?: 'abort' | 'continue';
+  /** Manage working memory through Observational Memory extraction. */
+  manageWorkingMemory?: boolean;
+
   /** Token count threshold that triggers observation */
   messageTokens?: number;
   /** Model settings (temperature, maxOutputTokens, etc.) */
@@ -1325,13 +1559,17 @@ export type SerializedObservationalMemoryObservationConfig = {
   /** Whether the Observer should suggest thread titles */
   threadTitle?: boolean;
   /** Whether image/file attachment parts are forwarded to the Observer LLM */
-  observeAttachments?: 'auto' | boolean;
+  observeAttachments?: 'auto' | boolean | string[];
 };
 
 /** Serializable subset of ObservationalMemoryReflectionConfig */
 export type SerializedObservationalMemoryReflectionConfig = {
   /** Reflector model ID */
   model?: string;
+  /** Number of retries after the initial Reflector model call */
+  maxRetries?: number;
+  /** Terminal policy after Reflector model retries are exhausted */
+  failurePolicy?: 'abort' | 'continue';
   /** Token count threshold that triggers reflection */
   observationTokens?: number;
   /** Model settings (temperature, maxOutputTokens, etc.) */
@@ -1346,4 +1584,36 @@ export type SerializedObservationalMemoryReflectionConfig = {
   activateOnProviderChange?: boolean;
   /** Ratio for async reflection buffering */
   bufferActivation?: number;
+};
+
+/**
+ * Observational Memory settings reported by a memory implementation that runs Observational
+ * Memory itself instead of through an `observational-memory` processor (for example a hosted
+ * backend).
+ */
+export type ObservationalMemorySettings = {
+  enabled: boolean;
+  scope: 'thread' | 'resource';
+  /** Unobserved message tokens that trigger an observation. */
+  messageTokens?: number;
+  /** Observation tokens that trigger a reflection. */
+  observationTokens?: number;
+};
+
+export type GetObservationalMemoryRecordsInput = {
+  threadId?: string;
+  resourceId?: string;
+  /** Number of past generations to return, newest first. */
+  historyLimit?: number;
+  from?: Date;
+  to?: Date;
+  offset?: number;
+  requestContext?: RequestContext;
+};
+
+export type ObservationalMemoryRecords = {
+  /** Current record, or null before the first observation. */
+  record: ObservationalMemoryRecord | null;
+  /** Past generations, newest first. */
+  history: ObservationalMemoryRecord[];
 };

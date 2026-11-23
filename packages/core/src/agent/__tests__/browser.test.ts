@@ -2,7 +2,8 @@ import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
-import type { MastraBrowser } from '../../browser';
+import { MastraBrowser } from '../../browser';
+import { MockMemory } from '../../memory/mock';
 import { createTool } from '../../tools';
 import { Agent } from '../agent';
 
@@ -56,6 +57,10 @@ function createMockBrowser(
       .fn()
       .mockImplementation((threadId?: string) => (threadId ? `${browserId}:${threadId}` : browserId)),
     getCurrentUrl: vi.fn().mockResolvedValue('https://example.com'),
+    getBrowserState: vi.fn().mockResolvedValue({
+      tabs: [{ url: 'https://example.com', title: 'Example' }],
+      activeTabIndex: 0,
+    }),
     startScreencast: vi.fn().mockResolvedValue({ on: vi.fn(), stop: vi.fn() }),
     startScreencastIfBrowserActive: vi.fn().mockResolvedValue(null),
     injectMouseEvent: vi.fn().mockResolvedValue(undefined),
@@ -89,7 +94,7 @@ describe('Agent browser integration', () => {
   });
 
   describe('listTools', () => {
-    it('does not include browser tools (they are added at execution time)', () => {
+    it('does not include browser tools (they are added at execution time)', async () => {
       const agentTool = createTool({
         id: 'my_tool',
         description: 'Custom tool',
@@ -108,7 +113,7 @@ describe('Agent browser integration', () => {
         browser,
       });
 
-      const tools = agent.listTools() as Record<string, any>;
+      const tools = (await agent.listTools()) as Record<string, any>;
       // listTools only returns agent-configured tools
       expect(Object.keys(tools)).toContain('my_tool');
       // Browser tools are NOT included in listTools - they're added at execution time
@@ -160,14 +165,61 @@ describe('Agent browser integration', () => {
       // Execute a generate call - this should inject browser context
       const result = await agent.generate('Hello');
 
-      // Without a threadId, browser context injection calls isBrowserRunning and getCurrentUrl
+      // Without a threadId, browser context injection calls isBrowserRunning and getBrowserState
       // hasThreadSession is only called when a threadId is provided
       expect(browser.isBrowserRunning).toHaveBeenCalled();
-      expect(browser.getCurrentUrl).toHaveBeenCalled();
+      expect(browser.getBrowserState).toHaveBeenCalled();
       expect(browser.getSessionId).toHaveBeenCalled();
 
       // Verify the result completed successfully
       expect(result.text).toBe('OK');
+    });
+
+    it('runs a memory-less agent with the real browser-context processor', async () => {
+      const browser = createMockBrowser(['browser_navigate']);
+      const getInputProcessors = vi.fn((configured, options) =>
+        MastraBrowser.prototype.getInputProcessors.call(browser, configured, options),
+      );
+      browser.getInputProcessors = getInputProcessors;
+
+      const model = createMockModel();
+      const agent = new Agent({
+        id: 'stateless-browser-agent' as const,
+        name: 'stateless-browser-agent',
+        instructions: 'test',
+        model,
+        browser,
+      });
+
+      // Previously threw: computeStateSignal requires Mastra memory
+      const result = await agent.generate('Hello');
+      expect(result.text).toBe('OK');
+      expect(JSON.stringify(model.doGenerateCalls[0]!.prompt)).toContain('You have access to a browser (mock).');
+
+      const [browserProcessor] = getInputProcessors.mock.results[0]!.value;
+      expect(browserProcessor.id).toBe('browser-context');
+      expect(browserProcessor.computeStateSignal).toBeUndefined();
+    });
+
+    it('keeps the browser state signal when the agent has memory', async () => {
+      const browser = createMockBrowser(['browser_navigate']);
+      const getInputProcessors = vi.fn((configured, options) =>
+        MastraBrowser.prototype.getInputProcessors.call(browser, configured, options),
+      );
+      browser.getInputProcessors = getInputProcessors;
+
+      const agent = new Agent({
+        id: 'memory-browser-agent' as const,
+        name: 'memory-browser-agent',
+        instructions: 'test',
+        model: createMockModel(),
+        memory: new MockMemory(),
+        browser,
+      });
+
+      await agent.listInputProcessors();
+      const [browserProcessor] = getInputProcessors.mock.results[0]!.value;
+      expect(typeof browserProcessor.computeStateSignal).toBe('function');
     });
 
     it('uses thread-aware browser context when threadId is provided', async () => {
@@ -193,7 +245,7 @@ describe('Agent browser integration', () => {
       // With a threadId, browser context injection should also check hasThreadSession
       expect(browser.isBrowserRunning).toHaveBeenCalled();
       expect(browser.hasThreadSession).toHaveBeenCalledWith('test-thread-123');
-      expect(browser.getCurrentUrl).toHaveBeenCalledWith('test-thread-123');
+      expect(browser.getBrowserState).toHaveBeenCalledWith('test-thread-123');
       expect(browser.getSessionId).toHaveBeenCalledWith('test-thread-123');
 
       // Verify the result completed successfully
@@ -208,6 +260,26 @@ describe('Agent browser integration', () => {
 
       // With threadId, returns composite ID
       expect(browser.getSessionId('thread-456')).toBe('browser-123:thread-456');
+    });
+
+    it('continues when browser state lookup fails', async () => {
+      const browser = createMockBrowser();
+      browser.isBrowserRunning = vi.fn().mockReturnValue(true);
+      browser.getBrowserState = vi.fn().mockRejectedValue(new Error('CDP connection lost'));
+
+      const agent = new Agent({
+        id: 'test-agent' as const,
+        name: 'test-agent',
+        instructions: 'test',
+        model: createMockModel(),
+        browser,
+      });
+
+      const result = await agent.generate('Hello');
+
+      // Should not throw, returns degraded state instead of aborting
+      expect(result.text).toBe('OK');
+      expect(browser.getBrowserState).toHaveBeenCalled();
     });
   });
 });

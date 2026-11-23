@@ -18,6 +18,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   delete process.env.MASTRA_API_TOKEN;
   delete process.env.MASTRA_ORG_ID;
 });
@@ -41,6 +42,44 @@ describe('getToken', () => {
     const token = await getToken();
 
     expect(token).toBe('from-env');
+  });
+});
+
+describe('token requests', () => {
+  it('passes the abort signal when verifying a token', async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { verifyToken } = await import('./credentials.js');
+
+    await expect(verifyToken('token', controller.signal)).resolves.toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith('http://localhost:9999/v1/auth/verify', {
+      headers: { Authorization: 'Bearer token' },
+      signal: controller.signal,
+    });
+  });
+
+  it('passes the abort signal when refreshing a token', async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { tryRefreshToken } = await import('./credentials.js');
+    const credentials = {
+      token: 'expired-token',
+      refreshToken: 'refresh-token',
+      user: { id: 'u1', email: 'e@e.com', firstName: 'A', lastName: 'B' },
+      organizationId: 'org-1',
+    };
+
+    await expect(tryRefreshToken(credentials, controller.signal)).resolves.toBeNull();
+    expect(fetchMock).toHaveBeenCalledWith('http://localhost:9999/v1/auth/refresh-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken: 'refresh-token' }),
+      signal: controller.signal,
+    });
   });
 });
 
@@ -105,5 +144,68 @@ describe('Credentials interface shape', () => {
     };
     expect(creds.refreshToken).toBe('ref-tok');
     expect(creds.currentOrgId).toBe('org2');
+  });
+});
+
+describe('openBrowser', () => {
+  const originalPlatform = process.platform;
+
+  async function loadWithMockedExec() {
+    vi.resetModules();
+    const execFileSync = vi.fn();
+    vi.doMock('node:child_process', () => ({ execFileSync }));
+    const { openBrowser } = await import('./credentials.js');
+    return { openBrowser, execFileSync };
+  }
+
+  function setPlatform(platform: NodeJS.Platform) {
+    Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+  }
+
+  afterEach(() => {
+    setPlatform(originalPlatform);
+    vi.doUnmock('node:child_process');
+  });
+
+  it.each(['file:///etc/passwd', 'javascript:alert(1)', 'calc.exe', '--help', '', 'ftp://example.com/x'])(
+    'refuses to open %j and never spawns a process',
+    async url => {
+      const { openBrowser, execFileSync } = await loadWithMockedExec();
+
+      expect(() => openBrowser(url)).toThrow(/Refusing to open/);
+      expect(execFileSync).not.toHaveBeenCalled();
+    },
+  );
+
+  it('passes the URL as a single argument on macOS', async () => {
+    setPlatform('darwin');
+    const { openBrowser, execFileSync } = await loadWithMockedExec();
+
+    openBrowser('https://example.com/login?a=1&b=2');
+
+    expect(execFileSync).toHaveBeenCalledWith('open', ['https://example.com/login?a=1&b=2']);
+  });
+
+  it('does not route the URL through cmd.exe on Windows', async () => {
+    setPlatform('win32');
+    const { openBrowser, execFileSync } = await loadWithMockedExec();
+
+    openBrowser('https://example.com/login?a=1&calc.exe');
+
+    expect(execFileSync).toHaveBeenCalledWith('rundll32.exe', [
+      'url.dll,FileProtocolHandler',
+      'https://example.com/login?a=1&calc.exe',
+    ]);
+    expect(execFileSync.mock.calls.some(([cmd]) => /^cmd/i.test(String(cmd)))).toBe(false);
+  });
+
+  it('percent-encodes shell metacharacters that are not valid in a URL', async () => {
+    setPlatform('darwin');
+    const { openBrowser, execFileSync } = await loadWithMockedExec();
+
+    openBrowser('http://localhost:3000/a b"$(touch x)`id`');
+
+    const [, args] = execFileSync.mock.calls[0]!;
+    expect(args).toEqual(['http://localhost:3000/a%20b%22$(touch%20x)%60id%60']);
   });
 });

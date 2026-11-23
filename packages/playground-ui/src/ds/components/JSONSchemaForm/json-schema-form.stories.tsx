@@ -1,10 +1,10 @@
 import type { Meta, StoryObj } from '@storybook/react-vite';
-import { PlusIcon } from 'lucide-react';
 import { useState } from 'react';
 import { TooltipProvider } from '../Tooltip';
 import type { SchemaField } from './types';
 import { createField } from './types';
 import { JSONSchemaForm } from './index';
+import { IconPlusMedium } from '@/ds/icons/central/IconPlusMedium';
 import type { JsonSchema } from '@/lib/json-schema';
 
 const meta: Meta<typeof JSONSchemaForm.Root> = {
@@ -28,7 +28,7 @@ type Story = StoryObj<typeof JSONSchemaForm.Root>;
 function JSONSchemaPreview({ schema }: { schema: JsonSchema | null }) {
   if (!schema) return null;
   return (
-    <pre className="mt-4 p-4 bg-surface2 rounded-md text-xs text-neutral4 overflow-auto max-h-64">
+    <pre className="mt-4 max-h-64 overflow-auto rounded-md bg-background p-4 text-caption text-muted-foreground">
       {JSON.stringify(schema, null, 2)}
     </pre>
   );
@@ -46,7 +46,7 @@ function RecursiveFieldRenderer({
 }) {
   return (
     <JSONSchemaForm.Field key={field.id} field={field} parentPath={parentPath} depth={depth}>
-      <div className="flex gap-2 items-start mb-2">
+      <div className="mb-2 flex items-start gap-2">
         <JSONSchemaForm.FieldName label="Name" placeholder="Property name" />
         <JSONSchemaForm.FieldType label="Type" placeholder="Type" />
         <JSONSchemaForm.FieldRemove />
@@ -57,7 +57,7 @@ function RecursiveFieldRenderer({
         placeholder="Description (optional)"
         className="mb-2"
       />
-      <div className="flex gap-4 mb-2">
+      <div className="mb-2 flex gap-4">
         <JSONSchemaForm.FieldOptional />
         <JSONSchemaForm.FieldNullable />
       </div>
@@ -73,7 +73,7 @@ function RecursiveFieldRenderer({
           )}
         </JSONSchemaForm.FieldList>
         <JSONSchemaForm.AddField className="mt-2">
-          <PlusIcon />
+          <IconPlusMedium />
           Add nested property
         </JSONSchemaForm.AddField>
       </JSONSchemaForm.NestedFields>
@@ -86,7 +86,7 @@ export const Default: Story = {
     const [schema, setSchema] = useState<JsonSchema | null>(null);
 
     return (
-      <div className="w-[500px]">
+      <div className="w-125">
         <JSONSchemaForm.Root onChange={setSchema}>
           <JSONSchemaForm.FieldList>
             {(field, _index, { parentPath, depth }) => (
@@ -94,7 +94,7 @@ export const Default: Story = {
             )}
           </JSONSchemaForm.FieldList>
           <JSONSchemaForm.AddField className="mt-4">
-            <PlusIcon className="w-4 h-4 mr-2" />
+            <IconPlusMedium className="mr-2 size-4" />
             Add property
           </JSONSchemaForm.AddField>
         </JSONSchemaForm.Root>
@@ -115,12 +115,12 @@ export const WithDefaultValues: Story = {
     ];
 
     return (
-      <div className="w-[500px]">
+      <div className="w-125">
         <JSONSchemaForm.Root onChange={setSchema} defaultValue={defaultFields}>
           <JSONSchemaForm.FieldList>
             {(field, _index, { parentPath, depth }) => (
               <JSONSchemaForm.Field key={field.id} field={field} parentPath={parentPath} depth={depth}>
-                <div className="flex gap-2 items-start mb-2">
+                <div className="mb-2 flex items-start gap-2">
                   <JSONSchemaForm.FieldName label="Name" labelIsHidden placeholder="Property name" className="flex-1" />
                   <JSONSchemaForm.FieldType label="Type" placeholder="Type" />
                   <JSONSchemaForm.FieldRemove />
@@ -131,7 +131,7 @@ export const WithDefaultValues: Story = {
                   placeholder="Description (optional)"
                   className="mb-2"
                 />
-                <div className="flex gap-4 mb-4">
+                <div className="mb-4 flex gap-4">
                   <JSONSchemaForm.FieldOptional />
                   <JSONSchemaForm.FieldNullable />
                 </div>
@@ -139,7 +139,7 @@ export const WithDefaultValues: Story = {
             )}
           </JSONSchemaForm.FieldList>
           <JSONSchemaForm.AddField className="mt-4">
-            <PlusIcon />
+            <IconPlusMedium />
             Add property
           </JSONSchemaForm.AddField>
         </JSONSchemaForm.Root>
@@ -154,7 +154,7 @@ export const CompactLayout: Story = {
     const [schema, setSchema] = useState<JsonSchema | null>(null);
 
     return (
-      <div className="w-[400px]">
+      <div className="w-100">
         <JSONSchemaForm.Root onChange={setSchema}>
           <JSONSchemaForm.FieldList>
             {(field, _index, { parentPath, depth }) => (
@@ -163,7 +163,7 @@ export const CompactLayout: Story = {
                 field={field}
                 parentPath={parentPath}
                 depth={depth}
-                className="flex gap-2 items-center mb-2"
+                className="mb-2 flex items-center gap-2"
               >
                 <JSONSchemaForm.FieldName label="Name" labelIsHidden placeholder="Name" className="flex-1" />
                 <JSONSchemaForm.FieldType label="Type" placeholder="Type" className="w-24" />
@@ -202,7 +202,7 @@ export const NestedObjects: Story = {
     ];
 
     return (
-      <div className="w-[600px]">
+      <div className="w-150">
         <JSONSchemaForm.Root onChange={setSchema} defaultValue={defaultFields} maxDepth={5}>
           <JSONSchemaForm.FieldList>
             {(field, _index, { parentPath, depth }) => (
@@ -210,7 +210,7 @@ export const NestedObjects: Story = {
             )}
           </JSONSchemaForm.FieldList>
           <JSONSchemaForm.AddField className="mt-4">
-            <PlusIcon />
+            <IconPlusMedium />
             Add property
           </JSONSchemaForm.AddField>
         </JSONSchemaForm.Root>
@@ -225,7 +225,7 @@ export const CustomStyling: Story = {
     const [schema, setSchema] = useState<JsonSchema | null>(null);
 
     return (
-      <div className="w-[500px]">
+      <div className="w-125">
         <JSONSchemaForm.Root onChange={setSchema} className="space-y-4">
           <JSONSchemaForm.FieldList className="space-y-4">
             {(field, _index, { parentPath, depth }) => (
@@ -234,29 +234,29 @@ export const CustomStyling: Story = {
                 field={field}
                 parentPath={parentPath}
                 depth={depth}
-                className="p-4 border border-border1 rounded-lg bg-surface1"
+                className="rounded-lg border border-border bg-sidebar p-4"
               >
-                <div className="grid grid-cols-2 gap-3 mb-3">
+                <div className="mb-3 grid grid-cols-2 gap-3">
                   <JSONSchemaForm.FieldName label="Property Name" placeholder="Enter name" />
                   <JSONSchemaForm.FieldType label="Data Type" placeholder="Select type" />
                 </div>
                 <JSONSchemaForm.FieldDescription
                   label="Description"
-                  placeholder="Describe this field..."
+                  placeholder="Describe this field"
                   className="mb-3"
                 />
-                <div className="flex justify-between items-center">
+                <div className="flex items-center justify-between">
                   <div className="flex gap-6">
-                    <JSONSchemaForm.FieldOptional label="Optional field" labelClassName="text-neutral4" />
-                    <JSONSchemaForm.FieldNullable label="Allow null" labelClassName="text-neutral4" />
+                    <JSONSchemaForm.FieldOptional label="Optional field" labelClassName="text-muted-foreground" />
+                    <JSONSchemaForm.FieldNullable label="Allow null" labelClassName="text-muted-foreground" />
                   </div>
-                  <JSONSchemaForm.FieldRemove variant="outline" tooltip="Remove this field" />
+                  <JSONSchemaForm.FieldRemove tooltip="Remove this field" />
                 </div>
               </JSONSchemaForm.Field>
             )}
           </JSONSchemaForm.FieldList>
           <JSONSchemaForm.AddField variant="primary" size="lg" className="w-full">
-            <PlusIcon className="w-4 h-4 mr-2" />
+            <IconPlusMedium className="mr-2 size-4" />
             Add New Property
           </JSONSchemaForm.AddField>
         </JSONSchemaForm.Root>

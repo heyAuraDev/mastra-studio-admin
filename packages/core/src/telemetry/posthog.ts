@@ -4,13 +4,24 @@ import { PostHog } from 'posthog-node';
 
 const POSTHOG_API_KEY = 'phc_SBLpZVAB6jmHOct9CABq3PF0Yn5FU3G2FgT4xUr2XrT';
 const POSTHOG_HOST = 'https://us.posthog.com';
+const TRUTHY_DISABLED_VALUES = new Set(['1', 'true', 'yes']);
 
 let client: PostHog | null = null;
 
 export type EEEventName = 'ee_license_check' | 'ee_feature_used';
 
-export function isEETelemetryEnabled(): boolean {
-  return process.env['MASTRA_TELEMETRY_DISABLED'] !== '1';
+export type TelemetryEventName =
+  | EEEventName
+  | 'mastra_model_token_usage'
+  | 'mastra_model_token_usage_v2'
+  | 'mastra_feature_usage';
+
+export function isTelemetryEnabled(): boolean {
+  const value = process.env['MASTRA_TELEMETRY_DISABLED'];
+  if (!value) {
+    return true;
+  }
+  return !TRUTHY_DISABLED_VALUES.has(value.trim().toLowerCase());
 }
 
 export function hashTelemetryValue(value: string): string {
@@ -26,7 +37,7 @@ export function getEETelemetryFallbackDistinctId(): string {
 }
 
 function getClient(): PostHog | null {
-  if (!isEETelemetryEnabled()) {
+  if (!isTelemetryEnabled()) {
     return null;
   }
 
@@ -53,28 +64,53 @@ function getSystemProperties(): Record<string, unknown> {
   };
 }
 
+function buildMessage(event: TelemetryEventName, distinctId: string | undefined, properties?: Record<string, unknown>) {
+  return {
+    distinctId: distinctId || getEETelemetryFallbackDistinctId(),
+    event,
+    properties: {
+      ...getSystemProperties(),
+      ...properties,
+    },
+  };
+}
+
+export function captureTelemetryEvent(
+  event: TelemetryEventName,
+  distinctId: string | undefined,
+  properties?: Record<string, unknown>,
+): void {
+  try {
+    getClient()?.capture(buildMessage(event, distinctId, properties));
+  } catch {
+    // Telemetry must never affect auth or EE feature behavior.
+  }
+}
+
+/**
+ * Sends the event right away and resolves once the request has finished, so callers
+ * can wait for delivery before the process exits. Never rejects: PostHog retries
+ * failed requests internally and reports what still fails through its own error
+ * channel.
+ */
+export async function captureTelemetryEventImmediate(
+  event: TelemetryEventName,
+  distinctId: string | undefined,
+  properties?: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await getClient()?.captureImmediate(buildMessage(event, distinctId, properties));
+  } catch {
+    // Telemetry must never affect server behavior.
+  }
+}
+
 export function captureEEEvent(
   event: EEEventName,
   distinctId: string | undefined,
   properties?: Record<string, unknown>,
 ): void {
-  try {
-    const posthog = getClient();
-    if (!posthog) {
-      return;
-    }
-
-    posthog.capture({
-      distinctId: distinctId || getEETelemetryFallbackDistinctId(),
-      event,
-      properties: {
-        ...getSystemProperties(),
-        ...properties,
-      },
-    });
-  } catch {
-    // Telemetry must never affect auth or EE feature behavior.
-  }
+  captureTelemetryEvent(event, distinctId, properties);
 }
 
 export function resetEETelemetryForTests(): void {

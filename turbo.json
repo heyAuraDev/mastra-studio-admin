@@ -1,5 +1,5 @@
 {
-  "$schema": "https://turbo.build/schema.json",
+  "$schema": "https://v2-9-16.turborepo.dev/schema.json",
   "ui": "stream",
   "futureFlags": {
     "affectedUsingTaskInputs": true
@@ -11,7 +11,16 @@
       "outputLogs": "new-only"
     },
     "lint": {
-      "dependsOn": []
+      "dependsOn": [],
+      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/oxlint.config.ts"]
+    },
+    "lint:fix": {
+      "dependsOn": [],
+      "cache": false
+    },
+    "//#lint:format": {
+      "dependsOn": [],
+      "cache": false
     },
     "typecheck": {
       "dependsOn": ["^build"]
@@ -24,8 +33,23 @@
       "cache": false,
       "persistent": true
     },
+    // The watch rebuilds dist from scratch, so it cannot run while `build` writes the same directory.
+    "@mastra/playground-ui#dev": {
+      "dependsOn": ["^build", "@mastra/playground-ui#build"],
+      "cache": false,
+      "persistent": true
+    },
+    "@mastra/react#dev": {
+      "dependsOn": ["^build", "@mastra/react#build"],
+      "cache": false,
+      "persistent": true
+    },
     "validate:package": {
       "dependsOn": []
+    },
+    "//#format:oxfmt": {
+      "dependsOn": [],
+      "cache": false
     }
   }
 }

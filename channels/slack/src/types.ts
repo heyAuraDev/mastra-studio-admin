@@ -5,6 +5,8 @@ import type {
   StaticToolDisplay,
   StreamingConfig,
   ToolDisplay,
+  WaitUntilFn,
+  WaitUntilResolver,
 } from '@mastra/core/channels';
 import type { ChannelsStorage } from '@mastra/core/storage';
 import type { SlackAdapterConfig } from '@chat-adapter/slack';
@@ -25,6 +27,23 @@ interface SlackAdapterChannelConfigBase {
   formatError?: ChannelAdapterConfig['formatError'];
 
   /**
+   * Dialect for the agent's final reply text. See `ChannelAdapterConfig['textFormat']`.
+   * `'markdown'` (default) posts replies as markdown for native Slack rendering;
+   * `'plain'` posts literal plain text (escape hatch for agents prompted to emit
+   * Slack mrkdwn). Applies to the static driver and the streaming fallback;
+   * native streaming is always markdown.
+   */
+  textFormat?: ChannelAdapterConfig['textFormat'];
+
+  /**
+   * Whether the agent's reply text is posted to Slack. See `ChannelAdapterConfig['textDisplay']`.
+   * `'hidden'` keeps it out of the thread, so the agent's own messages reach it only through tools you give it.
+   *
+   * @default 'show'
+   */
+  textDisplay?: ChannelAdapterConfig['textDisplay'];
+
+  /**
    * Control Slack typing indicators and Assistant-mode status text.
    *
    * - `true` — use built-in defaults: `"is typing…"` while generating text,
@@ -42,6 +61,18 @@ interface SlackAdapterChannelConfigBase {
    * @default true
    */
   typingStatus?: ChannelAdapterConfig['typingStatus'];
+
+  /** Who can approve or deny tool calls in a channel. Defaults to the requester; use `'anyone'` for shared channels. */
+  toolApprovers?: ChannelAdapterConfig['toolApprovers'];
+
+  /**
+   * **Experimental.** Give the agent a `render_card` tool that posts
+   * generative UI cards as native Block Kit. Needs `@json-render/chat`
+   * installed. See `ChannelAdapterConfig['generativeUI']`.
+   *
+   * @default false
+   */
+  generativeUI?: boolean;
 }
 
 /**
@@ -169,24 +200,6 @@ interface SlackProviderConfigBase extends SlackAdapterChannelConfigBase {
   logger?: SlackAdapterConfig['logger'];
 
   /**
-   * Slack App Configuration access token for programmatic app creation.
-   * Generate at: https://api.slack.com/apps > "Your App Configuration Tokens"
-   *
-   * Optional — will rotate to get a fresh token on startup using `refreshToken`.
-   */
-  token?: string;
-
-  /**
-   * Slack App Configuration refresh token.
-   * Used for automatic token rotation. Single-use; each rotation returns a new pair.
-   *
-   * Can be provided here or later via `configure({ refreshToken })`.
-   * If omitted, the provider starts unconfigured and cannot create apps until
-   * `configure()` is called or tokens are loaded from storage.
-   */
-  refreshToken?: string;
-
-  /**
    * Base URL for webhook callbacks.
    * Required when calling connect() to create apps.
    * Can also be set later via setBaseUrl() or auto-detected from server config.
@@ -223,6 +236,41 @@ interface SlackProviderConfigBase extends SlackAdapterChannelConfigBase {
    * Use a 32+ character random string. Can be set via MASTRA_ENCRYPTION_KEY env var.
    */
   encryptionKey?: string;
+
+  /**
+   * Resolver that returns a `waitUntil` for the current Slack webhook request.
+   *
+   * Required on serverless runtimes where Hono can't bridge the platform's
+   * `ExecutionContext` automatically (Vercel, AWS Lambda). Without `waitUntil`, the
+   * runtime freezes the invocation as soon as the 200 ack returns, killing the
+   * agent run mid-flight and leaving the user with no Slack reply.
+   *
+   * Pass the bare `waitUntil(promise)` function from your platform's SDK. If your
+   * runtime requires the Hono `Context` to derive `waitUntil`, use
+   * {@link resolveWaitUntil} instead.
+   *
+   * Cloudflare Workers and Netlify users typically don't need this — Mastra's
+   * default helper already reads `c.executionCtx.waitUntil` and
+   * `c.env.context.waitUntil`.
+   *
+   * @example
+   * ```ts
+   * import { waitUntil } from '@vercel/functions';
+   * new SlackProvider({ waitUntil });
+   * ```
+   */
+  waitUntil?: WaitUntilFn;
+
+  /**
+   * Resolve `waitUntil` from the request's Hono `Context`. Use this when the runtime
+   * exposes `waitUntil` through the request and core's default doesn't cover it.
+   *
+   * For platforms whose `waitUntil` is a bare import (e.g. `@vercel/functions`),
+   * pass it via {@link waitUntil} instead.
+   *
+   * Resolution order: {@link waitUntil} → {@link resolveWaitUntil} → core default.
+   */
+  resolveWaitUntil?: WaitUntilResolver;
 
   /**
    * Per-adapter overrides applied to the Slack adapter entry inside
@@ -281,17 +329,70 @@ export interface SlackProviderStaticConfig extends SlackProviderConfigBase {
 }
 
 /**
+ * Self-managed credentials: the provider rotates its own App Configuration
+ * token pair via `tooling.tokens.rotate` and persists it to storage.
+ * Mutually exclusive with {@link SlackDelegatedCredentialsConfig}.
+ */
+export interface SlackSelfManagedCredentialsConfig {
+  /**
+   * Slack App Configuration access token for programmatic app creation.
+   * Generate at: https://api.slack.com/apps > "Your App Configuration Tokens"
+   *
+   * Optional — will rotate to get a fresh token on startup using `refreshToken`.
+   */
+  token?: string;
+
+  /**
+   * Slack App Configuration refresh token.
+   * Used for automatic token rotation. Single-use; each rotation returns a new pair.
+   *
+   * Can be provided here or later via `configure({ refreshToken })`.
+   * If omitted, the provider starts unconfigured and cannot create apps until
+   * `configure()` is called or tokens are loaded from storage.
+   */
+  refreshToken?: string;
+
+  tokenResolver?: never;
+}
+
+/**
+ * Delegated credentials: an external credential manager (e.g. the Mastra
+ * platform) owns the token refresh cycle. The provider never calls
+ * `tooling.tokens.rotate` itself — before each manifest API call it asks the
+ * resolver for a currently-valid access token.
+ *
+ * The resolver is the single source of truth: direct credentials (`token`,
+ * `refreshToken`) cannot be combined with it, `configure()` throws, and
+ * stored config tokens are ignored.
+ */
+export interface SlackDelegatedCredentialsConfig {
+  /** Resolve a fresh App Configuration access token on demand. */
+  tokenResolver: () => Promise<string>;
+  token?: never;
+  refreshToken?: never;
+}
+
+/**
+ * How the provider obtains App Configuration credentials: either directly
+ * (`token` / `refreshToken`, self-rotated) or via a `tokenResolver`
+ * (externally managed) — never both.
+ */
+export type SlackCredentialsConfig = SlackSelfManagedCredentialsConfig | SlackDelegatedCredentialsConfig;
+
+/**
  * Configuration for SlackProvider at the Mastra level.
  *
- * Combines Slack-specific fields (tokens, baseUrl, OAuth callbacks),
+ * Combines Slack-specific fields (credentials, baseUrl, OAuth callbacks),
  * Slack-adapter overrides (`toolDisplay`, `streaming`, `typingStatus`, …), and a
  * curated subset of `AgentChannels` options forwarded to every connected agent
  * (`handlers`, `inlineMedia`, `inlineLinks`, …).
  *
  * `streaming` discriminates which `toolDisplay` modes are available —
- * `'timeline'` / `'grouped'` need streaming on.
+ * `'timeline'` / `'grouped'` need streaming on. Credentials are either direct
+ * (`token` / `refreshToken`) or delegated (`tokenResolver`), never both — see
+ * {@link SlackCredentialsConfig}.
  */
-export type SlackProviderConfig = SlackProviderStreamingConfig | SlackProviderStaticConfig;
+export type SlackProviderConfig = (SlackProviderStreamingConfig | SlackProviderStaticConfig) & SlackCredentialsConfig;
 
 // =============================================================================
 // Agent Configuration (serializable)

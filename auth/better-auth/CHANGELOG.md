@@ -1,5 +1,336 @@
 # @mastra/auth-better-auth
 
+## 1.1.12
+
+### Patch Changes
+
+- dependencies updates: ([#30464](https://github.com/mastra-ai/mastra/pull/30464))
+  - Updated dependency [`better-auth@^1.7.22` ↗︎](https://www.npmjs.com/package/better-auth/v/1.7.22) (from `^1.7.18`, in `dependencies`)
+
+## 1.1.12-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#30464](https://github.com/mastra-ai/mastra/pull/30464))
+  - Updated dependency [`better-auth@^1.7.22` ↗︎](https://www.npmjs.com/package/better-auth/v/1.7.22) (from `^1.7.18`, in `dependencies`)
+
+## 1.1.11
+
+### Patch Changes
+
+- dependencies updates: ([#29714](https://github.com/mastra-ai/mastra/pull/29714))
+  - Updated dependency [`better-auth@^1.7.18` ↗︎](https://www.npmjs.com/package/better-auth/v/1.7.18) (from `^1.7.15`, in `dependencies`)
+
+- Updated `better-auth` to `^1.7.15`. ([#29052](https://github.com/mastra-ai/mastra/pull/29052))
+
+- Added `user` support for dynamic agent configuration callbacks: the provider now implements `toMastraUser()` so callbacks receive a correctly mapped `user` argument (id, name, email, avatar, and role where available). ([#28612](https://github.com/mastra-ai/mastra/pull/28612))
+
+## 1.1.11-alpha.2
+
+### Patch Changes
+
+- Added `user` support for dynamic agent configuration callbacks: the provider now implements `toMastraUser()` so callbacks receive a correctly mapped `user` argument (id, name, email, avatar, and role where available). ([#28612](https://github.com/mastra-ai/mastra/pull/28612))
+
+## 1.1.11-alpha.1
+
+### Patch Changes
+
+- dependencies updates: ([#29714](https://github.com/mastra-ai/mastra/pull/29714))
+  - Updated dependency [`better-auth@^1.7.18` ↗︎](https://www.npmjs.com/package/better-auth/v/1.7.18) (from `^1.7.15`, in `dependencies`)
+
+## 1.1.11-alpha.0
+
+### Patch Changes
+
+- Updated `better-auth` to `^1.7.15`. ([#29052](https://github.com/mastra-ai/mastra/pull/29052))
+
+## 1.1.10
+
+### Patch Changes
+
+- dependencies updates: ([#28538](https://github.com/mastra-ai/mastra/pull/28538))
+  - Updated dependency [`better-auth@^1.7.13` ↗︎](https://www.npmjs.com/package/better-auth/v/1.7.13) (from `^1.7.12`, in `dependencies`)
+
+## 1.1.10-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#28538](https://github.com/mastra-ai/mastra/pull/28538))
+  - Updated dependency [`better-auth@^1.7.13` ↗︎](https://www.npmjs.com/package/better-auth/v/1.7.13) (from `^1.7.12`, in `dependencies`)
+
+## 1.1.9
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`better-auth@^1.7.12` ↗︎](https://www.npmjs.com/package/better-auth/v/1.7.12) (from `^1.7.7`, in `dependencies`)
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+## 1.1.9-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`better-auth@^1.7.12` ↗︎](https://www.npmjs.com/package/better-auth/v/1.7.12) (from `^1.7.7`, in `dependencies`)
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+## 1.1.8
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 1.1.8-alpha.0
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 1.1.7
+
+### Patch Changes
+
+- security: bump better-auth to ^1.7.7 and @modelcontextprotocol/sdk to ^1.32.1 for Vanta/Aikido findings (AIKIDO-2026-373183, AIKIDO-2026-261025, AIKIDO-2026-365378/156139/344432). ([#26773](https://github.com/mastra-ai/mastra/pull/26773))
+
+## 1.1.7-alpha.0
+
+### Patch Changes
+
+- security: bump better-auth to ^1.7.7 and @modelcontextprotocol/sdk to ^1.32.1 for Vanta/Aikido findings (AIKIDO-2026-373183, AIKIDO-2026-261025, AIKIDO-2026-365378/156139/344432). ([#26773](https://github.com/mastra-ai/mastra/pull/26773))
+
+## 1.1.6
+
+### Patch Changes
+
+- Fixed Better Auth so attackers cannot tell whether an account exists or send requests as a signed-in user from another site. Updated better-auth to 1.7.4. ([#24027](https://github.com/mastra-ai/mastra/pull/24027))
+
+## 1.1.6-alpha.0
+
+### Patch Changes
+
+- Fixed Better Auth so attackers cannot tell whether an account exists or send requests as a signed-in user from another site. Updated better-auth to 1.7.4. ([#24027](https://github.com/mastra-ai/mastra/pull/24027))
+
+## 1.1.5
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.1.5-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+## 1.1.5-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.1.4
+
+### Patch Changes
+
+- Resolve a default `activeOrganizationId` from the user's oldest existing membership when the stored better-auth session has no `activeOrganizationId` set. Nothing in a default sign-in flow calls the organization plugin's `setActive`, so the field was always null and org-scoped consumers saw users with no organization. ([#21482](https://github.com/mastra-ai/mastra/pull/21482))
+
+  ```ts
+  import { MastraAuthBetterAuth } from '@mastra/auth-better-auth';
+
+  const mastraAuth = new MastraAuthBetterAuth({ auth });
+  const user = await mastraAuth.authenticateToken(token, request);
+  // Populated even when the sign-in flow never called `setActive`.
+  console.log(user?.session.activeOrganizationId);
+  ```
+
+  The resolution is read-only and best-effort: the session row is not mutated, users with no memberships still authenticate, and a failed lookup falls back to today's behavior. Caveats: the resolved value is an inferred default, not an explicit user selection, and a session whose active organization was deliberately cleared via `setActive` is indistinguishable from one that was never set, so it also receives the default. A membership removed by an administrator stops being applied to new sessions within about a minute.
+
+- Fixed reading request headers from Express-style plain header objects so cookie-based auth providers no longer throw and fail with a misleading 401. ([#21261](https://github.com/mastra-ai/mastra/pull/21261))
+
+  Related to https://github.com/mastra-ai/mastra/issues/21253
+
+## 1.1.4-alpha.1
+
+### Patch Changes
+
+- Resolve a default `activeOrganizationId` from the user's oldest existing membership when the stored better-auth session has no `activeOrganizationId` set. Nothing in a default sign-in flow calls the organization plugin's `setActive`, so the field was always null and org-scoped consumers saw users with no organization. ([#21482](https://github.com/mastra-ai/mastra/pull/21482))
+
+  The resolution is read-only and best-effort: the session row is not mutated, users with no memberships still authenticate, and a failed lookup falls back to today's behavior. Caveats: the resolved value is an inferred default, not an explicit user selection, and a session whose active organization was deliberately cleared via `setActive` is indistinguishable from one that was never set, so it also receives the default. A membership removed by an administrator stops being applied to new sessions within about a minute.
+
+## 1.1.4-alpha.0
+
+### Patch Changes
+
+- Fixed reading request headers from Express-style plain header objects so cookie-based auth providers no longer throw and fail with a misleading 401. ([#21261](https://github.com/mastra-ai/mastra/pull/21261))
+
+  Related to https://github.com/mastra-ai/mastra/issues/21253
+
+## 1.1.3
+
+### Patch Changes
+
+- dependencies updates: ([#20162](https://github.com/mastra-ai/mastra/pull/20162))
+  - Updated dependency [`better-auth@^1.6.23` ↗︎](https://www.npmjs.com/package/better-auth/v/1.6.23) (from `^1.6.13`, in `dependencies`)
+
+## 1.1.3-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#20162](https://github.com/mastra-ai/mastra/pull/20162))
+  - Updated dependency [`better-auth@^1.6.23` ↗︎](https://www.npmjs.com/package/better-auth/v/1.6.23) (from `^1.6.13`, in `dependencies`)
+
+## 1.1.2
+
+### Patch Changes
+
+- Added a deferred instance mode and organization management to MastraAuthBetterAuth so it can be passed directly to a server host without a wrapper adapter. The provider can now be constructed with just a secret and will build its Better Auth instance (including running migrations) against the host database during init. It also bootstraps a personal organization for new users (ensureOrganization), checks organization admin roles (isOrganizationAdmin), and exposes the Better Auth HTTP handler (handleAuthRequest) so hosts can mount it under /auth/api/*. ([#19765](https://github.com/mastra-ai/mastra/pull/19765))
+
+  **Before**
+
+  ```ts
+  import { betterAuth } from 'better-auth';
+  import { MastraAuthBetterAuth } from '@mastra/auth-better-auth';
+
+  const auth = new MastraAuthBetterAuth({ auth: betterAuth({/* ... */}) });
+  ```
+
+  **After** (bring-your-own instance still works)
+
+  ```ts
+  import { MastraAuthBetterAuth } from '@mastra/auth-better-auth';
+
+  const auth = new MastraAuthBetterAuth({ secret: process.env.BETTER_AUTH_SECRET! });
+  // host calls auth.init({ database, publicUrl, allowedOrigins }) during startup
+  ```
+
+- Updated the minimum better-auth version to 1.6.13 to pull in the fix for a stored cross-site scripting vulnerability in better-auth's OIDC provider and MCP plugins (GHSA-86j7-9j95-vpqj). ([#19584](https://github.com/mastra-ai/mastra/pull/19584))
+
+- Fixed Better Auth bearer token authentication and implemented user lookup in `@mastra/auth-better-auth` (fixes [#19110](https://github.com/mastra-ai/mastra/issues/19110)). ([#19629](https://github.com/mastra-ai/mastra/pull/19629))
+
+  **Bearer tokens now work after credentials sign-in**
+
+  `signIn`/`signUp` return Better Auth's raw session token, but Better Auth only accepts _signed_ session cookies. Sending that token as `Authorization: Bearer <token>` previously always failed authentication. The provider now signs unsigned tokens with the Better Auth secret before verifying the session — matching the semantics of Better Auth's bearer plugin. The session cookie name is also resolved from the Better Auth instance, so secure-cookie setups (`__Secure-` prefix) work too.
+
+  **`getUser()` and `getUsers()` are now implemented**
+
+  Previously `getUser()` was a stub that always returned `null`, breaking Studio user lookup and author enrichment. It now resolves users by ID through Better Auth's internal database adapter, and `getUsers()` supports batch lookups.
+
+## 1.1.2-alpha.2
+
+### Patch Changes
+
+- Added a deferred instance mode and organization management to MastraAuthBetterAuth so it can be passed directly to a server host without a wrapper adapter. The provider can now be constructed with just a secret and will build its Better Auth instance (including running migrations) against the host database during init. It also bootstraps a personal organization for new users (ensureOrganization), checks organization admin roles (isOrganizationAdmin), and exposes the Better Auth HTTP handler (handleAuthRequest) so hosts can mount it under /auth/api/*. ([#19765](https://github.com/mastra-ai/mastra/pull/19765))
+
+  **Before**
+
+  ```ts
+  import { betterAuth } from 'better-auth';
+  import { MastraAuthBetterAuth } from '@mastra/auth-better-auth';
+
+  const auth = new MastraAuthBetterAuth({ auth: betterAuth({/* ... */}) });
+  ```
+
+  **After** (bring-your-own instance still works)
+
+  ```ts
+  import { MastraAuthBetterAuth } from '@mastra/auth-better-auth';
+
+  const auth = new MastraAuthBetterAuth({ secret: process.env.BETTER_AUTH_SECRET! });
+  // host calls auth.init({ database, publicUrl, allowedOrigins }) during startup
+  ```
+
+## 1.1.2-alpha.1
+
+### Patch Changes
+
+- Fixed Better Auth bearer token authentication and implemented user lookup in `@mastra/auth-better-auth` (fixes [#19110](https://github.com/mastra-ai/mastra/issues/19110)). ([#19629](https://github.com/mastra-ai/mastra/pull/19629))
+
+  **Bearer tokens now work after credentials sign-in**
+
+  `signIn`/`signUp` return Better Auth's raw session token, but Better Auth only accepts _signed_ session cookies. Sending that token as `Authorization: Bearer <token>` previously always failed authentication. The provider now signs unsigned tokens with the Better Auth secret before verifying the session — matching the semantics of Better Auth's bearer plugin. The session cookie name is also resolved from the Better Auth instance, so secure-cookie setups (`__Secure-` prefix) work too.
+
+  **`getUser()` and `getUsers()` are now implemented**
+
+  Previously `getUser()` was a stub that always returned `null`, breaking Studio user lookup and author enrichment. It now resolves users by ID through Better Auth's internal database adapter, and `getUsers()` supports batch lookups.
+
+## 1.1.2-alpha.0
+
+### Patch Changes
+
+- Updated the minimum better-auth version to 1.6.13 to pull in the fix for a stored cross-site scripting vulnerability in better-auth's OIDC provider and MCP plugins (GHSA-86j7-9j95-vpqj). ([#19584](https://github.com/mastra-ai/mastra/pull/19584))
+
+## 1.1.1
+
+### Patch Changes
+
+- Improved auth package builds by removing the direct core dependency from auth providers while preserving the existing public auth APIs. ([#17142](https://github.com/mastra-ai/mastra/pull/17142))
+
+## 1.1.1-alpha.0
+
+### Patch Changes
+
+- Improved auth package builds by removing the direct core dependency from auth providers while preserving the existing public auth APIs. ([#17142](https://github.com/mastra-ai/mastra/pull/17142))
+
+## 1.1.0
+
+### Minor Changes
+
+- Random bump ([#18178](https://github.com/mastra-ai/mastra/pull/18178))
+
+### Patch Changes
+
+- Updated dependencies [[`7c0d868`](https://github.com/mastra-ai/mastra/commit/7c0d868d97d0fdbc04c14d0166dbf44d4c5a4a62), [`d9d2273`](https://github.com/mastra-ai/mastra/commit/d9d2273c702690c9a26eab2aebea879701d4355a), [`b04369d`](https://github.com/mastra-ai/mastra/commit/b04369d6b167c698ef103981171a8bf92808e756), [`8f3c262`](https://github.com/mastra-ai/mastra/commit/8f3c262587b335588a02d96b17fd6aca34c885b3)]:
+  - @mastra/core@1.45.0
+
+## 1.1.0-alpha.0
+
+### Minor Changes
+
+- Random bump ([#18178](https://github.com/mastra-ai/mastra/pull/18178))
+
+### Patch Changes
+
+- Updated dependencies [[`7c0d868`](https://github.com/mastra-ai/mastra/commit/7c0d868d97d0fdbc04c14d0166dbf44d4c5a4a62), [`d9d2273`](https://github.com/mastra-ai/mastra/commit/d9d2273c702690c9a26eab2aebea879701d4355a), [`b04369d`](https://github.com/mastra-ai/mastra/commit/b04369d6b167c698ef103981171a8bf92808e756), [`8f3c262`](https://github.com/mastra-ai/mastra/commit/8f3c262587b335588a02d96b17fd6aca34c885b3)]:
+  - @mastra/core@1.45.0-alpha.0
+
+## 1.0.4
+
+### Patch Changes
+
+- Security remediation for the 2026-06-17 "easy-day-js" supply-chain incident. Patch bump to publish clean versions and move the `latest` dist-tag forward, superseding the compromised versions that declared the malicious `easy-day-js` dependency. ([#18056](https://github.com/mastra-ai/mastra/pull/18056))
+
+- Updated dependencies [[`339c57c`](https://github.com/mastra-ai/mastra/commit/339c57c5b2c6dbe75a125e138228e0556528976f), [`1dd4117`](https://github.com/mastra-ai/mastra/commit/1dd4117dcbd8e031ede9f0489436bfbc6f0315b8), [`2b11d1f`](https://github.com/mastra-ai/mastra/commit/2b11d1f6ac7024c5dd2b2dd12a48a956ac9d63bd), [`77a2351`](https://github.com/mastra-ai/mastra/commit/77a2351ee79296e360bce822cb3391f7cfd6489d), [`b7dff0a`](https://github.com/mastra-ai/mastra/commit/b7dff0a3d1022eb6868f48dc40a2b1febd5c277f), [`02087e1`](https://github.com/mastra-ai/mastra/commit/02087e1fbc54aa07f3071f7a200df1bf5be601a8), [`49af8df`](https://github.com/mastra-ai/mastra/commit/49af8df589c4ff71a5015a4553b377b32704b691), [`30ce559`](https://github.com/mastra-ai/mastra/commit/30ce55902ecf819b8ab8697398dd68b108228063), [`c241b92`](https://github.com/mastra-ai/mastra/commit/c241b929dc8c8d6a7b7219c99ed13ac1f3124a77), [`7d6ff70`](https://github.com/mastra-ai/mastra/commit/7d6ff708727297a0526ca0e26e93eeb5bbaaa187), [`ab975d4`](https://github.com/mastra-ai/mastra/commit/ab975d4dd9488752f05bda7afa03166d207e3e2a), [`9d6aa1b`](https://github.com/mastra-ai/mastra/commit/9d6aa1bae407e2afa6a089abc2a6accbbcb287b8)]:
+  - @mastra/core@1.44.0
+
+## 1.0.4-alpha.0
+
+### Patch Changes
+
+- Security remediation for the 2026-06-17 "easy-day-js" supply-chain incident. Patch bump to publish clean versions and move the `latest` dist-tag forward, superseding the compromised versions that declared the malicious `easy-day-js` dependency. ([#18056](https://github.com/mastra-ai/mastra/pull/18056))
+
+- Updated dependencies [[`77a2351`](https://github.com/mastra-ai/mastra/commit/77a2351ee79296e360bce822cb3391f7cfd6489d)]:
+  - @mastra/core@1.43.1-alpha.0
+
+## 1.0.3
+
+### Patch Changes
+
+- Removed Hono from @mastra/core and auth package runtime dependencies. Auth providers now receive framework-agnostic request types that support standard Request objects and Hono-compatible request shapes. MCP and deployer avoid relying on core-bundled Hono context types at package boundaries. ([#17410](https://github.com/mastra-ai/mastra/pull/17410))
+
+- Updated dependencies [[`c973db4`](https://github.com/mastra-ai/mastra/commit/c973db428df1b564ff0c35d4b2a90e8f4f1e13fd), [`552285e`](https://github.com/mastra-ai/mastra/commit/552285e5af43cfc680a0972032cab8de8776c6a0), [`77e686c`](https://github.com/mastra-ai/mastra/commit/77e686c264e493e99ae5024e4dfe3ea5d5a09718), [`ece8dba`](https://github.com/mastra-ai/mastra/commit/ece8dba7ec1a5089eee8c33167cd762bfa91e509), [`e751af2`](https://github.com/mastra-ai/mastra/commit/e751af219433fbf4c7035b2d771b4c9ec8813b05), [`e2a8380`](https://github.com/mastra-ai/mastra/commit/e2a838017a7657850404c1e94c70d79ffdc6f14a), [`be3f1cd`](https://github.com/mastra-ai/mastra/commit/be3f1cd81f0e2a649e8eac15a024d542d814aef8), [`a34d9db`](https://github.com/mastra-ai/mastra/commit/a34d9dbc39fedb722f271318e9355ecee70489ab)]:
+  - @mastra/core@1.39.0
+
+## 1.0.3-alpha.0
+
+### Patch Changes
+
+- Removed Hono from @mastra/core and auth package runtime dependencies. Auth providers now receive framework-agnostic request types that support standard Request objects and Hono-compatible request shapes. MCP and deployer avoid relying on core-bundled Hono context types at package boundaries. ([#17410](https://github.com/mastra-ai/mastra/pull/17410))
+
+- Updated dependencies [[`c973db4`](https://github.com/mastra-ai/mastra/commit/c973db428df1b564ff0c35d4b2a90e8f4f1e13fd), [`552285e`](https://github.com/mastra-ai/mastra/commit/552285e5af43cfc680a0972032cab8de8776c6a0), [`77e686c`](https://github.com/mastra-ai/mastra/commit/77e686c264e493e99ae5024e4dfe3ea5d5a09718), [`ece8dba`](https://github.com/mastra-ai/mastra/commit/ece8dba7ec1a5089eee8c33167cd762bfa91e509), [`e751af2`](https://github.com/mastra-ai/mastra/commit/e751af219433fbf4c7035b2d771b4c9ec8813b05), [`e2a8380`](https://github.com/mastra-ai/mastra/commit/e2a838017a7657850404c1e94c70d79ffdc6f14a), [`be3f1cd`](https://github.com/mastra-ai/mastra/commit/be3f1cd81f0e2a649e8eac15a024d542d814aef8), [`a34d9db`](https://github.com/mastra-ai/mastra/commit/a34d9dbc39fedb722f271318e9355ecee70489ab)]:
+  - @mastra/core@1.39.0-alpha.0
+
 ## 1.0.2
 
 ### Patch Changes

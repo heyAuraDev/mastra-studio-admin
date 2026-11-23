@@ -1,6 +1,6 @@
 # @mastra/voice-speechify
 
-Mastra Voice integration with Speechify's API.
+Add Speechify text-to-speech to Mastra with configurable voices, languages, audio formats, synthesis controls, and speaker discovery.
 
 ## Installation
 
@@ -10,59 +10,54 @@ npm install @mastra/voice-speechify
 
 ## Usage
 
-First, set your Speechify API key in your environment:
-
-```bash
-export SPEECHIFY_API_KEY=your_api_key_here
-```
-
-Then use it in your code:
+Set the API credentials required by your voice provider.
 
 ```typescript
 import { SpeechifyVoice } from '@mastra/voice-speechify';
 
 const voice = new SpeechifyVoice({
   speechModel: {
-    name: 'simba-english', // Optional, defaults to 'simba-english'
+    name: 'simba-3.5', // Optional, defaults to 'simba-3.5'
     apiKey: 'your-api-key', // Optional, can use SPEECHIFY_API_KEY env var
   },
-  speaker: 'george', // Optional, defaults to 'george'
+  speaker: 'harper_32', // Optional, defaults to a voice that matches the model
 });
 
-// List available speakers
+// List available speakers, read live from Speechify's catalog
 const speakers = await voice.getSpeakers();
 
 // Generate speech
 const stream = await voice.speak('Hello world', {
-  speaker: 'george', // Optional, defaults to constructor speaker
-  // Additional Speechify options
-  audioFormat: 'mp3',
+  speaker: 'harper_32', // Optional, defaults to constructor speaker
+  language: 'en-US', // Optional, the voice's own locale when omitted
+  audioFormat: 'mp3', // Optional: mp3, ogg, aac or pcm
 });
 
 // The stream can be piped to a destination
 stream.pipe(destination);
 ```
 
-## Configuration
+### Models
 
-The `SpeechifyVoice` constructor accepts the following options:
+- `simba-3.5`: the default and Speechify's recommended model. 48 languages on one id, and every catalog voice, cloned voices included, speaks all of them. Pass `language` to choose one.
+- `simba-3.2`: English only. A non-English voice returns an error.
+- `simba-3.0`: English, German, Spanish, French, Italian and Portuguese.
+- `simba-english` and `simba-multilingual`: legacy ids. New workspaces get a `model_retired` error; from 2026-11-21 they are served by `simba-3.2` and `simba-3.5`.
 
-```typescript
-interface SpeechifyConfig {
-  name?: string; // Optional Speechify model name (default: 'simba-english')
-  apiKey?: string; // Optional API key (can also use env var)
-}
-
-new SpeechifyVoice({
-  speechModel?: SpeechifyConfig,
-  speaker?: string // Optional default speaker ID
-})
-```
-
-## Available Speakers
-
-You can get a list of available speakers:
+The model can also be overridden per request:
 
 ```typescript
-const speakers = await voice.getSpeakers();
+const stream = await voice.speak('Olá, mundo', { language: 'pt-BR' });
 ```
+
+## Documentation
+
+- [Speechify](https://mastra.ai/integrations/voice/speechify)
+
+## Changelog
+
+See the [package changelog](https://github.com/mastra-ai/mastra/blob/main/voice/speechify/CHANGELOG.md) for version history and release notes.
+
+## Support
+
+We have an [open community Discord](https://discord.gg/mastra-ai). Come and say hello and let us know if you have any questions or need any help getting things running.

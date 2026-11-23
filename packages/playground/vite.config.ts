@@ -20,6 +20,7 @@ const studioStandalonePlugin = (opts: StudioPluginOptions): PluginOption => ({
     return html
       .replace(/%%MASTRA_SERVER_HOST%%/g, opts.targetHost)
       .replace(/%%MASTRA_SERVER_PORT%%/g, opts.targetPort)
+      .replace(/%%MASTRA_DEV_SERVER_INSTANCE_ID%%/g, '')
       .replace(/%%MASTRA_API_PREFIX%%/g, opts.apiPrefix || process.env.MASTRA_API_PREFIX || '/api')
       .replace(/%%MASTRA_HIDE_CLOUD_CTA%%/g, 'true')
       .replace(/%%MASTRA_STUDIO_BASE_PATH%%/g, opts.basePath ?? process.env.MASTRA_STUDIO_BASE_PATH ?? '')
@@ -27,12 +28,15 @@ const studioStandalonePlugin = (opts: StudioPluginOptions): PluginOption => ({
       .replace(/%%MASTRA_CLOUD_API_ENDPOINT%%/g, process.env.MASTRA_CLOUD_API_ENDPOINT || '')
       .replace(/%%MASTRA_EXPERIMENTAL_FEATURES%%/g, process.env.EXPERIMENTAL_FEATURES || 'false')
       .replace(/%%MASTRA_EXPERIMENTAL_UI%%/g, process.env.MASTRA_EXPERIMENTAL_UI || 'false')
-      .replace(/%%MASTRA_THEME_TOGGLE%%/g, process.env.MASTRA_THEME_TOGGLE || 'false')
       .replace(/%%MASTRA_TELEMETRY_DISABLED%%/g, process.env.MASTRA_TELEMETRY_DISABLED || '')
       .replace(/%%MASTRA_TEMPLATES%%/g, process.env.MASTRA_TEMPLATES || 'false')
       .replace(/%%MASTRA_AUTO_DETECT_URL%%/g, process.env.MASTRA_AUTO_DETECT_URL || '')
       .replace(/%%MASTRA_REQUEST_CONTEXT_PRESETS%%/g, process.env.MASTRA_REQUEST_CONTEXT_PRESETS || '')
-      .replace(/%%MASTRA_AGENT_SIGNALS%%/g, process.env.MASTRA_AGENT_SIGNALS || 'false');
+      .replace(/%%MASTRA_AGENT_SIGNALS%%/g, process.env.MASTRA_AGENT_SIGNALS ?? 'true')
+      .replace(/%%MASTRA_SIGNALS_UI%%/g, process.env.MASTRA_SIGNALS_UI || 'false')
+      .replace(/%%MASTRA_ORGANIZATION_ID%%/g, process.env.MASTRA_ORGANIZATION_ID || '')
+      .replace(/%%MASTRA_PLATFORM_PROJECT_ID%%/g, process.env.MASTRA_PLATFORM_PROJECT_ID || '')
+      .replace(/%%MASTRA_PLATFORM_OBSERVABILITY_ENDPOINT%%/g, process.env.MASTRA_PLATFORM_OBSERVABILITY_ENDPOINT || '');
   },
 });
 
@@ -222,6 +226,37 @@ const routesManifestPlugin = (): Plugin => {
   };
 };
 
+// `pnpm dev:playground` starts this server while @mastra/playground-ui's dev script has just emptied its `dist`
+// (scripts/prune-dist.mjs). Vite caches the imports it fails to resolve, so wait for the first watch build.
+const waitForPlaygroundUiWatchPlugin = (): Plugin => ({
+  name: 'wait-for-playground-ui-watch',
+  apply: 'serve',
+  async configureServer() {
+    const pendingFile = path.resolve(__dirname, '../playground-ui/node_modules/.cache/dev-watch-pending');
+    const exists = () =>
+      fs.access(pendingFile).then(
+        () => true,
+        () => false,
+      );
+    if (!(await exists())) return;
+
+    console.info('Waiting for the @mastra/playground-ui watch build…');
+    const deadline = Date.now() + 120_000;
+    while ((await exists()) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+  },
+});
+
+// Green mark while developing Studio itself. `mastra dev` serves the built bundle, so users keep the default icon.
+const devFaviconPlugin = (): Plugin => ({
+  name: 'dev-favicon',
+  apply: 'serve',
+  transformIndexHtml(html: string) {
+    return html.replace('href="./mastra-dark-tile.svg"', 'href="./mastra-dark-tile-dev.svg"');
+  },
+});
+
 export default defineConfig(({ mode }) => {
   const commonConfig: UserConfig = {
     plugins: [stubNodeBuiltinsPlugin, tailwindcss(), react(), routesManifestPlugin()],
@@ -254,7 +289,11 @@ export default defineConfig(({ mode }) => {
     const targetHost = process.env.HOST || 'localhost';
 
     if (commonConfig.plugins) {
-      commonConfig.plugins.push(studioStandalonePlugin({ targetPort, targetHost }));
+      commonConfig.plugins.push(
+        studioStandalonePlugin({ targetPort, targetHost }),
+        waitForPlaygroundUiWatchPlugin(),
+        devFaviconPlugin(),
+      );
     }
 
     return {
@@ -263,6 +302,20 @@ export default defineConfig(({ mode }) => {
         ...commonConfig.server,
         proxy: {
           '/api': {
+            target: `http://${targetHost}:${targetPort}`,
+            changeOrigin: true,
+          },
+          // Custom server routes (e.g. @mastra/livekit's connection-details endpoint)
+          // mount at the server root, outside the /api prefix, so forward them too.
+          '/voice': {
+            target: `http://${targetHost}:${targetPort}`,
+            changeOrigin: true,
+          },
+          // The Studio shell (index.html) opens an SSE connection to the dev
+          // server's refresh notifications at the root, outside /api. Without
+          // this entry the dev playground 404s the SSE and hot-reload
+          // refreshes never reach it.
+          '/refresh-events': {
             target: `http://${targetHost}:${targetPort}`,
             changeOrigin: true,
           },

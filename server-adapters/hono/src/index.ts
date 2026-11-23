@@ -6,36 +6,30 @@ import type { InMemoryTaskStore } from '@mastra/server/a2a/store';
 import type { MCPHttpTransportResult, MCPSseTransportResult } from '@mastra/server/handlers/mcp';
 import type { ParsedRequestParams, ServerRoute } from '@mastra/server/server-adapter';
 import {
+  MASTRA_FRAMEWORK_PUBLIC_KEY,
   MastraServer as MastraServerBase,
+  applyMcpRequestAuth,
   checkRouteFGA,
+  getFGAProvider,
+  getCustomHTTPExceptionResponse,
+  getHTTPErrorResponse,
+  isSafeObjectKey,
+  isZodError,
   normalizeQueryParams,
+  propagateRequestAbort,
   redactStreamChunk,
+  serializeStreamChunk,
 } from '@mastra/server/server-adapter';
 import { toReqRes, toFetchResponse } from 'fetch-to-node';
-import type { Context, HonoRequest, MiddlewareHandler } from 'hono';
+import type { Context, ExecutionContext, HonoRequest, MiddlewareHandler } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { stream } from 'hono/streaming';
-import { ZodError } from 'zod';
+import { propagateClientDisconnect } from './mcp-disconnect';
 export { createAuthMiddleware } from './auth-middleware';
 export type { HonoAuthMiddlewareOptions } from './auth-middleware';
 // Browser stream setup (Hono-specific WebSocket implementation)
 export { setupBrowserStream } from './browser-stream';
-
-type HasPermissionFn = (userPerms: string[], required: string) => boolean;
-let _hasPermissionPromise: Promise<HasPermissionFn | undefined> | undefined;
-function loadHasPermission(): Promise<HasPermissionFn | undefined> {
-  if (!_hasPermissionPromise) {
-    _hasPermissionPromise = import('@mastra/core/auth/ee')
-      .then(m => m.hasPermission)
-      .catch(() => {
-        console.error(
-          '[@mastra/hono] Auth features require @mastra/core >= 1.6.0. Please upgrade: npm install @mastra/core@latest',
-        );
-        return undefined;
-      });
-  }
-  return _hasPermissionPromise;
-}
+export type { HonoBrowserStreamConfig } from './browser-stream';
 
 // Export type definitions for Hono app configuration
 export type HonoVariables = {
@@ -46,7 +40,82 @@ export type HonoVariables = {
   taskStore: InMemoryTaskStore;
   customRouteAuthConfig?: Map<string, boolean>;
   cachedBody?: unknown;
+  /**
+   * True when the current request targets a route the framework has declared
+   * public (`requiresAuth: false`). Adapter authors MUST wrap user-registered
+   * middleware with {@link skipIfFrameworkPublic} so that user middleware
+   * cannot 401 these routes.
+   */
+  [MASTRA_FRAMEWORK_PUBLIC_KEY]?: boolean;
 };
+
+// Re-export the framework-public context key so users configuring Hono apps
+// can reference it directly without importing from @mastra/server.
+export { MASTRA_FRAMEWORK_PUBLIC_KEY } from '@mastra/server/server-adapter';
+
+/**
+ * Wrap a Hono middleware handler so it becomes a no-op for framework-public
+ * routes (routes registered with `requiresAuth: false`).
+ *
+ * Adapters that expose user-provided middleware — for example `serverMiddleware`
+ * on the Mastra instance or `server.middleware` in Mastra config — MUST wrap
+ * those handlers with this before registering them. This is the framework's
+ * guarantee that user middleware cannot accidentally (or intentionally) 401
+ * routes the framework needs to keep reachable (e.g. Studio sign-in endpoints).
+ *
+ * The framework-public flag is computed once per request by
+ * {@link MastraServer.registerContextMiddleware} and stashed on the Hono
+ * context under `MASTRA_FRAMEWORK_PUBLIC_KEY`.
+ */
+export const skipIfFrameworkPublic = (handler: MiddlewareHandler): MiddlewareHandler => {
+  return async (c, next) => {
+    if (c.get(MASTRA_FRAMEWORK_PUBLIC_KEY)) {
+      return next();
+    }
+    return handler(c, next);
+  };
+};
+
+/**
+ * Context key holding a pristine clone of the incoming request, captured by
+ * the context middleware before user middleware runs. The custom-route bridge
+ * reads the body from this clone so user middleware that consumes the request
+ * body (e.g. `await c.req.json()`) does not break custom API routes.
+ */
+const MASTRA_PRISTINE_REQUEST_KEY = '__mastraPristineRequest';
+
+const BODY_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+/**
+ * Cancels a response body the runtime never started reading once the request aborts. @hono/node-server skips the body
+ * of a request that closed while the route handler ran without cancelling it. A body the runtime already reads is
+ * locked, and the runtime cancels that one itself on disconnect.
+ *
+ * `body` is only read after the abort: reading it earlier turns off @hono/node-server's fast path for string and byte
+ * bodies, which is what sets `Content-Length` and the default content type.
+ */
+function cancelUnreadBodyOnAbort(response: Response, signal: AbortSignal): void {
+  const cancel = () => {
+    let body: ReadableStream | null;
+
+    try {
+      body = response.body;
+    } catch {
+      // @hono/node-server's Response throws on `body` once it is streaming the body, and it cancels that body itself.
+      return;
+    }
+
+    if (body && !body.locked) {
+      void body.cancel('request aborted').catch(() => {});
+    }
+  };
+
+  if (signal.aborted) {
+    cancel();
+  } else {
+    signal.addEventListener('abort', cancel, { once: true });
+  }
+}
 
 export type HonoBindings = {};
 
@@ -71,9 +140,32 @@ export interface HonoApp {
   all(path: string, ...handlers: HonoRouteHandler[]): unknown;
 }
 
+const requestClones = new WeakMap<Request, Request[]>();
+
+/**
+ * Clones a request and keeps the clone alive for as long as the request itself. Node 22 makes a request's body
+ * unreadable once a clone of it is garbage collected, which loses the body for anything that reads the original
+ * later, such as the MCP transport.
+ */
+function cloneRequest(request: Request): Request {
+  const clone = request.clone();
+  const clones = requestClones.get(request);
+  if (clones) clones.push(clone);
+  else requestClones.set(request, [clone]);
+  return clone;
+}
+
 export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context> {
   createContextMiddleware(): MiddlewareHandler {
     return async (c, next) => {
+      // Preserve a pristine clone of the request before user middleware runs.
+      // `Request.clone()` tees the body stream, so the clone stays readable
+      // even after middleware consumes the original (json/text/formData/raw).
+      // Only taken when custom routes exist — the bridge is the sole consumer.
+      if (this.hasCustomRouteHandler && BODY_METHODS.has(c.req.method) && c.req.raw.body) {
+        c.set(MASTRA_PRISTINE_REQUEST_KEY, c.req.raw.clone());
+      }
+
       // Patch req.json() to prevent "Body is unusable" errors when the body is read multiple times
       // e.g. by middleware and then by an agent.
       const originalJson = c.req.json.bind(c.req);
@@ -102,7 +194,7 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
         // Only parse if content-type is JSON and body is not empty
         if (contentType?.includes('application/json') && contentLength !== '0') {
           try {
-            const body = (await c.req.raw.clone().json()) as { requestContext?: Record<string, any> };
+            const body = (await cloneRequest(c.req.raw).json()) as { requestContext?: Record<string, any> };
             if (body.requestContext) {
               bodyRequestContext = body.requestContext;
             }
@@ -112,8 +204,8 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
         }
       }
 
-      // Parse request context from query params (GET)
-      if (c.req.method === 'GET') {
+      // Parse request context from query params.
+      if (c.req.method === 'GET' || c.req.method === 'POST') {
         try {
           const encodedRequestContext = c.req.query('requestContext');
           if (encodedRequestContext) {
@@ -172,22 +264,51 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
         const reader = readableStream.getReader();
 
         stream.onAbort(() => {
-          void reader.cancel('request aborted');
+          void reader.cancel('request aborted').catch(() => {});
         });
 
+        // Hono only aborts the stream when the runtime cancels the response body. @hono/node-server never reads or
+        // cancels the body of a request that closed while the route handler ran, so follow the request signal too.
+        const signal = res.req.raw.signal;
+        const abortStream = () => stream.abort();
+        if (signal.aborted) {
+          abortStream();
+        } else {
+          signal.addEventListener('abort', abortStream, { once: true });
+        }
+
         try {
+          if (streamFormat === 'sse' && route.sseFlushOnConnect) {
+            await stream.write(': connected\n\n');
+          }
+
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
 
             if (value) {
+              if (streamFormat === 'sse' && typeof value === 'string' && value.startsWith(':')) {
+                await stream.write(value);
+                continue;
+              }
+
               // Optionally redact sensitive data (system prompts, tool definitions, API keys) before sending to the client
               const shouldRedact = this.streamOptions?.redact ?? true;
               const outputValue = shouldRedact ? redactStreamChunk(value) : value;
+              // A chunk that can't be serialized must not kill the stream — skip it and keep streaming
+              const serialized = serializeStreamChunk(outputValue);
+              if (!serialized.ok) {
+                this.mastra.getLogger()?.error('Failed to serialize stream chunk, skipping', {
+                  path: route.path,
+                  chunkType: (outputValue as { type?: string })?.type,
+                  error: serialized.error.message,
+                });
+                continue;
+              }
               if (streamFormat === 'sse') {
-                await stream.write(`data: ${JSON.stringify(outputValue)}\n\n`);
+                await stream.write(`data: ${serialized.json}\n\n`);
               } else {
-                await stream.write(JSON.stringify(outputValue) + '\x1E');
+                await stream.write(serialized.json + '\x1E');
               }
             }
           }
@@ -200,6 +321,7 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
             error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
           });
         } finally {
+          signal.removeEventListener('abort', abortStream);
           await stream.close();
         }
       },
@@ -240,7 +362,7 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
       } else if (contentType.includes('application/json')) {
         // Clone the request to read the body text first
         // This allows us to check if there's actual content before parsing
-        const clonedReq = request.raw.clone();
+        const clonedReq = cloneRequest(request.raw);
         const bodyText = await clonedReq.text();
 
         if (bodyText && bodyText.trim().length > 0) {
@@ -270,6 +392,9 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
     const result: Record<string, unknown> = {};
 
     for (const [key, value] of formData.entries()) {
+      if (!isSafeObjectKey(key)) {
+        continue;
+      }
       if (value instanceof File) {
         const arrayBuffer = await value.arrayBuffer();
         result[key] = Buffer.from(arrayBuffer);
@@ -286,6 +411,11 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
     }
 
     return result;
+  }
+
+  /** Adapter `mcpOptions` win; otherwise use `server.mcpOptions` from the Mastra config. */
+  private resolveMcpOptions() {
+    return this.mcpOptions ?? this.mastra.getServer()?.mcpOptions;
   }
 
   async sendResponse(route: ServerRoute, response: Context, result: unknown, prefix?: string): Promise<any> {
@@ -306,6 +436,7 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
       return this.stream(route, response, result as { fullStream: ReadableStream });
     } else if (route.responseType === 'datastream-response') {
       const fetchResponse = result as globalThis.Response;
+      cancelUnreadBodyOnAbort(fetchResponse, response.req.raw.signal);
       return fetchResponse;
     } else if (route.responseType === 'mcp-http') {
       // MCP Streamable HTTP transport
@@ -313,7 +444,13 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
       const { req, res } = toReqRes(response.req.raw);
 
       // Merge class-level mcpOptions with route-specific options (route takes precedence)
-      const options = { ...this.mcpOptions, ...routeMcpOptions };
+      const { setRequestAuth, ...options } = { ...this.resolveMcpOptions(), ...routeMcpOptions };
+
+      // `toReqRes` builds a fresh IncomingMessage, so the principal resolved by
+      // auth middleware never reaches the MCP transport unless we bridge it here.
+      // This runs before startHTTP so every branch (stateless, existing session,
+      // new session) sees the same `req.auth`.
+      await applyMcpRequestAuth({ req, requestContext: response.get('requestContext'), setRequestAuth });
 
       // Do NOT await startHTTP — let it run in the background so SSE
       // notifications stream to the client as they are written.
@@ -346,17 +483,31 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
           }
         });
 
-      return await toFetchResponse(res);
+      // Client disconnect before any response bytes: abort the in-flight MCP request.
+      propagateRequestAbort(response.req.raw.signal, res);
+
+      return propagateClientDisconnect(await toFetchResponse(res), res);
     } else if (route.responseType === 'mcp-sse') {
       // MCP SSE transport
       const { server, ssePath, messagePath } = result as MCPSseTransportResult;
 
       try {
+        // SSE has no Node request to hang `req.auth` on, so resolve the auth info
+        // here and pass it explicitly. Reuse the same bridge as streamable HTTP so
+        // a `setRequestAuth` hook sees a real request object.
+        const { req } = toReqRes(response.req.raw);
+        await applyMcpRequestAuth({
+          req,
+          requestContext: response.get('requestContext'),
+          setRequestAuth: this.resolveMcpOptions()?.setRequestAuth,
+        });
+
         return await server.startHonoSSE({
           url: new URL(response.req.url),
           ssePath: `${resolvedPrefix}${ssePath}`,
           messagePath: `${resolvedPrefix}${messagePath}`,
           context: response,
+          authInfo: (req as typeof req & { auth?: unknown }).auth,
         });
       } catch {
         return response.json({ error: 'Error handling MCP SSE request' }, 500);
@@ -374,20 +525,27 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
     // Default prefix to this.prefix if not provided, or empty string
     const prefix = prefixParam ?? this.prefix ?? '';
 
-    // Determine if body limits should be applied
-    const shouldApplyBodyLimit = this.bodyLimitOptions && ['POST', 'PUT', 'PATCH'].includes(route.method.toUpperCase());
-
-    // Get the body size limit for this route (route-specific or default)
     const maxSize = route.maxBodySize ?? this.bodyLimitOptions?.maxSize;
+    const isBodyMethod = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(route.method.toUpperCase());
 
     // Build middleware array
     const middlewares: MiddlewareHandler[] = [];
 
-    if (shouldApplyBodyLimit && maxSize && this.bodyLimitOptions) {
+    if (isBodyMethod && maxSize !== undefined) {
       middlewares.push(
         bodyLimit({
           maxSize,
-          onError: this.bodyLimitOptions.onError as any,
+          onError: (c: Context) => {
+            let errorResponse: unknown = { error: 'Request body too large' };
+            if (route.maxBodySize === undefined && this.bodyLimitOptions) {
+              try {
+                errorResponse = this.bodyLimitOptions.onError(errorResponse);
+              } catch {
+                // Fall back to the default response.
+              }
+            }
+            return c.json(errorResponse, 413);
+          },
         }),
       );
     }
@@ -441,7 +599,7 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
             this.mastra.getLogger()?.error('Error parsing query params', {
               error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
             });
-            if (error instanceof ZodError) {
+            if (isZodError(error)) {
               const { status, body } = this.resolveValidationError(route, error, 'query');
               return c.json(body as any, status as any);
             }
@@ -455,14 +613,14 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
           }
         }
 
-        if (params.body) {
+        if (params.body !== undefined || route.bodySchema) {
           try {
             params.body = await this.parseBody(route, params.body);
           } catch (error) {
             this.mastra.getLogger()?.error('Error parsing body', {
               error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
             });
-            if (error instanceof ZodError) {
+            if (isZodError(error)) {
               const { status, body } = this.resolveValidationError(route, error, 'body');
               return c.json(body as any, status as any);
             }
@@ -484,7 +642,7 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
             this.mastra.getLogger()?.error('Error parsing path params', {
               error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
             });
-            if (error instanceof ZodError) {
+            if (isZodError(error)) {
               const { status, body } = this.resolveValidationError(route, error, 'path');
               return c.json(body as any, status as any);
             }
@@ -511,104 +669,67 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
           request: c.req.raw, // Standard Request object with headers/cookies
         };
 
-        // Check route permission requirement (EE feature)
-        // Uses convention-based permission derivation: permissions are auto-derived
-        // from route path/method unless explicitly set or route is public
-        const authConfig = this.mastra.getServer()?.auth;
-        if (authConfig) {
-          const hasPermission = await loadHasPermission();
-          if (hasPermission) {
-            const userPermissions = c.get('requestContext').get('mastra__userPermissions') as string[] | undefined;
-            const permissionError = this.checkRoutePermission(route, userPermissions, hasPermission);
-
-            if (permissionError) {
-              return c.json(
-                {
-                  error: permissionError.error,
-                  message: permissionError.message,
-                },
-                permissionError.status as any,
-              );
-            }
-          }
-        }
-
-        // Check FGA authorization (EE feature)
-        const fgaError = await checkRouteFGA(this.mastra, route, c.get('requestContext'), {
-          ...params.urlParams,
-          ...params.queryParams,
-          ...(typeof params.body === 'object' ? params.body : {}),
-        });
-        if (fgaError) {
-          return c.json({ error: fgaError.error, message: fgaError.message }, fgaError.status as any);
+        // Check route permission (RBAC) and FGA authorization (EE features)
+        const authzError = await this.authorizeRoute(
+          route,
+          {
+            ...params.urlParams,
+            ...params.queryParams,
+            ...(typeof params.body === 'object' ? params.body : {}),
+          },
+          c.get('requestContext'),
+        );
+        if (authzError) {
+          return c.json({ error: authzError.error, message: authzError.message }, authzError.status as any);
         }
 
         try {
           const result = await route.handler(handlerParams);
           return this.sendResponse(route, c, result, prefix);
         } catch (error) {
-          this.mastra.getLogger()?.error('Error calling handler', {
-            error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
-            path: route.path,
-            method: route.method,
-          });
-          // Check if it's an HTTPException or MastraError with a status code
-          if (error && typeof error === 'object') {
-            // Check for direct status property (HTTPException)
-            if ('status' in error) {
-              const status = (error as any).status;
-              let safeCause: { failingItems: unknown[] } | undefined;
-              try {
-                const raw = error instanceof Error ? error.cause : undefined;
-                if (
-                  raw &&
-                  typeof raw === 'object' &&
-                  !Array.isArray(raw) &&
-                  'failingItems' in raw &&
-                  Array.isArray((raw as any).failingItems)
-                ) {
-                  safeCause = { failingItems: (raw as any).failingItems };
-                }
-              } catch {
-                // serialization or access error — omit cause
-              }
-              return c.json(
-                {
-                  error: error instanceof Error ? error.message : 'Unknown error',
-                  ...(safeCause ? { cause: safeCause } : {}),
-                },
-                status,
-              );
-            }
-            // Check for MastraError with status in details
-            if ('details' in error && error.details && typeof error.details === 'object' && 'status' in error.details) {
-              const status = (error.details as any).status;
-              return c.json({ error: error instanceof Error ? error.message : 'Unknown error' }, status);
-            }
+          // 4xx errors are client conditions (e.g. no session, expired token) and are
+          // already returned as structured HTTP responses below. Logging them as errors
+          // produces noise for callers — skip the logger call for those cases.
+          const httpStatus =
+            error && typeof error === 'object' ? ((error as any).status ?? (error as any).details?.status) : undefined;
+          const isClientError = typeof httpStatus === 'number' && httpStatus >= 400 && httpStatus < 500;
+          if (!isClientError) {
+            // 501 means an optional capability isn't provided by the configured storage or core: expected, not a server fault.
+            const logLevel = httpStatus === 501 ? 'warn' : 'error';
+            this.mastra.getLogger()?.[logLevel]('Error calling handler', {
+              error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
+              path: route.path,
+              method: route.method,
+            });
           }
-          return c.json({ error: error instanceof Error ? error.message : 'Unknown error' }, 500);
+          const customResponse = getCustomHTTPExceptionResponse(error);
+          if (customResponse) {
+            return customResponse;
+          }
+
+          const { status, body } = getHTTPErrorResponse(error);
+          return c.json(body, status as any);
         }
       },
     );
   }
 
   async registerCustomApiRoutes(): Promise<void> {
-    if (!(await this.buildCustomRouteHandler())) return;
-
-    const routes = this.customApiRoutes ?? this.mastra.getServer()?.apiRoutes ?? [];
+    const routes = await this.registerSchemaApiRoutes();
+    if (!(await this.buildCustomRouteHandler(routes))) return;
 
     for (const route of routes) {
-      const serverRoute: ServerRoute = {
-        method: route.method as any,
-        path: route.path,
-        responseType: 'json',
-        handler: async () => {},
-        requiresAuth: route.requiresAuth,
-        requiresPermission: route.requiresPermission,
-        fga: route.fga,
-      };
-
       const routeHandler: MiddlewareHandler = async (c: Context) => {
+        // This app's router may pick a different route than the custom-route app (the
+        // app can use another router, and has more routes). Check auth against the
+        // route the custom-route app will actually run for the forwarded URL.
+        const { match, serverRoute, customRouteAuthConfig } = this.resolveCustomRouteAuth(
+          c.req.url,
+          c.req.method,
+          c.req.path,
+          route,
+        );
+
         // Per-route auth check (same pattern as registerRoute)
         const authError = await this.checkRouteAuth(serverRoute, {
           path: c.req.path,
@@ -618,6 +739,7 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
           requestContext: c.get('requestContext'),
           request: c.req.raw,
           buildAuthorizeContext: () => c,
+          customRouteAuthConfig,
         });
 
         if (authError) {
@@ -631,47 +753,50 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
           }
         }
 
-        const authConfig = this.mastra.getServer()?.auth;
-        if (authConfig) {
-          const hasPermission = await loadHasPermission();
-          if (hasPermission) {
-            const userPermissions = c.get('requestContext').get('mastra__userPermissions') as string[] | undefined;
-            const permissionError = this.checkRoutePermission(serverRoute, userPermissions, hasPermission);
-            if (permissionError) {
-              return c.json(
-                { error: permissionError.error, message: permissionError.message },
-                permissionError.status as any,
-              );
-            }
-          }
+        const permissionError = this.checkRouteRBAC(serverRoute, c.get('requestContext'));
+        if (permissionError) {
+          return c.json(
+            { error: permissionError.error, message: permissionError.message },
+            permissionError.status as any,
+          );
         }
+
+        // Use the pristine clone captured by the context middleware (before
+        // user middleware ran) so body reads survive middleware that already
+        // consumed `c.req.raw`.
+        const pristineRequest = (c.get(MASTRA_PRISTINE_REQUEST_KEY) as Request | undefined) ?? c.req.raw;
 
         // Check FGA authorization (EE feature)
         let bodyParams: Record<string, unknown> = {};
-        const contentType = c.req.header('content-type');
-        if (contentType?.includes('application/json')) {
-          try {
-            const body = (await c.req.raw.clone().json()) as unknown;
-            if (body && typeof body === 'object' && !Array.isArray(body)) {
-              bodyParams = body as Record<string, unknown>;
+        if (getFGAProvider(this.mastra, c.get('requestContext'))) {
+          const contentType = c.req.header('content-type');
+          if (contentType?.includes('application/json')) {
+            try {
+              const body = (await pristineRequest.clone().json()) as unknown;
+              if (body && typeof body === 'object' && !Array.isArray(body)) {
+                bodyParams = body as Record<string, unknown>;
+              }
+            } catch {
+              bodyParams = {};
             }
-          } catch {
-            bodyParams = {};
-          }
-        } else if (
-          contentType?.includes('application/x-www-form-urlencoded') ||
-          contentType?.includes('multipart/form-data')
-        ) {
-          try {
-            bodyParams = Object.fromEntries(await c.req.raw.clone().formData());
-          } catch {
-            bodyParams = {};
+          } else if (
+            contentType?.includes('application/x-www-form-urlencoded') ||
+            contentType?.includes('multipart/form-data')
+          ) {
+            try {
+              bodyParams = Object.fromEntries(await pristineRequest.clone().formData());
+            } catch {
+              bodyParams = {};
+            }
           }
         }
+        // Path params last: the custom handler reads them from the URL, so query/body
+        // values must not be able to change which resource FGA checks.
         const fgaError = await checkRouteFGA(this.mastra, serverRoute, c.get('requestContext'), {
-          ...c.req.param(),
           ...Object.fromEntries(new URL(c.req.url).searchParams.entries()),
           ...bodyParams,
+          // The dispatched route's params; this app's match may belong to another route.
+          ...(match ? match.params : c.req.param()),
         });
         if (fgaError) {
           return c.json({ error: fgaError.error, message: fgaError.message }, fgaError.status as any);
@@ -681,13 +806,24 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
         c.req.raw.headers.forEach((v, k) => {
           reqHeaders[k] = v;
         });
+        // Forward the platform execution context (e.g. Cloudflare Workers'
+        // `waitUntil`) so custom route handlers can keep background work alive
+        // after the response. Hono's `executionCtx` getter throws when no
+        // ExecutionContext exists (e.g. Node), so guard the access.
+        let executionCtx: ExecutionContext | undefined;
+        try {
+          executionCtx = c.executionCtx;
+        } catch {
+          executionCtx = undefined;
+        }
         const response = await this.handleCustomRouteRequest(
           c.req.url,
           c.req.method,
           reqHeaders,
-          c.req.raw.body,
+          pristineRequest.body,
           c.get('requestContext'),
           c.req.raw.signal,
+          executionCtx,
         );
         if (!response) {
           return c.json({ error: 'Not Found' }, 404);
@@ -701,12 +837,48 @@ export class MastraServer extends MastraServerBase<HonoApp, HonoRequest, Context
   }
 
   registerContextMiddleware(): void {
+    // Precompute the framework-public matcher once at registration time.
+    // Called per-request below; used by adapters (see `skipIfFrameworkPublic`)
+    // to short-circuit user-registered middleware for framework-public routes
+    // so users cannot 401 routes declared public via `requiresAuth: false`.
+    const isFrameworkPublic = this.getFrameworkPublicMatcher();
+
     this.app.use('*', this.createContextMiddleware());
+    this.app.use('*', async (c, next) => {
+      c.set(MASTRA_FRAMEWORK_PUBLIC_KEY, isFrameworkPublic(c.req.path, c.req.method));
+      return next();
+    });
+    this.app.use('*', async (c, next) => {
+      await next();
+      this.warnIfUnregisteredChannelWebhook(c.req.path, c.req.method, c.res.status);
+    });
   }
 
   registerAuthMiddleware(): void {
     // Auth is handled per-route in registerRoute() and registerCustomApiRoutes()
     // No global middleware needed
+  }
+
+  registerUserMiddleware(): void {
+    // Middleware added at runtime via `mastra.setServerMiddleware()` — already
+    // normalized to `{ path, handler }` entries by core.
+    for (const m of this.mastra.getServerMiddleware?.() ?? []) {
+      this.app.use(m.path, skipIfFrameworkPublic(m.handler));
+    }
+
+    const configMiddleware = this.mastra.getServer()?.middleware;
+    if (!configMiddleware) {
+      return;
+    }
+
+    const normalizedMiddlewares = Array.isArray(configMiddleware) ? configMiddleware : [configMiddleware];
+    for (const middleware of normalizedMiddlewares) {
+      const { path, handler } = typeof middleware === 'function' ? { path: '*', handler: middleware } : middleware;
+      // Wrap with skipIfFrameworkPublic so user middleware cannot 401 routes
+      // the framework declared public via `requiresAuth: false`
+      // (e.g. Studio sign-in endpoints like /api/auth/capabilities).
+      this.app.use(path, skipIfFrameworkPublic(handler as unknown as MiddlewareHandler));
+    }
   }
 
   registerHttpLoggingMiddleware(): void {

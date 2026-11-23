@@ -1,8 +1,14 @@
+import { compileSchema } from '@internal/types-builder/compile-zod';
 import type { ExpectedStep, Trajectory, TrajectoryExpectation, TrajectoryStep } from '@mastra/core/evals';
 import { createScorer } from '@mastra/core/evals';
 import type { MastraModelConfig } from '@mastra/core/llm';
-import { z } from 'zod';
-import { getUserMessageFromRunInput, getAssistantMessageFromRunOutput, roundToTwoDecimals } from '../../utils';
+import { z } from 'zod/v4';
+import {
+  getUserMessageFromRunInput,
+  getAssistantMessageFromRunOutput,
+  roundToTwoDecimals,
+  toToolLevelSteps,
+} from '../../utils';
 import { TRAJECTORY_EVALUATION_INSTRUCTIONS, createAnalyzePrompt, createReasonPrompt } from './prompts';
 
 export interface TrajectoryAccuracyLLMOptions {
@@ -12,19 +18,21 @@ export interface TrajectoryAccuracyLLMOptions {
   expectedTrajectory?: Trajectory | ExpectedStep[];
 }
 
-const analyzeOutputSchema = z.object({
-  stepEvaluations: z.array(
-    z.object({
-      stepName: z.string().describe('Name of the step (tool name or action)'),
-      wasNecessary: z.boolean().describe('Whether this step was necessary for the task'),
-      wasInOrder: z.boolean().describe('Whether this step was in a logical position in the sequence'),
-      reasoning: z.string().describe('Brief explanation of the evaluation'),
-    }),
-  ),
-  missingSteps: z.array(z.string()).optional().describe('Steps that should have been taken but were not'),
-  extraSteps: z.array(z.string()).optional().describe('Steps that were unnecessary or redundant'),
-  overallAssessment: z.string().describe('Brief overall assessment of the trajectory quality'),
-});
+const analyzeOutputSchema = compileSchema(
+  z.object({
+    stepEvaluations: z.array(
+      z.object({
+        stepName: z.string().describe('Name of the step (tool name or action)'),
+        wasNecessary: z.boolean().describe('Whether this step was necessary for the task'),
+        wasInOrder: z.boolean().describe('Whether this step was in a logical position in the sequence'),
+        reasoning: z.string().describe('Brief explanation of the evaluation'),
+      }),
+    ),
+    missingSteps: z.array(z.string()).optional().describe('Steps that should have been taken but were not'),
+    extraSteps: z.array(z.string()).optional().describe('Steps that were unnecessary or redundant'),
+    overallAssessment: z.string().describe('Brief overall assessment of the trajectory quality'),
+  }),
+);
 
 function formatStepDetails(step: TrajectoryStep): string {
   switch (step.stepType) {
@@ -35,8 +43,6 @@ function formatStepDetails(step: TrajectoryStep): string {
       if (step.toolResult !== undefined) parts.push(`result: ${JSON.stringify(step.toolResult)}`);
       return parts.length > 0 ? ` (${parts.join(', ')})` : '';
     }
-    case 'model_generation':
-      return step.modelId ? ` (model: ${step.modelId})` : '';
     case 'workflow_step':
       return step.output !== undefined ? ` (output: ${JSON.stringify(step.output)})` : '';
     default:
@@ -44,9 +50,11 @@ function formatStepDetails(step: TrajectoryStep): string {
   }
 }
 
+// Formats the tool-level view, so the judge sees the same steps for trace-derived and
+// message-derived trajectories (no processor_run or model_generation wrappers).
 function formatTrajectory(trajectory: Trajectory, indent: number = 0): string {
   const prefix = '  '.repeat(indent);
-  return trajectory.steps
+  return toToolLevelSteps(trajectory.steps)
     .map((step: TrajectoryStep, i: number) => {
       let line = `${prefix}${i + 1}. [${step.stepType}] ${step.name}${formatStepDetails(step)}`;
       if (step.children && step.children.length > 0) {
@@ -88,7 +96,7 @@ function formatExpectedSteps(steps: ExpectedStep[], indent: number = 0): string 
  *
  * @example
  * ```ts
- * import { createTrajectoryAccuracyScorerLLM } from '@mastra/evals/scorers';
+ * import { createTrajectoryAccuracyScorerLLM } from '@mastra/evals/scorers/prebuilt';
  *
  * // Without expected trajectory (evaluates quality based on task)
  * const scorer = createTrajectoryAccuracyScorerLLM({

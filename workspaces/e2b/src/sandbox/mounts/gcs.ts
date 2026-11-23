@@ -1,7 +1,10 @@
+import { createHash } from 'node:crypto';
+
 import type { FilesystemMountConfig } from '@mastra/core/workspace';
 
-import { LOG_PREFIX, validateBucketName } from './types';
-import type { MountContext } from './types';
+import { shellQuote } from '../../utils/shell-quote';
+import { LOG_PREFIX, validateGCSBucketName, validateOwner, validatePrefix } from './types';
+import type { MountContext, MountOwner } from './types';
 
 /**
  * GCS mount config for E2B (mounted via gcsfuse).
@@ -15,16 +18,34 @@ export interface E2BGCSMountConfig extends FilesystemMountConfig {
   bucket: string;
   /** Service account key JSON (optional - omit for public buckets) */
   serviceAccountKey?: string;
+  /**
+   * GCS key prefix to scope the mount (without trailing slash).
+   * When set, gcsfuse uses --only-dir to mount only this subdirectory, so
+   * sandbox paths map directly to prefixed GCS keys.
+   */
+  prefix?: string;
+  /**
+   * Owner of the files inside the mount, as numeric uid/gid.
+   * Defaults to the sandbox user's uid/gid (probed with `id -u && id -g`).
+   */
+  owner?: MountOwner;
 }
 
 /**
  * Mount a GCS bucket using gcsfuse.
+ *
+ * When `config.prefix` is set, gcsfuse uses `--only-dir` to mount only that
+ * subdirectory, aligning sandbox paths with the prefixed GCS keys (mirrors the
+ * S3 `bucket:/prefix` and Azure `--subdirectory` mounts).
  */
 export async function mountGCS(mountPath: string, config: E2BGCSMountConfig, ctx: MountContext): Promise<void> {
   const { sandbox, logger } = ctx;
 
   // Validate inputs before interpolating into shell commands
-  validateBucketName(config.bucket);
+  validateGCSBucketName(config.bucket);
+  if (config.owner) {
+    validateOwner(config.owner);
+  }
 
   // Install gcsfuse if not present
   const checkResult = await sandbox.commands.run('which gcsfuse || echo "not found"');
@@ -42,20 +63,35 @@ export async function mountGCS(mountPath: string, config: E2BGCSMountConfig, ctx
     );
   }
 
-  // Get user's uid/gid for proper file ownership
-  const idResult = await sandbox.commands.run('id -u && id -g');
-  const [uid, gid] = idResult.stdout.trim().split('\n');
+  // Resolve file ownership: an explicit `owner` wins; otherwise probe the default
+  // user's uid/gid so mounted files are owned by that user, not root.
+  let uid: string | undefined;
+  let gid: string | undefined;
+  if (config.owner) {
+    uid = String(config.owner.uid);
+    gid = String(config.owner.gid);
+  } else {
+    const idResult = await sandbox.commands.run('id -u && id -g');
+    [uid, gid] = idResult.stdout.trim().split('\n');
+  }
 
   // Build gcsfuse flags
   // Note: gcsfuse uses --uid/--gid flags, not -o uid=X style
   const uidGidFlags = uid && gid ? `--uid=${uid} --gid=${gid}` : '';
 
+  // Scope the mount to a subdirectory when a prefix is set (mirrors S3/Azure mounts).
+  // validatePrefix normalizes and guards against path traversal; shellQuote guards the shell.
+  const onlyDirFlag = config.prefix ? ` --only-dir=${shellQuote(validatePrefix(config.prefix))}` : '';
+
   const hasCredentials = !!config.serviceAccountKey;
   let mountCmd: string;
 
   if (hasCredentials) {
-    // Write service account key with root ownership so sudo gcsfuse can read it
-    const keyPath = '/tmp/gcs-key.json';
+    // Write service account key with root ownership so sudo gcsfuse can read it.
+    // Per-mount path (hashed mountPath) so concurrent mounts don't race on a single
+    // shared rm -> write -> chmod sequence (same approach as azure.ts).
+    const mountHash = createHash('md5').update(mountPath).digest('hex').slice(0, 8);
+    const keyPath = `/tmp/gcs-key-${mountHash}.json`;
     await sandbox.commands.run(`sudo rm -f ${keyPath}`);
     await sandbox.files.write(keyPath, config.serviceAccountKey!);
     // Make readable by root (sudo gcsfuse runs as root)
@@ -64,14 +100,14 @@ export async function mountGCS(mountPath: string, config: E2BGCSMountConfig, ctx
     // Mount with credentials using --key-file flag
     // Use sudo for /dev/fuse access (same as s3fs)
     // -o allow_other lets non-root users access the FUSE mount
-    mountCmd = `sudo gcsfuse --key-file=${keyPath} -o allow_other ${uidGidFlags} ${config.bucket} ${mountPath}`;
+    mountCmd = `sudo gcsfuse --key-file=${keyPath} -o allow_other ${uidGidFlags}${onlyDirFlag} ${config.bucket} ${mountPath}`;
   } else {
     // Public bucket mode - read-only access without credentials
     // Use --anonymous-access flag (not -o option)
     // Use sudo for /dev/fuse access (same as s3fs)
     logger.debug(`${LOG_PREFIX} No credentials provided, mounting GCS as public bucket (read-only)`);
 
-    mountCmd = `sudo gcsfuse --anonymous-access -o allow_other ${uidGidFlags} ${config.bucket} ${mountPath}`;
+    mountCmd = `sudo gcsfuse --anonymous-access -o allow_other ${uidGidFlags}${onlyDirFlag} ${config.bucket} ${mountPath}`;
   }
 
   logger.debug(`${LOG_PREFIX} Mounting GCS:`, mountCmd);

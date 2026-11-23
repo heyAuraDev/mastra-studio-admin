@@ -542,4 +542,93 @@ describe('createToolCallAccuracyScorerCode', () => {
     expect(result.preprocessStepResult?.correctToolCalled).toBe(true);
     expect(result.preprocessStepResult?.correctOrderCalled).toBe(null); // No order checking
   });
+
+  // Regression: with observable memory enabled, tool calls are stored only in
+  // V2 content.parts (no legacy toolInvocations array). Before the fix the
+  // scorer saw zero tools and always returned 0. See issue #17297.
+  test('should score V2 content.parts tool calls (observable memory format)', async () => {
+    const scorer = createToolCallAccuracyScorerCode({ expectedTool: 'weather-tool' });
+
+    const inputMessages = [createTestMessage({ content: 'What is the weather?', role: 'user', id: 'input-1' })];
+    const output = [
+      {
+        id: 'output-1',
+        role: 'assistant' as const,
+        content: {
+          format: 2,
+          parts: [
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                state: 'result',
+                toolCallId: 'call-1',
+                toolName: 'weather-tool',
+                args: { location: 'New York' },
+                result: { temperature: '20°C', condition: 'sunny' },
+              },
+            },
+            { type: 'text', text: 'The weather in New York is 20°C and sunny.' },
+          ],
+          content: 'The weather in New York is 20°C and sunny.',
+        },
+        createdAt: new Date(),
+      },
+    ] as any;
+
+    const run = createAgentTestRun({ inputMessages, output });
+    const result = await scorer.run(run);
+
+    expect(result.score).toBe(1);
+    expect(result.preprocessStepResult?.correctToolCalled).toBe(true);
+    expect(result.preprocessStepResult?.actualTools).toEqual(['weather-tool']);
+  });
+
+  describe('repeated tools in expectedToolOrder', () => {
+    const runWithTools = (scorer: ReturnType<typeof createToolCallAccuracyScorerCode>, toolNames: string[]) =>
+      scorer.run(
+        createAgentTestRun({
+          inputMessages: [createTestMessage({ content: 'Run the tools', role: 'user', id: 'input-1' })],
+          output: [
+            createTestMessage({
+              content: 'Running the tools.',
+              role: 'assistant',
+              id: 'output-1',
+              toolInvocations: toolNames.map((toolName, index) =>
+                createToolInvocation({
+                  toolCallId: `call-${index}`,
+                  toolName,
+                  args: {},
+                  result: {},
+                  state: 'result',
+                }),
+              ),
+            }),
+          ],
+        }),
+      );
+
+    test.each([
+      { actual: ['search', 'inspect', 'search'], expected: ['search', 'inspect', 'search'], score: 1 },
+      { actual: ['search', 'search'], expected: ['search', 'search'], score: 1 },
+      { actual: ['search', 'other', 'search'], expected: ['search', 'search'], score: 1 },
+      { actual: ['search'], expected: ['search', 'search'], score: 0 },
+      { actual: ['search', 'search', 'inspect'], expected: ['search', 'inspect', 'search'], score: 0 },
+    ])('non-strict: $actual vs expected $expected scores $score', async ({ actual, expected, score }) => {
+      const scorer = createToolCallAccuracyScorerCode({ expectedToolOrder: expected, strictMode: false });
+      const result = await runWithTools(scorer, actual);
+
+      expect(result.score).toBe(score);
+      expect(result.preprocessStepResult?.correctOrderCalled).toBe(score === 1);
+      expect(result.preprocessStepResult?.actualTools).toEqual(actual);
+    });
+
+    test('strict: matching repeated sequence scores 1', async () => {
+      const tools = ['search', 'inspect', 'search'];
+      const scorer = createToolCallAccuracyScorerCode({ expectedToolOrder: tools, strictMode: true });
+      const result = await runWithTools(scorer, tools);
+
+      expect(result.score).toBe(1);
+      expect(result.preprocessStepResult?.correctOrderCalled).toBe(true);
+    });
+  });
 });

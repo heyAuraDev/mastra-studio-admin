@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto';
-
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import {
   MCPServersStorage,
@@ -179,8 +177,6 @@ export class MongoDBMCPServersStorage extends MCPServersStorage {
         updatedAt: now,
       };
 
-      await collection.insertOne(this.serializeMCPServer(newMCPServer));
-
       // Extract snapshot config from flat input
       const snapshotConfig: Record<string, any> = {};
       for (const field of SNAPSHOT_FIELDS) {
@@ -190,21 +186,24 @@ export class MongoDBMCPServersStorage extends MCPServersStorage {
       }
 
       // Create version 1
-      const versionId = randomUUID();
-      try {
-        await this.createVersion({
-          id: versionId,
-          mcpServerId: mcpServer.id,
-          versionNumber: 1,
-          ...snapshotConfig,
-          changedFields: Object.keys(snapshotConfig),
-          changeMessage: 'Initial version',
-        } as CreateMCPServerVersionInput);
-      } catch (versionError) {
-        // Clean up the orphaned server record
-        await collection.deleteOne({ id: mcpServer.id });
-        throw versionError;
+      const versionId = globalThis.crypto.randomUUID();
+      const versionDoc: Record<string, any> = {
+        id: versionId,
+        mcpServerId: mcpServer.id,
+        versionNumber: 1,
+        changedFields: Object.keys(snapshotConfig),
+        changeMessage: 'Initial version',
+        createdAt: new Date(),
+      };
+      for (const field of SNAPSHOT_FIELDS) {
+        if (snapshotConfig[field] !== undefined) versionDoc[field] = snapshotConfig[field];
       }
+
+      await this.#connector.withTransaction(async session => {
+        await collection.insertOne(this.serializeMCPServer(newMCPServer), { session });
+        const versionsCol = await this.getCollection(TABLE_MCP_SERVER_VERSIONS);
+        await versionsCol.insertOne(versionDoc, { session });
+      });
 
       return newMCPServer;
     } catch (error) {
@@ -297,12 +296,12 @@ export class MongoDBMCPServersStorage extends MCPServersStorage {
 
   async delete(id: string): Promise<void> {
     try {
-      // Delete all versions first
-      await this.deleteVersionsByParentId(id);
-
-      // Then delete the MCP server
-      const collection = await this.getCollection(TABLE_MCP_SERVERS);
-      await collection.deleteOne({ id });
+      await this.#connector.withTransaction(async session => {
+        const versionsCol = await this.getCollection(TABLE_MCP_SERVER_VERSIONS);
+        await versionsCol.deleteMany({ mcpServerId: id }, { session });
+        const col = await this.getCollection(TABLE_MCP_SERVERS);
+        await col.deleteOne({ id }, { session });
+      });
     } catch (error) {
       if (error instanceof MastraError) throw error;
       throw new MastraError(

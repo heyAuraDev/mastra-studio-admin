@@ -137,6 +137,59 @@ describe('Stream vs Non-Stream Output Processor Consistency (Issue #7087)', () =
   });
 });
 
+describe('Output processor stream errors', () => {
+  it('fails before emitting an unprocessed sensitive chunk', async () => {
+    const sensitiveText = 'card: 4111-1111-1111-1111';
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          { type: 'response-metadata', id: 'id-0', modelId: 'mock-model', timestamp: new Date(0) },
+          { type: 'text-start', id: 'text-1' },
+          { type: 'text-delta', id: 'text-1', delta: sensitiveText },
+          { type: 'text-end', id: 'text-1' },
+          {
+            type: 'finish',
+            finishReason: 'stop',
+            usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          },
+        ]),
+      }),
+    });
+    const throwingRedactor: Processor = {
+      id: 'throwing-redactor',
+      name: 'Throwing redactor',
+      processOutputStream: async ({ part }) => {
+        if (part.type === 'text-delta' && part.payload.text.includes('4111')) {
+          throw new Error('redactor crashed');
+        }
+        return part;
+      },
+    };
+    const agent = new Agent({
+      id: 'output-processor-error-agent',
+      name: 'Output Processor Error Agent',
+      instructions: 'You are a test agent.',
+      model,
+      outputProcessors: [throwingRedactor],
+    });
+
+    const result = await agent.stream('Reveal the card number');
+    const chunks = [];
+
+    for await (const chunk of result.fullStream) {
+      chunks.push(chunk);
+    }
+
+    expect(JSON.stringify(chunks)).not.toContain(sensitiveText);
+    const errorChunks = chunks.filter(chunk => chunk.type === 'error');
+    expect(errorChunks).toHaveLength(1);
+    expect(errorChunks[0]?.payload.error.message).toContain('redactor crashed');
+    await expect(result.text).resolves.toBe('');
+    await expect(result.finishReason).resolves.toBe('error');
+  });
+});
+
 describe('Processor state persistence across processOutputStream and processOutputResult', () => {
   let mockModel: MockLanguageModelV2;
   let stateInOutputStream: Record<string, unknown> | null = null;
@@ -216,6 +269,46 @@ describe('Processor state persistence across processOutputStream and processOutp
     expect(stateInOutputResult).not.toBeNull();
     expect(stateInOutputResult?.streamProcessed).toBe(true);
     expect(stateInOutputResult?.chunks).toEqual(['Hello ', 'World']);
+  });
+
+  it('exposes prior processOutputStream state to the step-finish lifecycle chunk', async () => {
+    // Regression for #16687: lifecycle chunks (step-start/step-finish) are routed
+    // through output processors via a separate ProcessorRunner. That runner must share
+    // the same processorStates map as the main model-output path, otherwise the
+    // step-finish chunk is handled with a fresh, empty state and loses continuity.
+    const stateByChunkType: Record<string, Record<string, unknown>> = {};
+
+    class LifecycleStateProcessor implements Processor {
+      readonly id = 'lifecycle-state-processor';
+      readonly name = 'Lifecycle State Processor';
+
+      async processOutputStream({ part, state }: any) {
+        if (part.type === 'text-delta') {
+          state.sawText = true;
+        }
+        // Snapshot the state the processor sees for each chunk type
+        stateByChunkType[part.type] = { ...state };
+        return part;
+      }
+    }
+
+    const agent = new Agent({
+      id: 'lifecycle-agent',
+      name: 'lifecycle-agent',
+      instructions: 'Test agent',
+      model: mockModel as any,
+      outputProcessors: [new LifecycleStateProcessor()],
+    });
+
+    const stream = await agent.stream('test message');
+    for await (const _chunk of stream.textStream) {
+      // consume
+    }
+
+    // The processor must have observed the step-finish lifecycle chunk...
+    expect(stateByChunkType['step-finish']).toBeDefined();
+    // ...and at that point it must still see the state set while handling text-delta.
+    expect(stateByChunkType['step-finish']?.sawText).toBe(true);
   });
 });
 

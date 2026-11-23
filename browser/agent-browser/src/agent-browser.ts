@@ -1,5 +1,12 @@
-import { MastraBrowser, ScreencastStreamImpl, DEFAULT_THREAD_ID } from '@mastra/core/browser';
+import {
+  MastraBrowser,
+  ScreencastStreamImpl,
+  DEFAULT_THREAD_ID,
+  createBrowserRecordingTools,
+  resolveLaunchViewport,
+} from '@mastra/core/browser';
 import type {
+  BrowserCookie,
   BrowserState,
   BrowserTabState,
   BrowserToolError,
@@ -9,12 +16,13 @@ import type {
   CdpSessionLike,
   MouseEventParams,
   KeyboardEventParams,
+  ThreadSession,
 } from '@mastra/core/browser';
 import type { Tool } from '@mastra/core/tools';
 
-import { BrowserManager } from 'agent-browser';
-import type { BrowserLaunchOptions } from 'agent-browser';
 import type { Page, Locator } from 'playwright-core';
+import { BrowserManager } from './browser-manager';
+import type { BrowserLaunchOptions } from './browser-manager';
 import type {
   GotoInput,
   SnapshotInput,
@@ -32,9 +40,15 @@ import type {
   ScreenshotInput,
 } from './schemas';
 import { AgentBrowserThreadManager } from './thread-manager';
+import type { CreateAgentBrowserThreadManager } from './thread-manager';
 import { createAgentBrowserTools } from './tools';
 import type { BrowserConfig } from './types';
 import { getBrowserPid } from './utils';
+
+/** AgentBrowser accepts an optional thread-manager factory (see {@link CreateAgentBrowserThreadManager}). */
+export type AgentBrowserConfig = BrowserConfig & {
+  createThreadManager?: CreateAgentBrowserThreadManager;
+};
 
 /**
  * AgentBrowser - Browser automation using agent-browser (vercel-labs/agent-browser)
@@ -43,20 +57,22 @@ import { getBrowserPid } from './utils';
  */
 export class AgentBrowser extends MastraBrowser {
   override readonly id: string;
-  override readonly name = 'AgentBrowser';
-  override readonly provider = 'vercel-labs/agent-browser';
+  override readonly name: string = 'AgentBrowser';
+  override readonly provider: string = 'vercel-labs/agent-browser';
 
   /** Shared browser manager instance (for 'shared' scope) - narrowed type from base class */
   declare protected sharedManager: BrowserManager | null;
   private defaultTimeout = 30000;
   /** Pending PID lookups — awaited in disconnect handlers to avoid racing. */
   private pidLookups = new Set<Promise<void>>();
+  private readonly pendingCloseReasons = new Map<string, 'agent' | 'user' | 'process_restart' | 'error'>();
+  private readonly activeUrlChangeSources = new Map<string, { url: string; source: 'agent' | 'user' }>();
 
   /** Thread manager - narrowed type from base class */
   declare protected threadManager: AgentBrowserThreadManager;
   private browserConfig: BrowserConfig;
 
-  constructor(config: BrowserConfig = {}) {
+  constructor(config: AgentBrowserConfig = {}) {
     super(config);
     this.browserConfig = config;
     this.id = `agent-browser-${Date.now()}`;
@@ -68,23 +84,35 @@ export class AgentBrowser extends MastraBrowser {
     // Default to 'thread' otherwise (launching new browsers per thread)
     const effectiveScope = config.cdpUrl ? (config.scope ?? 'shared') : (config.scope ?? 'thread');
 
-    // Initialize thread manager
-    this.threadManager = new AgentBrowserThreadManager({
+    // Initialize thread manager (optional factory for extensions like Firecrawl per-thread sessions)
+    const threadManagerConfig = {
       scope: effectiveScope,
       browserConfig: { ...config, headless: this.headless },
       resolveCdpUrl: this.resolveCdpUrl.bind(this),
       logger: this.logger,
       // When a new thread session is created, notify listeners so screencast can start
-      onSessionCreated: session => {
+      onSessionCreated: (session: ThreadSession) => {
         // Trigger onBrowserReady callbacks for this specific thread
         // This allows ViewerRegistry to start screencast for just this thread
         this.notifyBrowserReady(session.threadId);
       },
       // When a new browser is created for a thread, set up close listener
-      onBrowserCreated: (manager, threadId) => {
-        this.setupCloseListenerForThread(manager, threadId);
+      onBrowserCreated: (manager: BrowserManager, threadId: string) => {
+        // Skip PID capture for browsers we reached over CDP (issue #23588) —
+        // their PID lives in another namespace. Subclasses that always drive a
+        // remote browser (e.g. Firecrawl per-thread sessions) override
+        // `isRemoteThreadBrowser`.
+        this.setupCloseListenerForThread(manager, threadId, this.isRemoteThreadBrowser());
       },
-    });
+      // Cookies go in before saved tabs reload, so restored pages load signed in.
+      onBrowserOpened: (threadId: string) => this.addPendingCookies(threadId),
+      // Thread browsers start Chrome outside launch(), so check the profile lock here too.
+      beforeLaunch: () => this.prepareThreadProfile(),
+    };
+    const createTm =
+      config.createThreadManager ??
+      ((opts: ConstructorParameters<typeof AgentBrowserThreadManager>[0]) => new AgentBrowserThreadManager(opts));
+    this.threadManager = createTm(threadManagerConfig);
   }
 
   // ---------------------------------------------------------------------------
@@ -136,7 +164,40 @@ export class AgentBrowser extends MastraBrowser {
       // Fall through to create a session for DEFAULT_THREAD_ID
     }
 
-    return this.threadManager.getManagerForThread(effectiveThreadId);
+    const manager = await this.threadManager.getManagerForThread(effectiveThreadId);
+    await this.addPendingCookies(effectiveThreadId);
+    return manager;
+  }
+
+  /**
+   * In thread scope launch() starts no Chrome (each thread launches its own,
+   * sometimes before launch() runs), so the profile is only prepared right
+   * before a thread's browser starts.
+   */
+  protected override getLocalProfilePath(): string | undefined {
+    if (this.threadManager?.getScope() === 'thread' && !this.preparingThreadProfile) return undefined;
+    return super.getLocalProfilePath();
+  }
+
+  private preparingThreadProfile = false;
+
+  private async prepareThreadProfile(): Promise<void> {
+    // Cores before prepareLocalProfile() existed (still in the peer range) skip this.
+    const prepare = (this as unknown as { prepareLocalProfile?: () => Promise<void> }).prepareLocalProfile;
+    if (typeof prepare !== 'function') return;
+    this.preparingThreadProfile = true;
+    try {
+      await prepare.call(this);
+    } finally {
+      this.preparingThreadProfile = false;
+    }
+  }
+
+  protected override async addCookiesToOpenBrowser(cookies: BrowserCookie[], threadId: string): Promise<boolean> {
+    const context = this.threadManager.getExistingManagerForThread(threadId)?.getContext();
+    if (!context) return false;
+    await context.addCookies(cookies);
+    return true;
   }
 
   // ---------------------------------------------------------------------------
@@ -144,6 +205,9 @@ export class AgentBrowser extends MastraBrowser {
   // ---------------------------------------------------------------------------
 
   protected override async doLaunch(): Promise<void> {
+    this.pendingCloseReasons.clear();
+    this.activeUrlChangeSources.clear();
+
     const scope = this.threadManager.getScope();
 
     // For 'thread' scope, don't launch a shared browser.
@@ -162,9 +226,9 @@ export class AgentBrowser extends MastraBrowser {
     this.sharedManager = new BrowserManager();
 
     const localConfig = this.config as BrowserConfig;
-    const launchOptions: BrowserLaunchOptions = {
+    const launchOptions: BrowserLaunchOptions & { cdpHeaders?: Record<string, string> } = {
       headless: this.headless,
-      viewport: localConfig.viewport,
+      ...resolveLaunchViewport(localConfig.viewport),
       profile: localConfig.profile,
       executablePath: localConfig.executablePath,
       storageState: localConfig.storageState,
@@ -174,40 +238,59 @@ export class AgentBrowser extends MastraBrowser {
     if (localConfig.cdpUrl) {
       launchOptions.cdpUrl = await this.resolveCdpUrl(localConfig.cdpUrl);
     }
+    if (localConfig.cdpHeaders) {
+      launchOptions.cdpHeaders = localConfig.cdpHeaders;
+    }
 
     await this.sharedManager.launch(launchOptions);
 
     // Register the shared manager with ThreadManager
     this.threadManager.setSharedManager(this.sharedManager);
 
-    // Set up close listeners to detect external browser closure
-    this.setupCloseListenerForSharedScope(this.sharedManager);
+    // Set up close listeners to detect external browser closure.
+    // A resolved `cdpUrl` means we connected to an existing (remote/container)
+    // browser we do not own — don't capture its PID (issue #23588).
+    this.setupCloseListenerForSharedScope(this.sharedManager, Boolean(launchOptions.cdpUrl));
   }
 
   /**
    * Set up close event listeners for 'shared' scope browser.
    * This handles the case where the shared browser is closed externally.
    */
-  private setupCloseListenerForSharedScope(manager: BrowserManager): void {
+  protected setupCloseListenerForSharedScope(manager: BrowserManager, connectedOverCdp = false): void {
     try {
       // Capture the Chrome process PID via CDP while the browser is alive.
       // The base class uses this to kill orphaned child processes on disconnect.
       // Guard: only store if this manager is still the active shared manager,
       // otherwise a stale lookup could overwrite a newer PID.
-      const pidLookup = getBrowserPid(manager)
-        .then(pid => {
-          if (pid && this.sharedManager === manager) this.sharedBrowserPid = pid;
-        })
-        .finally(() => this.pidLookups.delete(pidLookup));
-      this.pidLookups.add(pidLookup);
+      //
+      // Never capture the PID when we connected to an existing browser over
+      // `cdpUrl` (issue #23588): that browser runs in another PID namespace (a
+      // container, a remote host), so its PID is meaningless — and dangerous —
+      // to signal locally. Leaving `sharedBrowserPid` unset makes the base
+      // class's process-group cleanup a safe no-op for remote browsers.
+      let pidLookup: Promise<void> | undefined;
+      if (!connectedOverCdp) {
+        pidLookup = getBrowserPid(manager)
+          .then(pid => {
+            if (pid && this.sharedManager === manager) this.sharedBrowserPid = pid;
+          })
+          .finally(() => {
+            if (pidLookup) this.pidLookups.delete(pidLookup);
+          });
+        this.pidLookups.add(pidLookup);
+      }
 
       let disconnectHandled = false;
       const handleDisconnect = () => {
         if (disconnectHandled) return;
         disconnectHandled = true;
+        this.rememberClosedBrowserState(manager, 'user');
         // Wait for PID lookup to complete before cleanup, so killProcessGroup
         // has the actual PID instead of undefined.
-        void pidLookup.catch(() => undefined).then(() => this.handleBrowserDisconnected());
+        void Promise.resolve(pidLookup)
+          .catch(() => undefined)
+          .then(() => this.handleBrowserDisconnected());
       };
 
       // Listen for context close (fires when browser window is closed)
@@ -247,6 +330,15 @@ export class AgentBrowser extends MastraBrowser {
       await this.sharedManager.close();
     }
     this.sharedManager = null;
+  }
+
+  override async closeThreadSession(threadId: string): Promise<void> {
+    const manager = this.threadManager.getExistingManagerForThread(threadId);
+    if (manager) {
+      const state = this.getBrowserStateForManager(manager, threadId);
+      if (state) this.threadManager.updateBrowserState(threadId, state);
+    }
+    await super.closeThreadSession(threadId);
   }
 
   /**
@@ -296,6 +388,10 @@ export class AgentBrowser extends MastraBrowser {
    */
   getTools(): Record<string, Tool<any, any>> {
     const tools = createAgentBrowserTools(this);
+    if (this.browserConfig.recording) {
+      Object.assign(tools, createBrowserRecordingTools(this, this.browserConfig.recording));
+    }
+
     const exclude = this.browserConfig.excludeTools;
     if (exclude?.length) {
       for (const name of exclude) {
@@ -309,6 +405,41 @@ export class AgentBrowser extends MastraBrowser {
   // Helpers
   // ---------------------------------------------------------------------------
 
+  private browserStateKey(threadId?: string): string {
+    return threadId ?? this.getCurrentThread() ?? DEFAULT_THREAD_ID;
+  }
+
+  markBrowserCloseReason(reason: 'agent' | 'user' | 'process_restart' | 'error', threadId?: string): void {
+    this.pendingCloseReasons.set(this.browserStateKey(threadId), reason);
+  }
+
+  private markActiveUrlChangeSource(source: 'agent' | 'user', url: string, threadId?: string): void {
+    this.activeUrlChangeSources.set(this.browserStateKey(threadId), { url, source });
+  }
+
+  private getCloseReason(threadId?: string): 'agent' | 'user' | 'process_restart' | 'error' | undefined {
+    return (
+      this.pendingCloseReasons.get(this.browserStateKey(threadId)) ?? this.pendingCloseReasons.get(DEFAULT_THREAD_ID)
+    );
+  }
+
+  private getActiveUrlChangeSource(activeUrl?: string, threadId?: string): 'agent' | 'user' | undefined {
+    const entry = this.activeUrlChangeSources.get(this.browserStateKey(threadId));
+    return entry && entry.url === activeUrl ? entry.source : undefined;
+  }
+
+  private rememberClosedBrowserState(manager: BrowserManager, reason: 'agent' | 'user', threadId?: string): void {
+    const state = this.getBrowserStateForManager(manager, threadId);
+    if (!state || state.tabs.length === 0) return;
+
+    const closedState: BrowserState = { ...state, closeReason: this.getCloseReason(threadId) ?? reason };
+    if (threadId) {
+      this.threadManager.updateBrowserState(threadId, closedState);
+    } else {
+      this.lastBrowserState = closedState;
+    }
+  }
+
   /**
    * Get the page for the current thread.
    * Uses thread scope if enabled, otherwise returns the shared page.
@@ -320,9 +451,12 @@ export class AgentBrowser extends MastraBrowser {
     const threadId = explicitThreadId ?? this.getCurrentThread();
     // For thread scope, always use threadManager.getPageForThread
     if (scope === 'thread') {
-      return this.threadManager.getPageForThread(threadId);
+      const manager = await this.threadManager.getManagerForThread(threadId);
+      await this.addPendingCookies(threadId);
+      return manager.getPage();
     }
     if (!this.sharedManager) throw new Error('Browser not launched');
+    await this.addPendingCookies(threadId);
     return this.sharedManager.getPage();
   }
 
@@ -342,28 +476,53 @@ export class AgentBrowser extends MastraBrowser {
    * Set up close event listener for a thread's browser manager.
    * This handles the case where a thread's browser is closed externally.
    */
-  private setupCloseListenerForThread(manager: BrowserManager, threadId: string): void {
+  /**
+   * Whether per-thread browsers are reached over CDP (a remote/container
+   * browser we do not own). When true, their PID is never captured — signalling
+   * it locally is meaningless and dangerous (issue #23588).
+   *
+   * Base AgentBrowser only connects over CDP when a `cdpUrl` is configured
+   * (thread scope with `cdpUrl` is normally rejected by config validation, so
+   * this is defense in depth). Subclasses that always drive a remote browser
+   * per thread (e.g. Firecrawl) override this to return `true`.
+   */
+  protected isRemoteThreadBrowser(): boolean {
+    return Boolean((this.config as BrowserConfig).cdpUrl);
+  }
+
+  private setupCloseListenerForThread(manager: BrowserManager, threadId: string, connectedOverCdp = false): void {
     try {
       // Capture the Chrome process PID via CDP while the browser is alive.
       // The base class uses this to kill orphaned child processes on disconnect.
       // Guard: only store if this manager is still the active one for the thread,
       // otherwise a stale lookup could overwrite a newer PID.
-      const pidLookup = getBrowserPid(manager)
-        .then(pid => {
-          if (pid && this.threadManager?.getExistingManagerForThread(threadId) === manager) {
-            this.threadBrowserPids.set(threadId, pid);
-          }
-        })
-        .finally(() => this.pidLookups.delete(pidLookup));
-      this.pidLookups.add(pidLookup);
+      //
+      // Never capture the PID for a browser reached over `cdpUrl` (issue #23588):
+      // its PID lives in another namespace and must not be signalled locally.
+      let pidLookup: Promise<void> | undefined;
+      if (!connectedOverCdp) {
+        pidLookup = getBrowserPid(manager)
+          .then(pid => {
+            if (pid && this.threadManager?.getExistingManagerForThread(threadId) === manager) {
+              this.threadBrowserPids.set(threadId, pid);
+            }
+          })
+          .finally(() => {
+            if (pidLookup) this.pidLookups.delete(pidLookup);
+          });
+        this.pidLookups.add(pidLookup);
+      }
 
       let disconnectHandled = false;
       const handleDisconnect = () => {
         if (disconnectHandled) return;
         disconnectHandled = true;
+        this.rememberClosedBrowserState(manager, 'user', threadId);
         // Wait for PID lookup to complete before cleanup, so killProcessGroup
         // has the actual PID instead of undefined.
-        void pidLookup.catch(() => undefined).then(() => this.handleThreadBrowserDisconnected(threadId));
+        void Promise.resolve(pidLookup)
+          .catch(() => undefined)
+          .then(() => this.handleThreadBrowserDisconnected(threadId));
       };
 
       // Listen for context close (fires when browser window is closed)
@@ -531,12 +690,12 @@ export class AgentBrowser extends MastraBrowser {
    * Get the current browser state (all tabs and active tab index).
    */
   override async getBrowserState(threadId?: string): Promise<BrowserState | null> {
-    if (!this.isBrowserRunning()) {
+    if (!this.isBrowserRunning(threadId)) {
       return null;
     }
     try {
       const manager = await this.getManagerForThread(threadId);
-      return this.getBrowserStateForManager(manager);
+      return this.getBrowserStateForManager(manager, threadId);
     } catch {
       return null;
     }
@@ -550,25 +709,37 @@ export class AgentBrowser extends MastraBrowser {
     const effectiveThreadId = threadId ?? this.getCurrentThread() ?? DEFAULT_THREAD_ID;
     const manager = this.threadManager.getExistingManagerForThread(effectiveThreadId);
     if (!manager) return null;
-    return this.getBrowserStateForManager(manager);
+    return this.getBrowserStateForManager(manager, effectiveThreadId);
   }
 
   /**
    * Get browser state from a specific manager instance.
    */
-  private getBrowserStateForManager(manager: BrowserManager): BrowserState | null {
+  private getBrowserStateForManager(manager: BrowserManager, threadId?: string): BrowserState | null {
     try {
+      const stateKey = this.browserStateKey(threadId);
       const pages = manager.getPages();
       const activeIndex = manager.getActiveIndex();
 
       const tabs: BrowserTabState[] = pages.map(page => ({
         url: page.url(),
       }));
+      const activeUrl = tabs[activeIndex]?.url;
+      const previousState = this.threadManager.getSavedBrowserState(stateKey) ?? this.lastBrowserState;
+      const previousUrl = previousState?.tabs[previousState.activeTabIndex]?.url;
+      const activeUrlChangeSource =
+        this.getActiveUrlChangeSource(activeUrl, stateKey) ??
+        (previousUrl && activeUrl !== previousUrl ? 'user' : undefined);
 
-      return {
+      const state: BrowserState = {
         tabs,
         activeTabIndex: activeIndex,
+        ...(this.getCloseReason(stateKey) ? { closeReason: this.getCloseReason(stateKey) } : {}),
+        ...(activeUrlChangeSource ? { activeUrlChangeSource } : {}),
       };
+      this.threadManager.updateBrowserState(stateKey, state);
+      this.lastBrowserState = state;
+      return state;
     } catch {
       return null;
     }
@@ -632,10 +803,12 @@ export class AgentBrowser extends MastraBrowser {
         timeout: input.timeout ?? this.defaultTimeout,
         waitUntil: input.waitUntil ?? 'domcontentloaded',
       });
+      const url = page.url();
+      this.markActiveUrlChangeSource('agent', url, threadId);
 
       return {
         success: true,
-        url: page.url(),
+        url,
         title: await page.title(),
         hint: 'Take a snapshot to see interactive elements and get refs.',
       };
@@ -686,7 +859,8 @@ export class AgentBrowser extends MastraBrowser {
       }
 
       // Count refs
-      const refs = snapshot.match(/@e\d+/g) || [];
+      // Includes refs inside iframes (e.g. @f1e2)
+      const refs = snapshot.match(/@(?:f\d+)?e\d+/g) || [];
       const elementCount = new Set(refs).size;
 
       return {
@@ -732,6 +906,23 @@ export class AgentBrowser extends MastraBrowser {
     }
   }
 
+  /**
+   * Start a `waitForNavigation` wait (when `waitUntil` is set) and immediately
+   * attach a noop catch handler so a navigation timeout/rejection can't become
+   * an unhandled rejection (crashing the process) while the caller's action is
+   * still pending. Callers should still `await` the returned promise to observe
+   * the original error.
+   */
+  private startNavigationWait(
+    page: Page,
+    waitUntil: 'load' | 'domcontentloaded' | 'networkidle' | undefined,
+    timeout: number,
+  ): ReturnType<Page['waitForNavigation']> | undefined {
+    const navigation = waitUntil ? page.waitForNavigation({ waitUntil, timeout }) : undefined;
+    navigation?.catch(() => {});
+    return navigation;
+  }
+
   // ---------------------------------------------------------------------------
   // 3. browser_click - Click on element
   // ---------------------------------------------------------------------------
@@ -752,12 +943,18 @@ export class AgentBrowser extends MastraBrowser {
         );
       }
 
+      const timeout = input.timeout ?? this.defaultTimeout;
+
+      const navigation = this.startNavigationWait(page, input.waitUntil, timeout);
+
       await locator.click({
         button: input.button ?? 'left',
         clickCount: input.clickCount ?? 1,
         modifiers: input.modifiers,
-        timeout: this.defaultTimeout,
+        timeout,
       });
+
+      await navigation;
 
       return {
         success: true,
@@ -852,7 +1049,12 @@ export class AgentBrowser extends MastraBrowser {
   ): Promise<{ success: true; url: string; hint: string } | BrowserToolError> {
     try {
       const page = await this.getPage(threadId);
+      const timeout = input.timeout ?? this.defaultTimeout;
+      const navigation = this.startNavigationWait(page, input.waitUntil, timeout);
+
       await page.keyboard.press(input.key);
+
+      await navigation;
 
       return {
         success: true,
@@ -889,9 +1091,12 @@ export class AgentBrowser extends MastraBrowser {
       if (input.label) selectValue.label = input.label;
       if (input.index !== undefined) selectValue.index = input.index;
 
-      const selected = await locator.selectOption(selectValue, {
-        timeout: this.defaultTimeout,
-      });
+      const timeout = input.timeout ?? this.defaultTimeout;
+      const navigation = this.startNavigationWait(page, input.waitUntil, timeout);
+
+      const selected = await locator.selectOption(selectValue, { timeout });
+
+      await navigation;
 
       return {
         success: true,
@@ -1014,10 +1219,12 @@ export class AgentBrowser extends MastraBrowser {
     try {
       const page = await this.getPage(threadId);
       await page.goBack({ timeout: this.defaultTimeout });
+      const url = page.url();
+      this.markActiveUrlChangeSource('agent', url, threadId);
 
       return {
         success: true,
-        url: page.url(),
+        url,
         title: await page.title(),
         hint: 'Take a new snapshot to see the previous page.',
       };
@@ -1116,14 +1323,13 @@ export class AgentBrowser extends MastraBrowser {
           success: true,
           hint: `Element is now ${state}. Take a snapshot to continue.`,
         };
-      } else {
-        const page = await this.getPage(threadId);
-        await page.waitForTimeout(timeout);
-        return {
-          success: true,
-          hint: 'Wait complete. Take a snapshot to see current state.',
-        };
       }
+      const page = await this.getPage(threadId);
+      await page.waitForTimeout(timeout);
+      return {
+        success: true,
+        hint: 'Wait complete. Take a snapshot to see current state.',
+      };
     } catch (error) {
       return this.createErrorFromException(error, 'Wait');
     }
@@ -1188,6 +1394,7 @@ export class AgentBrowser extends MastraBrowser {
           if (input.url) {
             const page = await this.getPage(threadId);
             await page.goto(input.url);
+            this.markActiveUrlChangeSource('agent', page.url(), threadId);
           }
           // Save state after new tab
           this.updateSessionBrowserState(threadId);
@@ -1211,6 +1418,7 @@ export class AgentBrowser extends MastraBrowser {
           await this.reconnectScreencastForThread(threadId, 'tab switch');
           const page = browser.getPage();
           const pageUrl = page.url();
+          this.markActiveUrlChangeSource('agent', pageUrl, threadId);
           // Emit URL directly after switch using the same threadId
           const streamKey = this.getStreamKey(threadId);
           const stream = this.activeScreencastStreams.get(streamKey);

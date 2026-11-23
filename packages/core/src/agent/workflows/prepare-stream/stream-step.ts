@@ -3,30 +3,41 @@ import type { BackgroundTaskManager } from '../../../background-tasks';
 import type { AgentBackgroundConfig } from '../../../background-tasks/types';
 import { getModelMethodFromAgentMethod } from '../../../llm/model/model-method-from-agent';
 import type { ModelLoopStreamArgs, ModelMethodType } from '../../../llm/model/model.loop.types';
+import type { AgentLoopResumeClaim, ToolCallConcurrency } from '../../../loop/types';
 import type { MastraMemory } from '../../../memory/memory';
 import type { MemoryConfigInternal } from '../../../memory/types';
 import { resolveObservabilityContext } from '../../../observability';
 import { RequestContext } from '../../../request-context';
 import { MastraModelOutput } from '../../../stream';
-import type { ToolPayloadTransformPolicy } from '../../../tools';
+import type { RequireToolApproval, ToolPayloadTransformPolicy } from '../../../tools';
 import { createStep } from '../../../workflows/workflow';
 import type { Workspace } from '../../../workspace/workspace';
 import type { SaveQueueManager } from '../../save-queue';
-import type { CreatedAgentSignal } from '../../signals';
+import type { PendingSignalListener, CreatedAgentSignal } from '../../signals';
+import type { AgentStreamPublisher } from '../../streams/publisher';
 import type { AgentMethodType } from '../../types';
+import type { PrepareStreamRunScope } from './run-scope';
+import { LOOP_OPTIONS_KEY } from './run-scope-keys';
 import type { AgentCapabilities } from './schema';
 
-interface StreamStepOptions {
+interface StreamStepOptions<OUTPUT = undefined> {
   capabilities: AgentCapabilities;
   runId: string;
   returnScorerData?: boolean;
-  requireToolApproval?: boolean;
-  toolCallConcurrency?: number;
+  requireToolApproval?: RequireToolApproval;
+  toolCallConcurrency?: ToolCallConcurrency;
+  eagerToolExecution?: boolean;
+  streamPublisher?: AgentStreamPublisher;
   resumeContext?: {
     resumeData: any;
     snapshot: any;
+    claim?: AgentLoopResumeClaim;
   };
+  /** The resume snapshot with its transcript hydrated from memory; set when resuming. */
+  getResumeSnapshot?: () => Promise<any>;
   agentId: string;
+  agentVersionId?: string;
+  resolvedScopes?: string[];
   agentName?: string;
   toolCallId?: string;
   methodType: AgentMethodType;
@@ -45,7 +56,9 @@ interface StreamStepOptions {
    * drives continuation from outside the loop.
    */
   skipBgTaskWait?: boolean;
-  drainPendingSignals?: (runId: string) => CreatedAgentSignal[];
+  drainPendingSignals?: (runId: string, scope?: 'pending' | 'pre-run') => CreatedAgentSignal[];
+  subscribePendingSignals?: (runId: string, listener: PendingSignalListener) => () => void;
+  runScope: PrepareStreamRunScope<OUTPUT>;
 }
 
 export function createStreamStep<OUTPUT = undefined>({
@@ -54,8 +67,13 @@ export function createStreamStep<OUTPUT = undefined>({
   returnScorerData,
   requireToolApproval,
   toolCallConcurrency,
+  eagerToolExecution,
+  streamPublisher,
   resumeContext,
+  getResumeSnapshot,
   agentId,
+  agentVersionId,
+  resolvedScopes,
   agentName,
   toolCallId,
   methodType,
@@ -70,53 +88,65 @@ export function createStreamStep<OUTPUT = undefined>({
   toolPayloadTransform,
   skipBgTaskWait,
   drainPendingSignals,
-}: StreamStepOptions) {
+  subscribePendingSignals,
+  runScope,
+}: StreamStepOptions<OUTPUT>) {
   return createStep({
     id: 'stream-text-step',
-    inputSchema: z.any(), // tried to type this in various ways but it's too complex
+    inputSchema: z.any(),
     outputSchema: z.instanceof(MastraModelOutput<OUTPUT>),
-    execute: async ({ inputData, ...observabilityContext }) => {
-      // Instead of validating inputData with zod, we just cast it to the type we know it should be
-      const validatedInputData = inputData as ModelLoopStreamArgs<any, OUTPUT> & {
+    execute: async ({ tracing, tracingContext, loggerVNext, metrics }) => {
+      // `loopOptions` carries class instances (MessageList, Tools) and closures
+      // (onStepFinish, onFinish, ...) — none of which survive the evented engine's
+      // JSON round-trip in step inputs. map-results-step parked it on runScope.
+      const loopOptions = runScope.getOrThrow(LOOP_OPTIONS_KEY) as ModelLoopStreamArgs<any, OUTPUT> & {
         initialSignalEchoes?: CreatedAgentSignal[];
       };
 
       const processors =
-        validatedInputData.outputProcessors ||
+        loopOptions.outputProcessors ||
         (capabilities.outputProcessors
           ? typeof capabilities.outputProcessors === 'function'
             ? await capabilities.outputProcessors({
-                requestContext: validatedInputData.requestContext || new RequestContext(),
+                requestContext: loopOptions.requestContext || new RequestContext(),
               })
             : capabilities.outputProcessors
           : []);
 
       const modelMethodType: ModelMethodType = getModelMethodFromAgentMethod(methodType);
 
+      const resumeSnapshot = resumeContext && (await getResumeSnapshot?.());
+
       const streamResult = capabilities.llm.stream({
-        ...validatedInputData,
+        ...loopOptions,
         outputProcessors: processors,
         returnScorerData,
-        ...resolveObservabilityContext(observabilityContext),
+        ...resolveObservabilityContext({ tracing, tracingContext, loggerVNext, metrics }),
         requireToolApproval,
         toolCallConcurrency,
-        resumeContext,
+        eagerToolExecution,
+        streamPublisher,
+        resumeContext: resumeContext && { ...resumeContext, snapshot: resumeSnapshot },
         _internal: {
           generateId: capabilities.generateMessageId,
           saveQueueManager,
           memoryConfig,
-          threadId: validatedInputData.threadId,
+          threadId: loopOptions.threadId,
           resourceId,
           memory,
+          fixedMemory: capabilities.agent.__hasFixedMemory(),
           backgroundTaskManager,
           agentBackgroundConfig,
           backgroundTaskManagerConfig: backgroundTaskManager?.config,
           toolPayloadTransform,
           skipBgTaskWait,
           drainPendingSignals,
-          initialSignalEchoes: validatedInputData.initialSignalEchoes,
+          subscribePendingSignals,
+          initialSignalEchoes: loopOptions.initialSignalEchoes,
         },
         agentId,
+        agentVersionId,
+        resolvedScopes,
         agentName,
         toolCallId,
         methodType: modelMethodType,

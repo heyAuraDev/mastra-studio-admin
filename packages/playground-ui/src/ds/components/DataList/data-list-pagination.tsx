@@ -1,5 +1,6 @@
-import { ArrowLeftIcon, ArrowRightIcon } from 'lucide-react';
-import { cn } from '@/lib/utils';
+import { Button } from '@/ds/components/Button';
+import { IconArrowLeft } from '@/ds/icons/central/IconArrowLeft';
+import { IconArrowRight } from '@/ds/icons/central/IconArrowRight';
 
 export type DataListPaginationProps = {
   currentPage?: number;
@@ -12,29 +13,21 @@ export function DataListPagination({ currentPage, hasMore, onNextPage, onPrevPag
   const showNavigation = (typeof currentPage === 'number' && currentPage > 0) || hasMore;
 
   return (
-    <div className={cn('col-span-full flex py-4 items-center justify-center text-neutral3 text-ui-md gap-8')}>
+    <div className="col-span-full flex items-center justify-center gap-4 py-3 text-body text-muted-foreground">
       <span>
         Page <b>{currentPage ? currentPage + 1 : '1'}</b>
       </span>
       {showNavigation && (
-        <div
-          className={cn(
-            'flex gap-4',
-            '[&>button]:flex [&>button]:items-center [&>button]:gap-2 [&>button]:text-neutral4 [&>button:hover]:text-neutral5 [&>button]:transition-colors [&>button]:border [&>button]:border-border1 [&>button]:p-1 [&>button]:px-2 [&>button]:rounded-md',
-            '[&_svg]:w-[1em] [&_svg]:h-[1em] [&_svg]:text-neutral3',
-          )}
-        >
+        <div className="flex gap-4">
           {typeof currentPage === 'number' && currentPage > 0 && (
-            <button type="button" onClick={onPrevPage}>
-              <ArrowLeftIcon />
+            <Button type="button" size="sm" onClick={onPrevPage} icon={<IconArrowLeft />}>
               Previous
-            </button>
+            </Button>
           )}
           {hasMore && (
-            <button type="button" onClick={onNextPage}>
+            <Button type="button" size="sm" onClick={onNextPage} icon={<IconArrowRight />}>
               Next
-              <ArrowRightIcon />
-            </button>
+            </Button>
           )}
         </div>
       )}

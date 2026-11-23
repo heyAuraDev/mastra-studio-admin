@@ -7,10 +7,10 @@
  * Verifies trace context propagation and span hierarchy in Arize Phoenix.
  */
 
-import type { ChildProcess } from 'child_process';
-import { spawn } from 'child_process';
-import { dirname, resolve } from 'path';
-import { fileURLToPath } from 'url';
+import type { ChildProcess } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -112,14 +112,14 @@ async function waitForTrace(traceId: string, timeoutMs = 15000): Promise<any[]> 
           if (node.attributes && typeof node.attributes === 'string') {
             try {
               node.attributes = JSON.parse(node.attributes);
-            } catch (e) {
+            } catch {
               // If parsing fails, leave as string
             }
           }
           return node;
         });
       }
-    } catch (error) {
+    } catch {
       // Trace not found yet, continue waiting
     }
 

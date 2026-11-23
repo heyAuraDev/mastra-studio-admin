@@ -1,7 +1,7 @@
 import { PassThrough } from 'node:stream';
 
 import { createClient } from '@deepgram/sdk';
-import { MastraVoice } from '@mastra/core/voice';
+import { MastraVoice } from '@internal/voice';
 
 import { DEEPGRAM_VOICES } from './voices';
 import type { DeepgramVoiceId, DeepgramModel } from './voices';
@@ -208,11 +208,11 @@ export class DeepgramVoice extends MastraVoice {
     }
     const buffer = Buffer.concat(chunks);
     const { diarize, diarize_speaker_count: _, ...restOptions } = options ?? {};
-    const { result, error } = await this.listeningClient.listen.prerecorded.transcribeFile(buffer, {
-      ...restOptions,
-      model: this.storedListeningModel?.name,
-      diarize,
-    });
+    const requested = { ...restOptions, model: this.storedListeningModel?.name, diarize };
+    const { result, error } = await this.listeningClient.listen.prerecorded.transcribeFile(
+      buffer,
+      Object.fromEntries(Object.entries(requested).filter(([, value]) => value !== undefined)),
+    );
     if (error) {
       throw error;
     }

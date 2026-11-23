@@ -1,9 +1,10 @@
 import { z } from 'zod/v4';
 import { paginationInfoSchema, createPagePaginationSchema, statusQuerySchema } from './common';
 import { defaultOptionsSchema } from './default-options';
-import { serializedMemoryConfigSchema } from './memory-config';
+import { storedMemoryRefSchema } from './memory-config';
 import { ruleGroupSchema } from './rule-group';
 import { workspaceSnapshotConfigSchema } from './stored-workspaces';
+import { toolProvidersSchema } from './tool-providers';
 
 // ============================================================================
 // Path Parameter Schemas
@@ -78,7 +79,7 @@ const scorerConfigSchema = z.object({
  */
 const agentInstructionBlockSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('text'), content: z.string() }),
-  z.object({ type: z.literal('prompt_block_ref'), id: z.string() }),
+  z.object({ type: z.literal('prompt_block_ref'), id: z.string(), rules: ruleGroupSchema.optional() }),
   z.object({ type: z.literal('prompt_block'), content: z.string(), rules: ruleGroupSchema.optional() }),
 ]);
 
@@ -109,6 +110,14 @@ const modelConfigSchema = z
   })
   .passthrough();
 
+const modelListEntrySchema = z.object({
+  id: z.string(),
+  provider: z.string(),
+  modelId: z.string(),
+  enabled: z.boolean(),
+  maxRetries: z.number(),
+});
+
 /** Per-tool config schema */
 const toolConfigSchema = z.object({ description: z.string().optional(), rules: ruleGroupSchema.optional() });
 
@@ -131,10 +140,15 @@ const skillConfigSchema = z.object({
 /** Skills config: skill IDs mapped to per-skill config */
 const skillsConfigSchema = z.record(z.string(), skillConfigSchema);
 
-/** Workspace reference: either a stored workspace ID or an inline config */
+/** Workspace reference: a stored workspace ID, inline config, or a registered workspace provider */
 const workspaceRefSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('id'), workspaceId: z.string() }),
   z.object({ type: z.literal('inline'), config: workspaceSnapshotConfigSchema }),
+  z.object({
+    type: z.literal('provider'),
+    provider: z.string().describe('Workspace provider identifier'),
+    config: z.record(z.string(), z.unknown()).describe('Provider-specific configuration'),
+  }),
 ]);
 
 /** Screencast options for streaming browser frames */
@@ -176,6 +190,7 @@ const processorPhaseSchema = z.enum([
   'processOutputStream',
   'processOutputResult',
   'processOutputStep',
+  'processToolResult',
 ]);
 
 /**
@@ -245,6 +260,25 @@ const storedProcessorGraphSchema = z.object({
  * Fields that support conditional variants (StorageConditionalField) can be either
  * a static value OR an array of { value, rules? } variants evaluated at request time.
  */
+/**
+ * Serializable resumable-stream configuration. Mirrors `StorageDurableConfig`:
+ * `cache`/`pubsub` are live runtime objects and cannot be persisted, so they are
+ * not accepted here. Intentionally not a conditional field — stream configuration is
+ * decided when the agent is hydrated, not per request.
+ */
+const durableConfigSchema = z.union([
+  z.boolean(),
+  z.strictObject(
+    {
+      cleanupTimeoutMs: z.number().int().nonnegative().optional(),
+    },
+    {
+      error:
+        'Stored-agent durable configuration only accepts cleanupTimeoutMs. Use createDurableAgent({ agent, ...executionOptions }) for durable execution options.',
+    },
+  ),
+]);
+
 const snapshotConfigSchema = z.object({
   name: z.string().describe('Name of the agent'),
   description: z.string().optional().describe('Description of the agent'),
@@ -252,6 +286,7 @@ const snapshotConfigSchema = z.object({
   model: conditionalFieldSchema(modelConfigSchema).describe(
     'Model configuration — static value or array of conditional variants',
   ),
+  modelList: z.array(modelListEntrySchema).optional().describe('Ordered model fallback list owned by Studio'),
   tools: conditionalFieldSchema(toolsConfigSchema)
     .optional()
     .describe('Tool keys mapped to per-tool config — static or conditional'),
@@ -267,6 +302,11 @@ const snapshotConfigSchema = z.object({
   integrationTools: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema))
     .optional()
     .describe('Map of tool provider IDs to their tool configurations — static or conditional'),
+  toolProviders: conditionalFieldSchema(toolProvidersSchema)
+    .optional()
+    .describe(
+      'Tool provider connections and per-tool config (provider-agnostic). Coexists with the deprecated `integrationTools` field.',
+    ),
   mcpClients: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema))
     .optional()
     .describe('Map of stored MCP client IDs to their tool configurations — static or conditional'),
@@ -276,9 +316,9 @@ const snapshotConfigSchema = z.object({
   outputProcessors: conditionalFieldSchema(storedProcessorGraphSchema)
     .optional()
     .describe('Output processor graph — static or conditional'),
-  memory: conditionalFieldSchema(serializedMemoryConfigSchema)
+  memory: conditionalFieldSchema(storedMemoryRefSchema)
     .optional()
-    .describe('Memory configuration — static or conditional'),
+    .describe('Memory: registered memory reference or inline config — static or conditional'),
   scorers: conditionalFieldSchema(z.record(z.string(), scorerConfigSchema))
     .optional()
     .describe('Scorer keys with optional sampling config — static or conditional'),
@@ -296,6 +336,11 @@ const snapshotConfigSchema = z.object({
     .record(z.string(), z.unknown())
     .optional()
     .describe('JSON Schema defining valid request context variables for conditional rule evaluation'),
+  durable: durableConfigSchema
+    .optional()
+    .describe(
+      'Enable resumable streams when this agent is hydrated. Does not enable durable execution or checkpoint recovery.',
+    ),
 });
 
 /**
@@ -337,6 +382,14 @@ export const createStoredAgentBodySchema = z
       .enum(['private', 'public'])
       .optional()
       .describe('Agent visibility: private (owner/admin only) or public (any reader)'),
+    autoPublish: z
+      .boolean()
+      .optional()
+      .describe(
+        'Publish the initial version so the agent resolves at status="published". Defaults to true when omitted. ' +
+          'Pass false to stage the agent as an unpublished draft — useful when overriding a code-defined agent, ' +
+          'whose code definition keeps serving traffic until the override is published.',
+      ),
   })
   .merge(snapshotConfigCreateSchema);
 
@@ -345,9 +398,9 @@ export const createStoredAgentBodySchema = z
  */
 const snapshotConfigUpdateSchema = snapshotConfigSchema.extend({
   memory: z
-    .union([conditionalFieldSchema(serializedMemoryConfigSchema), z.null()])
+    .union([conditionalFieldSchema(storedMemoryRefSchema), z.null()])
     .optional()
-    .describe('Memory configuration — static, conditional, or null to disable memory'),
+    .describe('Memory: registered memory reference or inline config — static, conditional, or null to disable memory'),
 });
 
 /**
@@ -364,11 +417,36 @@ export const updateStoredAgentBodySchema = agentMetadataSchema
       .max(500)
       .optional()
       .describe('Optional message describing the changes for the auto-created version'),
+    autoPublish: z
+      .boolean()
+      .optional()
+      .describe('Immediately activate the auto-created version. Defaults to false when omitted.'),
   });
+
+export const exportStoredAgentBodySchema = snapshotConfigUpdateSchema.partial();
+
+export const openStoredAgentChangeRequestBodySchema = exportStoredAgentBodySchema.extend({
+  changeMessage: z.string().trim().max(500).optional(),
+  userName: z.string().trim().min(1).max(120).optional(),
+  inspectOnly: z.boolean().optional(),
+});
 
 // ============================================================================
 // Response Schemas
 // ============================================================================
+
+/**
+ * Resolved author object — server-side enrichment of `authorId` against the
+ * configured auth provider. Only `id` is required; the other fields mirror
+ * what `/auth/me` exposes and are optional because providers may not return
+ * every field.
+ */
+export const resolvedAuthorSchema = z.object({
+  id: z.string(),
+  name: z.string().optional(),
+  email: z.string().optional(),
+  avatarUrl: z.string().optional(),
+});
 
 /**
  * Stored agent object schema (resolved response: thin record + version config)
@@ -380,6 +458,7 @@ export const storedAgentSchema = z.object({
   status: z.string().describe('Agent status: draft or published'),
   activeVersionId: z.string().optional(),
   authorId: z.string().optional(),
+  author: resolvedAuthorSchema.optional().describe('Resolved author identity (when an auth provider is configured)'),
   metadata: z.record(z.string(), z.unknown()).optional(),
   visibility: z.enum(['private', 'public']).optional(),
   favoriteCount: z.number().int().nonnegative().optional().describe('Number of users who have favorited this agent'),
@@ -393,6 +472,7 @@ export const storedAgentSchema = z.object({
   model: conditionalFieldSchema(modelConfigSchema).describe(
     'Model configuration — static value or array of conditional variants',
   ),
+  modelList: z.array(modelListEntrySchema).optional().describe('Ordered model fallback list owned by Studio'),
   tools: conditionalFieldSchema(toolsConfigSchema)
     .optional()
     .describe('Tool keys mapped to per-tool config — static or conditional'),
@@ -408,6 +488,11 @@ export const storedAgentSchema = z.object({
   integrationTools: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema))
     .optional()
     .describe('Map of tool provider IDs to their tool configurations — static or conditional'),
+  toolProviders: conditionalFieldSchema(toolProvidersSchema)
+    .optional()
+    .describe(
+      'Tool provider connections and per-tool config (provider-agnostic). Coexists with the deprecated `integrationTools` field.',
+    ),
   mcpClients: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema))
     .optional()
     .describe('Map of stored MCP client IDs to their tool configurations — static or conditional'),
@@ -417,9 +502,9 @@ export const storedAgentSchema = z.object({
   outputProcessors: conditionalFieldSchema(storedProcessorGraphSchema)
     .optional()
     .describe('Output processor graph — static or conditional'),
-  memory: conditionalFieldSchema(serializedMemoryConfigSchema)
+  memory: conditionalFieldSchema(storedMemoryRefSchema)
     .optional()
-    .describe('Memory configuration — static or conditional'),
+    .describe('Memory: registered memory reference or inline config — static or conditional'),
   scorers: conditionalFieldSchema(z.record(z.string(), scorerConfigSchema))
     .optional()
     .describe('Scorer keys with optional sampling config — static or conditional'),
@@ -437,6 +522,16 @@ export const storedAgentSchema = z.object({
     .record(z.string(), z.unknown())
     .optional()
     .describe('JSON Schema defining valid request context variables'),
+  durable: z
+    .union([
+      z.boolean(),
+      z.object({
+        maxSteps: z.number().int().positive().optional(),
+        cleanupTimeoutMs: z.number().int().nonnegative().optional(),
+      }),
+    ])
+    .optional()
+    .describe('Persisted resumable-stream configuration, including legacy durable execution options'),
 });
 
 /**
@@ -487,6 +582,39 @@ export const updateStoredAgentResponseSchema = z.union([
 export const deleteStoredAgentResponseSchema = z.object({
   success: z.boolean(),
   message: z.string(),
+});
+
+/**
+ * Response for GET /stored/agents/:storedAgentId/dependents
+ *
+ * `dependents` lists caller-readable stored agents whose resolved `agents` map
+ * references the target. Includes both public and the caller's own private
+ * agents — anything the caller already has read access to.
+ * `hiddenCount` aggregates references from agents the caller cannot read
+ * (cross-workspace private agents). Only populated when the target agent is
+ * public, to avoid leaking cross-workspace structure for private targets.
+ */
+export const getStoredAgentDependentsResponseSchema = z.object({
+  dependents: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+    }),
+  ),
+  hiddenCount: z.number().int().nonnegative(),
+});
+
+export const exportStoredAgentResponseSchema = z.object({
+  agentId: z.string(),
+  fileName: z.string(),
+  content: z.string(),
+  config: z.record(z.string(), z.unknown()),
+});
+
+export const openStoredAgentChangeRequestResponseSchema = z.object({
+  id: z.union([z.string(), z.number()]).optional(),
+  url: z.string(),
+  ref: z.string().optional(),
 });
 
 // ============================================================================

@@ -13,9 +13,10 @@ export const Header = ({ children, border = true, className }: HeaderProps) => {
   return (
     <header
       className={cn(
-        'h-header-default z-50 flex w-full items-center gap-4 bg-transparent px-3',
+        'z-50 flex h-header-default w-full items-center gap-2 bg-transparent px-2',
         {
-          'border-b border-border1': border,
+          // Layout headers share the same edge color as their surrounding surface.
+          'border-b border-surface-rim': border,
         },
         className,
       )}
@@ -27,7 +28,7 @@ export const Header = ({ children, border = true, className }: HeaderProps) => {
 
 export const HeaderTitle = ({ children }: HeaderProps) => {
   return (
-    <Txt as="h1" variant="ui-md" className="text-neutral6 flex items-center gap-2">
+    <Txt as="h1" variant="body" tone="ink" className="flex items-center gap-2">
       {children}
     </Txt>
   );
@@ -38,5 +39,5 @@ export const HeaderAction = ({ children }: HeaderProps) => {
 };
 
 export const HeaderGroup = ({ children }: HeaderProps) => {
-  return <div className="gap-2 flex items-center">{children}</div>;
+  return <div className="flex items-center gap-2">{children}</div>;
 };

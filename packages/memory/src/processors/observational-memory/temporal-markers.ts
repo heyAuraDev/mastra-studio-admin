@@ -2,6 +2,7 @@ import type { MastraDBMessage } from '@mastra/core/agent';
 import type { ProcessInputStepArgs } from '@mastra/core/processors';
 
 import { formatTemporalGap, formatTemporalTimestamp, getMessagePartTimestamp, isTemporalGapMarker } from './date-utils';
+import { getObservableMessages } from './message-utils';
 
 export const TEMPORAL_GAP_REMINDER_TYPE = 'temporal-gap';
 
@@ -75,7 +76,9 @@ export async function insertTemporalGapMarkers({
     return;
   }
 
-  const allMessages = messageList.get.all.db().filter((message): message is MastraDBMessage => Boolean(message));
+  const allMessages = getObservableMessages(messageList).filter((message): message is MastraDBMessage =>
+    Boolean(message),
+  );
   const latestInputIndex = allMessages.findIndex(message => message.id === latestInputMessage.id);
 
   if (latestInputIndex <= 0) {
@@ -109,7 +112,8 @@ export async function insertTemporalGapMarkers({
 
   await sendSignal?.({
     id: `__temporal_gap_${crypto.randomUUID()}`,
-    type: 'system-reminder',
+    type: 'reactive',
+    tagName: 'system-reminder',
     contents: getTemporalGapReminderText(gapText, timestamp),
     createdAt: new Date(timestamp - 1),
     acceptedAt: new Date(timestamp),

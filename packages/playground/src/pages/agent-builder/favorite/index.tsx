@@ -1,0 +1,186 @@
+import type { ListStoredAgentsParams, StoredSkillResponse } from '@mastra/client-js';
+import { ActionRow } from '@mastra/playground-ui/components/ActionRow';
+import { EmptyState } from '@mastra/playground-ui/components/EmptyState';
+import { PageHeader } from '@mastra/playground-ui/components/PageHeader';
+import { PageLayout } from '@mastra/playground-ui/components/PageLayout';
+import { SearchInput, listSearchProps } from '@mastra/playground-ui/components/SearchInput';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { PermissionDenied } from '@mastra/playground-ui/domains/auth/components/permission-denied';
+import { SessionExpired } from '@mastra/playground-ui/domains/auth/components/session-expired';
+import { IconStar } from '@mastra/playground-ui/icons/central/IconStar';
+import { controlStateColorTransition } from '@mastra/playground-ui/primitives/transitions';
+import { quietTextHover } from '@mastra/playground-ui/primitives/typography';
+import { cn } from '@mastra/playground-ui/utils/cn';
+import { is401UnauthorizedError, is403ForbiddenError } from '@mastra/playground-ui/utils/errors';
+import { useStoredAgents, useStoredSkills } from '@mastra/react/hooks/agents';
+import { useCurrentUser } from '@mastra/react/hooks/auth';
+import { useMemo, useState } from 'react';
+import { useNavigate } from 'react-router';
+import {
+  AgentBuilderList,
+  AgentBuilderListSkeleton,
+} from '@/domains/agent-builder/components/agent-list/agent-builder-list';
+import {
+  SkillBuilderList,
+  SkillBuilderListSkeleton,
+} from '@/domains/agent-builder/components/skill-list/skill-builder-list';
+import { useBuilderAgentFeatures } from '@/domains/agent-builder/hooks/use-builder-agent-features';
+
+type Tab = 'agents' | 'skills';
+
+export default function AgentBuilderFavoritePage() {
+  const navigate = useNavigate();
+  const [search, setSearch] = useState('');
+  const [tab, setTab] = useState<Tab>('agents');
+  const features = useBuilderAgentFeatures();
+  const { data: currentUser } = useCurrentUser();
+
+  const handleSkillClick = (skill: StoredSkillResponse) => {
+    const isOwner = !skill.authorId || currentUser?.id === skill.authorId;
+    const destination = isOwner ? 'edit' : 'view';
+    void navigate(`/agent-builder/skills/${skill.id}/${destination}`, { viewTransition: true });
+  };
+
+  const agentListParams = useMemo<ListStoredAgentsParams>(
+    () => ({
+      favoritedOnly: 'true',
+      orderBy: { field: 'updatedAt', direction: 'DESC' },
+    }),
+    [],
+  );
+
+  const { data: agentsData, isLoading: agentsLoading, error: agentsError } = useStoredAgents(agentListParams);
+  const {
+    data: skillsData,
+    isLoading: skillsLoading,
+    error: skillsError,
+  } = useStoredSkills({ queryOptions: { enabled: tab === 'skills' && features.skills } });
+
+  const agents = agentsData?.agents ?? [];
+  const skills = skillsData?.skills ?? [];
+
+  const renderError = (error: Error, resource: string) => {
+    if (is401UnauthorizedError(error)) {
+      return (
+        <div className="flex items-center justify-center pt-10">
+          <SessionExpired />
+        </div>
+      );
+    }
+    if (is403ForbiddenError(error)) {
+      return (
+        <div className="flex items-center justify-center pt-10">
+          <PermissionDenied resource={resource} />
+        </div>
+      );
+    }
+    return (
+      <div className="flex items-center justify-center pt-10">
+        <EmptyState tone="error" titleSlot={`Failed to load favorite ${resource}`} descriptionSlot={error.message} />
+      </div>
+    );
+  };
+
+  const body = (() => {
+    if (tab === 'agents') {
+      if (agentsLoading) return <AgentBuilderListSkeleton rowTestId="favorite-skeleton-row" />;
+      if (agentsError) return renderError(agentsError, 'agents');
+      if (agents.length === 0) {
+        return (
+          <div className="flex items-center-safe justify-center-safe">
+            <EmptyState
+              titleSlot="No favorite agents yet"
+              descriptionSlot="Star agents to keep them here for quick access."
+            />
+          </div>
+        );
+      }
+      return <AgentBuilderList agents={agents} search={search} rowTestId="favorite-agent-row" />;
+    }
+
+    // Skills tab
+    if (skillsLoading) return <SkillBuilderListSkeleton />;
+    if (skillsError) return renderError(skillsError, 'skills');
+    if (skills.length === 0) {
+      return (
+        <div className="flex items-center-safe justify-center-safe">
+          <EmptyState
+            titleSlot="No favorite skills yet"
+            descriptionSlot="Star skills to keep them here for quick access."
+          />
+        </div>
+      );
+    }
+    return <SkillBuilderList skills={skills} search={search} onSkillClick={handleSkillClick} />;
+  })();
+
+  return (
+    <>
+      <PageLayout
+        variant="page"
+        actionRow={
+          <>
+            <ActionRow className="items-start">
+              <ActionRow.Start>
+                <PageHeader>
+                  <PageHeader.Title>
+                    <IconStar /> Favorites
+                  </PageHeader.Title>
+                  <PageHeader.Description>
+                    {tab === 'agents'
+                      ? "Agents you've starred in Agent Builder."
+                      : "Skills you've starred in Agent Builder."}
+                  </PageHeader.Description>
+                </PageHeader>
+              </ActionRow.Start>
+            </ActionRow>
+            <ActionRow>
+              <ActionRow.Start>
+                {features.skills && (
+                  <div className="flex overflow-hidden rounded-lg border border-border">
+                    <button
+                      onClick={() => setTab('agents')}
+                      className={cn(
+                        'text-foreground',
+                        'px-3 py-1.5',
+                        controlStateColorTransition,
+                        tab === 'agents' ? 'bg-muted' : cn('bg-background', quietTextHover),
+                      )}
+                    >
+                      <Txt as="span" variant="column" className="block">
+                        Agents
+                      </Txt>
+                    </button>
+                    <button
+                      onClick={() => setTab('skills')}
+                      className={cn(
+                        'text-foreground',
+                        'px-3 py-1.5',
+                        controlStateColorTransition,
+                        tab === 'skills' ? 'bg-muted' : cn('bg-background', quietTextHover),
+                      )}
+                    >
+                      <Txt as="span" variant="column" className="block">
+                        Skills
+                      </Txt>
+                    </button>
+                  </div>
+                )}
+                <div className="max-w-120 flex-1">
+                  <SearchInput
+                    {...listSearchProps}
+                    onValueChange={setSearch}
+                    label="Search favorites"
+                    placeholder="Search by name or description"
+                  />
+                </div>
+              </ActionRow.Start>
+            </ActionRow>
+          </>
+        }
+      >
+        {body}
+      </PageLayout>
+    </>
+  );
+}

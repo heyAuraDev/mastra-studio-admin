@@ -7,10 +7,9 @@ export {
   type LinkComponentProps,
   type LinkComponent,
   type LinkComponentProviderProps,
-} from './lib/framework';
+} from '@mastra/playground-ui/lib/framework';
 
 export { PlaygroundQueryClient } from './lib/tanstack-query';
+export { useTheme, type Theme, type ResolvedTheme } from '@mastra/playground-ui/components/ThemeProvider';
 
-export { usePlaygroundStore, useTheme, type Theme, type ResolvedTheme } from '@mastra/playground-ui';
-
-export { isWorkspaceV1Supported } from '@mastra/playground-ui/utils';
+export { isWorkspaceV1Supported } from '@mastra/playground-ui/utils/workspace-compat';

@@ -1,0 +1,159 @@
+import type { StoredSkillResponse } from '@mastra/client-js';
+import { EmptyState } from '@mastra/playground-ui/components/EmptyState';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@mastra/playground-ui/components/Tooltip';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { IconArrowInbox } from '@mastra/playground-ui/icons/central/IconArrowInbox';
+import { IconLock } from '@mastra/playground-ui/icons/central/IconLock';
+import { IconSquareBehindSquare1 } from '@mastra/playground-ui/icons/central/IconSquareBehindSquare1';
+import { Icon } from '@mastra/playground-ui/icons/Icon';
+import { useMemo } from 'react';
+import { SkillFavoriteButton } from './skill-favorite-button';
+import { getSkillOrigin } from '@/domains/agent-builder/utils/skill-origin';
+
+export type SkillBuilderListProps = {
+  skills: StoredSkillResponse[];
+  search?: string;
+  onSkillClick?: (skill: StoredSkillResponse) => void;
+  showFavorites?: boolean;
+};
+
+export function SkillBuilderList({ skills, search, onSkillClick, showFavorites = true }: SkillBuilderListProps) {
+  const filtered = useMemo(() => {
+    const q = (search ?? '').trim().toLowerCase();
+    if (!q) return skills;
+    return skills.filter(s => {
+      const name = s.name?.toLowerCase() ?? '';
+      const description = s.description?.toLowerCase() ?? '';
+      return name.includes(q) || description.includes(q);
+    });
+  }, [skills, search]);
+
+  if (filtered.length === 0) {
+    return (
+      <div className="flex items-center-safe justify-center-safe">
+        <EmptyState titleSlot="No skills match your search" descriptionSlot="Try a different name or description." />
+      </div>
+    );
+  }
+
+  return (
+    <div className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-background">
+      {filtered.map(skill => {
+        const row = (
+          <>
+            <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 items-center gap-2">
+                <Txt as="p" variant="body" tone="ink" className="truncate">
+                  {skill.name}
+                </Txt>
+                {skill.visibility === 'private' && (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span
+                        className="shrink-0 text-muted-foreground"
+                        aria-label="Private skill"
+                        data-testid="skill-builder-private-visibility-icon"
+                      >
+                        <Icon size="xs">
+                          <IconLock />
+                        </Icon>
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent>Only visible to you</TooltipContent>
+                  </Tooltip>
+                )}
+                {(() => {
+                  const origin = getSkillOrigin(skill.metadata);
+                  if (!origin) return null;
+                  const isCopy = origin.type === 'library-copy';
+                  return (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Txt
+                          as="span"
+                          variant="meta"
+                          tone="muted"
+                          className="inline-flex shrink-0 items-center gap-1 rounded bg-card px-1.5 py-0.5"
+                          aria-label={isCopy ? 'Copied skill' : 'Imported skill'}
+                          data-testid="skill-builder-origin-badge"
+                        >
+                          {isCopy ? (
+                            <IconSquareBehindSquare1 className="size-icon-xs" />
+                          ) : (
+                            <IconArrowInbox className="size-icon-xs" />
+                          )}
+                          {origin.type === 'skills-sh' ? 'skills.sh' : isCopy ? 'copied' : 'imported'}
+                        </Txt>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        {origin.type === 'skills-sh'
+                          ? `Imported from ${origin.owner}/${origin.repo}`
+                          : isCopy
+                            ? `Copied from "${origin.sourceSkillName}"`
+                            : 'Imported from external registry'}
+                      </TooltipContent>
+                    </Tooltip>
+                  );
+                })()}
+              </div>
+              <div className="mt-0.5 flex items-center gap-2">
+                <Txt as="span" variant="caption" tone="muted" className="line-clamp-1">
+                  {skill.description || 'No description'}
+                </Txt>
+              </div>
+              {showFavorites && (
+                <div className="mt-2 md:hidden">
+                  <SkillFavoriteButton
+                    skillId={skill.id}
+                    isFavorited={skill.isFavorited}
+                    favoriteCount={skill.favoriteCount}
+                    size="sm"
+                  />
+                </div>
+              )}
+            </div>
+            {showFavorites && (
+              <SkillFavoriteButton
+                skillId={skill.id}
+                isFavorited={skill.isFavorited}
+                favoriteCount={skill.favoriteCount}
+                size="sm"
+                className="hidden shrink-0 md:inline-flex"
+              />
+            )}
+          </>
+        );
+
+        return onSkillClick ? (
+          <button
+            key={skill.id}
+            className="flex w-full items-start gap-4 px-4 py-3 text-left hover:bg-fill-subtle md:items-center"
+            onClick={() => onSkillClick(skill)}
+          >
+            {row}
+          </button>
+        ) : (
+          <div key={skill.id} className="flex items-start gap-4 px-4 py-3 md:items-center">
+            {row}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+export function SkillBuilderListSkeleton({ rows = 4 }: { rows?: number }) {
+  return (
+    <div className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-background">
+      {Array.from({ length: rows }).map((_, i) => (
+        <div key={i} className="flex items-center gap-4 px-4 py-3">
+          <div className="min-w-0 flex-1 space-y-2">
+            <div className="h-3.5 w-48 animate-pulse rounded bg-card" />
+            <div className="h-3 w-72 max-w-full animate-pulse rounded bg-card" />
+          </div>
+          <div className="h-3 w-16 animate-pulse rounded bg-card" />
+        </div>
+      ))}
+    </div>
+  );
+}

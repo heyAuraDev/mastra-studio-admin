@@ -1,0 +1,401 @@
+// @vitest-environment jsdom
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { createRef } from 'react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { DataList } from './data-list';
+
+afterEach(() => {
+  cleanup();
+});
+
+const Header = () => (
+  <DataList.Top>
+    <DataList.TopCell>Name</DataList.TopCell>
+    <DataList.TopCell>Description</DataList.TopCell>
+  </DataList.Top>
+);
+
+describe('DataListRoot', () => {
+  it.each([true, false])('preserves custom root rendering and state-based styles with scrollable=%s', scrollable => {
+    const ref = createRef<HTMLDivElement>();
+    const scrollRef = createRef<HTMLDivElement>();
+    render(
+      <DataList
+        ref={ref}
+        columns="1fr"
+        scrollable={scrollable}
+        scrollRef={scrollRef}
+        render={<section aria-label="Styled list" />}
+        style={state => ({ paddingTop: state.hasOverflowY ? '4px' : '12px' })}
+        maxHeight="300px"
+        autoScroll={false}
+        scrollButtons={false}
+        revealScrollbarOnHover={false}
+      >
+        <DataList.RowButton>
+          <DataList.Cell>First row</DataList.Cell>
+        </DataList.RowButton>
+      </DataList>,
+    );
+
+    const root = screen.getByLabelText('Styled list');
+    expect(root.tagName).toBe('SECTION');
+    expect(ref.current).toBe(root);
+    expect(root.style.paddingTop).toBe('12px');
+    expect(root.hasAttribute('maxheight')).toBe(false);
+    expect(root.hasAttribute('autoscroll')).toBe(false);
+    expect(root.hasAttribute('scrollbuttons')).toBe(false);
+    expect(root.hasAttribute('revealscrollbaronhover')).toBe(false);
+    // Parent-scrolled lists must not introduce another clipping viewport.
+    if (scrollable) expect(scrollRef.current).not.toBeNull();
+    else expect(scrollRef.current).toBeNull();
+  });
+
+  describe('unified treatment — ScrollArea (overlay scrollbar + horizontal mask)', () => {
+    it('frames the list and separates its uniform rows', () => {
+      const { container } = render(
+        <DataList columns="1fr 1fr">
+          <Header />
+          <DataList.RowButton>
+            <DataList.Cell>one</DataList.Cell>
+            <DataList.Cell>first row</DataList.Cell>
+          </DataList.RowButton>
+          <DataList.RowButton>
+            <DataList.Cell>two</DataList.Cell>
+            <DataList.Cell>second row</DataList.Cell>
+          </DataList.RowButton>
+        </DataList>,
+      );
+
+      const grid = container.querySelector<HTMLElement>('[style*="grid-template-columns"]');
+      expect(grid).not.toBeNull();
+      expect(grid).not.toBe(container.firstElementChild);
+      expect(grid?.className).not.toContain('overflow-auto');
+      expect(container.firstElementChild?.className).toContain('rounded-xl');
+      expect(container.firstElementChild?.className).toContain('self-start');
+      expect(container.firstElementChild?.className).toContain('max-h-full');
+      expect(grid?.className).toContain('gap-y-px');
+      expect(grid?.className).toContain('[&_.data-list-subheader+.data-list-row]:rounded-t-lg');
+      expect(grid?.className).toContain('[&_.data-list-row:has(+.data-list-subheader)]:rounded-b-lg');
+    });
+
+    it('keeps the variant prop off the DOM node in the light variant', () => {
+      const { container } = render(
+        <DataList columns="1fr 1fr" variant="light">
+          <Header />
+        </DataList>,
+      );
+
+      const root = container.firstElementChild as HTMLElement;
+      expect(root.className).toContain('rounded-xl');
+      expect(root.getAttribute('variant')).toBeNull();
+    });
+
+    it('forwards scrollRef to the scrolling viewport that contains the grid', () => {
+      const scrollRef = createRef<HTMLDivElement>();
+      const { container } = render(
+        <DataList columns="1fr 1fr" scrollRef={scrollRef}>
+          <Header />
+        </DataList>,
+      );
+
+      expect(scrollRef.current).not.toBeNull();
+      const grid = container.querySelector<HTMLElement>('[style*="grid-template-columns"]');
+      expect(grid).not.toBeNull();
+      expect(scrollRef.current).not.toBe(grid);
+      expect(scrollRef.current?.contains(grid)).toBe(true);
+    });
+
+    it('allows callers to disable the left mask while keeping the right overflow mask', () => {
+      const scrollRef = createRef<HTMLDivElement>();
+      render(
+        <DataList columns="1fr 1fr" mask={{ left: false }} scrollRef={scrollRef}>
+          <Header />
+        </DataList>,
+      );
+
+      expect(scrollRef.current?.style.getPropertyValue('--scroll-area-fade-left')).toBe('0px');
+      expect(scrollRef.current?.style.getPropertyValue('--scroll-area-fade-right')).toBe('1.25rem');
+    });
+
+    // The sticky header sits at the top of the scroller, so a top mask would fade it with the rows.
+    // The top edge fades the rows just below the header instead.
+    it('never fades the header, and fades the rows below it by default', () => {
+      const scrollRef = createRef<HTMLDivElement>();
+      const { container } = render(
+        <DataList columns="1fr 1fr" scrollRef={scrollRef}>
+          <Header />
+        </DataList>,
+      );
+
+      expect(scrollRef.current?.style.getPropertyValue('--scroll-area-fade-top')).toBe('0px');
+      expect(scrollRef.current?.style.getPropertyValue('--scroll-area-fade-bottom')).toBe('1.25rem');
+      const grid = container.querySelector<HTMLElement>('[style*="grid-template-columns"]');
+      expect(grid?.style.getPropertyValue('--data-list-fade-top')).toBe('1.25rem');
+    });
+
+    it('uses the depth the caller gives for the top fade below the header', () => {
+      const scrollRef = createRef<HTMLDivElement>();
+      const { container } = render(
+        <DataList columns="1fr 1fr" mask={{ top: '3rem' }} scrollRef={scrollRef}>
+          <Header />
+        </DataList>,
+      );
+
+      expect(scrollRef.current?.style.getPropertyValue('--scroll-area-fade-top')).toBe('0px');
+      const grid = container.querySelector<HTMLElement>('[style*="grid-template-columns"]');
+      expect(grid?.style.getPropertyValue('--data-list-fade-top')).toBe('3rem');
+    });
+
+    it('drops only the top fade when the caller turns it off', () => {
+      const scrollRef = createRef<HTMLDivElement>();
+      const { container } = render(
+        <DataList columns="1fr 1fr" mask={{ top: false }} scrollRef={scrollRef}>
+          <Header />
+        </DataList>,
+      );
+
+      const grid = container.querySelector<HTMLElement>('[style*="grid-template-columns"]');
+      expect(grid?.style.getPropertyValue('--data-list-fade-top')).toBe('');
+      expect(scrollRef.current?.style.getPropertyValue('--scroll-area-fade-bottom')).toBe('1.25rem');
+    });
+
+    it('fades nothing when the caller turns masking off', () => {
+      const scrollRef = createRef<HTMLDivElement>();
+      render(
+        <DataList columns="1fr 1fr" mask={false} scrollRef={scrollRef}>
+          <Header />
+        </DataList>,
+      );
+
+      expect(scrollRef.current?.className).not.toContain('mask-');
+    });
+
+    it('passes vertical wheel scrolling on to the page once the list cannot scroll further', () => {
+      const scrollRef = createRef<HTMLDivElement>();
+      render(
+        <DataList columns="1fr 1fr" scrollRef={scrollRef}>
+          <Header />
+        </DataList>,
+      );
+
+      const classes = scrollRef.current?.className.split(' ');
+      expect(classes).toContain('overscroll-x-none');
+      expect(classes).not.toContain('overscroll-none');
+      expect(classes).not.toContain('overscroll-y-none');
+      expect(classes).not.toContain('overscroll-y-contain');
+    });
+
+    it('lets max-height classes constrain the scrollable viewport', () => {
+      const scrollRef = createRef<HTMLDivElement>();
+      render(
+        <DataList columns="1fr 1fr" className="max-h-80" scrollRef={scrollRef}>
+          <Header />
+          {Array.from({ length: 20 }, (_, index) => (
+            <DataList.RowStatic key={index}>
+              <DataList.Cell>row {index + 1}</DataList.Cell>
+              <DataList.Cell>value {index + 1}</DataList.Cell>
+            </DataList.RowStatic>
+          ))}
+        </DataList>,
+      );
+
+      // The root is a flex column clamped by max-height (flex, unlike grid `1fr`,
+      // shrinks items against the clamped size); the viewport is the shrinkable item
+      // so short lists stay compact and long ones scroll.
+      const root = scrollRef.current?.parentElement;
+      expect(root?.className).toContain('flex-col');
+      // Consumer max-height overrides the default `max-h-full`.
+      expect(root?.className).toContain('max-h-80');
+      expect(root?.className).not.toContain('max-h-full');
+      expect(root?.className).not.toContain('size-full');
+      expect(scrollRef.current?.className).toContain('min-h-0');
+      expect(scrollRef.current?.className).toContain('flex-1');
+    });
+  });
+
+  describe('header titles — overflow / sizing', () => {
+    it('truncates plain-text titles via an inner truncate span', () => {
+      const { container } = render(
+        <DataList columns="1fr">
+          <DataList.Top>
+            <DataList.TopCell>A title long enough to need truncation</DataList.TopCell>
+          </DataList.Top>
+        </DataList>,
+      );
+      const cell = container.querySelector<HTMLElement>('.data-list-top > *');
+      const inner = cell?.querySelector<HTMLElement>('span.truncate');
+      expect(inner).not.toBeNull();
+      expect(inner?.textContent).toBe('A title long enough to need truncation');
+    });
+
+    it('renders non-text title children as-is (not wrapped)', () => {
+      const { container } = render(
+        <DataList columns="1fr">
+          <DataList.Top>
+            <DataList.TopCell>
+              <svg data-testid="icon" />
+            </DataList.TopCell>
+          </DataList.Top>
+        </DataList>,
+      );
+      const cell = container.querySelector<HTMLElement>('.data-list-top > *');
+      expect(cell?.querySelector('span.truncate')).toBeNull();
+      expect(cell?.querySelector('[data-testid="icon"]')).not.toBeNull();
+    });
+  });
+
+  describe('selection header layout', () => {
+    it('keeps grouped header cells from covering the select-all checkbox', () => {
+      const onToggle = vi.fn();
+      const { container } = render(
+        <DataList columns="auto 1fr 1fr">
+          <DataList.Top hasLeadingCell>
+            <DataList.TopSelectCell checked={false} onToggle={onToggle} aria-label="Select all" />
+            <DataList.TopCells colStart={2} data-testid="header-cells">
+              <DataList.TopCell>Name</DataList.TopCell>
+              <DataList.TopCell>Description</DataList.TopCell>
+            </DataList.TopCells>
+          </DataList.Top>
+        </DataList>,
+      );
+
+      const headerCells = container.querySelector<HTMLElement>('[data-testid="header-cells"]');
+      expect(headerCells?.style.gridColumn).toBe('2 / -1');
+      expect(headerCells?.className).toContain('pointer-events-none');
+      expect(headerCells?.className).toContain('[&>*]:pointer-events-auto');
+      expect(headerCells?.className).not.toContain('col-span-full');
+
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Select all' }));
+
+      expect(onToggle).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('per-row error variant', () => {
+    it('exposes the error tone as data-variant', () => {
+      const { container } = render(
+        <DataList columns="1fr">
+          <DataList.RowButton variant="error">
+            <DataList.Cell>boom</DataList.Cell>
+          </DataList.RowButton>
+          <DataList.RowButton>
+            <DataList.Cell>ok</DataList.Cell>
+          </DataList.RowButton>
+        </DataList>,
+      );
+      const [errorRow, defaultRow] = container.querySelectorAll<HTMLButtonElement>('.data-list-row');
+      expect(errorRow.dataset.variant).toBe('error');
+      expect(defaultRow.dataset.variant).toBe('default');
+    });
+
+    it('exposes the info tone as data-variant', () => {
+      const { container } = render(
+        <DataList columns="1fr">
+          <DataList.RowButton variant="info">
+            <DataList.Cell>highlighted</DataList.Cell>
+          </DataList.RowButton>
+        </DataList>,
+      );
+      const row = container.querySelector<HTMLButtonElement>('.data-list-row');
+      expect(row?.dataset.variant).toBe('info');
+    });
+
+    describe('when the error row is pressed', () => {
+      it('keeps a red tint instead of the grey active fill', () => {
+        const { container } = render(
+          <DataList columns="1fr">
+            <DataList.RowButton variant="error">
+              <DataList.Cell>boom</DataList.Cell>
+            </DataList.RowButton>
+          </DataList>,
+        );
+        const row = container.querySelector<HTMLButtonElement>('.data-list-row');
+        expect(row?.className).toContain('data-[variant=error]:active:bg-destructive-subtle-active');
+      });
+    });
+
+    it('exposes featured rows as data-featured', () => {
+      const { container } = render(
+        <DataList columns="1fr">
+          <DataList.RowButton featured>
+            <DataList.Cell>selected</DataList.Cell>
+          </DataList.RowButton>
+        </DataList>,
+      );
+      const row = container.querySelector<HTMLButtonElement>('.data-list-row');
+      expect(row?.dataset.featured).toBe('true');
+    });
+
+    it('does not leak the variant prop onto the DOM element', () => {
+      const { container } = render(
+        <DataList columns="1fr">
+          <DataList.RowButton variant="error">
+            <DataList.Cell>boom</DataList.Cell>
+          </DataList.RowButton>
+        </DataList>,
+      );
+      const row = container.querySelector<HTMLButtonElement>('.data-list-row');
+      expect(row?.getAttribute('variant')).toBeNull();
+    });
+  });
+
+  describe('SortableTopCell', () => {
+    it('starts ascending when unsorted and reverses the active sort, passing the column key', () => {
+      const onSortChange = vi.fn();
+      const { rerender } = render(
+        <DataList columns="1fr">
+          <DataList.Top>
+            <DataList.SortableTopCell sortKey="name" onSortChange={onSortChange}>
+              Name
+            </DataList.SortableTopCell>
+          </DataList.Top>
+        </DataList>,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /Name.*not sorted.*sort ascending/i }));
+      expect(onSortChange).toHaveBeenLastCalledWith('asc', 'name');
+
+      rerender(
+        <DataList columns="1fr">
+          <DataList.Top>
+            <DataList.SortableTopCell sortKey="name" sort="asc" onSortChange={onSortChange}>
+              Name
+            </DataList.SortableTopCell>
+          </DataList.Top>
+        </DataList>,
+      );
+      fireEvent.click(screen.getByRole('button', { name: /Name.*sorted ascending.*sort descending/i }));
+      expect(onSortChange).toHaveBeenLastCalledWith('desc', 'name');
+
+      rerender(
+        <DataList columns="1fr">
+          <DataList.Top>
+            <DataList.SortableTopCell sortKey="name" sort="desc" onSortChange={onSortChange}>
+              Name
+            </DataList.SortableTopCell>
+          </DataList.Top>
+        </DataList>,
+      );
+      fireEvent.click(screen.getByRole('button', { name: /Name.*sorted descending.*sort ascending/i }));
+      expect(onSortChange).toHaveBeenLastCalledWith('asc', 'name');
+    });
+
+    it('names the sort button with the label when the visible header is not plain text', () => {
+      render(
+        <DataList columns="1fr">
+          <DataList.Top>
+            <DataList.SortableTopCell sortKey="ttfc" label="Time to first chunk" onSortChange={vi.fn()}>
+              <abbr>TTFC</abbr>
+            </DataList.SortableTopCell>
+          </DataList.Top>
+        </DataList>,
+      );
+
+      expect(screen.getByRole('button').getAttribute('aria-label')).toBe(
+        'Time to first chunk, not sorted, sort ascending',
+      );
+    });
+  });
+});

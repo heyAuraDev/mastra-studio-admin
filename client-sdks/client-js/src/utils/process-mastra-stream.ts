@@ -1,4 +1,5 @@
 import type { ChunkType, NetworkChunkType } from '@mastra/core/stream';
+import { createSseEventSplitter } from './sse-event-splitter';
 
 async function sharedProcessMastraStream({
   stream,
@@ -6,12 +7,12 @@ async function sharedProcessMastraStream({
   signal,
 }: {
   stream: globalThis.ReadableStream<Uint8Array>;
-  onChunk: (chunk: any) => Promise<void>;
+  onChunk: (chunk: any) => void | Promise<void>;
   signal?: AbortSignal;
 }) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
-  let buffer = '';
+  const splitEvents = createSseEventSplitter();
   const abort = () => void reader.cancel();
   if (signal?.aborted) abort();
   else signal?.addEventListener('abort', abort, { once: true });
@@ -22,12 +23,8 @@ async function sharedProcessMastraStream({
 
       if (done) break;
 
-      // Decode the chunk and add to buffer
-      buffer += decoder.decode(value, { stream: true });
-
-      // Process complete SSE messages
-      const lines = buffer.split('\n\n');
-      buffer = lines.pop() || ''; // Keep incomplete line in buffer
+      // Only complete events are emitted; this reader intentionally does not flush at EOF.
+      const lines = splitEvents(decoder.decode(value, { stream: true }));
 
       for (const line of lines) {
         if (line.startsWith('data: ')) {
@@ -61,7 +58,7 @@ export async function processMastraNetworkStream({
   signal,
 }: {
   stream: globalThis.ReadableStream<Uint8Array>;
-  onChunk: (chunk: NetworkChunkType) => Promise<void>;
+  onChunk: (chunk: NetworkChunkType) => void | Promise<void>;
   signal?: AbortSignal;
 }) {
   return sharedProcessMastraStream({
@@ -77,7 +74,7 @@ export async function processMastraStream({
   signal,
 }: {
   stream: globalThis.ReadableStream<Uint8Array>;
-  onChunk: (chunk: ChunkType) => Promise<void>;
+  onChunk: (chunk: ChunkType) => void | Promise<void>;
   signal?: AbortSignal;
 }) {
   return sharedProcessMastraStream({

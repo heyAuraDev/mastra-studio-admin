@@ -1,10 +1,23 @@
-import { randomUUID } from 'node:crypto';
 import type { InMemoryDB } from '../inmemory-db';
-import type { Schedule, ScheduleFilter, ScheduleTrigger, ScheduleTriggerListOptions, ScheduleUpdate } from './base';
-import { SchedulesStorage } from './base';
+import type {
+  Schedule,
+  ScheduleFilter,
+  ScheduleStatus,
+  ScheduleTrigger,
+  ScheduleTriggerListOptions,
+  ScheduleUpdate,
+} from './base';
+import { normalizeScheduleTarget, SchedulesStorage } from './base';
 
 function clone<T>(value: T): T {
   return value == null ? value : (JSON.parse(JSON.stringify(value)) as T);
+}
+
+/** Clone a stored row, normalizing legacy target discriminators on the way out. */
+function cloneRow(row: Schedule): Schedule {
+  const copy = clone(row);
+  copy.target = normalizeScheduleTarget(copy.target);
+  return copy;
 }
 
 export class InMemorySchedulesStorage extends SchedulesStorage {
@@ -31,7 +44,7 @@ export class InMemorySchedulesStorage extends SchedulesStorage {
 
   async getSchedule(id: string): Promise<Schedule | null> {
     const found = this.db.schedules.get(id);
-    return found ? clone(found) : null;
+    return found ? cloneRow(found) : null;
   }
 
   async listSchedules(filter?: ScheduleFilter): Promise<Schedule[]> {
@@ -49,7 +62,7 @@ export class InMemorySchedulesStorage extends SchedulesStorage {
       rows = rows.filter(r => (r.ownerId ?? null) === filter.ownerId);
     }
     rows.sort((a, b) => a.createdAt - b.createdAt);
-    return rows.map(clone);
+    return rows.map(cloneRow);
   }
 
   async listDueSchedules(now: number, limit?: number): Promise<Schedule[]> {
@@ -61,7 +74,7 @@ export class InMemorySchedulesStorage extends SchedulesStorage {
     }
     due.sort((a, b) => a.nextFireAt - b.nextFireAt);
     const cap = limit ?? due.length;
-    return due.slice(0, cap).map(clone);
+    return due.slice(0, cap).map(cloneRow);
   }
 
   async updateSchedule(id: string, patch: ScheduleUpdate): Promise<Schedule> {
@@ -78,7 +91,7 @@ export class InMemorySchedulesStorage extends SchedulesStorage {
     };
     const stored = clone(updated);
     this.db.schedules.set(id, stored);
-    return clone(stored);
+    return cloneRow(stored);
   }
 
   async updateScheduleNextFire(
@@ -87,6 +100,7 @@ export class InMemorySchedulesStorage extends SchedulesStorage {
     newNextFireAt: number,
     lastFireAt: number,
     lastRunId: string,
+    newStatus?: ScheduleStatus,
   ): Promise<boolean> {
     const existing = this.db.schedules.get(id);
     if (!existing) return false;
@@ -97,6 +111,7 @@ export class InMemorySchedulesStorage extends SchedulesStorage {
       nextFireAt: newNextFireAt,
       lastFireAt,
       lastRunId,
+      ...(newStatus ? { status: newStatus } : {}),
       updatedAt: Date.now(),
     };
     this.db.schedules.set(id, stored);
@@ -115,7 +130,7 @@ export class InMemorySchedulesStorage extends SchedulesStorage {
   async recordTrigger(trigger: ScheduleTrigger): Promise<void> {
     const stored: ScheduleTrigger = {
       ...trigger,
-      id: trigger.id ?? randomUUID(),
+      id: trigger.id ?? globalThis.crypto.randomUUID(),
       triggerKind: trigger.triggerKind ?? 'schedule-fire',
     };
     this.db.scheduleTriggers.push(clone(stored));

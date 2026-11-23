@@ -1,16 +1,23 @@
 import { v4 as uuid } from '@lukeed/uuid';
-import { Notice, Button } from '@mastra/playground-ui';
-import { Save } from 'lucide-react';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { Notice } from '@mastra/playground-ui/components/Notice';
+import { ThreadInputProvider } from '@mastra/playground-ui/domains/agents/chat/drafts/ThreadInputContext';
+import { ActivatedSkillsProvider } from '@mastra/playground-ui/domains/agents/context/activated-skills-context';
+import { BrowserToolCallsProvider } from '@mastra/playground-ui/domains/agents/context/browser-tool-calls-context';
+import { DatasetSaveProvider } from '@mastra/playground-ui/domains/chat';
+import { useEntityRequestContext } from '@mastra/playground-ui/domains/request-context/hooks/use-entity-request-context';
+import { IconFloppyDisk1 } from '@mastra/playground-ui/icons/central/IconFloppyDisk1';
+import { useAgent } from '@mastra/react/hooks/agents';
+
 import { useMemo } from 'react';
 import { useFormState } from 'react-hook-form';
-
 import { AgentSettingsProvider } from '../../context/agent-context';
 import { useOptionalAgentEditFormContext } from '../../context/agent-edit-form-context';
 import { BrowserSessionProvider } from '../../context/browser-session-provider';
-import { useAgent } from '../../hooks/use-agent';
+import { buildAgentDefaultSettings } from '../../utils/agent-default-settings';
 import { AgentChat } from '../agent-chat';
-import { useMergedRequestContext } from '@/domains/request-context/context/schema-request-context';
-import { DatasetSaveProvider } from '@/lib/ai-ui/context/dataset-save-context';
+import { BrowserViewPanel } from '../browser-view/browser-view-panel';
+import { AgentRunActions } from '@/domains/run-options/components/agent-run-actions';
 
 interface AgentPlaygroundTestChatProps {
   agentId: string;
@@ -24,8 +31,14 @@ function UnsavedChangesBanner({ ctx }: { ctx: NonNullable<ReturnType<typeof useO
   const { isDirty } = useFormState({ control: ctx.form.control });
   const handleSaveDraft = ctx.handleSaveDraft;
   const isSavingDraft = ctx.isSavingDraft ?? false;
+  const isCodeSource = ctx.isCodeSourceAgent ?? false;
 
   if (!isDirty) return null;
+
+  const saveLabel = isCodeSource ? 'Save to filesystem' : 'Save draft';
+  const message = isCodeSource
+    ? 'You have unsaved changes to the agent configuration. Save to filesystem to ensure the chat uses your latest changes.'
+    : 'You have unsaved changes to the agent configuration. Save your draft to ensure the chat uses your latest changes.';
 
   return (
     <Notice
@@ -34,17 +47,20 @@ function UnsavedChangesBanner({ ctx }: { ctx: NonNullable<ReturnType<typeof useO
       className="mx-4 mt-3 mb-0"
       action={
         handleSaveDraft && (
-          <Button type="button" variant="default" size="sm" onClick={() => handleSaveDraft()} disabled={isSavingDraft}>
-            <Save className="h-3.5 w-3.5" />
-            {isSavingDraft ? 'Saving...' : 'Save draft'}
+          <Button
+            type="button"
+            variant="default"
+            size="sm"
+            onClick={() => handleSaveDraft()}
+            disabled={isSavingDraft}
+            icon={<IconFloppyDisk1 />}
+          >
+            {isSavingDraft ? 'Saving...' : saveLabel}
           </Button>
         )
       }
     >
-      <Notice.Message>
-        You have unsaved changes to the agent configuration. Save your draft to ensure the chat uses your latest
-        changes.
-      </Notice.Message>
+      <Notice.Message>{message}</Notice.Message>
     </Notice>
   );
 }
@@ -59,39 +75,58 @@ export function AgentPlaygroundTestChat({
   // Generate a stable ephemeral thread ID for test chat sessions
   // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: regenerate thread ID when agent changes
   const testThreadId = useMemo(() => uuid(), [agentId]);
-  const mergedRequestContext = useMergedRequestContext();
+  const mergedRequestContext = useEntityRequestContext('agent', agentId)[0];
   const hasRequestContext = Object.keys(mergedRequestContext).length > 0;
 
   const editFormCtx = useOptionalAgentEditFormContext();
-  const { data: agent } = useAgent(agentId);
+  const { data: agent } = useAgent({
+    agentId: agentId,
+    requestContext: useEntityRequestContext('agent', agentId)[0],
+    queryOptions: { enabled: Boolean(agentId) },
+  });
+  const defaultSettings = useMemo(() => buildAgentDefaultSettings(agent), [agent]);
 
   return (
-    <AgentSettingsProvider agentId={agentId} defaultSettings={{ modelSettings: {} }}>
-      <BrowserSessionProvider agentId={agentId} threadId={testThreadId} enabled={Boolean(agent?.browserTools?.length)}>
-        <DatasetSaveProvider
-          enabled
-          threadId={testThreadId}
+    <AgentSettingsProvider agentId={agentId} defaultSettings={defaultSettings}>
+      <BrowserToolCallsProvider key={`browser-${agentId}-${testThreadId}`}>
+        <BrowserSessionProvider
+          key={`session-${agentId}-${testThreadId}`}
           agentId={agentId}
-          requestContext={hasRequestContext ? mergedRequestContext : undefined}
+          threadId={testThreadId}
+          enabled={Boolean(agent?.hasBrowser ?? agent?.browserTools?.length)}
         >
-          <div className="flex flex-col h-full">
-            {editFormCtx && <UnsavedChangesBanner ctx={editFormCtx} />}
-            <div className="flex-1 min-h-0">
-              <AgentChat
-                key={testThreadId}
-                agentId={agentId}
-                agentName={agentName}
-                modelVersion={modelVersion}
-                agentVersionId={agentVersionId}
+          <ThreadInputProvider>
+            <ActivatedSkillsProvider key={testThreadId}>
+              <DatasetSaveProvider
+                enabled
                 threadId={testThreadId}
-                memory={hasMemory}
-                refreshThreadList={async () => {}}
-                isNewThread
-              />
-            </div>
-          </div>
-        </DatasetSaveProvider>
-      </BrowserSessionProvider>
+                agentId={agentId}
+                requestContext={hasRequestContext ? mergedRequestContext : undefined}
+              >
+                <div className="flex h-full flex-col">
+                  {editFormCtx && <UnsavedChangesBanner ctx={editFormCtx} />}
+                  <div className="min-h-0 flex-1">
+                    <AgentChat
+                      key={testThreadId}
+                      agentId={agentId}
+                      agentName={agentName}
+                      modelVersion={modelVersion}
+                      agentVersionId={agentVersionId}
+                      supportsMemory={agent?.supportsMemory}
+                      threadId={testThreadId}
+                      memory={hasMemory}
+                      modelList={agent?.modelList}
+                      isNewThread
+                      runOptionsSlot={<AgentRunActions agentId={agentId} />}
+                    />
+                  </div>
+                </div>
+              </DatasetSaveProvider>
+            </ActivatedSkillsProvider>
+          </ThreadInputProvider>
+          <BrowserViewPanel />
+        </BrowserSessionProvider>
+      </BrowserToolCallsProvider>
     </AgentSettingsProvider>
   );
 }

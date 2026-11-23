@@ -1,4 +1,7 @@
 import type {
+  PruneOptions,
+  PruneResult,
+  RetentionTablesDescriptor,
   Schedule,
   ScheduleFilter,
   ScheduleStatus,
@@ -6,10 +9,17 @@ import type {
   ScheduleTrigger,
   ScheduleTriggerListOptions,
   ScheduleUpdate,
+  TableRetentionPolicy,
 } from '@mastra/core/storage';
-import { SchedulesStorage, TABLE_SCHEDULES, TABLE_SCHEDULE_TRIGGERS } from '@mastra/core/storage';
+import {
+  normalizeScheduleTarget,
+  SchedulesStorage,
+  TABLE_SCHEDULES,
+  TABLE_SCHEDULE_TRIGGERS,
+} from '@mastra/core/storage';
 import type { MongoDBConnector } from '../../connectors/MongoDBConnector';
 import { resolveMongoDBConfig } from '../../db';
+import { resolveTargets, runPrune } from '../../retention';
 import type { MongoDBDomainConfig, MongoDBIndexConfig } from '../../types';
 
 function scheduleToDoc(schedule: Schedule): Record<string, any> {
@@ -27,6 +37,8 @@ function scheduleToDoc(schedule: Schedule): Record<string, any> {
     metadata: schedule.metadata ?? null,
     owner_type: schedule.ownerType ?? null,
     owner_id: schedule.ownerId ?? null,
+    run_at: schedule.runAt ?? null,
+    end_at: schedule.endAt ?? null,
   };
 }
 
@@ -37,7 +49,7 @@ function docToSchedule(doc: Record<string, any>): Schedule {
   }
   const schedule: Schedule = {
     id: String(doc.id),
-    target,
+    target: normalizeScheduleTarget(target),
     cron: String(doc.cron),
     status: String(doc.status) as ScheduleStatus,
     nextFireAt: Number(doc.next_fire_at),
@@ -50,6 +62,8 @@ function docToSchedule(doc: Record<string, any>): Schedule {
   if (doc.metadata != null) schedule.metadata = doc.metadata as Record<string, unknown>;
   if (doc.owner_type != null) schedule.ownerType = String(doc.owner_type) as Schedule['ownerType'];
   if (doc.owner_id != null) schedule.ownerId = String(doc.owner_id);
+  if (doc.run_at != null) schedule.runAt = Number(doc.run_at);
+  if (doc.end_at != null) schedule.endAt = Number(doc.end_at);
   return schedule;
 }
 
@@ -92,6 +106,17 @@ export class SchedulesMongoDB extends SchedulesStorage {
 
   static readonly MANAGED_COLLECTIONS = [TABLE_SCHEDULES, TABLE_SCHEDULE_TRIGGERS] as const;
 
+  /**
+   * Only trigger (fire-history) rows are retention-eligible — schedule
+   * definitions are config, not growth. Anchor `actual_fire_at` is stored as a
+   * raw epoch-ms number, so `anchorType: 'epoch-ms'` keeps the cutoff numeric.
+   * The default composite index `(schedule_id, actual_fire_at)` can't serve a
+   * bare `actual_fire_at` range scan, hence the lazy single-field anchor index.
+   */
+  static override readonly retentionTables: RetentionTablesDescriptor = {
+    triggers: { table: TABLE_SCHEDULE_TRIGGERS, column: 'actual_fire_at', anchorType: 'epoch-ms', indexed: true },
+  };
+
   constructor(config: MongoDBDomainConfig) {
     super();
     this.#connector = resolveMongoDBConfig(config);
@@ -107,6 +132,16 @@ export class SchedulesMongoDB extends SchedulesStorage {
 
   private getTriggersCollection() {
     return this.#connector.getCollection(TABLE_SCHEDULE_TRIGGERS);
+  }
+
+  /** Delete trigger (fire-history) rows older than the `triggers` policy's `maxAge`, batched. */
+  async prune(policies: Record<string, TableRetentionPolicy>, options?: PruneOptions): Promise<PruneResult[]> {
+    const targets = resolveTargets({
+      policies,
+      descriptor: SchedulesMongoDB.retentionTables,
+      order: ['triggers'],
+    });
+    return runPrune({ connector: this.#connector, domain: 'schedules', targets, options, logger: this.logger });
   }
 
   getDefaultIndexDefinitions(): MongoDBIndexConfig[] {
@@ -211,6 +246,8 @@ export class SchedulesMongoDB extends SchedulesStorage {
     if ('metadata' in patch) $set.metadata = patch.metadata ?? null;
     if ('ownerType' in patch) $set.owner_type = (patch.ownerType as string | undefined) ?? null;
     if ('ownerId' in patch) $set.owner_id = (patch.ownerId as string | undefined) ?? null;
+    if ('runAt' in patch) $set.run_at = patch.runAt ?? null;
+    if ('endAt' in patch) $set.end_at = patch.endAt ?? null;
 
     $set.updated_at = Date.now();
 
@@ -226,6 +263,7 @@ export class SchedulesMongoDB extends SchedulesStorage {
     newNextFireAt: number,
     lastFireAt: number,
     lastRunId: string,
+    newStatus?: ScheduleStatus,
   ): Promise<boolean> {
     const collection = await this.getSchedulesCollection();
     const result = await collection.updateOne(
@@ -236,6 +274,7 @@ export class SchedulesMongoDB extends SchedulesStorage {
           last_fire_at: lastFireAt,
           last_run_id: lastRunId,
           updated_at: Date.now(),
+          ...(newStatus ? { status: newStatus } : {}),
         },
       },
     );
@@ -243,10 +282,12 @@ export class SchedulesMongoDB extends SchedulesStorage {
   }
 
   async deleteSchedule(id: string): Promise<void> {
-    const triggers = await this.getTriggersCollection();
-    await triggers.deleteMany({ schedule_id: id });
-    const schedules = await this.getSchedulesCollection();
-    await schedules.deleteOne({ id });
+    await this.#connector.withTransaction(async session => {
+      const triggers = await this.getTriggersCollection();
+      await triggers.deleteMany({ schedule_id: id }, { session });
+      const schedules = await this.getSchedulesCollection();
+      await schedules.deleteOne({ id }, { session });
+    });
   }
 
   async recordTrigger(trigger: ScheduleTrigger): Promise<void> {

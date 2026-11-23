@@ -1,0 +1,140 @@
+import { canUseProvider, getActiveRouteMemoryModelId } from '@mastra/code-sdk/agents/model';
+import {
+  applyOmRoleAuto,
+  applyOmRoleOverride,
+  persistOmObserveAttachments,
+} from '@mastra/code-sdk/onboarding/om-settings';
+import { resolveAutoOMModelId } from '@mastra/code-sdk/onboarding/packs';
+import { loadSettings, saveSettings } from '@mastra/code-sdk/onboarding/settings';
+import { OMSettingsComponent } from '../components/om-settings.js';
+import { getEffectiveOMRoleModelId } from '../om-model.js';
+import { showModalOverlay } from '../overlay.js';
+import { promptForApiKeyIfNeeded } from '../prompt-api-key.js';
+import { requireLocal } from '../runtime.js';
+import type { SlashCommandContext } from './types.js';
+
+// Re-exported for existing importers/tests; the implementations live in
+// onboarding/om-settings.ts so non-TUI surfaces (web routes) can share them.
+export { applyOmRoleAuto, applyOmRoleOverride, persistOmObserveAttachments };
+
+function persistOmRoleOverride(role: 'observer' | 'reflector', modelId: string): void {
+  const settings = loadSettings();
+  applyOmRoleOverride(settings, role, modelId);
+  saveSettings(settings);
+}
+
+function persistOmRoleAuto(role: 'observer' | 'reflector'): void {
+  const settings = loadSettings();
+  applyOmRoleAuto(settings, role);
+  saveSettings(settings);
+}
+
+function persistOmThresholds({
+  observationThreshold,
+  reflectionThreshold,
+}: {
+  observationThreshold?: number;
+  reflectionThreshold?: number;
+}): void {
+  const settings = loadSettings();
+  if (observationThreshold !== undefined) {
+    settings.models.omObservationThreshold = observationThreshold;
+  }
+  if (reflectionThreshold !== undefined) {
+    settings.models.omReflectionThreshold = reflectionThreshold;
+  }
+  saveSettings(settings);
+}
+
+function persistOmCavemanObservations(enabled: boolean): void {
+  const settings = loadSettings();
+  settings.models.omCavemanObservations = enabled;
+  saveSettings(settings);
+}
+
+export async function handleOMCommand(ctx: SlashCommandContext): Promise<void> {
+  const availableModels = await ctx.state.controller.listAvailableModels();
+  const { session } = requireLocal(ctx.state, '/om');
+
+  const agentControllerState = ctx.state.session.state.get() as Record<string, unknown> | undefined;
+  const observerModelId = getEffectiveOMRoleModelId(session, 'observer') ?? '';
+  const reflectorModelId = getEffectiveOMRoleModelId(session, 'reflector') ?? '';
+  const packMemoryModelId = getActiveRouteMemoryModelId(agentControllerState, ctx.state.session.thread.getId());
+  const autoModelId = resolveAutoOMModelId(ctx.state.session.model.get() ?? undefined, canUseProvider);
+  const config = {
+    observerModel: session.om.observer.model() ?? 'auto',
+    observerModelId,
+    observerAutoModelId: autoModelId,
+    reflectorModel: session.om.reflector.model() ?? 'auto',
+    reflectorModelId,
+    reflectorAutoModelId: autoModelId,
+    packMemoryModelId,
+    observationThreshold: session.om.observer.threshold() ?? 30_000,
+    reflectionThreshold: session.om.reflector.threshold() ?? 40_000,
+    cavemanObservations: (agentControllerState?.cavemanObservations as boolean | undefined) ?? false,
+    observeAttachments: (agentControllerState?.observeAttachments as 'auto' | boolean | undefined) ?? 'auto',
+  };
+
+  return new Promise<void>(resolve => {
+    const settings = new OMSettingsComponent(
+      config,
+      {
+        onObserverModelChange: async model => {
+          await promptForApiKeyIfNeeded(ctx.state.ui, model, ctx.authStorage);
+          await session.om.observer.switchModel({ modelId: model.id });
+          persistOmRoleOverride('observer', model.id);
+          ctx.showInfo(`Observer model → ${model.id}`);
+        },
+        onObserverAuto: async () => {
+          await session.om.observer.switchModel({ modelId: 'auto' });
+          persistOmRoleAuto('observer');
+          ctx.showInfo(`Observer model → Auto (${getEffectiveOMRoleModelId(session, 'observer') ?? 'unavailable'})`);
+        },
+        onReflectorModelChange: async model => {
+          await promptForApiKeyIfNeeded(ctx.state.ui, model, ctx.authStorage);
+          await session.om.reflector.switchModel({ modelId: model.id });
+          persistOmRoleOverride('reflector', model.id);
+          ctx.showInfo(`Reflector model → ${model.id}`);
+        },
+        onReflectorAuto: async () => {
+          await session.om.reflector.switchModel({ modelId: 'auto' });
+          persistOmRoleAuto('reflector');
+          ctx.showInfo(`Reflector model → Auto (${getEffectiveOMRoleModelId(session, 'reflector') ?? 'unavailable'})`);
+        },
+        onObservationThresholdChange: async value => {
+          await ctx.state.session.state.set({ observationThreshold: value } as any);
+          await ctx.state.session.thread.setSetting({ key: 'observationThreshold', value });
+          persistOmThresholds({ observationThreshold: value });
+        },
+        onReflectionThresholdChange: async value => {
+          await ctx.state.session.state.set({ reflectionThreshold: value } as any);
+          await ctx.state.session.thread.setSetting({ key: 'reflectionThreshold', value });
+          persistOmThresholds({ reflectionThreshold: value });
+        },
+        onCavemanObservationsChange: async enabled => {
+          await ctx.state.session.state.set({ cavemanObservations: enabled } as any);
+          await ctx.state.session.thread.setSetting({ key: 'cavemanObservations', value: enabled });
+          persistOmCavemanObservations(enabled);
+          ctx.showInfo(`Caveman observations → ${enabled ? 'on' : 'off'}`);
+        },
+        onObserveAttachmentsChange: async value => {
+          await ctx.state.session.state.set({ observeAttachments: value } as any);
+          await ctx.state.session.thread.setSetting({ key: 'observeAttachments', value });
+          persistOmObserveAttachments(value);
+          const label = value === 'auto' ? 'auto' : value ? 'on' : 'off';
+          ctx.showInfo(`Observe attachments → ${label}`);
+        },
+        onClose: () => {
+          ctx.state.ui.hideOverlay();
+          ctx.updateStatusLine();
+          resolve();
+        },
+      },
+      availableModels,
+      ctx.state.ui,
+    );
+
+    showModalOverlay(ctx.state.ui, settings, { widthPercent: 0.8, maxHeight: '70%' });
+    settings.focused = true;
+  });
+}

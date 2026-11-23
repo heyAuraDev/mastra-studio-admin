@@ -1,6 +1,16 @@
-import { Button, Popover, PopoverContent, PopoverTrigger, Txt } from '@mastra/playground-ui';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { Popover, PopoverContent, PopoverTrigger } from '@mastra/playground-ui/components/Popover';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { IconArrowBoxLeft } from '@mastra/playground-ui/icons/central/IconArrowBoxLeft';
+import { IconCrossMedium } from '@mastra/playground-ui/icons/central/IconCrossMedium';
+import { IconLoadingCircle } from '@mastra/playground-ui/icons/central/IconLoadingCircle';
+import { IconSettingsGear5 } from '@mastra/playground-ui/icons/central/IconSettingsGear5';
+import { useAuthCapabilities, isAuthenticated } from '@mastra/react/hooks/auth';
+import type { AuthenticatedUser, CurrentUser } from '@mastra/react/hooks/auth';
+import { useState } from 'react';
+import { Link } from 'react-router';
 import { useLogout } from '../hooks';
-import type { AuthenticatedUser, CurrentUser } from '../types';
+import { useRoleImpersonation } from '../hooks/use-role-impersonation';
 import { UserAvatar } from './user-avatar';
 
 export type UserMenuProps = {
@@ -11,66 +21,119 @@ export type UserMenuProps = {
  * User menu component.
  *
  * Displays user avatar with a dropdown menu containing
- * user info and logout button.
- *
- * @example
- * ```tsx
- * import { UserMenu } from '@/domains/auth/components/user-menu';
-import { useCurrentUser } from '@/domains/auth/hooks/use-current-user';
- *
- * function Header() {
- *   const { data: user } = useCurrentUser();
- *
- *   if (!user) return null;
- *
- *   return <UserMenu user={user} />;
- * }
- * ```
+ * user info, role preview options for admins, and logout button.
  */
 export function UserMenu({ user }: UserMenuProps) {
-  const { mutate: logout, isPending } = useLogout();
+  const [open, setOpen] = useState(false);
+  const { mutate: logout, isPending, error: logoutError } = useLogout();
+  const { data: capabilities } = useAuthCapabilities();
+  const { isImpersonating, impersonatedRole, startImpersonation, stopImpersonation, isSwitching } =
+    useRoleImpersonation();
 
   if (!user) return null;
 
   const handleLogout = () => {
-    logout(undefined, {
-      onSuccess: data => {
-        if (data.redirectTo) {
-          window.location.href = data.redirectTo;
-        } else {
-          window.location.reload();
-        }
+    logout(
+      { userId: user.id },
+      {
+        onSuccess: data => {
+          if (data.redirectTo) {
+            window.location.href = data.redirectTo;
+          } else {
+            window.location.reload();
+          }
+        },
       },
-    });
+    );
   };
+
+  const availableRoles = capabilities && isAuthenticated(capabilities) ? capabilities.availableRoles : undefined;
 
   const displayName = user.name || user.email || 'User';
 
   return (
-    <Popover>
+    <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
-        <button type="button" className="flex items-center gap-2 rounded-md p-1 hover:bg-surface2 transition-colors">
+        <button type="button" className="flex items-center gap-2 rounded-md p-1 hover:bg-fill-subtle">
           <UserAvatar user={user} size="sm" />
         </button>
       </PopoverTrigger>
-      <PopoverContent align="end" className="w-56 p-0">
-        <div className="border-b border-border1 p-3">
+      <PopoverContent align="end" className="w-64 p-0">
+        <div className="border-b border-border p-3">
           <div className="flex items-center gap-3">
             <UserAvatar user={user} size="md" />
             <div className="flex flex-col overflow-hidden">
-              <Txt variant="ui-md" className="truncate font-medium">
+              <Txt variant="subheading" className="truncate">
                 {displayName}
               </Txt>
               {user.email && (
-                <Txt variant="ui-sm" className="truncate text-neutral3">
+                <Txt variant="caption" tone="muted" className="truncate">
                   {user.email}
                 </Txt>
               )}
             </div>
           </div>
         </div>
-        <div className="p-2">
-          <Button variant="ghost" onClick={handleLogout} disabled={isPending} className="w-full justify-start">
+
+        {/* Preview as role section — only for admins with available roles */}
+        {availableRoles && availableRoles.length > 0 && (
+          <div className="border-b border-border p-2">
+            <Txt variant="meta" tone="muted" className="px-2 py-1 uppercase">
+              Preview as role
+            </Txt>
+            {availableRoles.map(role => {
+              const isActive = isImpersonating && impersonatedRole?.id === role.id;
+              return (
+                <button
+                  key={role.id}
+                  type="button"
+                  disabled={isSwitching}
+                  onClick={() => {
+                    if (isActive) {
+                      stopImpersonation();
+                    } else {
+                      void startImpersonation(role);
+                    }
+                    setOpen(false);
+                  }}
+                  className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left ${
+                    isActive ? 'bg-fill-hover' : 'hover:bg-fill-subtle'
+                  } ${isSwitching ? 'cursor-not-allowed opacity-50' : ''}`}
+                >
+                  {isSwitching && <IconLoadingCircle className="size-icon-sm animate-spin" />}
+                  <Txt as="span" variant="body" className="flex-1 capitalize">
+                    {role.name}
+                  </Txt>
+                  {isActive && <IconCrossMedium className="size-icon-sm text-muted-foreground" />}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        <div className="flex flex-col gap-1 p-2">
+          {logoutError && (
+            <Txt variant="caption" role="alert">
+              {logoutError.message}
+            </Txt>
+          )}
+          <Button
+            render={<Link to="/settings" />}
+
+            variant="ghost"
+            className="w-full justify-start"
+            onClick={() => setOpen(false)}
+            icon={<IconSettingsGear5 />}
+          >
+            Settings
+          </Button>
+          <Button
+            icon={<IconArrowBoxLeft />}
+            variant="ghost"
+            onClick={() => handleLogout()}
+            disabled={isPending}
+            className="w-full justify-start"
+          >
             {isPending ? 'Signing out...' : 'Sign out'}
           </Button>
         </div>

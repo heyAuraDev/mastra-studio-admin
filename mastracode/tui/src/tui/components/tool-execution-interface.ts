@@ -1,0 +1,52 @@
+/**
+ * Common interface and shared types for tool execution components
+ */
+
+import type { ChatSpacingKind } from './chat-spacing.js';
+
+export type CompactToolLabelColor = 'toolTitle' | 'error';
+
+export interface ToolResult {
+  content: Array<{
+    type: string;
+    text?: string;
+    data?: string;
+    mimeType?: string;
+  }>;
+  isError: boolean;
+}
+
+/** The sandbox's exit record for a shell call (`data-sandbox-exit`). */
+export interface CommandExitRecord {
+  exitCode: number;
+  success: boolean;
+  executionTimeMs?: number;
+}
+
+export interface IToolExecutionComponent {
+  updateArgs(args: unknown, rebuild?: boolean): void;
+  /** The tool and arguments this row shows (an approval for a different target must name its own). */
+  getToolCall?(): { toolName: string; args: unknown };
+  setArgsStreaming?(streaming: boolean): void;
+  stopLiveUpdates?(): void;
+  refresh?(): void;
+  updateResult(result: ToolResult, isPartial?: boolean): void;
+  setCommandExit?(exit: CommandExitRecord): void;
+  setBackgroundTaskId?(taskId: string): void;
+  getBackgroundTaskId?(): string | undefined;
+  cancelBackground?(): void;
+  setExpanded(expanded: boolean): void;
+  setPreviewLineLimit?(limit: number): void;
+  setCompactToolModeColor?(color: string | undefined): void;
+  getChatSpacingKind?(): ChatSpacingKind | undefined;
+  getCompactToolGroupKey?(): string | undefined;
+  getCompactToolGroupSummary?(): string | undefined;
+  hasStreamingPreview?(): boolean;
+  getOwnCompactToolLabelColor?(): CompactToolLabelColor | undefined;
+  setCompactToolGroupLabelColor?(color: CompactToolLabelColor | undefined): void;
+  setCompactToolContinuation?(continuation: boolean, previousSummary?: string): void;
+  setCompactToolHasFollowingContinuation?(hasFollowingContinuation: boolean): void;
+  isComplete?(): boolean;
+  /** Append streaming output for shell commands */
+  appendStreamingOutput?(output: string): void;
+}

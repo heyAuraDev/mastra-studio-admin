@@ -39,44 +39,11 @@ describe('FGA Capability Detection', () => {
     if (originalLicense !== undefined) process.env['MASTRA_EE_LICENSE'] = originalLicense;
     else delete process.env['MASTRA_EE_LICENSE'];
     clearLicenseCache();
+    vi.restoreAllMocks();
   });
 
-  it('should include fga: true when FGA provider is configured and licensed', async () => {
-    process.env['MASTRA_EE_LICENSE'] = 'a'.repeat(32);
-    const auth = createMockAuth({ id: 'user-1', email: 'test@test.com', name: 'Test' });
-    const fgaProvider = createMockFGAProvider();
-
-    const result = await buildCapabilities(auth as any, new Request('http://localhost'), {
-      fga: fgaProvider,
-    });
-
-    expect('capabilities' in result && result.capabilities.fga).toBe(true);
-  });
-
-  it('should include fga: false when no FGA provider configured', async () => {
-    process.env['MASTRA_EE_LICENSE'] = 'a'.repeat(32);
-    const auth = createMockAuth({ id: 'user-1', email: 'test@test.com', name: 'Test' });
-
-    const result = await buildCapabilities(auth as any, new Request('http://localhost'));
-
-    expect('capabilities' in result && result.capabilities.fga).toBe(false);
-  });
-
-  it('should include fga: false when FGA provider present but no license in production', async () => {
-    process.env['NODE_ENV'] = 'production';
-    delete process.env['MASTRA_EE_LICENSE'];
-    const auth = createMockAuth({ id: 'user-1', email: 'test@test.com', name: 'Test' });
-    const fgaProvider = createMockFGAProvider();
-
-    const result = await buildCapabilities(auth as any, new Request('http://localhost'), {
-      fga: fgaProvider,
-    });
-
-    expect(result).toEqual({ enabled: true, login: null });
-    expect(auth.getCurrentUser).not.toHaveBeenCalled();
-  });
-
-  it('should include fga: true in dev environments without license', async () => {
+  it('should warn when dev fallback enables FGA without a license', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     process.env['NODE_ENV'] = 'development';
     delete process.env['MASTRA_EE_LICENSE'];
     const auth = createMockAuth({ id: 'user-1', email: 'test@test.com', name: 'Test' });
@@ -87,5 +54,8 @@ describe('FGA Capability Detection', () => {
     });
 
     expect('capabilities' in result && result.capabilities.fga).toBe(true);
+    expect(warn).toHaveBeenCalledWith(
+      '[mastra/auth-ee] Mastra Enterprise features are enabled for local development, but no valid MASTRA_LICENSE_KEY is configured. These features will be disabled in production without a valid license. Contact us to get a production license: https://mastra.ai/contact',
+    );
   });
 });

@@ -1,8 +1,4 @@
-import { cn } from '@mastra/playground-ui';
-
-export function getRepoName(githubUrl: string) {
-  return githubUrl.replace(/\/$/, '').split('/').pop();
-}
+import { cn } from '@mastra/playground-ui/utils/cn';
 
 type ContainerProps = { children: React.ReactNode; className?: string };
 
@@ -10,7 +6,7 @@ export function Container({ children, className }: ContainerProps) {
   return (
     <div
       className={cn(
-        'border border-border1 rounded-lg mt-12 py-8 lg:min-h-[25rem] transition-height px-4 lg:px-12',
+        'transition-height mt-12 rounded-lg border border-border px-4 py-5 lg:min-h-[25rem] lg:px-12',
         className,
       )}
     >

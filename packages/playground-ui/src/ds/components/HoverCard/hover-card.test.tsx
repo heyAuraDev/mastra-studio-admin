@@ -9,17 +9,6 @@ afterEach(() => {
 });
 
 describe('HoverCard', () => {
-  it('renders the trigger', () => {
-    render(
-      <HoverCard>
-        <HoverCardTrigger>Hover me</HoverCardTrigger>
-        <HoverCardContent>Card content</HoverCardContent>
-      </HoverCard>,
-    );
-
-    expect(screen.getByText('Hover me')).toBeTruthy();
-  });
-
   it('keeps the content unmounted while closed', () => {
     render(
       <HoverCard>

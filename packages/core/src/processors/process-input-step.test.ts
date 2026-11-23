@@ -721,6 +721,38 @@ describe('processInputStep', () => {
   });
 
   describe('tools', () => {
+    it('should pass the active run ID to the processor', async () => {
+      let receivedRunId: string | undefined;
+
+      const processor: Processor = {
+        id: 'run-id-reader',
+        processInputStep: async ({ runId }) => {
+          receivedRunId = runId;
+          return {};
+        },
+      };
+
+      const runner = new ProcessorRunner({
+        inputProcessors: [processor],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      const messageList = new MessageList({ threadId: 'test-thread' });
+      messageList.add([createMessage('Hello')], 'input');
+
+      await runner.runProcessInputStep({
+        messageList,
+        runId: 'origin-run-id',
+        stepNumber: 0,
+        model: createMockModel(),
+        steps: [],
+      });
+
+      expect(receivedRunId).toBe('origin-run-id');
+    });
+
     it('should pass tools to processor', async () => {
       let receivedTools: any;
 
@@ -1740,6 +1772,128 @@ describe('processInputStep', () => {
       // Final result has 3 system messages (check via messageList)
       const systemMessages = messageList.getAllSystemMessages();
       expect(systemMessages.length).toBe(3);
+    });
+
+    it('should preserve tagged system messages when processor returns systemMessages', async () => {
+      const processor: Processor = {
+        id: 'system-modifier',
+        processInputStep: async ({ systemMessages }) => {
+          return {
+            systemMessages: [...systemMessages, { role: 'system' as const, content: 'Additional instruction' }],
+          };
+        },
+      };
+
+      const runner = new ProcessorRunner({
+        inputProcessors: [processor],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      const messageList = new MessageList({ threadId: 'test-thread' });
+      messageList.add([createMessage('User message')], 'input');
+      messageList.addSystem('Original instruction');
+      messageList.addSystem('Memory context', 'observational-memory');
+
+      await runner.runProcessInputStep({
+        messageList,
+        stepNumber: 0,
+        model: createMockModel(),
+        steps: [],
+      });
+
+      expect(messageList.getSystemMessages('observational-memory').map(message => message.content)).toEqual([
+        'Memory context',
+      ]);
+      expect(messageList.getSystemMessages().map(message => message.content)).toEqual([
+        'Original instruction',
+        'Additional instruction',
+      ]);
+      expect(messageList.getAllSystemMessages().map(message => message.content)).toEqual([
+        'Original instruction',
+        'Additional instruction',
+        'Memory context',
+      ]);
+    });
+
+    it('should allow processor-returned systemMessages to prepend untagged system context', async () => {
+      const processor: Processor = {
+        id: 'system-prepender',
+        processInputStep: async ({ systemMessages }) => {
+          return {
+            systemMessages: [{ role: 'system' as const, content: 'Priority instruction' }, ...systemMessages],
+          };
+        },
+      };
+
+      const runner = new ProcessorRunner({
+        inputProcessors: [processor],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      const messageList = new MessageList({ threadId: 'test-thread' });
+      messageList.add([createMessage('User message')], 'input');
+      messageList.addSystem('Original instruction');
+      messageList.addSystem('Memory context', 'observational-memory');
+
+      await runner.runProcessInputStep({
+        messageList,
+        stepNumber: 0,
+        model: createMockModel(),
+        steps: [],
+      });
+
+      expect(messageList.getSystemMessages('observational-memory').map(message => message.content)).toEqual([
+        'Memory context',
+      ]);
+      expect(messageList.getSystemMessages().map(message => message.content)).toEqual([
+        'Priority instruction',
+        'Original instruction',
+      ]);
+      expect(messageList.getAllSystemMessages().map(message => message.content)).toEqual([
+        'Priority instruction',
+        'Original instruction',
+        'Memory context',
+      ]);
+    });
+
+    it('should not include tagged system messages in processor args.systemMessages', async () => {
+      let seenSystemMessages: any[] = [];
+      const processor: Processor = {
+        id: 'system-inspector',
+        processInputStep: async ({ systemMessages, messageList }) => {
+          seenSystemMessages = systemMessages;
+          return { messageList };
+        },
+      };
+
+      const runner = new ProcessorRunner({
+        inputProcessors: [processor],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      const messageList = new MessageList({ threadId: 'test-thread' });
+      messageList.add([createMessage('User message')], 'input');
+      messageList.addSystem('Original instruction');
+      messageList.addSystem('Memory context', 'observational-memory');
+
+      await runner.runProcessInputStep({
+        messageList,
+        stepNumber: 0,
+        model: createMockModel(),
+        steps: [],
+      });
+
+      expect(seenSystemMessages.map(m => m.content)).toEqual(['Original instruction']);
+      expect(messageList.getAllSystemMessages().map(m => m.content)).toEqual([
+        'Original instruction',
+        'Memory context',
+      ]);
     });
   });
 

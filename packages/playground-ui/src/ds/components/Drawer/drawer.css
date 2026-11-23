@@ -3,7 +3,7 @@
  * Only the *advanced* motion lives here — the swipe/stack transforms are long
  * calc() expressions that are unreadable as escaped Tailwind arbitrary values
  * (`[transform:translateY(calc(..._-_...))]`). Everything native (layout, colour,
- * sizing, borders, the `after:` dim overlay) stays as inline Tailwind in drawer.tsx.
+ * sizing, the `after:` dim overlay) stays as inline Tailwind in drawer.tsx.
  *
  * Base UI drives the gesture through CSS custom properties set on the popup:
  *   --drawer-swipe-movement-x/y   finger tracking
@@ -42,6 +42,16 @@
     opacity 450ms cubic-bezier(0.32, 0.72, 0, 1);
 }
 
+/* DataPanel grows from `wide` to `full` while a span detail opens; match the
+ * 300ms grid-template-columns transition inside TracePanelColumns. */
+.drawer-popup[data-slot='data-panel-popup'] {
+  transition:
+    transform 450ms cubic-bezier(0.32, 0.72, 0, 1),
+    width 300ms ease-in-out,
+    height 450ms cubic-bezier(0.32, 0.72, 0, 1),
+    opacity 450ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
 /* Track the finger 1:1 — no easing while a drag (own or nested) is in progress. */
 .drawer-popup[data-swiping],
 .drawer-popup[data-nested-drawer-swiping] {
@@ -51,6 +61,17 @@
 /* Release after a swipe: scale the settle duration by the gesture velocity. */
 .drawer-popup[data-ending-style] {
   transition-duration: calc(var(--drawer-swipe-strength, 1) * 400ms);
+}
+
+.drawer-popup-floating {
+  --bleed: 0rem;
+  --drawer-floating-offset: 0.75rem;
+}
+
+@media (min-width: 40rem) {
+  .drawer-popup-floating {
+    --drawer-floating-offset: 1rem;
+  }
 }
 
 /* ---- Bottom sheet (swipe down) ---------------------------------------------- */
@@ -67,6 +88,11 @@
   transform: translateY(calc(100% - var(--bleed) + 2px));
 }
 
+.drawer-popup-floating[data-swipe-direction='down'][data-starting-style],
+.drawer-popup-floating[data-swipe-direction='down'][data-ending-style] {
+  transform: translateY(calc(100% + var(--drawer-floating-offset)));
+}
+
 /* ---- Top sheet (swipe up) --------------------------------------------------- */
 
 .drawer-popup[data-swipe-direction='up'] {
@@ -77,6 +103,11 @@
 .drawer-popup[data-swipe-direction='up'][data-starting-style],
 .drawer-popup[data-swipe-direction='up'][data-ending-style] {
   transform: translateY(calc(-100% + var(--bleed) - 2px));
+}
+
+.drawer-popup-floating[data-swipe-direction='up'][data-starting-style],
+.drawer-popup-floating[data-swipe-direction='up'][data-ending-style] {
+  transform: translateY(calc(-100% - var(--drawer-floating-offset)));
 }
 
 /* Collapse a stacked top/bottom parent to the frontmost drawer's height. */
@@ -101,6 +132,16 @@
 .drawer-popup[data-swipe-direction='left'][data-starting-style],
 .drawer-popup[data-swipe-direction='left'][data-ending-style] {
   transform: translateX(-100%);
+}
+
+.drawer-popup-floating[data-swipe-direction='right'][data-starting-style],
+.drawer-popup-floating[data-swipe-direction='right'][data-ending-style] {
+  transform: translateX(calc(100% + var(--drawer-floating-offset)));
+}
+
+.drawer-popup-floating[data-swipe-direction='left'][data-starting-style],
+.drawer-popup-floating[data-swipe-direction='left'][data-ending-style] {
+  transform: translateX(calc(-100% - var(--drawer-floating-offset)));
 }
 
 /* ---- Backdrop --------------------------------------------------------------- */

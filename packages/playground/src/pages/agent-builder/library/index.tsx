@@ -1,0 +1,186 @@
+import type { ListStoredAgentsParams } from '@mastra/client-js';
+import { ActionRow } from '@mastra/playground-ui/components/ActionRow';
+import { EmptyState } from '@mastra/playground-ui/components/EmptyState';
+import { PageHeader } from '@mastra/playground-ui/components/PageHeader';
+import { PageLayout } from '@mastra/playground-ui/components/PageLayout';
+import { SearchInput, listSearchProps } from '@mastra/playground-ui/components/SearchInput';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { PermissionDenied } from '@mastra/playground-ui/domains/auth/components/permission-denied';
+import { SessionExpired } from '@mastra/playground-ui/domains/auth/components/session-expired';
+import { IconLibrary } from '@mastra/playground-ui/icons/central/IconLibrary';
+import { controlStateColorTransition } from '@mastra/playground-ui/primitives/transitions';
+import { quietTextHover } from '@mastra/playground-ui/primitives/typography';
+import { cn } from '@mastra/playground-ui/utils/cn';
+import { is401UnauthorizedError, is403ForbiddenError } from '@mastra/playground-ui/utils/errors';
+import { useStoredAgents, useStoredSkills } from '@mastra/react/hooks/agents';
+import { useMemo, useState } from 'react';
+import { useNavigate } from 'react-router';
+import {
+  AgentBuilderList,
+  AgentBuilderListSkeleton,
+} from '@/domains/agent-builder/components/agent-list/agent-builder-list';
+import {
+  SkillBuilderList,
+  SkillBuilderListSkeleton,
+} from '@/domains/agent-builder/components/skill-list/skill-builder-list';
+import { useBuilderAgentAccess } from '@/domains/agent-builder/hooks/use-builder-agent-access';
+import { useBuilderAgentFeatures } from '@/domains/agent-builder/hooks/use-builder-agent-features';
+
+type Tab = 'agents' | 'skills';
+
+export default function AgentBuilderLibraryPage() {
+  const navigate = useNavigate();
+  const [search, setSearch] = useState('');
+  const [tab, setTab] = useState<Tab>('agents');
+  const features = useBuilderAgentFeatures();
+  const { canUseFavorites } = useBuilderAgentAccess();
+
+  const agentListParams = useMemo<ListStoredAgentsParams>(() => ({ visibility: 'public' }), []);
+
+  const { data: agentsData, isLoading: agentsLoading, error: agentsError } = useStoredAgents(agentListParams);
+  const {
+    data: skillsData,
+    isLoading: skillsLoading,
+    error: skillsError,
+  } = useStoredSkills({ queryOptions: { enabled: tab === 'skills' && features.skills } });
+
+  const agents = agentsData?.agents ?? [];
+  const skills = skillsData?.skills ?? [];
+
+  const renderError = (error: Error) => {
+    if (is401UnauthorizedError(error)) {
+      return (
+        <div className="flex items-center justify-center pt-10">
+          <SessionExpired />
+        </div>
+      );
+    }
+    if (is403ForbiddenError(error)) {
+      return (
+        <div className="flex items-center justify-center pt-10">
+          <PermissionDenied resource={tab} />
+        </div>
+      );
+    }
+    return (
+      <div className="flex items-center justify-center pt-10">
+        <EmptyState tone="error" titleSlot="Failed to load the library" descriptionSlot={error.message} />
+      </div>
+    );
+  };
+
+  const body = (() => {
+    if (tab === 'agents') {
+      if (agentsLoading) return <AgentBuilderListSkeleton rowTestId="library-skeleton-row" />;
+      if (agentsError) return renderError(agentsError);
+      if (agents.length === 0) {
+        return (
+          <div className="flex items-center-safe justify-center-safe">
+            <EmptyState
+              titleSlot="No public agents yet"
+              descriptionSlot="Mark an agent as Public to share it with the team library."
+            />
+          </div>
+        );
+      }
+      return (
+        <AgentBuilderList
+          agents={agents}
+          search={search}
+          rowTestId="library-agent-row"
+          showFavorites={canUseFavorites}
+        />
+      );
+    }
+
+    // Skills tab
+    if (skillsLoading) return <SkillBuilderListSkeleton />;
+    if (skillsError) return renderError(skillsError);
+    if (skills.length === 0) {
+      return (
+        <div className="flex items-center-safe justify-center-safe">
+          <EmptyState
+            titleSlot="No public skills yet"
+            descriptionSlot="Mark a skill as Public to share it with the team library."
+          />
+        </div>
+      );
+    }
+    return (
+      <SkillBuilderList
+        skills={skills}
+        search={search}
+        onSkillClick={skill => navigate(`/agent-builder/skills/${skill.id}/view`, { viewTransition: true })}
+        showFavorites={canUseFavorites}
+      />
+    );
+  })();
+
+  return (
+    <>
+      <PageLayout
+        variant="page"
+        actionRow={
+          <>
+            <ActionRow className="items-start">
+              <ActionRow.Start>
+                <PageHeader>
+                  <PageHeader.Title>
+                    <IconLibrary /> Library
+                  </PageHeader.Title>
+                  <PageHeader.Description>
+                    {tab === 'agents' ? 'Agents shared with the team library.' : 'Skills shared with the team library.'}
+                  </PageHeader.Description>
+                </PageHeader>
+              </ActionRow.Start>
+            </ActionRow>
+            <ActionRow>
+              <ActionRow.Start>
+                {features.skills && (
+                  <div className="flex overflow-hidden rounded-lg border border-border">
+                    <button
+                      onClick={() => setTab('agents')}
+                      className={cn(
+                        'text-foreground',
+                        'px-3 py-1.5',
+                        controlStateColorTransition,
+                        tab === 'agents' ? 'bg-muted' : cn('bg-background', quietTextHover),
+                      )}
+                    >
+                      <Txt as="span" variant="column" className="block">
+                        Agents
+                      </Txt>
+                    </button>
+                    <button
+                      onClick={() => setTab('skills')}
+                      className={cn(
+                        'text-foreground',
+                        'px-3 py-1.5',
+                        controlStateColorTransition,
+                        tab === 'skills' ? 'bg-muted' : cn('bg-background', quietTextHover),
+                      )}
+                    >
+                      <Txt as="span" variant="column" className="block">
+                        Skills
+                      </Txt>
+                    </button>
+                  </div>
+                )}
+                <div className="max-w-120 flex-1">
+                  <SearchInput
+                    {...listSearchProps}
+                    onValueChange={setSearch}
+                    label="Search library"
+                    placeholder="Search by name or description"
+                  />
+                </div>
+              </ActionRow.Start>
+            </ActionRow>
+          </>
+        }
+      >
+        {body}
+      </PageLayout>
+    </>
+  );
+}

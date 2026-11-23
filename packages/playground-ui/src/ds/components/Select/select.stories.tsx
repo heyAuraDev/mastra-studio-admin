@@ -15,7 +15,7 @@ type Story = StoryObj<typeof Select>;
 export const Default: Story = {
   render: () => (
     <Select>
-      <SelectTrigger className="w-[180px]">
+      <SelectTrigger className="w-45">
         <SelectValue placeholder="Select option" />
       </SelectTrigger>
       <SelectContent>
@@ -30,7 +30,7 @@ export const Default: Story = {
 export const Experimental: Story = {
   render: () => (
     <Select>
-      <SelectTrigger className="w-[180px]" size="default">
+      <SelectTrigger className="w-45" size="md">
         <SelectValue placeholder="Select option" />
       </SelectTrigger>
       <SelectContent>
@@ -42,10 +42,54 @@ export const Experimental: Story = {
   ),
 };
 
+export const Sizes: Story = {
+  render: () => (
+    <div className="flex flex-col items-start gap-3">
+      {(['sm', 'md', 'lg'] as const).map(size => (
+        <Select key={size}>
+          <SelectTrigger className="w-45" size={size}>
+            <SelectValue placeholder={size} />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="option1">Option 1</SelectItem>
+            <SelectItem value="option2">Option 2</SelectItem>
+            <SelectItem value="option3">Option 3</SelectItem>
+          </SelectContent>
+        </Select>
+      ))}
+    </div>
+  ),
+};
+
+/**
+ * A select is a field, so it shares the Input's surface rather than the Button's:
+ * `default` (the Input's overlay surface, the default here too) and `ghost`
+ * (borderless, for dense toolbars). It does
+ * not expose the high-emphasis `primary` look.
+ */
+export const Variants: Story = {
+  render: () => (
+    <div className="flex flex-col items-start gap-3">
+      {(['default', 'ghost'] as const).map(variant => (
+        <Select key={variant}>
+          <SelectTrigger className="w-45" variant={variant}>
+            <SelectValue placeholder={variant} />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="option1">Option 1</SelectItem>
+            <SelectItem value="option2">Option 2</SelectItem>
+            <SelectItem value="option3">Option 3</SelectItem>
+          </SelectContent>
+        </Select>
+      ))}
+    </div>
+  ),
+};
+
 export const WithValue: Story = {
   render: () => (
     <Select defaultValue="option2">
-      <SelectTrigger className="w-[180px]">
+      <SelectTrigger className="w-45">
         <SelectValue placeholder="Select option" />
       </SelectTrigger>
       <SelectContent>
@@ -60,7 +104,7 @@ export const WithValue: Story = {
 export const Disabled: Story = {
   render: () => (
     <Select disabled>
-      <SelectTrigger className="w-[180px]">
+      <SelectTrigger className="w-45">
         <SelectValue placeholder="Select option" />
       </SelectTrigger>
       <SelectContent>
@@ -74,7 +118,7 @@ export const Disabled: Story = {
 export const WithGroups: Story = {
   render: () => (
     <Select>
-      <SelectTrigger className="w-[200px]">
+      <SelectTrigger className="w-50">
         <SelectValue placeholder="Select a fruit" />
       </SelectTrigger>
       <SelectContent>
@@ -91,7 +135,7 @@ export const WithGroups: Story = {
 export const LongOptions: Story = {
   render: () => (
     <Select>
-      <SelectTrigger className="w-[280px]">
+      <SelectTrigger className="w-70">
         <SelectValue placeholder="Select a timezone" />
       </SelectTrigger>
       <SelectContent>
@@ -108,7 +152,7 @@ export const LongOptions: Story = {
 export const ManyOptions: Story = {
   render: () => (
     <Select>
-      <SelectTrigger className="w-[200px]">
+      <SelectTrigger className="w-50">
         <SelectValue placeholder="Select a country" />
       </SelectTrigger>
       <SelectContent>
@@ -122,6 +166,27 @@ export const ManyOptions: Story = {
         <SelectItem value="br">Brazil</SelectItem>
         <SelectItem value="in">India</SelectItem>
         <SelectItem value="cn">China</SelectItem>
+      </SelectContent>
+    </Select>
+  ),
+};
+
+/** Selected, disabled and grouped items side by side, to compare against the menu components. */
+export const KitchenSink: Story = {
+  render: () => (
+    <Select defaultValue="selected" defaultOpen>
+      <SelectTrigger className="w-56">
+        <SelectValue placeholder="Select option" />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectGroup>
+          <SelectItem value="plain">Plain item</SelectItem>
+          <SelectItem value="selected">Selected item</SelectItem>
+          <SelectItem value="disabled" disabled>
+            Disabled item
+          </SelectItem>
+          <SelectItem value="long">A very long option label that should truncate inside the popup</SelectItem>
+        </SelectGroup>
       </SelectContent>
     </Select>
   ),

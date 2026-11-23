@@ -1,23 +1,17 @@
-import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { z } from 'zod/v4';
 import { Mastra } from '../mastra';
 import { MockStore } from '../storage/mock';
-import { createStep, createWorkflow } from './workflow';
-
-vi.mock('crypto', () => {
-  return {
-    randomUUID: vi.fn(() => 'mock-uuid-1'),
-  };
-});
+import { createWorkflow } from './create';
+import { createStep } from './workflow';
 
 describe('Branch with Map Bug - Issue #10407', () => {
   beforeEach(() => {
-    vi.resetAllMocks();
+    vi.clearAllMocks();
 
     let counter = 0;
-    (randomUUID as vi.Mock).mockImplementation(() => {
-      return `mock-uuid-${++counter}`;
+    vi.spyOn(globalThis.crypto, 'randomUUID').mockImplementation(() => {
+      return `00000000-0000-4000-8000-${(++counter).toString().padStart(12, '0')}`;
     });
   });
 

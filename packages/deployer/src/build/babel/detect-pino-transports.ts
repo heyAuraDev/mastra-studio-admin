@@ -1,4 +1,4 @@
-import type { PluginObj, NodePath } from '@babel/core';
+import type { PluginObject, NodePath } from '@babel/core';
 import { types as t } from '@babel/core';
 
 /**
@@ -156,6 +156,22 @@ function extractTransportsFromArg(arg: t.Node): string[] {
   return targets;
 }
 
+// Also matches `x[transport](`: the detector does not check `computed` on the member expression.
+const TRANSPORT_CALL_RE = /[.[]\s*transport\s*\]?\s*[(<]/;
+const PINO_SOURCE_RE = /['"]pino['"]/;
+const GLOBAL_PINO_TRANSPORT_RE = /\bpino\s*(?:\.\s*default\s*)?(?:\.\s*transport\b|\[\s*transport\s*\])/;
+
+/**
+ * Cheap text pre-check so callers can skip a full Babel parse of large bundles.
+ * Must stay a superset of what `detectPinoTransports` matches: every match needs a
+ * `.transport(` call and either a `'pino'` import/require source or an unbound `pino` identifier.
+ */
+export function mayContainPinoTransport(code: string): boolean {
+  if (!code.includes('pino')) return false;
+  if (!TRANSPORT_CALL_RE.test(code)) return false;
+  return PINO_SOURCE_RE.test(code) || GLOBAL_PINO_TRANSPORT_RE.test(code);
+}
+
 /**
  * Babel plugin to detect pino transport targets in code.
  * Matches patterns like:
@@ -166,7 +182,7 @@ function extractTransportsFromArg(arg: t.Node): string[] {
  * @param transports - Set to collect detected transport package names
  * @returns Babel plugin object
  */
-export function detectPinoTransports(transports: Set<string>): PluginObj {
+export function detectPinoTransports(transports: Set<string>): PluginObject {
   return {
     name: 'detect-pino-transports',
     visitor: {

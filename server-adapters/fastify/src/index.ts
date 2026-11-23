@@ -7,30 +7,21 @@ import type { MCPHttpTransportResult, MCPSseTransportResult } from '@mastra/serv
 import type { ParsedRequestParams, ServerRoute } from '@mastra/server/server-adapter';
 import {
   MastraServer as MastraServerBase,
+  applyMcpRequestAuth,
+  cancelReaderOnResponseClose,
   checkRouteFGA,
+  getCustomHTTPExceptionResponse,
+  getHTTPErrorResponse,
+  isSafeObjectKey,
+  isZodError,
   normalizeQueryParams,
   redactStreamChunk,
+  serializeStreamChunk,
+  writeWithBackpressure,
 } from '@mastra/server/server-adapter';
 import type { FastifyInstance, FastifyReply, FastifyRequest, preHandlerHookHandler, RouteHandlerMethod } from 'fastify';
-import { ZodError } from 'zod';
 export { createAuthMiddleware } from './auth-middleware';
 export type { FastifyAuthMiddlewareOptions } from './auth-middleware';
-
-type HasPermissionFn = (userPerms: string[], required: string) => boolean;
-let _hasPermissionPromise: Promise<HasPermissionFn | undefined> | undefined;
-function loadHasPermission(): Promise<HasPermissionFn | undefined> {
-  if (!_hasPermissionPromise) {
-    _hasPermissionPromise = import('@mastra/core/auth/ee')
-      .then(m => m.hasPermission)
-      .catch(() => {
-        console.error(
-          '[@mastra/fastify] Auth features require @mastra/core >= 1.6.0. Please upgrade: npm install @mastra/core@latest',
-        );
-        return undefined;
-      });
-  }
-  return _hasPermissionPromise;
-}
 
 /**
  * Convert Fastify request to Web API Request for cookie-based auth providers.
@@ -94,8 +85,8 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         }
       }
 
-      // Parse request context from query params (GET)
-      if (request.method === 'GET') {
+      // Parse request context from query params.
+      if (request.method === 'GET' || request.method === 'POST') {
         try {
           const query = request.query as Record<string, string>;
           const encodedRequestContext = query.requestContext;
@@ -150,6 +141,12 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           controller.abort();
         }
       });
+      // A client that dropped while an earlier hook ran (for example async auth in onRequest) fired 'close' before
+      // these listeners existed.
+      if (reply.raw.destroyed) {
+        controller.abort();
+      }
+
       request.abortSignal = controller.signal;
     };
   }
@@ -200,22 +197,18 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
       'Transfer-Encoding': 'chunked',
     });
 
+    if (streamFormat === 'sse' && route.sseFlushOnConnect) {
+      reply.raw.write(': connected\n\n');
+    }
+
     const readableStream = result instanceof ReadableStream ? result : result.fullStream;
     const reader = readableStream.getReader();
-
-    let readerCanceled = false;
-    const cancelReader = (reason: string) => {
-      if (readerCanceled) return;
-      readerCanceled = true;
-      void reader.cancel(reason);
-    };
-    const cancelReaderOnResponseClose = () => cancelReader('request aborted');
+    const readerCancel = cancelReaderOnResponseClose(reader, reply.raw);
     const cancelReaderOnRequestClose = () => {
       if (request && isRequestAborted(request.raw)) {
-        cancelReader('request aborted');
+        readerCancel.cancel('request aborted');
       }
     };
-    reply.raw.on('close', cancelReaderOnResponseClose);
     request?.raw.on('close', cancelReaderOnRequestClose);
 
     try {
@@ -224,13 +217,28 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         if (done) break;
 
         if (value) {
+          if (streamFormat === 'sse' && typeof value === 'string' && value.startsWith(':')) {
+            await writeWithBackpressure(reply.raw, value);
+            continue;
+          }
+
           // Optionally redact sensitive data (system prompts, tool definitions, API keys) before sending to the client
           const shouldRedact = this.streamOptions?.redact ?? true;
           const outputValue = shouldRedact ? redactStreamChunk(value) : value;
+          // A chunk that can't be serialized must not kill the stream — skip it and keep streaming
+          const serialized = serializeStreamChunk(outputValue);
+          if (!serialized.ok) {
+            this.mastra.getLogger()?.error('Failed to serialize stream chunk, skipping', {
+              path: route.path,
+              chunkType: (outputValue as { type?: string })?.type,
+              error: serialized.error.message,
+            });
+            continue;
+          }
           if (streamFormat === 'sse') {
-            reply.raw.write(`data: ${JSON.stringify(outputValue)}\n\n`);
+            await writeWithBackpressure(reply.raw, `data: ${serialized.json}\n\n`);
           } else {
-            reply.raw.write(JSON.stringify(outputValue) + '\x1E');
+            await writeWithBackpressure(reply.raw, serialized.json + '\x1E');
           }
         }
       }
@@ -239,7 +247,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
       });
     } finally {
-      reply.raw.off('close', cancelReaderOnResponseClose);
+      readerCancel.dispose();
       request?.raw.off('close', cancelReaderOnRequestClose);
       if (!reply.raw.writableEnded && !reply.raw.destroyed) {
         reply.raw.end();
@@ -316,7 +324,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           });
 
           file.on('end', () => {
-            if (!limitExceeded) {
+            if (!limitExceeded && isSafeObjectKey(fieldname)) {
               result[fieldname] = Buffer.concat(chunks);
             }
           });
@@ -324,6 +332,9 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
       );
 
       busboy.on('field', (fieldname: string, value: string) => {
+        if (!isSafeObjectKey(fieldname)) {
+          return;
+        }
         // Try to parse JSON strings (like 'options')
         try {
           result[fieldname] = JSON.parse(value);
@@ -343,6 +354,11 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
       // Pipe the raw request to busboy
       request.raw.pipe(busboy);
     });
+  }
+
+  /** Adapter `mcpOptions` win; otherwise use `server.mcpOptions` from the Mastra config. */
+  private resolveMcpOptions() {
+    return this.mcpOptions ?? this.mastra.getServer()?.mcpOptions;
   }
 
   async sendResponse(
@@ -370,22 +386,29 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
     } else if (route.responseType === 'datastream-response') {
       // Handle AI SDK Response objects - pipe Response.body to Fastify response
       const fetchResponse = result as globalThis.Response;
-      fetchResponse.headers.forEach((value, key) => reply.header(key, value));
-      reply.status(fetchResponse.status);
+      // Writing to reply.raw bypasses Fastify's header map, so merge plugin-set
+      // headers (e.g. CORS) with the upstream headers and flush them via writeHead.
+      const headers: Record<string, string | number | string[]> = {};
+      for (const [key, value] of Object.entries(reply.getHeaders())) {
+        if (value === undefined) continue;
+        const lowerKey = key.toLowerCase();
+        if (lowerKey === 'content-length' || lowerKey === 'transfer-encoding') continue;
+        headers[lowerKey] = value;
+      }
+      fetchResponse.headers.forEach((value, key) => {
+        if (key.toLowerCase() !== 'set-cookie') headers[key.toLowerCase()] = value;
+      });
+      const setCookies = fetchResponse.headers.getSetCookie();
+      if (setCookies.length > 0) headers['set-cookie'] = setCookies;
+
+      reply.hijack();
+      reply.raw.writeHead(fetchResponse.status, headers);
       if (fetchResponse.body) {
         const reader = fetchResponse.body.getReader();
-        let readerCanceled = false;
-
-        const cancelReader = (reason: string) => {
-          if (readerCanceled) return;
-          readerCanceled = true;
-          void reader.cancel(reason);
-        };
-
-        const cancelReaderOnResponseClose = () => cancelReader('request aborted');
+        const readerCancel = cancelReaderOnResponseClose(reader, reply.raw);
         const cancelReaderOnRequestClose = () => {
           if (request && isRequestAborted(request.raw)) {
-            cancelReader('request aborted');
+            readerCancel.cancel('request aborted');
           }
         };
 
@@ -393,17 +416,16 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           this.mastra.getLogger()?.error('Error writing datastream response', {
             error: err instanceof Error ? { message: err.message, stack: err.stack } : err,
           });
-          cancelReader('response write error');
+          readerCancel.cancel('response write error');
         };
         reply.raw.once('error', onResError);
-        reply.raw.on('close', cancelReaderOnResponseClose);
         request?.raw.on('close', cancelReaderOnRequestClose);
 
         try {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            reply.raw.write(value);
+            await writeWithBackpressure(reply.raw, value);
           }
         } catch (error) {
           this.mastra.getLogger()?.error('Error in datastream processing', {
@@ -411,7 +433,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           });
         } finally {
           reply.raw.off('error', onResError);
-          reply.raw.off('close', cancelReaderOnResponseClose);
+          readerCancel.dispose();
           request?.raw.off('close', cancelReaderOnRequestClose);
           if (!reply.raw.writableEnded && !reply.raw.destroyed) {
             reply.raw.end();
@@ -442,7 +464,9 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         }
 
         // Merge class-level mcpOptions with route-specific options (route takes precedence)
-        const options = { ...this.mcpOptions, ...routeMcpOptions };
+        const { setRequestAuth, ...options } = { ...this.resolveMcpOptions(), ...routeMcpOptions };
+
+        await applyMcpRequestAuth({ req: rawReq, requestContext: request.requestContext, setRequestAuth });
 
         await server.startHTTP({
           url: new URL(request.url, `http://${request.headers.host}`),
@@ -484,6 +508,12 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         if (request.body !== undefined) {
           rawReq.body = request.body;
         }
+
+        await applyMcpRequestAuth({
+          req: rawReq,
+          requestContext: request.requestContext,
+          setRequestAuth: this.resolveMcpOptions()?.setRequestAuth,
+        });
 
         await server.startSSE({
           url: new URL(request.url, `http://${request.headers.host}`),
@@ -561,7 +591,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           this.mastra.getLogger()?.error('Error parsing query params', {
             error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
           });
-          if (error instanceof ZodError) {
+          if (isZodError(error)) {
             const { status, body } = this.resolveValidationError(route, error, 'query');
             return reply.status(status).send(body);
           }
@@ -572,14 +602,14 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         }
       }
 
-      if (params.body) {
+      if (params.body !== undefined || route.bodySchema) {
         try {
           params.body = await this.parseBody(route, params.body);
         } catch (error) {
           this.mastra.getLogger()?.error('Error parsing body', {
             error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
           });
-          if (error instanceof ZodError) {
+          if (isZodError(error)) {
             const { status, body } = this.resolveValidationError(route, error, 'body');
             return reply.status(status).send(body);
           }
@@ -598,7 +628,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           this.mastra.getLogger()?.error('Error parsing path params', {
             error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
           });
-          if (error instanceof ZodError) {
+          if (isZodError(error)) {
             const { status, body } = this.resolveValidationError(route, error, 'path');
             return reply.status(status).send(body);
           }
@@ -619,72 +649,68 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         taskStore: request.taskStore,
         abortSignal: request.abortSignal,
         routePrefix: prefix,
+        request: toWebRequest(request),
       };
 
-      // Check route permission requirement (EE feature)
-      // Uses convention-based permission derivation: permissions are auto-derived
-      // from route path/method unless explicitly set or route is public
-      const authConfig = this.mastra.getServer()?.auth;
-      if (authConfig) {
-        const hasPermission = await loadHasPermission();
-        if (hasPermission) {
-          const userPermissions = request.requestContext.get('mastra__userPermissions') as string[] | undefined;
-          const permissionError = this.checkRoutePermission(route, userPermissions, hasPermission);
-
-          if (permissionError) {
-            return reply.status(permissionError.status).send({
-              error: permissionError.error,
-              message: permissionError.message,
-            });
-          }
-        }
-      }
-
-      // Check FGA authorization (EE feature)
-      const fgaError = await checkRouteFGA(this.mastra, route, request.requestContext, {
-        ...params.urlParams,
-        ...params.queryParams,
-        ...(typeof params.body === 'object' ? params.body : {}),
-      });
-      if (fgaError) {
-        return reply.status(fgaError.status).send({ error: fgaError.error, message: fgaError.message });
+      // Check route permission (RBAC) and FGA authorization (EE features)
+      const authzError = await this.authorizeRoute(
+        route,
+        {
+          ...params.urlParams,
+          ...params.queryParams,
+          ...(typeof params.body === 'object' ? params.body : {}),
+        },
+        request.requestContext,
+      );
+      if (authzError) {
+        return reply.status(authzError.status).send({ error: authzError.error, message: authzError.message });
       }
 
       try {
         const result = await route.handler(handlerParams);
         await this.sendResponse(route, reply, result, request, prefix);
       } catch (error) {
-        this.mastra.getLogger()?.error('Error calling handler', {
-          error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
-          path: route.path,
-          method: route.method,
-        });
-        // Check if it's an HTTPException or MastraError with a status code
-        let status = 500;
-        if (error && typeof error === 'object') {
-          // Check for direct status property (HTTPException)
-          if ('status' in error) {
-            status = (error as any).status;
-          }
-          // Check for MastraError with status in details
-          else if (
-            'details' in error &&
-            error.details &&
-            typeof error.details === 'object' &&
-            'status' in error.details
-          ) {
-            status = (error.details as any).status;
-          }
+        const httpStatus =
+          error && typeof error === 'object' ? ((error as any).status ?? (error as any).details?.status) : undefined;
+        const isClientError = typeof httpStatus === 'number' && httpStatus >= 400 && httpStatus < 500;
+        if (!isClientError) {
+          // 501 means an optional capability isn't provided by the configured storage or core: expected, not a server fault.
+          const logLevel = httpStatus === 501 ? 'warn' : 'error';
+          this.mastra.getLogger()?.[logLevel]('Error calling handler', {
+            error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
+            path: route.path,
+            method: route.method,
+          });
         }
-        await reply.status(status).send({ error: error instanceof Error ? error.message : 'Unknown error' });
+        const customResponse = getCustomHTTPExceptionResponse(error);
+        if (customResponse) {
+          customResponse.headers.forEach((value, name) => reply.header(name, value));
+          await reply.status(customResponse.status).send(Buffer.from(await customResponse.arrayBuffer()));
+          return;
+        }
+
+        const { status, body } = getHTTPErrorResponse(error);
+        await reply.status(status).send(body);
       }
     };
 
     // Add body limit if configured
-    const shouldApplyBodyLimit = this.bodyLimitOptions && ['POST', 'PUT', 'PATCH'].includes(route.method.toUpperCase());
+    const isBodyMethod = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(route.method.toUpperCase());
     const maxSize = route.maxBodySize ?? this.bodyLimitOptions?.maxSize;
 
-    const config = shouldApplyBodyLimit && maxSize ? { bodyLimit: maxSize } : undefined;
+    // Fastify enforces body size limits via the route-level `bodyLimit` option,
+    // not `config` (which is arbitrary metadata exposed as request.routeOptions.config
+    // and is never read by Fastify's body-parsing pipeline).
+    const bodyLimit = isBodyMethod ? maxSize : undefined;
+    const bodyLimitErrorHandler =
+      route.maxBodySize !== undefined
+        ? (error: Error & { code?: string }, _request: FastifyRequest, reply: FastifyReply) => {
+            if (error.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
+              return reply.status(413).send({ error: 'Request body too large' });
+            }
+            throw error;
+          }
+        : undefined;
 
     // Handle ALL method by registering for each HTTP method
     // Fastify doesn't support 'ALL' method natively like Express
@@ -698,7 +724,8 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
             method,
             url: fastifyPath,
             handler,
-            config,
+            bodyLimit,
+            errorHandler: bodyLimitErrorHandler,
           });
         } catch (err) {
           // Skip duplicate route errors - can happen if route is registered multiple times
@@ -713,38 +740,41 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         method: route.method as 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH',
         url: fastifyPath,
         handler,
-        config,
+        bodyLimit,
+        errorHandler: bodyLimitErrorHandler,
       });
     }
   }
 
   async registerCustomApiRoutes(): Promise<void> {
-    if (!(await this.buildCustomRouteHandler())) return;
-
-    const routes = this.customApiRoutes ?? this.mastra.getServer()?.apiRoutes ?? [];
+    const routes = await this.registerSchemaApiRoutes();
+    if (!(await this.buildCustomRouteHandler(routes))) return;
 
     for (const route of routes) {
-      // Create pseudo ServerRoute for auth checking
-      const serverRoute: ServerRoute = {
-        method: route.method as any,
-        path: route.path,
-        responseType: 'json',
-        handler: async () => {},
-        requiresAuth: route.requiresAuth,
-        requiresPermission: route.requiresPermission,
-        fga: route.fga,
-      };
-
       const fastifyHandler: RouteHandlerMethod = async (request: FastifyRequest, reply: FastifyReply) => {
+        // Fastify prefers static paths, but the custom-route app may dispatch the request
+        // to a different route. Check auth against the route that will actually run for
+        // the URL it's forwarded.
+        const requestPath = String(request.url.split('?')[0] || '/');
+        const requestMethod = String(request.method || 'GET');
+        const dispatchUrl = `http://${request.headers.host}${request.url}`;
+        const { match, serverRoute, customRouteAuthConfig } = this.resolveCustomRouteAuth(
+          dispatchUrl,
+          requestMethod,
+          requestPath,
+          route,
+        );
+
         // Per-route auth check (same pattern as registerRoute)
         const authError = await this.checkRouteAuth(serverRoute, {
-          path: String(request.url.split('?')[0] || '/'),
-          method: String(request.method || 'GET'),
+          path: requestPath,
+          method: requestMethod,
           getHeader: name => request.headers[name.toLowerCase()] as string | undefined,
           getQuery: name => (request.query as Record<string, string>)[name],
           requestContext: request.requestContext,
           request: toWebRequest(request),
           buildAuthorizeContext: () => toWebRequest(request),
+          customRouteAuthConfig,
         });
 
         if (authError) {
@@ -758,43 +788,32 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           }
         }
 
-        const authConfig = this.mastra.getServer()?.auth;
-        if (authConfig) {
-          let hasPermission: ((userPerms: string[], required: string) => boolean) | undefined;
-          try {
-            ({ hasPermission } = await import('@mastra/core/auth/ee'));
-          } catch {
-            console.error(
-              '[@mastra/fastify] Auth features require @mastra/core >= 1.6.0. Please upgrade: npm install @mastra/core@latest',
-            );
-          }
-
-          if (hasPermission) {
-            const userPermissions = request.requestContext.get('mastra__userPermissions') as string[] | undefined;
-            const permissionError = this.checkRoutePermission(serverRoute, userPermissions, hasPermission);
-            if (permissionError) {
-              return reply.status(permissionError.status).send({
-                error: permissionError.error,
-                message: permissionError.message,
-              });
-            }
-          }
+        const requestContext = request.requestContext;
+        const permissionError = this.checkRouteRBAC(serverRoute, requestContext);
+        if (permissionError) {
+          return reply.status(permissionError.status).send({
+            error: permissionError.error,
+            message: permissionError.message,
+          });
         }
 
         // Check FGA authorization (EE feature)
-        const fgaError = await checkRouteFGA(this.mastra, serverRoute, request.requestContext, {
-          ...(request.params as Record<string, string>),
+        // Path params last: the custom handler reads them from the URL, so query/body
+        // values must not be able to change which resource FGA checks.
+        const fgaError = await checkRouteFGA(this.mastra, serverRoute, requestContext, {
           ...(request.query as Record<string, string>),
           ...(typeof request.body === 'object' && request.body !== null
             ? (request.body as Record<string, unknown>)
             : {}),
+          // Use the dispatched route's params; Fastify's may belong to a different route.
+          ...(match ? match.params : (request.params as Record<string, string>)),
         });
         if (fgaError) {
           return reply.status(fgaError.status).send({ error: fgaError.error, message: fgaError.message });
         }
 
         const response = await this.handleCustomRouteRequest(
-          `http://${request.headers.host}${request.url}`,
+          dispatchUrl,
           request.method,
           request.headers as Record<string, string | string[] | undefined>,
           request.body,
@@ -804,6 +823,30 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         if (!response) {
           reply.status(404).send({ error: 'Not Found' });
           return;
+        }
+        // Merge headers set by Fastify hooks/plugins (e.g. @fastify/cors) into
+        // the Fetch Response before hijacking. Otherwise writeCustomRouteResponse's
+        // nodeRes.writeHead() overwrites them with only the response.headers set
+        // by the custom route handler. Route-set headers win on conflict, except
+        // for set-cookie which is always appended so plugin cookies survive
+        // alongside handler cookies (distinct cookies, not a collision).
+        // Skip framing headers (RFC 7230) — writeCustomRouteResponse /
+        // Node's writeHead owns content-length and transfer-encoding.
+        const existingHeaders = reply.getHeaders();
+        for (const [key, value] of Object.entries(existingHeaders)) {
+          if (value === undefined) continue;
+          const lowerKey = key.toLowerCase();
+          if (lowerKey === 'content-length' || lowerKey === 'transfer-encoding') continue;
+          const isSetCookie = lowerKey === 'set-cookie';
+          if (!isSetCookie && response.headers.has(key)) continue;
+          if (Array.isArray(value)) {
+            for (const item of value) response.headers.append(key, String(item));
+          } else if (isSetCookie) {
+            // set-cookie must always append so plugin cookies coexist with handler cookies.
+            response.headers.append(key, String(value));
+          } else {
+            response.headers.set(key, String(value));
+          }
         }
         reply.hijack();
         await this.writeCustomRouteResponse(response, reply.raw, request.abortSignal);
@@ -851,6 +894,11 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
     });
 
     this.app.addHook('preHandler', this.createContextMiddleware());
+
+    this.app.addHook('onResponse', async (request, reply) => {
+      const path = request.url.split('?')[0]!;
+      this.warnIfUnregisteredChannelWebhook(path, request.method, reply.statusCode);
+    });
   }
 
   registerAuthMiddleware(): void {

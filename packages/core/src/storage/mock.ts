@@ -7,36 +7,45 @@ import { InMemoryChannelsStorage } from './domains/channels/inmemory';
 import { DatasetsInMemory } from './domains/datasets/inmemory';
 import { ExperimentsInMemory } from './domains/experiments/inmemory';
 import { InMemoryFavoritesStorage } from './domains/favorites/inmemory';
+import { InMemoryHarness } from './domains/harness/inmemory';
 import { InMemoryDB } from './domains/inmemory-db';
+import { InMemoryKnowledgeStorage } from './domains/knowledge/inmemory';
 import { InMemoryMCPClientsStorage } from './domains/mcp-clients/inmemory';
 import { InMemoryMCPServersStorage } from './domains/mcp-servers/inmemory';
 import { InMemoryMemory } from './domains/memory/inmemory';
+import { InMemoryNotificationsStorage } from './domains/notifications';
 import { ObservabilityInMemory } from './domains/observability/inmemory';
 import { InMemoryPromptBlocksStorage } from './domains/prompt-blocks/inmemory';
 import { InMemorySchedulesStorage } from './domains/schedules/inmemory';
 import { InMemoryScorerDefinitionsStorage } from './domains/scorer-definitions/inmemory';
 import { ScoresInMemory } from './domains/scores/inmemory';
 import { InMemorySkillsStorage } from './domains/skills/inmemory';
+import { InMemoryThreadStateStorage } from './domains/thread-state/inmemory';
+import { InMemoryToolProviderConnectionsStorage } from './domains/tool-provider-connections/inmemory';
+import { InMemoryWorkflowDefinitionsStorage } from './domains/workflow-definitions/inmemory';
 import { WorkflowsInMemory } from './domains/workflows/inmemory';
 import { InMemoryWorkspacesStorage } from './domains/workspaces/inmemory';
 /**
- * In-memory storage implementation for testing and development.
- *
- * All data is stored in memory and will be lost when the process ends.
- * Access domain-specific storage via `getStore()`:
+ * Provides in-memory storage for testing and development.
+ * Data is lost when the process ends. Access individual storage domains with `getStore()`.
  *
  * @example
  * ```typescript
- * const storage = new InMemoryStore();
+ * import { Mastra } from '@mastra/core/mastra';
+ * import { InMemoryStore } from '@mastra/core/storage';
  *
- * // Access memory domain
- * const memory = await storage.getStore('memory');
- * await memory?.saveThread({ thread });
- *
- * // Access workflows domain
- * const workflows = await storage.getStore('workflows');
- * await workflows?.persistWorkflowSnapshot({ workflowName, runId, snapshot });
+ * const mastra = new Mastra({
+ *   storage: new InMemoryStore(),
+ * });
  * ```
+ *
+ * @see For documentation bundled with your installed package, locate
+ * `@mastra/core/package.json` with your project's resolver or package-manager
+ * tooling, then read `dist/docs/SKILL.md` from that package root and follow its
+ * reference links. Use package-manager tools for virtual or archived packages.
+ *
+ * @see [Storage documentation](https://mastra.ai/docs/storage)
+ * if packaged docs are unavailable.
  */
 export class InMemoryStore extends MastraCompositeStore {
   stores: StorageDomains;
@@ -59,11 +68,14 @@ export class InMemoryStore extends MastraCompositeStore {
     // Create all domain instances with the shared db
     this.stores = {
       memory: new InMemoryMemory({ db: this.#db }),
+      knowledge: new InMemoryKnowledgeStorage({ db: this.#db }),
       workflows: new WorkflowsInMemory({ db: this.#db }),
+      workflowDefinitions: new InMemoryWorkflowDefinitionsStorage({ db: this.#db }),
       scores: new ScoresInMemory({ db: this.#db }),
       observability: new ObservabilityInMemory({ db: this.#db }),
       agents: new InMemoryAgentsStorage({ db: this.#db }),
       channels: new InMemoryChannelsStorage(),
+      notifications: new InMemoryNotificationsStorage(),
       datasets: new DatasetsInMemory({ db: this.#db }),
       experiments: new ExperimentsInMemory({ db: this.#db }),
       promptBlocks: new InMemoryPromptBlocksStorage({ db: this.#db }),
@@ -76,6 +88,9 @@ export class InMemoryStore extends MastraCompositeStore {
       blobs: new InMemoryBlobStore(),
       backgroundTasks: new BackgroundTasksInMemory({ db: this.#db }),
       schedules: new InMemorySchedulesStorage({ db: this.#db }),
+      harness: new InMemoryHarness(),
+      toolProviderConnections: new InMemoryToolProviderConnectionsStorage({ db: this.#db }),
+      threadState: new InMemoryThreadStateStorage(),
     };
   }
 
@@ -86,8 +101,10 @@ export class InMemoryStore extends MastraCompositeStore {
    */
   clear(): void {
     this.#db.clear();
-    // InMemoryChannelsStorage doesn't share the InMemoryDB
+    // These domains don't share the InMemoryDB
     void this.stores.channels?.dangerouslyClearAll?.();
+    void this.stores.harness?.dangerouslyClearAll?.();
+    void this.stores.notifications?.dangerouslyClearAll?.();
   }
 }
 

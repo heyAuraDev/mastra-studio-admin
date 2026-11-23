@@ -1,15 +1,24 @@
+import { Agent, AGENT_SCHEDULE_PREFIX } from '@mastra/core/agent';
 import { Mastra } from '@mastra/core/mastra';
+import { RequestContext } from '@mastra/core/request-context';
 import type { Schedule, ScheduleTrigger } from '@mastra/core/storage';
 import { MockStore } from '@mastra/core/storage';
 import type { WorkflowRunState } from '@mastra/core/workflows';
+import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { describe, it, expect, beforeEach } from 'vitest';
+import { z } from 'zod';
+import { MASTRA_RESOURCE_ID_KEY, MASTRA_USER_KEY, MASTRA_USER_PERMISSIONS_KEY } from '../constants';
 import { HTTPException } from '../http-exception';
 import {
+  CREATE_SCHEDULE_ROUTE,
+  DELETE_SCHEDULE_ROUTE,
   GET_SCHEDULE_ROUTE,
   LIST_SCHEDULES_ROUTE,
   LIST_SCHEDULE_TRIGGERS_ROUTE,
   PAUSE_SCHEDULE_ROUTE,
   RESUME_SCHEDULE_ROUTE,
+  RUN_SCHEDULE_ROUTE,
+  UPDATE_SCHEDULE_ROUTE,
 } from './schedules';
 
 const makeSnapshot = (overrides: Partial<WorkflowRunState> = {}): WorkflowRunState => ({
@@ -28,13 +37,33 @@ const makeSnapshot = (overrides: Partial<WorkflowRunState> = {}): WorkflowRunSta
 });
 
 const baseCtx = () => ({
-  requestContext: {} as any,
+  requestContext: new RequestContext(),
   abortSignal: new AbortController().signal,
 });
 
-const makeSchedule = (overrides: Partial<Schedule> = {}): Schedule => ({
+const makeWorkflowSchedule = (overrides: Partial<Schedule> = {}): Schedule => ({
   id: overrides.id ?? 'wf_test',
   target: { type: 'workflow', workflowId: 'test' },
+  cron: '0 * * * *',
+  status: 'active',
+  nextFireAt: 1_000_000,
+  createdAt: 100,
+  updatedAt: 100,
+  ...overrides,
+});
+
+const makeAgentSchedule = (overrides: Partial<Schedule> = {}): Schedule => ({
+  id: overrides.id ?? `${AGENT_SCHEDULE_PREFIX}agent-1_thread-1`,
+  ownerType: 'agent',
+  ownerId: 'agent-1',
+  target: {
+    type: 'agent',
+    agentId: 'agent-1',
+    threadId: 'thread-1',
+    resourceId: 'resource-1',
+    prompt: 'Check in',
+    ...((overrides.target as any) ?? {}),
+  },
   cron: '0 * * * *',
   status: 'active',
   nextFireAt: 1_000_000,
@@ -59,7 +88,31 @@ describe('Schedules handlers', () => {
 
   beforeEach(async () => {
     storage = new MockStore();
-    mastra = new Mastra({ logger: false, storage });
+    const agent = new Agent({
+      id: 'agent-1',
+      name: 'agent-1',
+      instructions: 'test',
+      model: {} as any,
+    });
+    const step = createStep({
+      id: 'noop',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      execute: async () => ({}),
+    });
+    const workflow = createWorkflow({
+      id: 'test',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(step)
+      .commit();
+    mastra = new Mastra({
+      logger: false,
+      storage,
+      agents: { 'agent-1': agent },
+      workflows: { test: workflow },
+    });
   });
 
   describe('LIST_SCHEDULES_ROUTE', () => {
@@ -72,10 +125,10 @@ describe('Schedules handlers', () => {
       expect(result).toEqual({ schedules: [] });
     });
 
-    it('returns schedules after they are created in storage', async () => {
+    it('returns both agent and workflow schedules', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_a' }));
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_b', target: { type: 'workflow', workflowId: 'b' } }));
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a' }));
+      await schedulesStore.createSchedule(makeAgentSchedule());
 
       const result = await LIST_SCHEDULES_ROUTE.handler({
         mastra,
@@ -83,13 +136,19 @@ describe('Schedules handlers', () => {
       } as any);
 
       expect(result.schedules.length).toBe(2);
-      expect(result.schedules.map(s => s.id).sort()).toEqual(['wf_a', 'wf_b']);
+      const agentSchedule = result.schedules.find(s => s.agentId !== undefined)!;
+      const workflowSchedule = result.schedules.find(s => s.workflowId !== undefined)!;
+      expect(agentSchedule.agentId).toBe('agent-1');
+      expect(workflowSchedule.workflowId).toBe('test');
     });
 
-    it('filters by workflowId', async () => {
+    it('filters by workflowId and excludes agent schedules', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_a' }));
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_b', target: { type: 'workflow', workflowId: 'b' } }));
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a' }));
+      await schedulesStore.createSchedule(
+        makeWorkflowSchedule({ id: 'wf_b', target: { type: 'workflow', workflowId: 'b' } }),
+      );
+      await schedulesStore.createSchedule(makeAgentSchedule());
 
       const result = await LIST_SCHEDULES_ROUTE.handler({
         mastra,
@@ -101,10 +160,32 @@ describe('Schedules handlers', () => {
       expect(result.schedules[0].id).toBe('wf_b');
     });
 
+    it('filters by agentId and excludes workflow schedules', async () => {
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a', ownerType: 'agent', ownerId: 'agent-1' }));
+      await schedulesStore.createSchedule(makeAgentSchedule());
+      await schedulesStore.createSchedule(
+        makeAgentSchedule({
+          id: `${AGENT_SCHEDULE_PREFIX}agent-2_t`,
+          ownerId: 'agent-2',
+          target: { type: 'agent', agentId: 'agent-2', prompt: 'Hi' },
+        }),
+      );
+
+      const result = await LIST_SCHEDULES_ROUTE.handler({
+        mastra,
+        agentId: 'agent-1',
+        ...baseCtx(),
+      } as any);
+
+      expect(result.schedules.length).toBe(1);
+      expect(result.schedules[0].agentId).toBe('agent-1');
+    });
+
     it('filters by status', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_a', status: 'active' }));
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_b', status: 'paused' }));
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a', status: 'active' }));
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_b', status: 'paused' }));
 
       const result = await LIST_SCHEDULES_ROUTE.handler({
         mastra,
@@ -116,6 +197,25 @@ describe('Schedules handlers', () => {
       expect(result.schedules[0].id).toBe('wf_b');
     });
 
+    it('surfaces legacy heartbeat rows as agent schedules via the read-shim', async () => {
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      await schedulesStore.createSchedule(
+        makeAgentSchedule({
+          id: 'hb_legacy',
+          target: { type: 'heartbeat', agentId: 'agent-1', prompt: 'Legacy' } as any,
+        }),
+      );
+
+      const result = await LIST_SCHEDULES_ROUTE.handler({
+        mastra,
+        ...baseCtx(),
+      } as any);
+
+      expect(result.schedules.length).toBe(1);
+      expect(result.schedules[0].id).toBe('hb_legacy');
+      expect(result.schedules[0].agentId).toBe('agent-1');
+    });
+
     it('returns empty list when schedules domain is unavailable', async () => {
       const mastraNoStorage = new Mastra({ logger: false });
       const result = await LIST_SCHEDULES_ROUTE.handler({
@@ -125,23 +225,12 @@ describe('Schedules handlers', () => {
 
       expect(result).toEqual({ schedules: [] });
     });
-
-    it('rejects ownerId without ownerType via query schema', () => {
-      const schema = LIST_SCHEDULES_ROUTE.queryParamSchema!;
-      expect(schema.safeParse({ ownerId: 'agent_1' }).success).toBe(false);
-    });
-
-    it('accepts ownerType with optional ownerId via query schema', () => {
-      const schema = LIST_SCHEDULES_ROUTE.queryParamSchema!;
-      expect(schema.safeParse({ ownerType: 'agent' }).success).toBe(true);
-      expect(schema.safeParse({ ownerType: 'agent', ownerId: 'agent_1' }).success).toBe(true);
-    });
   });
 
   describe('GET_SCHEDULE_ROUTE', () => {
-    it('returns the schedule when it exists', async () => {
+    it('returns a workflow schedule when it exists', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_a' }));
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a' }));
 
       const result = await GET_SCHEDULE_ROUTE.handler({
         mastra,
@@ -150,6 +239,24 @@ describe('Schedules handlers', () => {
       } as any);
 
       expect(result.id).toBe('wf_a');
+      expect(result.workflowId).toBe('test');
+    });
+
+    it('returns an agent schedule with flattened target fields', async () => {
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      const schedule = makeAgentSchedule();
+      await schedulesStore.createSchedule(schedule);
+
+      const result = await GET_SCHEDULE_ROUTE.handler({
+        mastra,
+        scheduleId: schedule.id,
+        ...baseCtx(),
+      } as any);
+
+      expect(result.id).toBe(schedule.id);
+      expect(result.agentId).toBe('agent-1');
+      expect(result.threadId).toBe('thread-1');
+      expect(result.prompt).toBe('Check in');
     });
 
     it('throws 404 when the schedule does not exist', async () => {
@@ -174,10 +281,408 @@ describe('Schedules handlers', () => {
     });
   });
 
+  describe('CREATE_SCHEDULE_ROUTE', () => {
+    it('creates an agent schedule when agentId is provided', async () => {
+      const result = await CREATE_SCHEDULE_ROUTE.handler({
+        mastra,
+        agentId: 'agent-1',
+        cron: '0 * * * *',
+        prompt: 'Hello',
+        threadId: 'thread-2',
+        resourceId: 'resource-2',
+        ...baseCtx(),
+      } as any);
+
+      expect(result.agentId).toBe('agent-1');
+      expect((result as any).threadId).toBe('thread-2');
+      expect((result as any).prompt).toBe('Hello');
+
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      const created = await schedulesStore.getSchedule(result.id);
+      expect(created).toBeDefined();
+      expect(created!.ownerId).toBe('agent-1');
+      expect(created!.target.type).toBe('agent');
+    });
+
+    it('creates a workflow schedule when workflowId is provided', async () => {
+      const result = await CREATE_SCHEDULE_ROUTE.handler({
+        mastra,
+        workflowId: 'test',
+        cron: '0 * * * *',
+        inputData: { foo: 'bar' },
+        ...baseCtx(),
+      } as any);
+
+      expect(result.workflowId).toBe('test');
+      expect(result.id).not.toMatch(/^wf_/);
+
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      const created = await schedulesStore.getSchedule(result.id);
+      expect(created).toBeDefined();
+      expect(created!.target.type).toBe('workflow');
+    });
+
+    it('creates a one-off workflow schedule from runAt', async () => {
+      const runAt = Date.now() + 60_000;
+      const result = await CREATE_SCHEDULE_ROUTE.handler({
+        mastra,
+        workflowId: 'test',
+        runAt,
+        ...baseCtx(),
+      } as any);
+
+      expect((result as any).runAt).toBe(runAt);
+      expect((result as any).cron).toBeUndefined();
+      expect(result.nextFireAt).toBe(runAt);
+    });
+
+    it('creates a bounded cron agent schedule with endAt', async () => {
+      const endAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+      const result = await CREATE_SCHEDULE_ROUTE.handler({
+        mastra,
+        agentId: 'agent-1',
+        cron: '0 * * * *',
+        endAt,
+        prompt: 'Hello',
+        threadId: 'thread-3',
+        resourceId: 'resource-3',
+        ...baseCtx(),
+      } as any);
+
+      expect((result as any).endAt).toBe(endAt);
+      expect(result.status).toBe('active');
+    });
+
+    it('body schema requires exactly one of cron or runAt', () => {
+      const schema = CREATE_SCHEDULE_ROUTE.bodySchema!;
+      expect(schema.safeParse({ workflowId: 'test' }).success).toBe(false);
+      expect(schema.safeParse({ workflowId: 'test', cron: '* * * * *', runAt: 1 }).success).toBe(false);
+      expect(schema.safeParse({ workflowId: 'test', runAt: 1, endAt: 2 }).success).toBe(false);
+      expect(schema.safeParse({ workflowId: 'test', runAt: 1 }).success).toBe(true);
+      expect(schema.safeParse({ workflowId: 'test', cron: '* * * * *', endAt: 2 }).success).toBe(true);
+    });
+
+    it('persists resourceId on a workflow schedule for run attribution', async () => {
+      const result = await CREATE_SCHEDULE_ROUTE.handler({
+        mastra,
+        workflowId: 'test',
+        cron: '0 * * * *',
+        resourceId: 'tenant-1',
+        ...baseCtx(),
+      } as any);
+
+      expect((result as { resourceId?: string }).resourceId).toBe('tenant-1');
+
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      const created = await schedulesStore.getSchedule(result.id);
+      expect((created!.target as { resourceId?: string }).resourceId).toBe('tenant-1');
+    });
+
+    it('404s when the agent does not exist', async () => {
+      await expect(
+        CREATE_SCHEDULE_ROUTE.handler({
+          mastra,
+          agentId: 'unknown-agent',
+          cron: '0 * * * *',
+          prompt: 'Hello',
+          ...baseCtx(),
+        } as any),
+      ).rejects.toThrow(HTTPException);
+    });
+
+    it('404s when the workflow does not exist', async () => {
+      await expect(
+        CREATE_SCHEDULE_ROUTE.handler({
+          mastra,
+          workflowId: 'unknown-workflow',
+          cron: '0 * * * *',
+          ...baseCtx(),
+        } as any),
+      ).rejects.toThrow(HTTPException);
+    });
+
+    it('404s when the workflow is a hidden internal workflow', async () => {
+      expect(mastra.getWorkflowById('__mastra_notification_dispatcher')).toBeDefined();
+      await expect(
+        CREATE_SCHEDULE_ROUTE.handler({
+          mastra,
+          workflowId: '__mastra_notification_dispatcher',
+          cron: '0 * * * *',
+          ...baseCtx(),
+        } as any),
+      ).rejects.toMatchObject({ status: 404 });
+    });
+
+    it('404s when a public workflow shares its id with a hidden internal workflow', async () => {
+      const step = createStep({
+        id: 'noop',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        execute: async () => ({}),
+      });
+      const colliding = createWorkflow({
+        id: '__mastra_notification_dispatcher',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      })
+        .then(step)
+        .commit();
+      const collidingMastra = new Mastra({
+        logger: false,
+        storage,
+        workflows: { colliding },
+      });
+      expect(collidingMastra.getWorkflowById('__mastra_notification_dispatcher')).not.toBe(colliding);
+
+      await expect(
+        CREATE_SCHEDULE_ROUTE.handler({
+          mastra: collidingMastra,
+          workflowId: '__mastra_notification_dispatcher',
+          cron: '0 * * * *',
+          ...baseCtx(),
+        } as any),
+      ).rejects.toMatchObject({ status: 404 });
+    });
+
+    it('404s for workflow ids that only match inherited object properties', async () => {
+      await expect(
+        CREATE_SCHEDULE_ROUTE.handler({
+          mastra,
+          workflowId: 'toString',
+          cron: '0 * * * *',
+          ...baseCtx(),
+        } as any),
+      ).rejects.toMatchObject({ status: 404 });
+    });
+
+    it('rejects ambiguous bodies carrying both agentId and workflowId', () => {
+      const result = CREATE_SCHEDULE_ROUTE.bodySchema!.safeParse({
+        agentId: 'agent-1',
+        workflowId: 'test',
+        cron: '0 * * * *',
+        prompt: 'Hello',
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects empty-string target ids', () => {
+      expect(
+        CREATE_SCHEDULE_ROUTE.bodySchema!.safeParse({ agentId: '', cron: '0 * * * *', prompt: 'Hi' }).success,
+      ).toBe(false);
+      expect(CREATE_SCHEDULE_ROUTE.bodySchema!.safeParse({ workflowId: '', cron: '0 * * * *' }).success).toBe(false);
+    });
+
+    it('rejects unknown keys on the create body', () => {
+      const result = CREATE_SCHEDULE_ROUTE.bodySchema!.safeParse({
+        agentId: 'agent-1',
+        cron: '0 * * * *',
+        prompt: 'Hello',
+        bogus: true,
+      });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe('UPDATE_SCHEDULE_ROUTE', () => {
+    it('updates an agent schedule prompt without touching cron/nextFireAt', async () => {
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      const schedule = makeAgentSchedule();
+      await schedulesStore.createSchedule(schedule);
+
+      const result = await UPDATE_SCHEDULE_ROUTE.handler({
+        mastra,
+        scheduleId: schedule.id,
+        prompt: 'New prompt',
+        ...baseCtx(),
+      } as any);
+
+      expect((result as any).prompt).toBe('New prompt');
+      expect(result.cron).toBe(schedule.cron);
+      expect(result.nextFireAt).toBe(schedule.nextFireAt);
+    });
+
+    it('updates cron and recomputes nextFireAt', async () => {
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      const schedule = makeAgentSchedule();
+      await schedulesStore.createSchedule(schedule);
+
+      const result = await UPDATE_SCHEDULE_ROUTE.handler({
+        mastra,
+        scheduleId: schedule.id,
+        cron: '*/5 * * * *',
+        ...baseCtx(),
+      } as any);
+
+      expect(result.cron).toBe('*/5 * * * *');
+      expect(result.nextFireAt).toBeGreaterThan(schedule.nextFireAt);
+    });
+
+    it('updates workflow schedule inputData', async () => {
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a' }));
+
+      const result = await UPDATE_SCHEDULE_ROUTE.handler({
+        mastra,
+        scheduleId: 'wf_a',
+        inputData: { hello: 'world' },
+        ...baseCtx(),
+      } as any);
+
+      expect((result as any).inputData).toEqual({ hello: 'world' });
+    });
+
+    it('updates workflow schedule resourceId', async () => {
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      await schedulesStore.createSchedule(
+        makeWorkflowSchedule({ id: 'wf_a', target: { type: 'workflow', workflowId: 'test', resourceId: 'tenant-1' } }),
+      );
+
+      const result = await UPDATE_SCHEDULE_ROUTE.handler({
+        mastra,
+        scheduleId: 'wf_a',
+        resourceId: 'tenant-2',
+        ...baseCtx(),
+      } as any);
+
+      expect((result as { resourceId?: string }).resourceId).toBe('tenant-2');
+
+      const persisted = await schedulesStore.getSchedule('wf_a');
+      expect((persisted!.target as { resourceId?: string }).resourceId).toBe('tenant-2');
+    });
+
+    it('rejects invalid cron', async () => {
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      const schedule = makeAgentSchedule();
+      await schedulesStore.createSchedule(schedule);
+
+      await expect(
+        UPDATE_SCHEDULE_ROUTE.handler({
+          mastra,
+          scheduleId: schedule.id,
+          cron: 'not-a-cron',
+          ...baseCtx(),
+        } as any),
+      ).rejects.toThrow();
+    });
+
+    it('404s when the schedule does not exist', async () => {
+      await expect(
+        UPDATE_SCHEDULE_ROUTE.handler({
+          mastra,
+          scheduleId: 'missing',
+          prompt: 'nope',
+          ...baseCtx(),
+        } as any),
+      ).rejects.toThrow(HTTPException);
+    });
+  });
+
+  describe('ifIdle.requireClaimedOwner round-trip', () => {
+    // Mirrors the adapter: bodies are parsed through the route's bodySchema
+    // before the handler sees them, and clients read the responseSchema shape.
+    const callWithBody = async (route: any, body: Record<string, unknown>, params: Record<string, unknown> = {}) => {
+      const parsedBody = await route.bodySchema.parseAsync(body);
+      const result = await route.handler({ mastra, ...params, ...parsedBody, ...baseCtx() });
+      return route.responseSchema.parse(result);
+    };
+
+    it('keeps the flag through create, read, and PATCH', async () => {
+      const created = await callWithBody(CREATE_SCHEDULE_ROUTE, {
+        agentId: 'agent-1',
+        cron: '0 * * * *',
+        prompt: 'Check in',
+        threadId: 'thread-owned',
+        resourceId: 'resource-1',
+        ifIdle: { behavior: 'wake', requireClaimedOwner: true },
+      });
+      expect(created.ifIdle).toEqual({ behavior: 'wake', requireClaimedOwner: true });
+
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      const stored = await schedulesStore.getSchedule(created.id);
+      expect((stored!.target as any).ifIdle).toEqual({ behavior: 'wake', requireClaimedOwner: true });
+
+      const read: any = GET_SCHEDULE_ROUTE.responseSchema!.parse(
+        await GET_SCHEDULE_ROUTE.handler({ mastra, scheduleId: created.id, ...baseCtx() } as any),
+      );
+      expect(read.ifIdle).toEqual({ behavior: 'wake', requireClaimedOwner: true });
+
+      // PATCH another field only.
+      const renamed = await callWithBody(UPDATE_SCHEDULE_ROUTE, { name: 'renamed' }, { scheduleId: created.id });
+      expect(renamed.ifIdle).toEqual({ behavior: 'wake', requireClaimedOwner: true });
+
+      // Read-modify-write: a client sends back the ifIdle it read alongside the change.
+      const rewritten = await callWithBody(
+        UPDATE_SCHEDULE_ROUTE,
+        { prompt: 'Check in again', ifIdle: read.ifIdle },
+        { scheduleId: created.id },
+      );
+      expect(rewritten.prompt).toBe('Check in again');
+      expect(rewritten.ifIdle).toEqual({ behavior: 'wake', requireClaimedOwner: true });
+
+      const finalStored = await schedulesStore.getSchedule(created.id);
+      expect((finalStored!.target as any).ifIdle).toEqual({ behavior: 'wake', requireClaimedOwner: true });
+    });
+  });
+
+  describe('DELETE_SCHEDULE_ROUTE', () => {
+    it('deletes the schedule and removes the row', async () => {
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      const schedule = makeAgentSchedule();
+      await schedulesStore.createSchedule(schedule);
+
+      const result = await DELETE_SCHEDULE_ROUTE.handler({
+        mastra,
+        scheduleId: schedule.id,
+        ...baseCtx(),
+      } as any);
+
+      expect(result).toEqual({ message: 'Schedule deleted' });
+      expect(await schedulesStore.getSchedule(schedule.id)).toBeFalsy();
+    });
+
+    it('404s when the schedule does not exist', async () => {
+      await expect(
+        DELETE_SCHEDULE_ROUTE.handler({
+          mastra,
+          scheduleId: 'missing',
+          ...baseCtx(),
+        } as any),
+      ).rejects.toThrow(HTTPException);
+    });
+  });
+
+  describe('RUN_SCHEDULE_ROUTE', () => {
+    it('fires an agent schedule manually and returns claim info', async () => {
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      const schedule = makeAgentSchedule();
+      await schedulesStore.createSchedule(schedule);
+
+      const result = await RUN_SCHEDULE_ROUTE.handler({
+        mastra,
+        scheduleId: schedule.id,
+        ...baseCtx(),
+      } as any);
+
+      expect(result.scheduleId).toBe(schedule.id);
+      expect(result.claimId).toBeTruthy();
+      expect(result.scheduledFireAt).toBeGreaterThan(0);
+    });
+
+    it('404s when the schedule does not exist', async () => {
+      await expect(
+        RUN_SCHEDULE_ROUTE.handler({
+          mastra,
+          scheduleId: 'missing',
+          ...baseCtx(),
+        } as any),
+      ).rejects.toThrow(HTTPException);
+    });
+  });
+
   describe('LIST_SCHEDULE_TRIGGERS_ROUTE', () => {
     it('returns triggers ordered by actualFireAt desc', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_a' }));
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a' }));
       await schedulesStore.recordTrigger(makeTrigger({ scheduleId: 'wf_a', runId: 'r1', actualFireAt: 1 }));
       await schedulesStore.recordTrigger(makeTrigger({ scheduleId: 'wf_a', runId: 'r2', actualFireAt: 2 }));
 
@@ -192,7 +697,7 @@ describe('Schedules handlers', () => {
 
     it('respects the limit parameter', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_a' }));
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a' }));
       await schedulesStore.recordTrigger(makeTrigger({ scheduleId: 'wf_a', runId: 'r1', actualFireAt: 1 }));
       await schedulesStore.recordTrigger(makeTrigger({ scheduleId: 'wf_a', runId: 'r2', actualFireAt: 2 }));
       await schedulesStore.recordTrigger(makeTrigger({ scheduleId: 'wf_a', runId: 'r3', actualFireAt: 3 }));
@@ -222,7 +727,7 @@ describe('Schedules handlers', () => {
     it('hydrates published triggers with run summary from workflows storage', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
       const workflowsStore = (await storage.getStore('workflows'))!;
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_a' }));
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a' }));
       await schedulesStore.recordTrigger(makeTrigger({ scheduleId: 'wf_a', runId: 'run-success', actualFireAt: 1 }));
       await schedulesStore.recordTrigger(makeTrigger({ scheduleId: 'wf_a', runId: 'run-failed', actualFireAt: 2 }));
       await workflowsStore.persistWorkflowSnapshot({
@@ -257,7 +762,7 @@ describe('Schedules handlers', () => {
 
     it('omits run summary for failed publish triggers', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_a' }));
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a' }));
       await schedulesStore.recordTrigger(
         makeTrigger({ scheduleId: 'wf_a', runId: 'run-x', outcome: 'failed', error: 'publish failed' }),
       );
@@ -274,12 +779,30 @@ describe('Schedules handlers', () => {
 
     it('tolerates missing run records', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_a' }));
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a' }));
       await schedulesStore.recordTrigger(makeTrigger({ scheduleId: 'wf_a', runId: 'run-missing' }));
 
       const result = await LIST_SCHEDULE_TRIGGERS_ROUTE.handler({
         mastra,
         scheduleId: 'wf_a',
+        ...baseCtx(),
+      } as any);
+
+      expect(result.triggers).toHaveLength(1);
+      expect(result.triggers[0].run).toBeUndefined();
+    });
+
+    it('skips workflow-run hydration for agent schedule triggers', async () => {
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      const schedule = makeAgentSchedule();
+      await schedulesStore.createSchedule(schedule);
+      await schedulesStore.recordTrigger(
+        makeTrigger({ scheduleId: schedule.id, runId: 'agent-run-1', outcome: 'succeeded' }),
+      );
+
+      const result = await LIST_SCHEDULE_TRIGGERS_ROUTE.handler({
+        mastra,
+        scheduleId: schedule.id,
         ...baseCtx(),
       } as any);
 
@@ -292,7 +815,7 @@ describe('Schedules handlers', () => {
     it('hydrates lastRun on list response when lastRunId points at a run', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
       const workflowsStore = (await storage.getStore('workflows'))!;
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_a', lastRunId: 'last-run' }));
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a', lastRunId: 'last-run' }));
       await workflowsStore.persistWorkflowSnapshot({
         workflowName: 'test',
         runId: 'last-run',
@@ -313,7 +836,7 @@ describe('Schedules handlers', () => {
     it('hydrates lastRun on get response', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
       const workflowsStore = (await storage.getStore('workflows'))!;
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_a', lastRunId: 'last-run' }));
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a', lastRunId: 'last-run' }));
       await workflowsStore.persistWorkflowSnapshot({
         workflowName: 'test',
         runId: 'last-run',
@@ -330,12 +853,27 @@ describe('Schedules handlers', () => {
 
       expect(result.lastRun?.status).toBe('failed');
     });
+
+    it('does not hydrate lastRun for agent schedules', async () => {
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      const schedule = makeAgentSchedule({ lastRunId: 'agent-run-1' });
+      await schedulesStore.createSchedule(schedule);
+
+      const result = await GET_SCHEDULE_ROUTE.handler({
+        mastra,
+        scheduleId: schedule.id,
+        ...baseCtx(),
+      } as any);
+
+      expect(result.lastRun).toBeUndefined();
+      expect(result.lastRunId).toBe('agent-run-1');
+    });
   });
 
   describe('PAUSE_SCHEDULE_ROUTE', () => {
     it('flips an active schedule to paused', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_a', status: 'active' }));
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a', status: 'active' }));
 
       const result = await PAUSE_SCHEDULE_ROUTE.handler({
         mastra,
@@ -350,7 +888,7 @@ describe('Schedules handlers', () => {
 
     it('is idempotent on an already-paused schedule', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_a', status: 'paused', updatedAt: 100 }));
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a', status: 'paused', updatedAt: 100 }));
 
       const result = await PAUSE_SCHEDULE_ROUTE.handler({
         mastra,
@@ -362,6 +900,21 @@ describe('Schedules handlers', () => {
       // updatedAt is unchanged because no write occurred.
       const persisted = await schedulesStore.getSchedule('wf_a');
       expect(persisted?.updatedAt).toBe(100);
+    });
+
+    it('pauses an agent schedule', async () => {
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      const schedule = makeAgentSchedule();
+      await schedulesStore.createSchedule(schedule);
+
+      const result = await PAUSE_SCHEDULE_ROUTE.handler({
+        mastra,
+        scheduleId: schedule.id,
+        ...baseCtx(),
+      } as any);
+
+      expect(result.status).toBe('paused');
+      expect(result.agentId).toBe('agent-1');
     });
 
     it('returns 404 for missing scheduleId', async () => {
@@ -376,7 +929,7 @@ describe('Schedules handlers', () => {
 
     it('after pause, listDueSchedules excludes the row even if nextFireAt <= now', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
-      await schedulesStore.createSchedule(makeSchedule({ id: 'wf_a', status: 'active', nextFireAt: 1 }));
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a', status: 'active', nextFireAt: 1 }));
 
       await PAUSE_SCHEDULE_ROUTE.handler({
         mastra,
@@ -393,17 +946,8 @@ describe('Schedules handlers', () => {
     it('flips a paused schedule to active and recomputes nextFireAt from now', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
       const oldNext = 1_000_000;
-      await schedulesStore.createSchedule(
-        makeSchedule({
-          id: 'wf_a',
-          status: 'paused',
-          // Cron that fires every minute — recomputed next must be > now and finite.
-          cron: '* * * * *',
-          nextFireAt: oldNext,
-        }),
-      );
+      await schedulesStore.createSchedule(makeWorkflowSchedule({ id: 'wf_a', status: 'paused', nextFireAt: oldNext }));
 
-      const before = Date.now();
       const result = await RESUME_SCHEDULE_ROUTE.handler({
         mastra,
         scheduleId: 'wf_a',
@@ -411,16 +955,13 @@ describe('Schedules handlers', () => {
       } as any);
 
       expect(result.status).toBe('active');
-      // Recomputed from "now" — must be in the future, not the stale value.
-      expect(result.nextFireAt).toBeGreaterThan(before);
-      expect(result.nextFireAt).not.toBe(oldNext);
+      expect(result.nextFireAt).toBeGreaterThan(oldNext);
     });
 
     it('is idempotent on an already-active schedule', async () => {
       const schedulesStore = (await storage.getStore('schedules'))!;
-      const oldNext = 1_000_000;
       await schedulesStore.createSchedule(
-        makeSchedule({ id: 'wf_a', status: 'active', nextFireAt: oldNext, updatedAt: 100 }),
+        makeWorkflowSchedule({ id: 'wf_a', status: 'active', nextFireAt: 1_000_000 }),
       );
 
       const result = await RESUME_SCHEDULE_ROUTE.handler({
@@ -430,10 +971,22 @@ describe('Schedules handlers', () => {
       } as any);
 
       expect(result.status).toBe('active');
-      // No-op: nextFireAt is not recomputed.
-      expect(result.nextFireAt).toBe(oldNext);
-      const persisted = await schedulesStore.getSchedule('wf_a');
-      expect(persisted?.updatedAt).toBe(100);
+      expect(result.nextFireAt).toBe(1_000_000);
+    });
+
+    it('resumes a paused agent schedule', async () => {
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      const schedule = makeAgentSchedule({ status: 'paused' });
+      await schedulesStore.createSchedule(schedule);
+
+      const result = await RESUME_SCHEDULE_ROUTE.handler({
+        mastra,
+        scheduleId: schedule.id,
+        ...baseCtx(),
+      } as any);
+
+      expect(result.status).toBe('active');
+      expect(result.nextFireAt).toBeGreaterThan(schedule.nextFireAt);
     });
 
     it('returns 404 for missing scheduleId', async () => {
@@ -444,6 +997,49 @@ describe('Schedules handlers', () => {
           ...baseCtx(),
         } as any),
       ).rejects.toThrow(HTTPException);
+    });
+  });
+
+  describe('schedules of a deleted agent', () => {
+    const caller = (id: string, permissions: string[]) => {
+      const ctx = new RequestContext();
+      ctx.set(MASTRA_USER_KEY, { id });
+      ctx.set(MASTRA_RESOURCE_ID_KEY, id);
+      ctx.set(MASTRA_USER_PERMISSIONS_KEY, permissions);
+      return ctx;
+    };
+    const visibleTo = async (requestContext: RequestContext) => {
+      const { schedules } = await LIST_SCHEDULES_ROUTE.handler({ mastra, requestContext } as any);
+      return schedules.map(s => s.id);
+    };
+
+    it('are hidden from signed-in users, but not from admins or setups without auth', async () => {
+      // The agent is neither registered nor stored any more, e.g. a stored agent that was deleted.
+      const id = `${AGENT_SCHEDULE_PREFIX}gone_thread-1`;
+      const schedulesStore = (await storage.getStore('schedules'))!;
+      await schedulesStore.createSchedule(
+        makeAgentSchedule({
+          id,
+          ownerId: 'gone',
+          target: { ...makeAgentSchedule().target, agentId: 'gone', prompt: 'secret prompt' } as Schedule['target'],
+        }),
+      );
+
+      const bob = caller('bob', ['schedules:read', 'schedules:write', 'schedules:execute']);
+      expect(await visibleTo(bob)).toEqual([]);
+      await expect(
+        GET_SCHEDULE_ROUTE.handler({ mastra, requestContext: bob, scheduleId: id } as any),
+      ).rejects.toMatchObject({
+        status: 404,
+      });
+      await expect(
+        RUN_SCHEDULE_ROUTE.handler({ mastra, requestContext: bob, scheduleId: id } as any),
+      ).rejects.toMatchObject({
+        status: 404,
+      });
+
+      expect(await visibleTo(caller('admin', ['*']))).toEqual([id]);
+      expect(await visibleTo(new RequestContext())).toEqual([id]);
     });
   });
 });

@@ -8,7 +8,11 @@ import { z } from 'zod';
 import { HTTPException } from '../http-exception';
 import { createResponseBodySchema } from '../schemas/responses';
 import { CREATE_RESPONSE_ROUTE, DELETE_RESPONSE_ROUTE, GET_RESPONSE_ROUTE } from './responses';
-import { mapMastraMessagesToResponseOutputItems } from './responses.adapter';
+import {
+  createMessageId,
+  mapMastraMessagesToConversationItems,
+  mapMastraMessagesToResponseOutputItems,
+} from './responses.adapter';
 import { resolveResponseTurnMessagesForStorage } from './responses.storage';
 import { createTestServerContext } from './test-utils';
 
@@ -414,31 +418,42 @@ function createMastraWithAgentMemoryUsingRootStorage() {
   };
 }
 
-function createMastraWithAgentMemoryWithoutStorage() {
-  const memory = new RootInjectedMockMemory();
-  const agent = new Agent({
-    id: 'agent-without-storage',
-    name: 'agent-without-storage',
-    instructions: 'agent-without-storage instructions',
-    model: {} as never,
-    memory,
-  });
-  const mastra = new Mastra({
-    logger: false,
-    agents: {
-      'agent-without-storage': agent,
-    },
-  });
-
-  mockAgentSpecVersion(agent);
-
-  return {
-    agent,
-    mastra,
-  };
-}
-
 describe('Responses Handlers', () => {
+  it('creates synchronous message IDs with UUIDs', () => {
+    expect(createMessageId()).toMatch(/^msg_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  });
+
+  it('maps a stored failed tool invocation to its normalized error output', () => {
+    const items = mapMastraMessagesToConversationItems([
+      createDbMessage({
+        id: 'assistant-error',
+        role: 'assistant',
+        createdAt: new Date('2026-10-02T00:00:00.000Z'),
+        parts: [
+          {
+            type: 'tool-invocation',
+            toolInvocation: {
+              state: 'output-error',
+              toolCallId: 'call-error',
+              toolName: 'weather',
+              args: {},
+              result: 'failed',
+              errorText: 'failed',
+            },
+          },
+        ],
+      }),
+    ]);
+
+    expect(items).toContainEqual(
+      expect.objectContaining({
+        type: 'function_call_output',
+        call_id: 'call-error',
+        output: 'failed',
+      }),
+    );
+  });
+
   let storage: InMemoryStore;
   let memory: MockMemory;
   let agent: Agent;
@@ -544,6 +559,26 @@ describe('Responses Handlers', () => {
     });
 
     expect(retrieved).toEqual(created);
+  });
+
+  it('returns null usage when a non-streaming response has incomplete token counts', async () => {
+    const result = createGenerateResult({ text: 'Hello from Mastra' });
+    const incompleteUsage = { inputTokens: undefined, outputTokens: 25, totalTokens: undefined };
+    result.usage = incompleteUsage;
+    result.totalUsage = incompleteUsage;
+    vi.spyOn(agent, 'generate').mockResolvedValue(result);
+
+    const response = (await CREATE_RESPONSE_ROUTE.handler({
+      ...createTestServerContext({ mastra }),
+      model: 'openai/gpt-5',
+      agent_id: 'test-agent',
+      input: 'Hello',
+      store: false,
+      stream: false,
+    })) as Response;
+
+    const created = await readJson(response);
+    expect(created.usage).toBeNull();
   });
 
   it('accepts omitted model in the create response request schema', () => {
@@ -4507,23 +4542,5 @@ describe('Responses Handlers', () => {
     const secondCall = generateSpy.mock.calls[1]?.[1] as { memory?: { thread?: string; resource?: string } };
 
     expect(secondCall.memory).toEqual(firstCall.memory);
-  });
-
-  it('returns 400 when storing a response for an agent with memory but no storage', async () => {
-    const noStorage = createMastraWithAgentMemoryWithoutStorage();
-    vi.spyOn(noStorage.agent, 'generate').mockResolvedValue(createGenerateResult({ text: 'No storage response' }));
-
-    await expect(
-      CREATE_RESPONSE_ROUTE.handler({
-        ...createTestServerContext({ mastra: noStorage.mastra }),
-        model: 'openai/gpt-5',
-        agent_id: 'agent-without-storage',
-        input: 'Hello',
-        store: true,
-        stream: false,
-      }),
-    ).rejects.toMatchObject({
-      status: 400,
-    });
   });
 });

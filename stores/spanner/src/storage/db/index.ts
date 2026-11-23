@@ -7,6 +7,7 @@ import {
   TABLE_SPANS,
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_SCHEMAS,
+  TABLE_CONFIGS,
   getDefaultValue,
 } from '@mastra/core/storage';
 import type {
@@ -369,7 +370,9 @@ export class SpannerDB extends MastraBase {
         } catch (err) {
           // The Spanner client does NOT auto-rollback when the runFn throws
           // explicitly release the transaction so its row locks are freed.
-          await tx.rollback().catch(() => {});
+          await tx.rollback().catch(rollbackErr => {
+            throw new AggregateError([err, rollbackErr], 'Transaction and rollback both failed');
+          });
           throw err;
         }
       });
@@ -393,7 +396,11 @@ export class SpannerDB extends MastraBase {
         return await fn();
       } catch (error: any) {
         attempt++;
-        const aborted = error && (error.code === 10 || /ABORTED/i.test(String(error?.message ?? '')));
+        let checkError = error;
+        if (checkError instanceof AggregateError && checkError.errors.length > 0) {
+          checkError = checkError.errors[0];
+        }
+        const aborted = checkError && (checkError.code === 10 || /ABORTED/i.test(String(checkError?.message ?? '')));
         if (!aborted || attempt >= maxAttempts) {
           throw error;
         }
@@ -401,6 +408,47 @@ export class SpannerDB extends MastraBase {
         delay *= 2;
       }
     }
+  }
+
+  /**
+   * Delete up to `limit` rows keyed by `runId` whose epoch-ms `column` is
+   * older than `cutoff`. Used to prune the run fencing tables.
+   */
+  async pruneRunRows({
+    tableName,
+    column,
+    cutoff,
+    limit,
+  }: {
+    tableName: string;
+    column: string;
+    cutoff: number;
+    limit: number;
+  }): Promise<number> {
+    const table = quoteIdent(tableName, 'table name');
+    const col = quoteIdent(column, 'column name');
+    const runId = quoteIdent('runId', 'column name');
+    const [rows] = await this.database.run({
+      sql: `SELECT ${runId} FROM ${table} WHERE ${col} IS NOT NULL AND ${col} < @cutoff ORDER BY ${col} LIMIT @limit`,
+      params: { cutoff, limit },
+      types: { cutoff: 'int64', limit: 'int64' },
+      json: true,
+    });
+    const runIds = (rows as Array<{ runId: string }>).map(row => row.runId);
+    if (runIds.length === 0) return 0;
+    let deleted = 0;
+    await this.runWithAbortRetry(async () => {
+      await this.database.runTransactionAsync(async (tx: Transaction) => {
+        const [count] = await tx.runUpdate({
+          sql: `DELETE FROM ${table} WHERE ${runId} IN UNNEST(@runIds) AND ${col} < @cutoff`,
+          params: { runIds, cutoff },
+          types: { runIds: { type: 'array', child: 'string' }, cutoff: 'int64' },
+        });
+        await tx.commit();
+        deleted = count;
+      });
+    });
+    return deleted;
   }
 
   /**
@@ -414,6 +462,20 @@ export class SpannerDB extends MastraBase {
     }
     if (tableName === TABLE_SPANS) {
       return ['traceId', 'spanId'];
+    }
+    // Tables with composite primary keys (e.g. mastra_favorites,
+    // mastra_dataset_items) declare them in core's TABLE_CONFIGS rather than via
+    // per-column `primaryKey: true` flags. Honor that first so the PRIMARY KEY
+    // clause emitted by createTable matches what the domains expect.
+    const compositePk = TABLE_CONFIGS[tableName]?.compositePrimaryKey;
+    if (compositePk && compositePk.length > 0) {
+      const missing = compositePk.filter(col => !schema[col]);
+      if (missing.length > 0) {
+        throw new Error(
+          `Table ${tableName}: composite primary key references columns not present in schema: ${missing.join(', ')}`,
+        );
+      }
+      return [...compositePk];
     }
     const pk = Object.entries(schema)
       .filter(([, col]) => col.primaryKey)
@@ -946,7 +1008,9 @@ export class SpannerDB extends MastraBase {
           } catch (err) {
             // The Spanner client does NOT auto-rollback when the runFn throws
             // explicitly release the transaction so its row locks are freed.
-            await tx.rollback().catch(() => {});
+            await tx.rollback().catch(rollbackErr => {
+              throw new AggregateError([err, rollbackErr], 'Transaction and rollback both failed');
+            });
             throw err;
           }
         }),
@@ -981,7 +1045,9 @@ export class SpannerDB extends MastraBase {
             }
             await tx.commit();
           } catch (err) {
-            await tx.rollback().catch(() => {});
+            await tx.rollback().catch(rollbackErr => {
+              throw new AggregateError([err, rollbackErr], 'Transaction and rollback both failed');
+            });
             throw err;
           }
         }),
@@ -1019,7 +1085,9 @@ export class SpannerDB extends MastraBase {
             }
             await tx.commit();
           } catch (err) {
-            await tx.rollback().catch(() => {});
+            await tx.rollback().catch(rollbackErr => {
+              throw new AggregateError([err, rollbackErr], 'Transaction and rollback both failed');
+            });
             throw err;
           }
         }),

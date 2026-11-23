@@ -3,6 +3,7 @@ import { join } from 'path';
 import { mkdtemp, rm, writeFile, mkdir, readFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { spawnSync } from 'node:child_process';
+import { installWithRetry } from '../_local-registry-setup/install.js';
 
 const timeout = 5 * 60 * 1000;
 
@@ -13,13 +14,14 @@ const timeout = 5 * 60 * 1000;
  */
 describe.for([['pnpm'] as const])(`%s bundler analysis`, ([pkgManager]) => {
   let fixturePath: string;
+  let env: typeof process.env;
 
   beforeAll(
     async () => {
       const registry = inject('registry');
 
       fixturePath = await mkdtemp(join(tmpdir(), `mastra-bundler-analysis-test-${pkgManager}-`));
-      process.env.npm_config_registry = registry;
+      process.env.pnpm_config_registry = registry;
 
       // Create a basic project structure
       await mkdir(join(fixturePath, 'src', 'mastra'), { recursive: true });
@@ -37,8 +39,8 @@ describe.for([['pnpm'] as const])(`%s bundler analysis`, ([pkgManager]) => {
               build: 'mastra build',
             },
             dependencies: {
-              '@mastra/core': 'deployers-e2e-test',
-              mastra: 'deployers-e2e-test',
+              '@mastra/core': inject('tag'),
+              mastra: inject('tag'),
               pino: '^9.0.0',
               'pino-pretty': '^11.0.0',
               'pino-opentelemetry-transport': '^1.0.0',
@@ -52,6 +54,12 @@ describe.for([['pnpm'] as const])(`%s bundler analysis`, ([pkgManager]) => {
           null,
           2,
         ),
+      );
+
+      // Create pnpm-workspace.yaml (required by pnpm v11 for build policy)
+      await writeFile(
+        join(fixturePath, 'pnpm-workspace.yaml'),
+        "packages:\n  - '.'\nallowBuilds:\n  esbuild: true\n  protobufjs: true\n  sharp: true\n  workerd: true\n  bufferutil: true\n  utf-8-validate: true\n",
       );
 
       // Create tsconfig.json
@@ -101,13 +109,16 @@ export const mastra = new Mastra({
 
       // Install dependencies
       const installArgs = pkgManager === 'pnpm' ? ['install', '--config.minimum-release-age=0'] : ['install'];
+      env = {
+        ...process.env,
+        PNPM_CONFIG_MINIMUM_RELEASE_AGE: '0',
+        pnpm_config_minimum_release_age: '0',
+      };
 
       console.log('Installing dependencies...');
-      spawnSync(pkgManager, installArgs, {
+      installWithRetry(pkgManager, installArgs, {
         cwd: fixturePath,
-        stdio: 'inherit',
-        shell: true,
-        env: process.env,
+        env,
       });
     },
     10 * 60 * 1000,
@@ -128,8 +139,7 @@ export const mastra = new Mastra({
       const result = spawnSync(pkgManager, ['build'], {
         cwd: fixturePath,
         stdio: 'inherit',
-        shell: true,
-        env: process.env,
+        env,
       });
 
       // Check if build succeeded

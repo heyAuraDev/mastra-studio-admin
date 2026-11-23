@@ -1,4 +1,3 @@
-import type { ReasoningPart } from '@ai-sdk/provider-utils-v5';
 import type {
   LanguageModelV2FinishReason,
   LanguageModelV2CallWarning,
@@ -7,6 +6,7 @@ import type {
 } from '@ai-sdk/provider-v5';
 import type { LanguageModelRequestMetadata, LogProbs as LanguageModelV1LogProbs } from '@internal/ai-sdk-v4';
 import type {
+  ReasoningPart,
   StepResult,
   ModelMessage,
   LanguageModelUsage,
@@ -24,9 +24,11 @@ import { z } from 'zod/v4';
 // Type definitions for the workflow data
 export interface LLMIterationStepResult {
   /** Includes 'tripwire' and 'retry' for processor scenarios */
-  reason: LanguageModelV2FinishReason | 'tripwire' | 'retry';
+  reason: LanguageModelV2FinishReason | 'tripwire' | 'retry' | 'abort';
   warnings: LanguageModelV2CallWarning[];
   isContinued: boolean;
+  /** Private continuation: the physical attempt did not complete a logical step (signal preemption, API-error retry). */
+  signalPreempted?: boolean;
   logprobs?: LanguageModelV1LogProbs;
   totalUsage: LanguageModelUsage;
   headers?: Record<string, string>;
@@ -86,6 +88,11 @@ export interface LLMIterationData<Tools extends ToolSet = ToolSet, OUTPUT = unde
    * Preserved across processor-triggered retries so retries resume on the same fallback model.
    */
   fallbackModelIndex?: number;
+  /**
+   * Set on the retry that follows an attachment download failure nothing else
+   * recovered. That retry replaces unavailable attachments with a placeholder.
+   */
+  skipUnavailableAttachments?: boolean;
   processorRetryFeedback?: string;
   /**
    * True when a background task result was injected and the LLM needs another
@@ -110,6 +117,7 @@ export const llmIterationStepResultSchema = z.object({
   reason: z.string(),
   warnings: z.array(z.any()),
   isContinued: z.boolean(),
+  signalPreempted: z.boolean().optional(),
   logprobs: z.any().optional(),
   totalUsage: languageModelUsageSchema.optional(),
   headers: z.record(z.string(), z.string()).optional(),
@@ -158,6 +166,7 @@ export const llmIterationOutputSchema = z.object({
   stepResult: llmIterationStepResultSchema,
   processorRetryCount: z.number().optional(),
   fallbackModelIndex: z.number().optional(),
+  skipUnavailableAttachments: z.boolean().optional(),
   processorRetryFeedback: z.string().optional(),
   isTaskCompleteCheckFailed: z.boolean().optional(), //true if the isTaskComplete check failed and LLM has to run again
   backgroundTaskPending: z.boolean().optional(), // true if a background task result was injected and LLM needs to process it
@@ -175,4 +184,24 @@ export const toolCallInputSchema = z.object({
 export const toolCallOutputSchema = toolCallInputSchema.extend({
   result: z.any().optional(),
   error: z.any().optional(),
+  // Set when execution was interrupted by request abort (not a tool error); no result/error
+  // so downstream leaves the call incomplete. See tool-call-step.ts. Declared for schema
+  // honesty — no engine validates step outputs today, but Zod would strip an undeclared
+  // field if validation is ever (re-)enabled (see schema.test.ts).
+  aborted: z.boolean().optional(),
+  // Model-facing form of a validation error Mastra's own validation produced for this call
+  // (see getModelFacingValidationError). Read in the process that ran the tool and carried beside
+  // the result, because the marker on the result does not survive serialization between steps.
+  // llm-mapping sends it to the model in place of the tool's `toModelOutput` mapping.
+  validationError: z
+    .object({ error: z.literal(true), message: z.string(), validationErrors: z.any().optional() })
+    .optional(),
+  // HITL approval decision, present when the tool required approval and was resumed.
+  approval: z
+    .object({
+      id: z.string(),
+      approved: z.boolean(),
+      reason: z.string().optional(),
+    })
+    .optional(),
 });

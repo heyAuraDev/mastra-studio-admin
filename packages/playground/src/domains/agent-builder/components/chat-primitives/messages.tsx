@@ -1,0 +1,545 @@
+import type { MastraDBMessage } from '@mastra/core/agent/message-list';
+import { ActivityItem, ReasoningActivity } from '@mastra/playground-ui/components/ai/activity';
+import {
+  hasToolArguments,
+  presentTool,
+  stringifyToolValue,
+  ToolCallArguments,
+  ToolCallOutput,
+} from '@mastra/playground-ui/components/ai/tool-call';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { Card } from '@mastra/playground-ui/components/Card';
+import { Code } from '@mastra/playground-ui/components/Code';
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@mastra/playground-ui/components/Collapsible';
+import { InlineCode } from '@mastra/playground-ui/components/InlineCode';
+import { MarkdownRenderer } from '@mastra/playground-ui/components/MarkdownRenderer';
+import { Skeleton } from '@mastra/playground-ui/components/Skeleton';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import type { MessageMetadata } from '@mastra/playground-ui/domains/chat';
+import { MessageText } from '@mastra/playground-ui/domains/chat/messages/renderers/message-text';
+import {
+  WarningStatusRenderer,
+  TripwireStatusRenderer,
+} from '@mastra/playground-ui/domains/chat/messages/renderers/status-renderers';
+import { SignalBadge } from '@mastra/playground-ui/domains/chat/messages/signal-badge';
+import {
+  getSignalType,
+  isSignalData,
+  isUserSignalType,
+  toReactiveSignalData,
+} from '@mastra/playground-ui/domains/chat/messages/signal-data';
+import { ProviderLogo } from '@mastra/playground-ui/domains/llm';
+import { IconAlignmentLeft } from '@mastra/playground-ui/icons/central/IconAlignmentLeft';
+import { IconArrowRotateClockwise } from '@mastra/playground-ui/icons/central/IconArrowRotateClockwise';
+import { IconBuildings } from '@mastra/playground-ui/icons/central/IconBuildings';
+import { IconCheckmark2Medium } from '@mastra/playground-ui/icons/central/IconCheckmark2Medium';
+import { IconExclamationTriangle } from '@mastra/playground-ui/icons/central/IconExclamationTriangle';
+import { IconFileText } from '@mastra/playground-ui/icons/central/IconFileText';
+import { IconGlobe } from '@mastra/playground-ui/icons/central/IconGlobe';
+import { IconLoadingCircle } from '@mastra/playground-ui/icons/central/IconLoadingCircle';
+import { IconMaintenance } from '@mastra/playground-ui/icons/central/IconMaintenance';
+import { IconZap } from '@mastra/playground-ui/icons/central/IconZap';
+import { Icon } from '@mastra/playground-ui/icons/Icon';
+import { controlStateColorTransition } from '@mastra/playground-ui/primitives/transitions';
+import { quietTextHover } from '@mastra/playground-ui/primitives/typography';
+import { cn } from '@mastra/playground-ui/utils/cn';
+import type { MastraDBMessageMetadata, RequireApprovalEntry } from '@mastra/react';
+import { MessageFactory } from '@mastra/react/ui';
+import type { MessageRenderers, MessageStatusRenderers, DynamicToolPart, ToolInvocationPart } from '@mastra/react/ui';
+import { GlobeLockIcon } from 'lucide-react';
+import { useState } from 'react';
+import type { ReactNode } from 'react';
+import { useFormContext } from 'react-hook-form';
+import { useAgentPrimitives } from '../../contexts/agent-primitives-context';
+import { useStreamApproval, useStreamRetry } from '../../contexts/stream-chat-context';
+import { useAvailableAgentTools } from '../../hooks/use-available-agent-tools';
+import { parseStreamErrorText } from './parse-stream-error';
+import type { ParsedStreamError } from './parse-stream-error';
+import type { AgentBuilderEditFormValues } from '@/domains/agent-builder/schemas';
+import {
+  SET_AGENT_BROWSER_ENABLED_TOOL_NAME,
+  SET_AGENT_DESCRIPTION_TOOL_NAME,
+  SET_AGENT_INSTRUCTIONS_TOOL_NAME,
+  SET_AGENT_MODEL_TOOL_NAME,
+  SET_AGENT_NAME_TOOL_NAME,
+  SET_AGENT_SKILLS_TOOL_NAME,
+  SET_AGENT_TOOLS_TOOL_NAME,
+  SET_AGENT_WORKSPACE_ID_TOOL_NAME,
+} from '@/domains/agent-builder/services/tool-constants';
+
+interface MessageRowProps {
+  message: MastraDBMessage;
+}
+
+type RequireApprovalMetadata = NonNullable<MastraDBMessageMetadata['requireApprovalMetadata']>;
+
+const ToolApprovalPrompt = ({ toolCallId, toolName }: { toolCallId: string; toolName: string }) => {
+  const { approveToolCall, declineToolCall } = useStreamApproval();
+  const [pending, setPending] = useState<'approve' | 'decline' | null>(null);
+  const decided = pending !== null;
+
+  const handleApprove = () => {
+    setPending('approve');
+    approveToolCall(toolCallId);
+  };
+
+  const handleDecline = () => {
+    setPending('decline');
+    declineToolCall(toolCallId);
+  };
+
+  return (
+    <ToolCard testId="agent-builder-chat-tool-approval" className="border-transparent bg-muted">
+      <Txt as="p" variant="caption" tone="ink" className="pb-2">
+        Approval required for <InlineCode>{toolName}</InlineCode>
+      </Txt>
+      <div className="flex items-center gap-2">
+        <Button
+          variant="default"
+          onClick={handleApprove}
+          disabled={decided}
+          data-testid="agent-builder-chat-tool-approve"
+          aria-label={`Approve ${toolName}`}
+        >
+          <Icon>
+            {pending === 'approve' ? <IconLoadingCircle className="animate-spin" /> : <IconCheckmark2Medium />}
+          </Icon>
+          Approve
+        </Button>
+        <Button
+          variant="ghost"
+          onClick={handleDecline}
+          disabled={decided}
+          data-testid="agent-builder-chat-tool-decline"
+          aria-label={`Decline ${toolName}`}
+        >
+          {pending === 'decline' && (
+            <Icon>
+              <IconLoadingCircle className="animate-spin" />
+            </Icon>
+          )}
+          Decline
+        </Button>
+      </div>
+    </ToolCard>
+  );
+};
+
+const getMessageDisplayRole = (message: MastraDBMessage): MastraDBMessage['role'] | null => {
+  if (message.role === 'assistant' || message.role === 'user' || message.role === 'system') return message.role;
+  if (message.role === 'signal') return isUserSignalType(getSignalType(message)) ? 'user' : 'assistant';
+  return null;
+};
+
+/**
+ * Convert a persisted reactive (non-user) `signal` row into an assistant message
+ * carrying a single `data-signal` part, so the `SignalBadge` renderer shows it
+ * on read-back. Restores 1.41.0 behavior lost in the chat renderer rewrite
+ * (PR #17774).
+ */
+const toReactiveSignalMessage = (message: MastraDBMessage): MastraDBMessage | null => {
+  const data = toReactiveSignalData(message);
+  if (!isSignalData(data)) return null;
+  return {
+    ...message,
+    role: 'assistant',
+    content: {
+      ...message.content,
+      parts: [{ type: 'data-signal', data }],
+    },
+  };
+};
+
+const getRequireApprovalMetadata = (message: MastraDBMessage): RequireApprovalMetadata | undefined => {
+  const metadata = message.content.metadata as MastraDBMessageMetadata | undefined;
+  if (!metadata || typeof metadata !== 'object') return undefined;
+  const { mode } = metadata;
+  if (mode !== 'stream' && mode !== 'network' && mode !== 'generate') return undefined;
+  return metadata.requireApprovalMetadata;
+};
+
+const getNameFromInput = (input: unknown): string => {
+  if (!input || typeof input !== 'object' || !('name' in input)) return 'unknown';
+  return typeof input.name === 'string' ? input.name : 'unknown';
+};
+
+const findApprovalEntry = (
+  approvals: RequireApprovalMetadata | undefined,
+  toolName: string | undefined,
+  toolCallId: string | undefined,
+): RequireApprovalEntry | undefined => {
+  if (!approvals) return undefined;
+  return (toolName ? approvals[toolName] : undefined) ?? (toolCallId ? approvals[toolCallId] : undefined);
+};
+
+/**
+ * Normalize the stored message role for display. The `signal`+`type:'user'`
+ * case is mapped to `role: 'user'` so it renders as a user message. Returns
+ * `null` when the message has no displayable role.
+ */
+const toDisplayMessage = (message: MastraDBMessage): MastraDBMessage | null => {
+  const displayRole = getMessageDisplayRole(message);
+  if (displayRole === null) return null;
+  if (message.role === 'signal' && displayRole === 'assistant') return toReactiveSignalMessage(message);
+  if (displayRole === message.role) return message;
+  return { ...message, role: displayRole };
+};
+
+/**
+ * Shared agent-builder tool-card dispatch for both the legacy `tool-invocation`
+ * slot and the runtime `dynamic-tool` / `tool-${string}` slot.
+ */
+const renderToolCard = (toolName: string, input: unknown, output: unknown): ReactNode => {
+  switch (toolName) {
+    case SET_AGENT_NAME_TOOL_NAME:
+      return <MessageSetAgentName />;
+    case SET_AGENT_DESCRIPTION_TOOL_NAME:
+      return <MessageSetAgentDescription />;
+    case SET_AGENT_INSTRUCTIONS_TOOL_NAME:
+      return <MessageSetAgentInstructions />;
+    case SET_AGENT_TOOLS_TOOL_NAME:
+      return <MessageSetAgentTools />;
+    case SET_AGENT_SKILLS_TOOL_NAME:
+      return <MessageSetAgentSkills />;
+    case SET_AGENT_MODEL_TOOL_NAME:
+      return <MessageSetAgentModel />;
+    case SET_AGENT_BROWSER_ENABLED_TOOL_NAME:
+      return <MessageSetAgentBrowserEnabled />;
+    case SET_AGENT_WORKSPACE_ID_TOOL_NAME:
+      return <MessageSetAgentWorkspaceId />;
+    case 'skill':
+      return <SkillTool name={getNameFromInput(input)} />;
+    default:
+      return <GenericTool toolName={toolName} input={input} output={output} />;
+  }
+};
+
+export const MessageRow = ({ message }: MessageRowProps) => {
+  const approvals = getRequireApprovalMetadata(message);
+  const retry = useStreamRetry();
+  const displayRole = getMessageDisplayRole(message);
+
+  const dbMessage = toDisplayMessage(message);
+  if (dbMessage === null) return null;
+
+  const metadata = message.content.metadata;
+
+  const renderers: MessageRenderers = {
+    Text: part => <Txtmessage txt={part.text ?? ''} role={displayRole} metadata={metadata} />,
+    Reasoning: part => {
+      const state = 'state' in part ? part.state : undefined;
+      if (state !== 'streaming') return null;
+      return <ReasoningActivity text="" streaming />;
+    },
+    Data: part => (part.type === 'data-signal' && isSignalData(part.data) ? <SignalBadge signal={part.data} /> : null),
+    ToolInvocation: (part: ToolInvocationPart) => {
+      const inv = part.toolInvocation;
+      const entry = findApprovalEntry(approvals, inv.toolName, inv.toolCallId);
+      if (entry && inv.state !== 'result') {
+        return <ToolApprovalPrompt toolCallId={entry.toolCallId} toolName={entry.toolName} />;
+      }
+      if (inv.state !== 'result') return null;
+      const input = 'args' in inv ? inv.args : undefined;
+      const output = 'result' in inv ? inv.result : undefined;
+      return renderToolCard(inv.toolName, input, output);
+    },
+    DynamicTool: (part: DynamicToolPart) => {
+      const toolName = part.toolName ?? part.type.replace(/^tool-/, '');
+      const entry = findApprovalEntry(approvals, toolName, part.toolCallId);
+      if (entry && part.state !== 'output-available') {
+        return <ToolApprovalPrompt toolCallId={entry.toolCallId} toolName={entry.toolName} />;
+      }
+      if (part.state !== 'output-available') return null;
+      return renderToolCard(toolName, part.input, part.output);
+    },
+  };
+
+  const status: MessageStatusRenderers = {
+    Error: ({ text }) => <ErrorMessage error={parseStreamErrorText(text)} onRetry={retry} />,
+    Warning: WarningStatusRenderer,
+    Tripwire: TripwireStatusRenderer,
+  };
+
+  return <MessageFactory message={dbMessage} {...renderers} status={status} />;
+};
+
+export const Txtmessage = ({
+  txt,
+  role,
+  metadata,
+}: {
+  txt: string;
+  role: MastraDBMessage['role'] | null;
+  metadata?: MessageMetadata;
+}) => {
+  if (role === 'user') {
+    return (
+      <div className="flex justify-end">
+        <div className="max-w-[80%] rounded-2xl bg-white px-4 py-2.5 [&_li]:!my-0 [&_ol]:!space-y-1 [&_p]:!whitespace-normal [&_ul]:!space-y-1">
+          <MarkdownRenderer className="text-black">{txt}</MarkdownRenderer>
+        </div>
+      </div>
+    );
+  }
+
+  if (role === 'assistant' || role === 'system') {
+    return (
+      <div className="max-w-[80%] text-muted-foreground [&_li]:!my-0 [&_ol]:!space-y-1 [&_p]:!whitespace-normal [&_ul]:!space-y-1">
+        <MessageText text={txt} metadata={metadata} externalLinkTarget={role === 'assistant' ? 'window' : undefined} />
+      </div>
+    );
+  }
+
+  return null;
+};
+
+export const ErrorMessage = ({ error, onRetry }: { error: ParsedStreamError; onRetry: (() => void) | null }) => {
+  return (
+    <Card
+      className="flex max-w-[80%] flex-col gap-3 border-warning-edge bg-warning-subtle p-4"
+      role="alert"
+      data-testid="agent-builder-chat-error"
+    >
+      <div className="flex items-start gap-2.5">
+        <IconExclamationTriangle className="mt-0.5 size-icon-md shrink-0 text-warning-foreground" aria-hidden />
+        <div className="flex min-w-0 flex-col gap-1">
+          <Txt as="p" variant="subheading" tone="ink">
+            Something went wrong while building the agent.
+          </Txt>
+          <Txt
+            as="p"
+            variant="caption"
+            tone="muted"
+            data-testid="agent-builder-chat-error-summary"
+            className="break-words"
+          >
+            {error.summary}
+          </Txt>
+        </div>
+      </div>
+
+      {error.details && error.details !== error.summary ? (
+        <Collapsible className="flex flex-col gap-2">
+          <div className="flex items-center gap-3">
+            {onRetry !== null && (
+              <Button
+                variant="default"
+                onClick={onRetry}
+                data-testid="agent-builder-chat-error-retry"
+                icon={<IconArrowRotateClockwise aria-hidden />}
+              >
+                Try again
+              </Button>
+            )}
+            <CollapsibleTrigger
+              className={cn(
+                'underline-offset-2 hover:underline',
+                quietTextHover,
+                controlStateColorTransition,
+                'text-body',
+              )}
+              data-testid="agent-builder-chat-error-details-trigger"
+            >
+              Details
+            </CollapsibleTrigger>
+          </div>
+          <CollapsibleContent>
+            <Code
+              className="max-h-48 overflow-auto rounded-md bg-sidebar p-2 text-caption break-all whitespace-pre-wrap text-muted-foreground"
+              data-testid="agent-builder-chat-error-details"
+              code={error.details}
+            />
+          </CollapsibleContent>
+        </Collapsible>
+      ) : (
+        onRetry !== null && (
+          <div className="flex items-center gap-3">
+            <Button
+              variant="default"
+              onClick={onRetry}
+              data-testid="agent-builder-chat-error-retry"
+              icon={<IconArrowRotateClockwise aria-hidden />}
+            >
+              Try again
+            </Button>
+          </div>
+        )
+      )}
+    </Card>
+  );
+};
+
+export const MessagesSkeleton = ({ testId }: { testId?: string }) => {
+  return (
+    <div className="flex flex-col gap-4" data-testid={testId}>
+      <div className="flex justify-end">
+        <Skeleton className="h-10 w-56 rounded-2xl" />
+      </div>
+      <Skeleton className="h-6 w-[70%] rounded-full" />
+      <Skeleton className="h-6 w-[55%] rounded-full" />
+      <div className="flex justify-end">
+        <Skeleton className="h-10 w-40 rounded-2xl" />
+      </div>
+      <Skeleton className="h-6 w-[65%] rounded-full" />
+    </div>
+  );
+};
+
+const GenericTool = ({ toolName, input, output }: { toolName: string; input?: unknown; output?: unknown }) => {
+  const { icon: ToolIcon, label, detail } = presentTool(toolName, input);
+  const outputText = output === undefined ? undefined : stringifyToolValue(output);
+  const hasBody = hasToolArguments({ toolName, args: input }) || Boolean(outputText);
+
+  return (
+    <ActivityItem
+      data-testid="agent-builder-chat-generic-tool"
+      icon={<ToolIcon aria-hidden />}
+      label={label}
+      detail={detail}
+      aria-label={label}
+    >
+      {hasBody && (
+        <>
+          <ToolCallArguments toolName={toolName} args={input} />
+          {outputText && <ToolCallOutput text={outputText} />}
+        </>
+      )}
+    </ActivityItem>
+  );
+};
+
+export const ToolCard = ({
+  children,
+  testId,
+  className,
+}: {
+  children: ReactNode;
+  testId?: string;
+  className?: string;
+}) => (
+  <Card
+    data-testid={testId}
+    className={cn('max-w-[80%] animate-in bg-background/60 p-3 duration-300 fade-in slide-in-from-left-2', className)}
+  >
+    {children}
+  </Card>
+);
+
+const SkillToolLine = ({ icon, label, value }: { icon: ReactNode; label: string; value: ReactNode }) => (
+  <div className="flex max-w-full min-w-0 animate-in items-start gap-2 duration-500 ease-out fade-in slide-in-from-right-4">
+    <div className="pt-0.5">
+      <Icon>{icon}</Icon>
+    </div>
+    <Txt tone="muted" as="p" variant="body" className="min-w-0 flex-1 truncate">
+      {label}{' '}
+      <Txt as="strong" variant="subheading" tone="ink">
+        {value}
+      </Txt>
+    </Txt>
+  </div>
+);
+
+const MessageSetAgentName = () => {
+  const { watch } = useFormContext<AgentBuilderEditFormValues>();
+  const name = watch('name');
+
+  if (!name) return null;
+
+  return <SkillToolLine icon={<IconAlignmentLeft />} label="Setting the agent name:" value={name} />;
+};
+
+const MessageSetAgentDescription = () => {
+  const { watch } = useFormContext<AgentBuilderEditFormValues>();
+  const description = watch('description');
+
+  if (!description) return null;
+
+  return <SkillToolLine icon={<IconAlignmentLeft />} label="Setting the agent description:" value={description} />;
+};
+
+const MessageSetAgentInstructions = () => {
+  const { watch } = useFormContext<AgentBuilderEditFormValues>();
+  const instructions = watch('instructions');
+
+  if (!instructions) return null;
+
+  return <SkillToolLine icon={<IconFileText />} label="Setting the agent instructions:" value={instructions} />;
+};
+
+const MessageSetAgentTools = () => {
+  const { agentId, toolsData, agentsData, workflowsData } = useAgentPrimitives();
+  const { watch } = useFormContext<AgentBuilderEditFormValues>();
+  const selectedTools = watch('tools');
+  const selectedAgents = watch('agents');
+  const selectedWorkflows = watch('workflows');
+
+  const availableAgentTools = useAvailableAgentTools({
+    toolsData,
+    agentsData,
+    workflowsData,
+    selectedTools,
+    selectedAgents,
+    selectedWorkflows,
+    excludeAgentId: agentId,
+  });
+
+  const enabled = availableAgentTools.filter(t => t.isChecked);
+  const value = enabled.length === 0 ? 'none' : enabled.map(t => t.name).join(', ');
+
+  return <SkillToolLine icon={<IconMaintenance />} label="Enabling tools:" value={value} />;
+};
+
+const MessageSetAgentSkills = () => {
+  const { availableSkills } = useAgentPrimitives();
+  const { watch } = useFormContext<AgentBuilderEditFormValues>();
+  const skillsField = watch('skills');
+  const enabled = skillsField ? availableSkills.filter(s => skillsField[s.id] === true) : [];
+  const value = enabled.length === 0 ? 'none' : enabled.map(s => s.name).join(', ');
+
+  return <SkillToolLine icon={<IconZap />} label="Enabling skills:" value={value} />;
+};
+
+const MessageSetAgentModel = () => {
+  const { watch } = useFormContext<AgentBuilderEditFormValues>();
+  const model = watch('model');
+
+  if (!model) return null;
+
+  return (
+    <SkillToolLine
+      icon={<ProviderLogo providerId={model.provider} size={16} />}
+      label="Setting agent model to"
+      value={`${model.provider}/${model.name}`}
+    />
+  );
+};
+
+const MessageSetAgentBrowserEnabled = () => {
+  const { watch } = useFormContext<AgentBuilderEditFormValues>();
+  const browserEnabled = watch('browserEnabled');
+
+  return (
+    <SkillToolLine
+      icon={browserEnabled ? <IconGlobe /> : <GlobeLockIcon />}
+      label="Browser access"
+      value={browserEnabled ? 'enabled' : 'disabled'}
+    />
+  );
+};
+
+const MessageSetAgentWorkspaceId = () => {
+  const { watch } = useFormContext<AgentBuilderEditFormValues>();
+  const workspaceId = watch('workspaceId');
+
+  if (!workspaceId) return null;
+
+  return <SkillToolLine icon={<IconBuildings />} label="Setting workspace to" value={workspaceId} />;
+};
+
+interface SkillToolProps {
+  name: string;
+}
+
+const SkillTool = ({ name }: SkillToolProps) => (
+  <SkillToolLine icon={<IconZap />} label="Using super-powers:" value={name} />
+);

@@ -1,5 +1,21 @@
 import type { TABLE_NAMES } from '@mastra/core/storage';
 
+/**
+ * Observational memory table name. Defined locally (not value-imported from
+ * core) following the mongodb/pg convention: core exports the constant, but
+ * OM is optional and the constant is absent from older cores in the peer range.
+ */
+export const TABLE_OBSERVATIONAL_MEMORY = 'mastra_observational_memory';
+
+/**
+ * Table names accepted by ConvexDB: core storage tables plus the Convex OM
+ * table, which is intentionally excluded from core's TABLE_NAMES union
+ * because observational memory is an optional, per-adapter capability.
+ * Kept as a closed union (never `| string`) so table-name typos stay
+ * compile-time errors instead of routing to the mastra_documents fallback.
+ */
+export type ConvexStorageTable = TABLE_NAMES | typeof TABLE_OBSERVATIONAL_MEMORY | RunClaimTable;
+
 export type EqualityFilter = {
   field: string;
   value: string | number | boolean | null;
@@ -8,6 +24,52 @@ export type EqualityFilter = {
 export type IndexHint =
   | { index: 'by_workflow'; workflowName: string }
   | { index: 'by_workflow_run'; workflowName: string; runId: string };
+
+/**
+ * A buffered observation chunk in wire/storage format: Date fields are ISO
+ * strings so chunks survive the JSON HTTP boundary and Convex storage
+ * (persisted as a JSON string inside the record's bufferedObservationChunks).
+ */
+export type SerializedOMChunk = {
+  id: string;
+  cycleId: string;
+  observations: string;
+  tokenCount: number;
+  messageIds: string[];
+  messageTokens: number;
+  /** ISO timestamp */
+  lastObservedAt: string;
+  /** ISO timestamp */
+  createdAt: string;
+  suggestedContinuation?: string;
+  currentTask?: string;
+  threadTitle?: string;
+  extractedValues?: Record<string, unknown>;
+  extractionFailures?: Array<{ slug: string; error: string }>;
+};
+
+/**
+ * Serialized observational memory generation fields the server needs to create
+ * a new generation record (used by omSwapBufferedReflection). Timestamps are
+ * ISO strings; config/metadata are JSON strings.
+ */
+export type SerializedOMCurrentRecord = {
+  id: string;
+  lookupKey: string;
+  scope: string;
+  threadId: string | null;
+  resourceId: string;
+  config: string;
+  metadata: string | null;
+  observedTimezone: string | null;
+  lastObservedAt: string | null;
+  totalTokensObserved: number;
+  generationCount: number;
+  /** The snapshot's active observations; the server only applies a rollover if the stored text equals or extends it. */
+  activeObservations?: string;
+  /** The snapshot's observation token count; tokens appended since are added to the new generation. */
+  observationTokenCount?: number;
+};
 
 export type StorageRequest =
   | {
@@ -25,11 +87,34 @@ export type StorageRequest =
       tableName: TABLE_NAMES | string;
       id: string;
       record: Record<string, any>;
+      expected?: Record<string, any>;
+    }
+  | {
+      op: 'updateThread';
+      tableName: TABLE_NAMES | string;
+      id: string;
+      title?: string;
+      metadata?: Record<string, any>;
+      updatedAt: string;
+    }
+  | {
+      op: 'updateResource';
+      tableName: TABLE_NAMES | string;
+      resourceId: string;
+      workingMemory?: string;
+      metadata?: Record<string, any>;
+      createdAt: string;
+      updatedAt: string;
     }
   | {
       op: 'load';
       tableName: TABLE_NAMES | string;
       keys: Record<string, any>;
+    }
+  | {
+      op: 'loadMany';
+      tableName: TABLE_NAMES | string;
+      ids: string[];
     }
   | {
       op: 'clearTable' | 'dropTable';
@@ -40,12 +125,34 @@ export type StorageRequest =
       tableName: TABLE_NAMES | string;
       filters?: EqualityFilter[];
       limit?: number;
+      /** Cursor pagination is currently supported for vector table reads. */
+      pageSize?: number;
+      /** Requires pageSize; currently supported for vector table reads. */
+      cursor?: string | null;
       indexHint?: IndexHint;
     }
   | {
       op: 'deleteMany';
       tableName: TABLE_NAMES | string;
       ids: string[];
+    }
+  | {
+      op: 'mergeWorkflowStepResult';
+      tableName: TABLE_NAMES | string;
+      workflowName: string;
+      runId: string;
+      stepId: string;
+      result: string;
+      requestContext: string;
+      /** JSON-encoded workflow state recorded as `context.__state` in the same write. */
+      state?: string;
+    }
+  | {
+      op: 'mergeWorkflowState';
+      tableName: TABLE_NAMES | string;
+      workflowName: string;
+      runId: string;
+      opts: string;
     }
   | {
       op: 'createSchedule';
@@ -71,6 +178,7 @@ export type StorageRequest =
       newNextFireAt: number;
       lastFireAt: number;
       lastRunId: string;
+      newStatus?: string;
     }
   | {
       op: 'updateSchedule';
@@ -90,14 +198,206 @@ export type StorageRequest =
       op: 'deleteScheduleTriggers';
       tableName: TABLE_NAMES | string;
       scheduleId: string;
+    }
+  | {
+      op: 'omGetLatest';
+      tableName: TABLE_NAMES | string;
+      lookupKey: string;
+    }
+  | {
+      op: 'omGetHistory';
+      tableName: TABLE_NAMES | string;
+      lookupKey: string;
+      limit: number;
+      /** ISO timestamp; records with createdAt >= from */
+      from?: string;
+      /** ISO timestamp; records with createdAt <= to */
+      to?: string;
+      offset?: number;
+      groupId?: string;
+      recordId?: string;
+      beforeGeneration?: number;
+      afterGeneration?: number;
+      sortDirection?: 'ASC' | 'DESC';
+    }
+  | {
+      op: 'omInitialize';
+      tableName: TABLE_NAMES | string;
+      /** Serialized generation-0 record (deterministic id); inserted only when the lookup key has no record. */
+      record: Record<string, unknown> & { id: string; lookupKey: string };
+    }
+  | {
+      op: 'omCreateReflectionGeneration';
+      tableName: TABLE_NAMES | string;
+      currentRecord: SerializedOMCurrentRecord;
+      /** ID for the new generation record */
+      newId: string;
+      reflection: string;
+      tokenCount: number;
+      /** ISO timestamp */
+      now: string;
+    }
+  | {
+      op: 'omSetPendingMessageTokens';
+      tableName: TABLE_NAMES | string;
+      id: string;
+      tokenCount: number;
+      /** ISO timestamp */
+      updatedAt: string;
+    }
+  | {
+      op: 'omSetBufferingObservationFlag';
+      tableName: TABLE_NAMES | string;
+      id: string;
+      isBuffering: boolean;
+      lastBufferedAtTokens?: number;
+      /** ISO timestamp */
+      updatedAt: string;
+    }
+  | {
+      op: 'omUpdateActive';
+      tableName: TABLE_NAMES | string;
+      id: string;
+      observations: string;
+      tokenCount: number;
+      /** ISO timestamp */
+      lastObservedAt: string;
+      observedMessageIds: string[] | null;
+      /** ISO timestamp */
+      updatedAt: string;
+      /** Commit only if the stored active observations still equal this text. */
+      expectedActiveObservations?: string;
+    }
+  | {
+      op: 'omAppendBufferedChunk';
+      tableName: TABLE_NAMES | string;
+      id: string;
+      chunk: SerializedOMChunk;
+      /** ISO timestamp */
+      lastBufferedAtTime?: string;
+      /** ISO timestamp */
+      updatedAt: string;
+    }
+  | {
+      op: 'omSwapBuffered';
+      tableName: TABLE_NAMES | string;
+      id: string;
+      activationRatio: number;
+      messageTokensThreshold: number;
+      currentPendingTokens: number;
+      forceMaxActivation?: boolean;
+      /** ISO timestamp override for lastObservedAt after swap */
+      lastObservedAt?: string;
+      /** Refreshed chunks with up-to-date messageTokens (see SwapBufferedToActiveInput) */
+      bufferedChunks?: SerializedOMChunk[];
+      /** ISO timestamp used for updatedAt and lastObservedAt fallback */
+      now: string;
+    }
+  | {
+      op: 'omUpdateBufferedReflection';
+      tableName: TABLE_NAMES | string;
+      id: string;
+      reflection: string;
+      tokenCount: number;
+      inputTokenCount: number;
+      reflectedObservationLineCount: number;
+      /** ISO timestamp */
+      updatedAt: string;
+    }
+  | {
+      op: 'omSwapBufferedReflection';
+      tableName: TABLE_NAMES | string;
+      currentRecord: SerializedOMCurrentRecord;
+      /** ID for the new generation record */
+      newId: string;
+      /** Token count of the combined new activeObservations */
+      tokenCount: number;
+      /** ISO timestamp */
+      now: string;
+    }
+  | {
+      op: 'omUpdateConfig';
+      tableName: TABLE_NAMES | string;
+      id: string;
+      /** JSON string; deep-merged into the stored config server-side */
+      config: string;
+      /** ISO timestamp */
+      updatedAt: string;
+    };
+
+/**
+ * Tables holding a run's current claim: its ownership (workflows) or raised
+ * fence (memory). Claims live in the generic documents table under these
+ * names. Spelled out rather than imported from core for the same reason as
+ * TABLE_OBSERVATIONAL_MEMORY.
+ */
+export type RunClaimTable = 'mastra_workflow_run_owners' | 'mastra_memory_run_fences';
+
+export type RunClaimFence = { runId: string; generation: number; ownerId: string };
+
+/**
+ * A run's claim as stored. Times are epoch ms on the Convex clock.
+ * `leaseExpiresAt` is null once released. Ownership claims carry `updatedAt`,
+ * the time of the last claim, renewal or release. Raised fences carry
+ * `retiredAt`, set once the execution holding the fence settles and cleared
+ * when a fence is raised again.
+ */
+export type StoredRunClaim = RunClaimFence & {
+  leaseExpiresAt: number | null;
+  updatedAt?: number;
+  retiredAt?: number | null;
+};
+
+/** Reply to the ownership operations. `now` is the Convex clock the operation ran at. */
+export type RunClaimResult = { applied: boolean; claim: StoredRunClaim | null; now: number };
+
+/**
+ * Run fencing operations. They are routed by `op` before `tableName`, so a
+ * storage function deployed before run fencing rejects them as unsupported
+ * operations rather than running a write unfenced.
+ */
+export type RunClaimRequest =
+  | {
+      op: 'claimRunOwnership';
+      tableName: RunClaimTable;
+      runId: string;
+      ownerId: string;
+      leaseMs: number;
+      force: boolean;
+      expectedGeneration?: number;
+    }
+  | { op: 'renewRunOwnership'; tableName: RunClaimTable; fence: RunClaimFence; leaseMs: number }
+  | { op: 'releaseRunOwnership'; tableName: RunClaimTable; fence: RunClaimFence }
+  | { op: 'getRunOwnership'; tableName: RunClaimTable; runId: string }
+  | { op: 'raiseRunFence'; tableName: RunClaimTable; fence: RunClaimFence }
+  | { op: 'retireRunFence'; tableName: RunClaimTable; fence: RunClaimFence }
+  | {
+      /** Deletes up to `limit` claims whose epoch-ms `column` is set and older than `cutoff`. */
+      op: 'pruneRunClaims';
+      tableName: RunClaimTable;
+      column: 'updatedAt' | 'retiredAt';
+      cutoff: number;
+      limit: number;
+    }
+  | {
+      /**
+       * Runs `request` only if `fence` is the run's current claim in
+       * `tableName`, in the same mutation. Without `request`, only checks.
+       */
+      op: 'fenced';
+      tableName: RunClaimTable;
+      fence: RunClaimFence;
+      request?: StorageRequest;
     };
 
 export type StorageResponse =
   | {
       ok: true;
       result?: any;
-      /** Indicates more batches remain for bulk operations (e.g., clearTable) */
+      /** Indicates more batches or pages remain for the operation. */
       hasMore?: boolean;
+      /** Cursor for the next page when hasMore is true. */
+      continuationCursor?: string | null;
     }
   | {
       ok: false;

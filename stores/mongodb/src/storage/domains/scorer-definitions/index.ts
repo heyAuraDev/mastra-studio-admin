@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto';
-
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import {
   ScorerDefinitionsStorage,
@@ -175,8 +173,6 @@ export class MongoDBScorerDefinitionsStorage extends ScorerDefinitionsStorage {
         updatedAt: now,
       };
 
-      await collection.insertOne(this.serializeScorerDefinition(newScorerDefinition));
-
       // Extract snapshot config from flat input
       const snapshotConfig: Record<string, any> = {};
       for (const field of SNAPSHOT_FIELDS) {
@@ -186,15 +182,24 @@ export class MongoDBScorerDefinitionsStorage extends ScorerDefinitionsStorage {
       }
 
       // Create version 1
-      const versionId = randomUUID();
-      await this.createVersion({
+      const versionId = globalThis.crypto.randomUUID();
+      const versionDoc: Record<string, any> = {
         id: versionId,
         scorerDefinitionId: scorerDefinition.id,
         versionNumber: 1,
-        ...snapshotConfig,
         changedFields: Object.keys(snapshotConfig),
         changeMessage: 'Initial version',
-      } as CreateScorerDefinitionVersionInput);
+        createdAt: new Date(),
+      };
+      for (const field of SNAPSHOT_FIELDS) {
+        if (snapshotConfig[field] !== undefined) versionDoc[field] = snapshotConfig[field];
+      }
+
+      await this.#connector.withTransaction(async session => {
+        await collection.insertOne(this.serializeScorerDefinition(newScorerDefinition), { session });
+        const versionsCol = await this.getCollection(TABLE_SCORER_DEFINITION_VERSIONS);
+        await versionsCol.insertOne(versionDoc, { session });
+      });
 
       return newScorerDefinition;
     } catch (error) {
@@ -287,12 +292,12 @@ export class MongoDBScorerDefinitionsStorage extends ScorerDefinitionsStorage {
 
   async delete(id: string): Promise<void> {
     try {
-      // Delete all versions first
-      await this.deleteVersionsByParentId(id);
-
-      // Then delete the scorer definition
-      const collection = await this.getCollection(TABLE_SCORER_DEFINITIONS);
-      await collection.deleteOne({ id });
+      await this.#connector.withTransaction(async session => {
+        const versionsCol = await this.getCollection(TABLE_SCORER_DEFINITION_VERSIONS);
+        await versionsCol.deleteMany({ scorerDefinitionId: id }, { session });
+        const col = await this.getCollection(TABLE_SCORER_DEFINITIONS);
+        await col.deleteOne({ id }, { session });
+      });
     } catch (error) {
       throw new MastraError(
         {

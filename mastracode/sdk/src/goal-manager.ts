@@ -1,0 +1,463 @@
+/**
+ * GoalManager — persistent cross-turn goals, backed by the Agent's native goal
+ * mechanism.
+ *
+ * The objective lives in the durable `threadState` `'goal'` slot (via
+ * `agent.setObjective`/`getObjective`/`clearObjective`/`updateObjectiveOptions`)
+ * and is judged in-loop by the core goal step. This manager is a thin adapter:
+ * it keeps a synchronous in-memory view of the current objective for the TUI
+ * (status line, modal, keyboard shortcuts) and delegates persistence to the
+ * agent. There is no standalone judge agent and no between-turn re-invocation —
+ * the core goal step drives continuation and surfaces progress via `goal` stream
+ * chunks.
+ */
+import { getGoalActivityDurationMs } from '@mastra/core/agent';
+import type { Agent } from '@mastra/core/agent';
+import type { AgentController, Session } from '@mastra/core/agent-controller';
+import type { GoalObjectiveRecord } from '@mastra/core/storage';
+import { loadSettings } from './onboarding/settings.js';
+
+export interface GoalManagerState<TState extends Record<string, unknown> = Record<string, unknown>> {
+  controller: AgentController<TState>;
+  session: Session<TState>;
+}
+
+// =============================================================================
+// Types
+// =============================================================================
+
+export type GoalStatus = 'active' | 'paused' | 'done';
+
+/**
+ * TUI-facing view of a goal. Derived from the durable {@link GoalObjectiveRecord}
+ * plus the effective judge/max-runs settings, with display-only timer fields and
+ * a stable `id` used to match plan-started goals.
+ */
+export interface GoalState {
+  id: string;
+  objective: string;
+  status: GoalStatus;
+  turnsUsed: number;
+  maxTurns: number;
+  judgeModelId: string;
+  startedAt: string;
+  activeStartedAt?: string;
+  activeDurationMs?: number;
+  /** Why the goal paused (judge failure, budget exhaustion, ...). Only set while paused. */
+  pausedReason?: string;
+}
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+export const DEFAULT_MAX_TURNS = 50;
+const THREAD_GOAL_KEY = 'goal';
+
+function normalizeActiveDurationMs(value: number | undefined): number {
+  return value !== undefined && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+// =============================================================================
+// GoalManager
+// =============================================================================
+
+export class GoalManager {
+  /** Synchronous in-memory view of the active objective record (source of truth is ThreadState). */
+  private record: (GoalObjectiveRecord & { id: string }) | null = null;
+  private threadId: string | undefined;
+  private agentId: string | undefined;
+  private persistGoalOnNextThreadCreate = false;
+  /**
+   * Set by {@link clear} to the thread the goal was cleared on: the next save
+   * with an empty mirror on that same thread deletes the goal. A goal hydrated
+   * from legacy metadata has no known thread, so its clear applies to whichever
+   * thread the next save runs on (the pre-existing behaviour).
+   */
+  private pendingDelete: { threadId: string | undefined; goalId?: string } | null = null;
+
+  // ---------------------------------------------------------------------------
+  // Synchronous TUI surface
+  // ---------------------------------------------------------------------------
+
+  getGoal(): GoalState | null {
+    if (!this.record) return null;
+    const { judgeModelId, maxTurns } = this.effectiveSettings(this.record);
+    return {
+      id: this.record.id,
+      objective: this.record.objective,
+      status: this.record.status,
+      turnsUsed: this.record.runsUsed,
+      maxTurns,
+      judgeModelId,
+      startedAt: new Date(this.record.startedAt).toISOString(),
+      ...(this.record.pausedReason ? { pausedReason: this.record.pausedReason } : {}),
+      activeDurationMs:
+        this.agentId && this.threadId
+          ? getGoalActivityDurationMs({
+              agentId: this.agentId,
+              threadId: this.threadId,
+              objectiveId: this.record.id,
+              activeDurationMs: this.record.activeDurationMs,
+            })
+          : normalizeActiveDurationMs(this.record.activeDurationMs),
+    };
+  }
+
+  isActive(): boolean {
+    return this.record?.status === 'active';
+  }
+
+  persistOnNextThreadCreate(): void {
+    this.persistGoalOnNextThreadCreate = true;
+  }
+
+  consumePersistOnNextThreadCreate(): boolean {
+    if (!this.persistGoalOnNextThreadCreate) return false;
+    this.persistGoalOnNextThreadCreate = false;
+    return true;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Objective lifecycle (ThreadState-backed via the agent)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Set a new objective. Persists to ThreadState via `agent.setObjective` and
+   * updates the in-memory view. Only the provided settings are persisted into
+   * the record; unset ones fall back to the agent's `goal` config at read time.
+   */
+  async setGoal(
+    state: GoalManagerState,
+    objective: string,
+    judgeModelId: string,
+    maxTurns: number = DEFAULT_MAX_TURNS,
+  ): Promise<GoalState | null> {
+    const threadId = state.session.thread.getId();
+    const agent = this.getAgent(state);
+    const now = Date.now();
+    const id = globalThis.crypto.randomUUID();
+    this.pendingDelete = null;
+    this.threadId = threadId ?? undefined;
+    this.agentId = agent?.id;
+
+    if (agent && threadId) {
+      const persisted = await agent.setObjective(objective, {
+        id,
+        threadId,
+        resourceId: state.session.identity.getResourceId(),
+        ...(judgeModelId ? { judgeModelId } : {}),
+        maxRuns: maxTurns,
+      });
+      this.record = persisted
+        ? { ...persisted, id: persisted.id ?? id }
+        : this.localRecord(objective, judgeModelId, maxTurns, now, id);
+    } else {
+      this.record = this.localRecord(objective, judgeModelId, maxTurns, now, id);
+    }
+
+    return this.getGoal();
+  }
+
+  /**
+   * Update the judge model / max-runs defaults. Persists into the active record
+   * (so the override is remembered in thread state) when a goal is set.
+   */
+  async updateJudgeDefaults(
+    state: GoalManagerState,
+    judgeModelId: string,
+    maxTurns: number,
+  ): Promise<GoalState | null> {
+    if (!this.record) return null;
+    const threadId = state.session.thread.getId();
+    const agent = this.getAgent(state);
+    if (agent && threadId) {
+      const updated = await agent.updateObjectiveOptions({
+        threadId,
+        ...(judgeModelId ? { judgeModelId } : {}),
+        maxRuns: maxTurns,
+      });
+      if (updated) this.record = { ...updated, id: this.record.id };
+    } else {
+      this.record = {
+        ...this.record,
+        ...(judgeModelId ? { judgeModelId } : {}),
+        maxRuns: maxTurns,
+        updatedAt: Date.now(),
+      };
+    }
+    return this.getGoal();
+  }
+
+  pause(reason?: string): GoalState | null {
+    if (this.record && this.record.status === 'active') {
+      this.record = { ...this.record, status: 'paused', pausedReason: reason, updatedAt: Date.now() };
+    }
+    return this.getGoal();
+  }
+
+  resume(): GoalState | null {
+    if (this.record && this.record.status === 'paused') {
+      this.record = { ...this.record, status: 'active', pausedReason: undefined, updatedAt: Date.now() };
+    }
+    return this.getGoal();
+  }
+
+  markDone(): void {
+    if (this.record) {
+      this.record = { ...this.record, status: 'done', pausedReason: undefined, updatedAt: Date.now() };
+    }
+  }
+
+  clear(): void {
+    this.pendingDelete = { threadId: this.threadId, goalId: this.record?.id };
+    this.record = null;
+    this.threadId = undefined;
+    this.agentId = undefined;
+    this.persistGoalOnNextThreadCreate = false;
+  }
+
+  /**
+   * Sync the latest objective record from ThreadState into the in-memory view.
+   * Called from the `goal` stream-chunk handler after each evaluation.
+   */
+  applyEvaluation(update: { runsUsed: number; status: GoalStatus; pausedReason?: string }): GoalState | null {
+    if (!this.record) return null;
+    const pausedReason =
+      update.status === 'paused'
+        ? (update.pausedReason ?? (this.record.status === 'paused' ? this.record.pausedReason : undefined))
+        : undefined;
+    this.record = {
+      ...this.record,
+      runsUsed: update.runsUsed,
+      status: update.status,
+      // The cause lasts for one pause; leaving paused retires it.
+      pausedReason,
+      updatedAt: Date.now(),
+    };
+    return this.getGoal();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Persistence
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Persist the active objective to ThreadState via the agent. The objective
+   * record is the source of truth; the legacy thread-metadata key is cleared on
+   * a save that actually wrote, so stale state from older sessions cannot
+   * shadow the record — and a save that wrote nothing leaves it alone.
+   *
+   * An empty in-memory mirror means "I have nothing *loaded*", which is not the
+   * same statement as "there is nothing": the mirror is also emptied by storage
+   * failures and thread switches. So a save with an empty mirror deletes the
+   * goal (durable record and legacy key) only right after an explicit
+   * {@link clear} on the same thread (or any thread, for a legacy-hydrated goal
+   * whose thread is unknown), and is a complete no-op otherwise.
+   */
+  async saveToThread(state: GoalManagerState): Promise<void> {
+    const threadId = state.session.thread.getId();
+    const agent = this.getAgent(state);
+    if (!this.record && this.pendingDelete) {
+      const clearedThreadId = this.pendingDelete.threadId;
+      if (clearedThreadId === undefined || clearedThreadId === threadId) {
+        await this.deleteFromThread(state);
+      }
+      return;
+    }
+    try {
+      if (agent && threadId) {
+        if (this.record) {
+          // Push the current status/options into the existing record. If no
+          // record is persisted yet (e.g. first save), create one.
+          const updated = await agent.updateObjectiveOptions({
+            threadId,
+            status: this.record.status,
+            ...(this.record.pausedReason ? { pausedReason: this.record.pausedReason } : {}),
+            ...(this.record.judgeModelId ? { judgeModelId: this.record.judgeModelId } : {}),
+            ...(this.record.maxRuns !== undefined ? { maxRuns: this.record.maxRuns } : {}),
+          });
+          if (!updated) {
+            // No persisted record yet: create one. `setObjective` always writes
+            // `status: 'active'`, so re-apply the in-memory status afterwards if
+            // the local goal was already paused/done — otherwise the resumed
+            // thread state would no longer match the in-memory state.
+            const desiredStatus = this.record.status;
+            const created = await agent.setObjective(this.record.objective, {
+              id: this.record.id,
+              threadId,
+              resourceId: state.session.identity.getResourceId(),
+              activeDurationMs: normalizeActiveDurationMs(this.record.activeDurationMs),
+              ...(this.record.judgeModelId ? { judgeModelId: this.record.judgeModelId } : {}),
+              ...(this.record.maxRuns !== undefined ? { maxRuns: this.record.maxRuns } : {}),
+            });
+            // Nothing durable was written (no goal store, or no thread), so
+            // there is no record for a legacy key to shadow — and wiping it
+            // would take a pre-migration thread's only copy with it.
+            if (!created) return;
+            if (desiredStatus !== 'active') {
+              await agent.updateObjectiveOptions({
+                threadId,
+                status: desiredStatus,
+                ...(this.record.pausedReason ? { pausedReason: this.record.pausedReason } : {}),
+              });
+            }
+          }
+          // Clear any legacy thread-metadata goal so it can't shadow the
+          // record we just wrote. Only on the path that actually wrote: on the
+          // no-op path a pre-migration thread's only goal may live in that key.
+          await state.session.thread.setSetting({ key: THREAD_GOAL_KEY, value: undefined });
+        }
+      }
+    } catch {
+      // Persistence is not critical.
+    }
+  }
+
+  /**
+   * Remove the objective from the thread, whatever the in-memory mirror holds.
+   *
+   * The durable record needs an agent and a thread; the legacy thread-metadata
+   * key does not, so it is wiped either way — unlike {@link saveToThread}, which
+   * writes nothing with an empty mirror unless {@link clear} ran. That asymmetry is deliberate: a
+   * pre-migration goal must not resurface from the legacy key after a clear.
+   * Like the save, this is best-effort: a failed durable delete also skips the
+   * legacy wipe. A pending {@link clear} stays pending until both writes
+   * succeed, so a later save retries it; loading the thread retries it once
+   * and then drops it. Resolves to whether the delete landed.
+   */
+  async deleteFromThread(state: GoalManagerState): Promise<boolean> {
+    const threadId = state.session.thread.getId();
+    const agent = this.getAgent(state);
+    try {
+      if (agent && threadId) {
+        await agent.clearObjective({ threadId });
+      }
+      await state.session.thread.setSetting({ key: THREAD_GOAL_KEY, value: undefined });
+      this.pendingDelete = null;
+      return true;
+    } catch {
+      // Persistence is not critical, but keep the retry scoped to the thread
+      // this delete targeted so an empty save elsewhere cannot delete a goal.
+      // An unknown thread would widen the retry to every thread, so keep the old scope then.
+      if (threadId) this.pendingDelete = { threadId, goalId: this.pendingDelete?.goalId };
+      return false;
+    }
+  }
+
+  /**
+   * Load the objective from ThreadState (called on thread switch). Falls back to
+   * the legacy thread-metadata goal for threads created before this migration.
+   *
+   * A clear whose delete failed is retried here when it targeted this thread and
+   * the stored goal is the one that was cleared; otherwise the stored goal loads,
+   * so the mirror never hides a goal core is still judging. Resolves to whether
+   * that retried delete landed.
+   */
+  async loadFromThread(state: GoalManagerState, isCurrent: () => boolean = () => true): Promise<boolean> {
+    const pending = this.pendingDelete;
+    const threadId = state.session.thread.getId();
+    const agent = this.getAgent(state);
+    let nextRecord: typeof this.record = null;
+    let storedId: string | undefined;
+    if (agent && threadId) {
+      try {
+        const record = await agent.getObjective({ threadId });
+        if (record) {
+          storedId = record.id;
+          nextRecord = {
+            ...record,
+            id: record.id ?? globalThis.crypto.randomUUID(),
+            activeDurationMs: normalizeActiveDurationMs(record.activeDurationMs),
+          };
+        }
+      } catch {
+        // fall through to legacy metadata
+      }
+    }
+    if (!isCurrent()) return false;
+    // A goal set or cleared during the read replaced this intent; keep the newer state.
+    if (pending && this.pendingDelete !== pending) return false;
+    let retriedDelete = false;
+    if (pending?.goalId && pending.threadId === threadId && storedId === pending.goalId) {
+      retriedDelete = await this.deleteFromThread(state);
+      if (retriedDelete) nextRecord = null;
+      if (!isCurrent()) return false;
+    }
+    this.persistGoalOnNextThreadCreate = false;
+    this.pendingDelete = null;
+    this.threadId = threadId ?? undefined;
+    this.agentId = agent?.id;
+    this.record = nextRecord;
+    return retriedDelete;
+  }
+
+  /**
+   * Legacy entry point retained for thread-switch call sites that only have the
+   * thread metadata available. Hydrates from a previously-persisted GoalState.
+   */
+  loadFromThreadMetadata(metadata: Record<string, unknown> | undefined): void {
+    const saved = metadata?.[THREAD_GOAL_KEY] as Partial<GoalState> | undefined;
+    this.persistGoalOnNextThreadCreate = false;
+    this.pendingDelete = null;
+    this.threadId = undefined;
+    this.agentId = undefined;
+    if (saved && saved.objective && saved.status) {
+      this.record = {
+        objective: saved.objective,
+        status: saved.status,
+        runsUsed: saved.turnsUsed ?? 0,
+        activeDurationMs: normalizeActiveDurationMs(saved.activeDurationMs),
+        maxRuns: saved.maxTurns ?? DEFAULT_MAX_TURNS,
+        judgeModelId: saved.judgeModelId ?? '',
+        ...(saved.pausedReason ? { pausedReason: saved.pausedReason } : {}),
+        startedAt: saved.startedAt ? Date.parse(saved.startedAt) || Date.now() : Date.now(),
+        updatedAt: Date.now(),
+        id: saved.id ?? globalThis.crypto.randomUUID(),
+      };
+    } else {
+      this.record = null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private
+  // ---------------------------------------------------------------------------
+
+  private getAgent(state: GoalManagerState): Agent | undefined {
+    try {
+      return state.controller.getCurrentAgent(state.session);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Resolve effective judge model + max runs (record value → settings default). */
+  private effectiveSettings(record: GoalObjectiveRecord): { judgeModelId: string; maxTurns: number } {
+    const settings = loadSettings();
+    return {
+      judgeModelId: record.judgeModelId ?? settings.models.goalJudgeModel ?? '',
+      maxTurns: record.maxRuns ?? settings.models.goalMaxTurns ?? DEFAULT_MAX_TURNS,
+    };
+  }
+
+  private localRecord(
+    objective: string,
+    judgeModelId: string,
+    maxTurns: number,
+    now: number,
+    id: string,
+  ): GoalObjectiveRecord & { id: string } {
+    return {
+      objective,
+      status: 'active',
+      runsUsed: 0,
+      activeDurationMs: 0,
+      maxRuns: maxTurns,
+      ...(judgeModelId ? { judgeModelId } : {}),
+      startedAt: now,
+      updatedAt: now,
+      id,
+    };
+  }
+}

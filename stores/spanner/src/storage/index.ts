@@ -2,12 +2,16 @@ import { Spanner } from '@google-cloud/spanner';
 import type { Database, Instance } from '@google-cloud/spanner';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import { createStorageErrorId, MastraCompositeStore } from '@mastra/core/storage';
-import type { StorageDomains, CreateIndexOptions } from '@mastra/core/storage';
+import type { StorageDomains, CreateIndexOptions, RetentionConfig } from '@mastra/core/storage';
 
 import type { SpannerInitMode } from './db';
 import { AgentsSpanner } from './domains/agents';
 import { BackgroundTasksSpanner } from './domains/background-tasks';
 import { BlobsSpanner } from './domains/blobs';
+import { ChannelsSpanner } from './domains/channels';
+import { DatasetsSpanner } from './domains/datasets';
+import { ExperimentsSpanner } from './domains/experiments';
+import { FavoritesSpanner } from './domains/favorites';
 import { MCPClientsSpanner } from './domains/mcp-clients';
 import { MCPServersSpanner } from './domains/mcp-servers';
 import { MemorySpanner } from './domains/memory';
@@ -17,13 +21,19 @@ import { SchedulesSpanner } from './domains/schedules';
 import { ScorerDefinitionsSpanner } from './domains/scorer-definitions';
 import { ScoresSpanner } from './domains/scores';
 import { SkillsSpanner } from './domains/skills';
+import { WorkflowDefinitionsSpanner } from './domains/workflow-definitions';
 import { WorkflowsSpanner } from './domains/workflows';
+import { WorkspacesSpanner } from './domains/workspaces';
 
 // Export domain classes for direct use with MastraStorage composition
 export {
   AgentsSpanner,
   BackgroundTasksSpanner,
   BlobsSpanner,
+  ChannelsSpanner,
+  DatasetsSpanner,
+  ExperimentsSpanner,
+  FavoritesSpanner,
   MCPClientsSpanner,
   MCPServersSpanner,
   MemorySpanner,
@@ -33,7 +43,9 @@ export {
   ScorerDefinitionsSpanner,
   ScoresSpanner,
   SkillsSpanner,
+  WorkflowDefinitionsSpanner,
   WorkflowsSpanner,
+  WorkspacesSpanner,
 };
 export type { SpannerDomainConfig, SpannerInitMode } from './db';
 
@@ -52,6 +64,12 @@ export const SPANNER_DOMAIN_KEYS = [
   'scorerDefinitions',
   'schedules',
   'observability',
+  'channels',
+  'datasets',
+  'experiments',
+  'favorites',
+  'workspaces',
+  'workflowDefinitions',
 ] as const satisfies ReadonlyArray<keyof StorageDomains>;
 
 export type SpannerDomainKey = (typeof SPANNER_DOMAIN_KEYS)[number];
@@ -152,6 +170,11 @@ export type SpannerConfigType = {
    * @default true
    */
   disableMetrics?: boolean;
+  /**
+   * Opt-in age-based retention policies. Only configured tables are pruned.
+   * Call `store.prune()` from your scheduler to apply them.
+   */
+  retention?: RetentionConfig;
 } & (
   | {
       /** Pre-configured Spanner Database handle. */
@@ -203,7 +226,7 @@ export class SpannerStore extends MastraCompositeStore {
     if (!config.id || config.id.trim() === '') {
       throw new Error('SpannerStore: id must be provided and cannot be empty.');
     }
-    super({ id: config.id, name: 'SpannerStore', disableInit: config.disableInit });
+    super({ id: config.id, name: 'SpannerStore', disableInit: config.disableInit, retention: config.retention });
     try {
       if (isPreConfiguredDatabase(config)) {
         this.database = config.database;
@@ -264,6 +287,14 @@ export class SpannerStore extends MastraCompositeStore {
         ...(wants('scorerDefinitions') && { scorerDefinitions: new ScorerDefinitionsSpanner(domainConfig) }),
         ...(wants('schedules') && { schedules: new SchedulesSpanner(domainConfig) }),
         ...(wants('observability') && { observability: new ObservabilitySpanner(domainConfig) }),
+        ...(wants('channels') && { channels: new ChannelsSpanner(domainConfig) }),
+        ...(wants('datasets') && { datasets: new DatasetsSpanner(domainConfig) }),
+        ...(wants('experiments') && { experiments: new ExperimentsSpanner(domainConfig) }),
+        ...(wants('favorites') && { favorites: new FavoritesSpanner(domainConfig) }),
+        ...(wants('workspaces') && { workspaces: new WorkspacesSpanner(domainConfig) }),
+        ...(wants('workflowDefinitions') && {
+          workflowDefinitions: new WorkflowDefinitionsSpanner(domainConfig),
+        }),
       };
     } catch (e) {
       throw new MastraError(
@@ -308,7 +339,9 @@ export class SpannerStore extends MastraCompositeStore {
     // root throw below propagates to the current call. Attach a no-op catch
     // here so a rejected `pending` without other awaiters is not flagged as
     // an unhandled rejection.
-    pending.catch(() => {});
+    pending.catch(e => {
+      this.logger?.warn?.('Initialization failed', e);
+    });
 
     try {
       // Initialize domains sequentially to avoid concurrent DDL errors in Spanner.
@@ -326,6 +359,12 @@ export class SpannerStore extends MastraCompositeStore {
         'scorerDefinitions',
         'schedules',
         'observability',
+        'channels',
+        'datasets',
+        'experiments',
+        'workspaces',
+        'favorites',
+        'workflowDefinitions',
       ];
       for (const key of domainOrder) {
         const store = this.stores?.[key];
@@ -359,15 +398,11 @@ export class SpannerStore extends MastraCompositeStore {
    */
   async close() {
     if (!this.ownsClient) return;
-    try {
-      await this.database.close();
-      if (this.spanner) {
-        // Spanner node lib wraps most functions (including this one with PromisifyAll), but currently there's a bug that causes awaiting on it to hand indefinitely.
-        // Current workaround is to just call it without await https://github.com/googleapis/google-cloud-node/issues/8106
-        this.spanner.close();
-      }
-    } catch (error) {
-      throw error;
+    await this.database.close();
+    if (this.spanner) {
+      // Spanner node lib wraps most functions (including this one with PromisifyAll), but currently there's a bug that causes awaiting on it to hand indefinitely.
+      // Current workaround is to just call it without await https://github.com/googleapis/google-cloud-node/issues/8106
+      void this.spanner.close();
     }
   }
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-import { readFileSync, readdirSync, statSync } from 'fs';
-import { join, dirname, relative } from 'path';
-import { fileURLToPath } from 'url';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { join, dirname, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import semver from 'semver';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -22,7 +22,7 @@ function findPackageJsonFiles(dir, basePath = '') {
     const stat = statSync(fullPath);
     const relativePath = join(basePath, entry);
 
-    if (entry === 'node_modules' || entry === 'dist' || entry === 'build' || entry === '.pnpm') {
+    if (entry === 'node_modules' || entry === 'dist' || entry === 'build' || entry.startsWith('.')) {
       continue;
     }
 

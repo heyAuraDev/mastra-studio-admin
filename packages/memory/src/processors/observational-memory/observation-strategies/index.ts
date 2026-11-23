@@ -19,6 +19,7 @@ import type { ObservationRunOpts } from './types';
 ObservationStrategy.create = ((om: ObservationalMemory, opts: ObservationRunOpts): ObservationStrategy => {
   const deps: StrategyDeps = {
     storage: om.getStorage(),
+    memory: om.getMemory(),
     messageHistory: om.getMessageHistory(),
     tokenCounter: om.getTokenCounter(),
     observationConfig: om.getObservationConfig(),
@@ -31,6 +32,7 @@ ObservationStrategy.create = ((om: ObservationalMemory, opts: ObservationRunOpts
     obscureThreadIds: om.getObscureThreadIds(),
     onIndexObservations: om.onIndexObservations,
     emitDebugEvent: e => om.emitDebugEvent(e),
+    prepareObserverContext: (observations, record) => om.prepareObserverContext(observations, record),
   };
 
   if (opts.cycleId) return new AsyncBufferObservationStrategy(deps, opts);

@@ -23,8 +23,11 @@ import type {
   ListSkillVersionsInput,
   ListSkillVersionsOutput,
 } from '@mastra/core/storage/domains/skills';
-import { PgDB, resolvePgConfig } from '../../db';
-import type { PgDomainConfig } from '../../db';
+import { skillSnapshotFieldValuesEqual } from '@mastra/core/storage/domains/skills';
+import { schemaNamePrefix } from '../../../shared/schema-name';
+import { PgDB, resolvePgConfig, generateTableSQL, generateIndexSQL } from '../../db';
+import type { DbClient, PgDomainConfig } from '../../db';
+import { toPgJson } from '../../db/sanitize-json';
 import { getTableName, getSchemaName, parseJsonResilient } from '../utils';
 
 const SNAPSHOT_FIELDS = [
@@ -52,22 +55,50 @@ export class SkillsPG extends SkillsStorage {
 
   constructor(config: PgDomainConfig) {
     super();
-    const { client, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
-    this.#db = new PgDB({ client, schemaName, skipDefaultIndexes });
+    const { client, readClient, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
+    this.#db = new PgDB({ client, readClient, schemaName, skipDefaultIndexes });
     this.#schema = schemaName || 'public';
     this.#skipDefaultIndexes = skipDefaultIndexes;
     this.#indexes = indexes?.filter(idx => (SkillsPG.MANAGED_TABLES as readonly string[]).includes(idx.table));
   }
 
-  getDefaultIndexDefinitions(): CreateIndexOptions[] {
+  static getDefaultIndexDefs(schemaPrefix: string): CreateIndexOptions[] {
     return [
       {
-        name: 'idx_skill_versions_skill_version',
+        name: `${schemaPrefix}idx_skill_versions_skill_version`,
         table: TABLE_SKILL_VERSIONS,
         columns: ['skillId', 'versionNumber'],
         unique: true,
       },
     ];
+  }
+
+  static getExportDDL(schemaName?: string): string[] {
+    const statements: string[] = [];
+    const parsedSchema = schemaName ? schemaNamePrefix(schemaName) : '';
+    const schemaPrefix = parsedSchema && parsedSchema !== 'public' ? `${parsedSchema}_` : '';
+
+    for (const tableName of SkillsPG.MANAGED_TABLES) {
+      statements.push(
+        generateTableSQL({
+          tableName,
+          schema: TABLE_SCHEMAS[tableName],
+          schemaName,
+          includeAllConstraints: true,
+        }),
+      );
+    }
+
+    for (const idx of SkillsPG.getDefaultIndexDefs(schemaPrefix)) {
+      statements.push(generateIndexSQL(idx, schemaName));
+    }
+
+    return statements;
+  }
+
+  getDefaultIndexDefinitions(): CreateIndexOptions[] {
+    const schemaPrefix = this.#schema !== 'public' ? `${schemaNamePrefix(this.#schema)}_` : '';
+    return SkillsPG.getDefaultIndexDefs(schemaPrefix);
   }
 
   async createDefaultIndexes(): Promise<void> {
@@ -130,9 +161,17 @@ export class SkillsPG extends SkillsStorage {
   // ==========================================================================
 
   async getById(id: string): Promise<StorageSkillType | null> {
+    return this.#getById(this.#db.readClient, id);
+  }
+
+  /**
+   * Same lookup against an explicit client. Mutation paths pass the writer so a
+   * lagging read replica cannot yield stale or missing rows mid-update.
+   */
+  async #getById(client: DbClient, id: string): Promise<StorageSkillType | null> {
     try {
       const tableName = getTableName({ indexName: TABLE_SKILLS, schemaName: getSchemaName(this.#schema) });
-      const result = await this.#db.client.oneOrNone(`SELECT * FROM ${tableName} WHERE id = $1`, [id]);
+      const result = await client.oneOrNone(`SELECT * FROM ${tableName} WHERE id = $1`, [id]);
 
       if (!result) {
         return null;
@@ -155,6 +194,7 @@ export class SkillsPG extends SkillsStorage {
 
   async create(input: { skill: StorageCreateSkillInput }): Promise<StorageSkillType> {
     const { skill } = input;
+    let draftInserted = false;
     try {
       const tableName = getTableName({ indexName: TABLE_SKILLS, schemaName: getSchemaName(this.#schema) });
       const now = new Date();
@@ -170,6 +210,7 @@ export class SkillsPG extends SkillsStorage {
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
         [skill.id, 'draft', null, skill.authorId ?? null, visibility ?? null, 0, nowIso, nowIso, nowIso, nowIso],
       );
+      draftInserted = true;
 
       // 2. Extract snapshot fields and create version 1
       const { id: _id, authorId: _authorId, visibility: _visibility, ...snapshotConfig } = skill;
@@ -194,18 +235,21 @@ export class SkillsPG extends SkillsStorage {
         updatedAt: now,
       };
     } catch (error) {
-      // Best-effort cleanup
-      try {
-        const tableName = getTableName({
-          indexName: TABLE_SKILLS,
-          schemaName: getSchemaName(this.#schema),
-        });
-        await this.#db.client.none(
-          `DELETE FROM ${tableName} WHERE id = $1 AND status = 'draft' AND "activeVersionId" IS NULL`,
-          [skill.id],
-        );
-      } catch {
-        // Ignore cleanup errors
+      // Best-effort cleanup, only for a draft this call inserted. If our INSERT failed
+      // (e.g. duplicate id), the row belongs to a concurrent creator and must be kept.
+      if (draftInserted) {
+        try {
+          const tableName = getTableName({
+            indexName: TABLE_SKILLS,
+            schemaName: getSchemaName(this.#schema),
+          });
+          await this.#db.client.none(
+            `DELETE FROM ${tableName} WHERE id = $1 AND status = 'draft' AND "activeVersionId" IS NULL`,
+            [skill.id],
+          );
+        } catch {
+          // Ignore cleanup errors
+        }
       }
 
       if (error instanceof MastraError) throw error;
@@ -226,7 +270,7 @@ export class SkillsPG extends SkillsStorage {
     try {
       const tableName = getTableName({ indexName: TABLE_SKILLS, schemaName: getSchemaName(this.#schema) });
 
-      const existingSkill = await this.getById(id);
+      const existingSkill = await this.#getById(this.#db.client, id);
       if (!existingSkill) {
         throw new MastraError({
           id: createStorageErrorId('PG', 'UPDATE_SKILL', 'NOT_FOUND'),
@@ -253,7 +297,7 @@ export class SkillsPG extends SkillsStorage {
       const hasConfigUpdate = SNAPSHOT_FIELDS.some(field => field in configFields);
 
       if (hasConfigUpdate) {
-        const latestVersion = await this.getLatestVersion(id);
+        const latestVersion = await this.#getLatestVersion(this.#db.client, id);
         if (!latestVersion) {
           throw new MastraError({
             id: createStorageErrorId('PG', 'UPDATE_SKILL', 'NO_VERSIONS'),
@@ -278,8 +322,10 @@ export class SkillsPG extends SkillsStorage {
         const changedFields = SNAPSHOT_FIELDS.filter(
           field =>
             field in configFields &&
-            JSON.stringify(configFields[field as keyof typeof configFields]) !==
-              JSON.stringify(latestConfig[field as keyof typeof latestConfig]),
+            !skillSnapshotFieldValuesEqual(
+              configFields[field as keyof typeof configFields],
+              latestConfig[field as keyof typeof latestConfig],
+            ),
         );
 
         if (changedFields.length > 0) {
@@ -335,15 +381,9 @@ export class SkillsPG extends SkillsStorage {
 
       values.push(id);
 
-      if (setClauses.length > 2 || versionCreated) {
-        // More than just updatedAt and updatedAtZ, or a new version was created
-        await this.#db.client.none(
-          `UPDATE ${tableName} SET ${setClauses.join(', ')} WHERE id = $${paramIndex}`,
-          values,
-        );
-      }
+      await this.#db.client.none(`UPDATE ${tableName} SET ${setClauses.join(', ')} WHERE id = $${paramIndex}`, values);
 
-      const updatedSkill = await this.getById(id);
+      const updatedSkill = await this.#getById(this.#db.client, id);
       if (!updatedSkill) {
         throw new MastraError({
           id: createStorageErrorId('PG', 'UPDATE_SKILL', 'NOT_FOUND_AFTER_UPDATE'),
@@ -398,6 +438,7 @@ export class SkillsPG extends SkillsStorage {
       entityIds,
       pinFavoritedFor,
       favoritedOnly,
+      metadata,
     } = args || {};
     const { field, direction } = this.parseOrderBy(orderBy);
 
@@ -458,6 +499,22 @@ export class SkillsPG extends SkillsStorage {
         queryParams.push(visibility);
       }
 
+      if (metadata && Object.keys(metadata).length > 0) {
+        // Metadata lives on version rows; match against the resolved version
+        // (active, falling back to latest; latest when listing drafts).
+        const versionsTable = getTableName({
+          indexName: TABLE_SKILL_VERSIONS,
+          schemaName: getSchemaName(this.#schema),
+        });
+        const latestVersionId = `(SELECT lv.id FROM ${versionsTable} lv WHERE lv."skillId" = s.id ORDER BY lv."versionNumber" DESC LIMIT 1)`;
+        const resolvedVersionId =
+          status === 'draft' ? latestVersionId : `COALESCE(s."activeVersionId", ${latestVersionId})`;
+        conditions.push(
+          `EXISTS (SELECT 1 FROM ${versionsTable} mv WHERE mv."skillId" = s.id AND mv.id = ${resolvedVersionId} AND mv.metadata @> $${paramIdx++}::jsonb)`,
+        );
+        queryParams.push(toPgJson(metadata));
+      }
+
       if (entityIds && entityIds.length > 0) {
         const placeholders = entityIds.map(() => `$${paramIdx++}`).join(', ');
         conditions.push(`s.id IN (${placeholders})`);
@@ -480,7 +537,7 @@ export class SkillsPG extends SkillsStorage {
       const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
       // Get total count (mirrors join + where, no ORDER BY / LIMIT).
-      const countResult = await this.#db.client.one(
+      const countResult = await this.#db.readClient.one(
         `SELECT COUNT(*) as count FROM ${tableName} s ${joinClause} ${whereClause}`,
         [...joinParams, ...queryParams],
       );
@@ -508,7 +565,7 @@ export class SkillsPG extends SkillsStorage {
       const limitValue = perPageInput === false ? total : perPage;
       const limitIdx = paramIdx++;
       const offsetIdx = paramIdx++;
-      const dataResult = await this.#db.client.manyOrNone(
+      const dataResult = await this.#db.readClient.manyOrNone(
         `SELECT s.* FROM ${tableName} s ${joinClause} ${whereClause} ${orderByClause} LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
         [...joinParams, ...queryParams, limitValue, offset],
       );
@@ -571,15 +628,15 @@ export class SkillsPG extends SkillsStorage {
           input.description ?? null,
           input.instructions ?? null,
           input.license ?? null,
-          input.compatibility ? JSON.stringify(input.compatibility) : null,
-          input.source ? JSON.stringify(input.source) : null,
-          input.references ? JSON.stringify(input.references) : null,
-          input.scripts ? JSON.stringify(input.scripts) : null,
-          input.assets ? JSON.stringify(input.assets) : null,
-          input.files ? JSON.stringify(input.files) : null,
-          input.metadata ? JSON.stringify(input.metadata) : null,
-          input.tree ? JSON.stringify(input.tree) : null,
-          input.changedFields ? JSON.stringify(input.changedFields) : null,
+          input.compatibility ? toPgJson(input.compatibility) : null,
+          input.source ? toPgJson(input.source) : null,
+          input.references ? toPgJson(input.references) : null,
+          input.scripts ? toPgJson(input.scripts) : null,
+          input.assets ? toPgJson(input.assets) : null,
+          input.files ? toPgJson(input.files) : null,
+          input.metadata ? toPgJson(input.metadata) : null,
+          input.tree ? toPgJson(input.tree) : null,
+          input.changedFields ? toPgJson(input.changedFields) : null,
           input.changeMessage ?? null,
           nowIso,
           nowIso,
@@ -610,7 +667,7 @@ export class SkillsPG extends SkillsStorage {
         indexName: TABLE_SKILL_VERSIONS,
         schemaName: getSchemaName(this.#schema),
       });
-      const result = await this.#db.client.oneOrNone(`SELECT * FROM ${tableName} WHERE id = $1`, [id]);
+      const result = await this.#db.readClient.oneOrNone(`SELECT * FROM ${tableName} WHERE id = $1`, [id]);
 
       if (!result) {
         return null;
@@ -631,13 +688,42 @@ export class SkillsPG extends SkillsStorage {
     }
   }
 
+  async getVersions(ids: string[]): Promise<SkillVersion[]> {
+    if (ids.length === 0) {
+      return [];
+    }
+    try {
+      const tableName = getTableName({
+        indexName: TABLE_SKILL_VERSIONS,
+        schemaName: getSchemaName(this.#schema),
+      });
+      const placeholders = ids.map((_, i) => `$${i + 1}`).join(', ');
+      const rows = await this.#db.readClient.manyOrNone(
+        `SELECT * FROM ${tableName} WHERE id IN (${placeholders})`,
+        ids,
+      );
+      return rows.map(row => this.parseVersionRow(row));
+    } catch (error) {
+      if (error instanceof MastraError) throw error;
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'GET_SKILL_VERSIONS', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { count: ids.length },
+        },
+        error,
+      );
+    }
+  }
+
   async getVersionByNumber(skillId: string, versionNumber: number): Promise<SkillVersion | null> {
     try {
       const tableName = getTableName({
         indexName: TABLE_SKILL_VERSIONS,
         schemaName: getSchemaName(this.#schema),
       });
-      const result = await this.#db.client.oneOrNone(
+      const result = await this.#db.readClient.oneOrNone(
         `SELECT * FROM ${tableName} WHERE "skillId" = $1 AND "versionNumber" = $2`,
         [skillId, versionNumber],
       );
@@ -662,12 +748,20 @@ export class SkillsPG extends SkillsStorage {
   }
 
   async getLatestVersion(skillId: string): Promise<SkillVersion | null> {
+    return this.#getLatestVersion(this.#db.readClient, skillId);
+  }
+
+  /**
+   * Same lookup against an explicit client. Mutation paths pass the writer so a
+   * lagging read replica cannot yield stale or missing rows mid-update.
+   */
+  async #getLatestVersion(client: DbClient, skillId: string): Promise<SkillVersion | null> {
     try {
       const tableName = getTableName({
         indexName: TABLE_SKILL_VERSIONS,
         schemaName: getSchemaName(this.#schema),
       });
-      const result = await this.#db.client.oneOrNone(
+      const result = await client.oneOrNone(
         `SELECT * FROM ${tableName} WHERE "skillId" = $1 ORDER BY "versionNumber" DESC LIMIT 1`,
         [skillId],
       );
@@ -716,9 +810,10 @@ export class SkillsPG extends SkillsStorage {
         schemaName: getSchemaName(this.#schema),
       });
 
-      const countResult = await this.#db.client.one(`SELECT COUNT(*) as count FROM ${tableName} WHERE "skillId" = $1`, [
-        skillId,
-      ]);
+      const countResult = await this.#db.readClient.one(
+        `SELECT COUNT(*) as count FROM ${tableName} WHERE "skillId" = $1`,
+        [skillId],
+      );
       const total = parseInt(countResult.count, 10);
 
       if (total === 0) {
@@ -732,7 +827,7 @@ export class SkillsPG extends SkillsStorage {
       }
 
       const limitValue = perPageInput === false ? total : perPage;
-      const dataResult = await this.#db.client.manyOrNone(
+      const dataResult = await this.#db.readClient.manyOrNone(
         `SELECT * FROM ${tableName} WHERE "skillId" = $1 ORDER BY "${field}" ${direction} LIMIT $2 OFFSET $3`,
         [skillId, limitValue, offset],
       );
@@ -815,7 +910,7 @@ export class SkillsPG extends SkillsStorage {
         indexName: TABLE_SKILL_VERSIONS,
         schemaName: getSchemaName(this.#schema),
       });
-      const result = await this.#db.client.one(`SELECT COUNT(*) as count FROM ${tableName} WHERE "skillId" = $1`, [
+      const result = await this.#db.readClient.one(`SELECT COUNT(*) as count FROM ${tableName} WHERE "skillId" = $1`, [
         skillId,
       ]);
       return parseInt(result.count, 10);

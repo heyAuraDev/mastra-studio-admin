@@ -4,76 +4,183 @@ import { MastraBase } from '@mastra/core/base';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import type { MCPServerBase } from '@mastra/core/mcp';
 import type { Tool } from '@mastra/core/tools';
-import { DEFAULT_REQUEST_TIMEOUT_MSEC } from '@modelcontextprotocol/sdk/shared/protocol.js';
-import type {
-  ElicitRequest,
-  ElicitResult,
-  ProgressNotification,
-  Prompt,
-  Resource,
-  ResourceTemplate,
-} from '@modelcontextprotocol/sdk/types.js';
+import { DEFAULT_REQUEST_TIMEOUT_MSEC } from '@modelcontextprotocol/client';
+import type { ProgressNotification, Prompt, Resource, ResourceTemplateType } from '@modelcontextprotocol/client';
 import equal from 'fast-deep-equal';
+import { UnauthorizedError } from '../shared/oauth-types';
+import type { MCPDetailedTask, MCPTaskInputResponses } from '../shared/tasks';
 import { InternalMastraMCPClient } from './client';
-import type { MastraMCPServerDefinition } from './client';
-import { isReconnectableMCPError } from './error-utils';
+import type { MastraMCPServerDefinition, MCPServerAuthState } from './client';
+import { getMCPDiscoveryErrorDetails, isReconnectableMCPError } from './error-utils';
+import type { MCPDiscoveryErrorDetails } from './error-utils';
+import type {
+  MCPClientWebhookOptions,
+  MCPEventDescriptor,
+  MCPEventSubscribeOptions,
+  MCPEventSubscription,
+} from './events';
+import type { EventsWebhookSetup } from './events/types';
+import { WebhookReceiver } from './events/webhook-receiver';
+import { loadInputSchemaMetaValidator } from './input-schema-meta-schema';
+import { createOAuthCallbackServer } from './oauth-callback-server';
+import type { OAuthCallbackServer } from './oauth-callback-server';
+import { MCPOAuthClientProvider } from './oauth-provider';
 import { MCPClientServerProxy } from './server-proxy';
+import type {
+  MCPClientInfo,
+  MCPClientServers,
+  MCPClientTools,
+  MCPClientToolsets,
+  MCPServerImplementation,
+  MCPServerMap,
+  SerializableMCPToolCatalog,
+  SerializableMCPToolDefinition,
+} from './types';
 
-const mcpClientInstances = new Map<string, InstanceType<typeof MCPClient>>();
+// Client snapshots are erased in the shared runtime cache.
+const mcpClientInstances = new Map<string, object>();
+
+/** Reads the shared cache without promising the snapshot shape it was created with. */
+function cachedClient<TServers extends MCPClientServers<TServers>>(id: string): MCPClient<TServers> | undefined {
+  return mcpClientInstances.get(id) as MCPClient<TServers> | undefined;
+}
 const TOOL_DISCOVERY_MAX_ATTEMPTS = 2;
+
+/**
+ * `code` of the discovery error reported when a server exceeds `perServerTimeoutMs`.
+ * The server's connect keeps running, so a later discovery can still succeed.
+ */
+export const MCP_DISCOVERY_TIMEOUT_CODE = 'MCP_DISCOVERY_TIMEOUT';
+
+// Outcome of a single server's discovery within discoverAcrossServers(). An
+// explicit discriminated union (rather than `{ value?: T; error?: string }`) so
+// that narrowing on `error` also narrows `value` — Promise.all would otherwise
+// widen the two branches into independent optional props and break the fold.
+type ServerDiscoveryResult<T> =
+  | { serverName: string; value: T; error: undefined; duration: number }
+  | { serverName: string; value: undefined; error: MCPDiscoveryErrorDetails; duration: number };
+
+/** Outcome of one server's discovery, passed to {@link MCPDiscoveryOptions.onServerSettled}. */
+export type MCPServerSettledResult<T> =
+  | { value: T; error?: undefined; duration: number }
+  | { value?: undefined; error: MCPDiscoveryErrorDetails; duration: number };
+
+/** Options for aggregate discovery across configured MCP servers. */
+export interface MCPDiscoveryOptions<T = unknown> {
+  /** Maximum time to wait for each server's discovery operation, in milliseconds. */
+  perServerTimeoutMs?: number;
+  /** Only discover these configured servers. Unknown names are ignored. Defaults to every server. */
+  serverNames?: string[];
+  /**
+   * Called as soon as each server's discovery succeeds, fails, or times out, before the
+   * aggregate result resolves. Lets callers report each server independently instead of
+   * waiting for the slowest one. Errors thrown by the callback are logged and ignored.
+   */
+  onServerSettled?: (serverName: string, result: MCPServerSettledResult<T>) => void;
+}
+
+// Matches the entire 127.0.0.0/8 range in dotted-quad form. `URL` normalizes
+// IPv4 hosts to four octets (so `127.1` becomes `127.0.0.1`), so anchoring the
+// pattern is enough — and it rejects lookalikes like `127.evil.com` that a
+// prefix check would wrongly accept and leak the authorization code to.
+const LOOPBACK_IPV4 = /^127\.(?:\d{1,3})\.(?:\d{1,3})\.(?:\d{1,3})$/;
+
+// Whether a hostname is a loopback address authenticate() accepts for the
+// provider's redirect URL (RFC 8252 loopback redirection). Kept in sync with the
+// mastracode config parser, which accepts any 127.0.0.0/8 host, so a config that
+// parses (e.g. 127.0.0.2) does not later fail here.
+function isLoopbackHostname(hostname: string): boolean {
+  return hostname === 'localhost' || hostname === '[::1]' || hostname === '::1' || LOOPBACK_IPV4.test(hostname);
+}
 
 /**
  * Configuration options for creating an MCPClient instance.
  */
-export interface MCPClientOptions {
+export interface MCPClientOptions<TServers extends MCPClientServers<TServers> = MCPServerMap> {
   /** Optional unique identifier to prevent memory leaks when creating multiple instances with identical configurations */
   id?: string;
-  /** Map of server names to their connection configurations (stdio or HTTP-based) */
-  servers: Record<string, MastraMCPServerDefinition>;
+  /**
+   * Map of server names to their connection configurations (stdio or HTTP-based).
+   *
+   * Broad when no snapshot generic is supplied, so ordinary object literals stay contextually
+   * typed (a mapped type over an unresolved type parameter suppresses that); exact keys once the
+   * caller supplies a generated server map.
+   */
+  servers: string extends keyof TServers
+    ? Record<string, MastraMCPServerDefinition>
+    : Record<keyof NoInfer<TServers> & string, MastraMCPServerDefinition>;
   /** Optional global timeout in milliseconds for all servers (default: 60000ms) */
   timeout?: number;
+  /** Optional output path for the package's generate command, relative to its working directory. */
+  typegen?: { outFile: string };
+  /**
+   * Default `clientInfo` every server receives on connect and with each request.
+   * Per-server `clientInfo` overrides it field-wise. Defaults to the server key and `'1.0.0'`.
+   */
+  clientInfo?: MCPClientInfo;
+  /**
+   * Install process exit and signal hooks that disconnect servers and end the process (default: true).
+   * Set to false when the host handles shutdown, and call disconnect() from its shutdown handler.
+   * Set this on every client: exit-hook's global signal listeners persist after disconnect().
+   */
+  registerProcessHooks?: boolean;
+  /**
+   * Webhook delivery for MCP Events. Servers that offer webhook delivery POST occurrences to
+   * `webhook.url`, which must route to {@link MCPClient.events}`.handleWebhook()`.
+   *
+   * @experimental SEP-3415 is a draft; this API may change.
+   */
+  webhook?: MCPClientWebhookOptions;
 }
 
+/** Which server and tool each `serverName_toolName` key came from, to detect two pairs producing one key. */
+type NamespacedToolKeySources = Map<string, { serverName: string; toolName: string }>;
+
 /**
- * MCPClient manages multiple MCP server connections and their tools in a Mastra application.
+ * Manages Model Context Protocol (MCP) server connections and tool namespacing,
+ * with access to tools, resources, prompts, and elicitation.
  *
- * This class handles connection lifecycle, tool namespacing, and provides access to tools,
- * resources, prompts, and elicitation across all configured servers.
+ * Configure authentication when required by your servers.
  *
  * @example
+ * `yourServerUrl` is a URL for a running MCP server's HTTP endpoint.
  * ```typescript
  * import { MCPClient } from '@mastra/mcp';
- * import { Agent } from '@mastra/core/agent';
  *
  * const mcp = new MCPClient({
  *   servers: {
- *     weather: {
- *       url: new URL('http://localhost:8080/sse'),
- *     },
- *     stockPrice: {
- *       command: 'npx',
- *       args: ['tsx', 'stock-price.ts'],
- *       env: { API_KEY: 'your-api-key' },
- *     },
+ *     remote: { url: yourServerUrl },
  *   },
- *   timeout: 30000,
- * });
- *
- * const agent = new Agent({
- *   id: 'multi-tool-agent',
- *   name: 'Multi-tool Agent',
- *   instructions: 'You have access to multiple tools.',
- *   model: 'openai/gpt-4o',
- *   tools: await mcp.listTools(),
  * });
  * ```
+ *
+ * @see For documentation bundled with your installed package, locate
+ * `@mastra/mcp/package.json` with your project's resolver or package-manager
+ * tooling, then read `dist/docs/SKILL.md` from that package root and follow its
+ * reference links. Use package-manager tools for virtual or archived packages.
+ *
+ * @see [MCP client documentation](https://mastra.ai/reference/tools/mcp-client)
+ * if packaged docs are unavailable.
  */
-export class MCPClient extends MastraBase {
+export class MCPClient<TServers extends MCPClientServers<TServers> = MCPServerMap> extends MastraBase {
+  readonly typegen?: Readonly<{ outFile: string }>;
   private serverConfigs: Record<string, MastraMCPServerDefinition> = {};
   private id: string;
   private defaultTimeout: number;
+  private defaultClientInfo?: MCPClientInfo;
+  private readonly registerProcessHooks: boolean;
+  private webhook?: EventsWebhookSetup;
   private mcpClientsById = new Map<string, InternalMastraMCPClient>();
   private disconnectPromise: Promise<void> | null = null;
+  private authFlowsByServer = new Map<string, Promise<void>>();
+  private authCallbackServersByServer = new Map<string, OAuthCallbackServer>();
+  /**
+   * Per-server abort controllers for in-flight authorization flows. Created
+   * synchronously at the start of {@link runAuthorizationFlow} — before the
+   * callback server exists — so cancel/disconnect can interrupt the setup phase
+   * (discovery, registration, port binding) and not just the waitForCode wait.
+   */
+  private authAbortControllersByServer = new Map<string, AbortController>();
 
   /**
    * Creates a new MCPClient instance for managing MCP server connections.
@@ -93,7 +200,7 @@ export class MCPClient extends MastraBase {
    * const mcp = new MCPClient({
    *   servers: {
    *     weatherServer: {
-   *       url: new URL('http://localhost:8080/sse'),
+   *       url: new URL('http://localhost:8080/mcp'),
    *       requestInit: {
    *         headers: { Authorization: 'Bearer token' }
    *       }
@@ -103,29 +210,37 @@ export class MCPClient extends MastraBase {
    * });
    * ```
    */
-  constructor(args: MCPClientOptions) {
+  constructor(args: MCPClientOptions<NoInfer<TServers>>) {
     super({ name: 'MCPClient' });
     this.defaultTimeout = args.timeout ?? DEFAULT_REQUEST_TIMEOUT_MSEC;
+    this.defaultClientInfo = args.clientInfo && { ...args.clientInfo };
+    this.registerProcessHooks = args.registerProcessHooks ?? true;
     this.serverConfigs = args.servers;
+    this.webhook = args.webhook && { options: { ...args.webhook }, receiver: new WebhookReceiver() };
     this.id = args.id ?? this.makeId();
 
     if (args.id) {
       this.id = args.id;
-      const cached = mcpClientInstances.get(this.id);
+      const cached = cachedClient<TServers>(this.id);
 
-      if (cached && !equal(cached.serverConfigs, args.servers)) {
-        const existingInstance = mcpClientInstances.get(this.id);
-        if (existingInstance) {
-          void existingInstance.disconnect();
-          mcpClientInstances.delete(this.id);
-        }
+      // `typegen`, `clientInfo`, and process hook ownership belong to the cache identity.
+      // A mismatch replaces the instance just like a server configuration change.
+      if (
+        cached &&
+        (!equal(cached.serverConfigs, args.servers) ||
+          !equal(cached.defaultClientInfo, args.clientInfo) ||
+          cached.registerProcessHooks !== this.registerProcessHooks ||
+          cached.typegen?.outFile !== args.typegen?.outFile)
+      ) {
+        void cached.disconnect();
+        mcpClientInstances.delete(this.id);
       }
     } else {
       this.id = this.makeId();
     }
 
     // to prevent memory leaks return the same MCP server instance when configured the same way multiple times
-    const existingInstance = mcpClientInstances.get(this.id);
+    const existingInstance = cachedClient<TServers>(this.id);
     if (existingInstance) {
       if (!args.id) {
         throw new Error(`MCPClient was initialized multiple times with the same configuration options.
@@ -141,6 +256,13 @@ To fix this you have three different options:
       return existingInstance;
     }
 
+    const { typegen } = args;
+    if (typegen !== undefined) {
+      // Runtime guard for untyped callers; the option is typed as `{ outFile: string }`.
+      if (!typegen || typeof typegen.outFile !== 'string' || !typegen.outFile.trim() || typegen.outFile.includes('\0'))
+        throw new Error('typegen.outFile must be a nonempty file path');
+      this.typegen = Object.freeze({ outFile: typegen.outFile });
+    }
     mcpClientInstances.set(this.id, this);
     this.addToInstanceCache();
     return this;
@@ -190,65 +312,127 @@ To fix this you have three different options:
   }
 
   /**
-   * Provides access to elicitation-related operations for interactive user input collection.
+   * Provides access to MCP Events (SEP-3415) on configured servers: list event types and
+   * subscribe to their occurrences over webhook (when `webhook` is configured), push or poll
+   * delivery.
    *
-   * Elicitation allows MCP servers to request structured information from users during tool execution.
+   * @experimental SEP-3415 is a draft; this API may change.
    *
    * @example
    * ```typescript
-   * // Set up handler for elicitation requests from a server
-   * await mcp.elicitation.onRequest('serverName', async (request) => {
-   *   console.log(`Server requests: ${request.message}`);
-   *   console.log('Schema:', request.requestedSchema);
-   *
-   *   // Collect user input and return response
-   *   return {
-   *     action: 'accept',
-   *     content: { name: 'John Doe', email: 'john@example.com' }
-   *   };
-   * });
+   * const events = await mcp.events.list('github');
+   * const sub = await mcp.events.subscribe('github', 'push', { repo: 'mastra-ai/mastra' });
+   * for await (const event of sub) {
+   *   console.log(event.eventId, event.data);
+   *   await saveCursor(sub.cursor);
+   * }
    * ```
    */
-  public get elicitation() {
+  public get events() {
     this.addToInstanceCache();
+    const wrap = async <T>(
+      id: Uppercase<string>,
+      details: Record<string, string>,
+      run: () => Promise<T>,
+    ): Promise<T> => {
+      try {
+        return await run();
+      } catch (error) {
+        throw new MastraError({ id, domain: ErrorDomain.MCP, category: ErrorCategory.THIRD_PARTY, details }, error);
+      }
+    };
     return {
       /**
-       * Sets up a handler function for elicitation requests from a specific server.
+       * Lists the event types a server offers. Changes are not announced yet; call it again to refresh.
        *
-       * The handler receives requests for user input and must return a response with
-       * action ('accept', 'decline', or 'cancel') and optional content.
-       *
-       * @param serverName - Name of the server to handle elicitation requests for
-       * @param handler - Function to handle elicitation requests
-       * @throws {MastraError} If setting up the handler fails
-       *
-       * @example
-       * ```typescript
-       * await mcp.elicitation.onRequest('weatherServer', async (request) => {
-       *   // Prompt user for input
-       *   const userInput = await promptUser(request.requestedSchema);
-       *   return { action: 'accept', content: userInput };
-       * });
-       * ```
+       * @throws {MastraError} `MCP_CLIENT_LIST_EVENTS_FAILED`; the cause is `MCP_EVENTS_NOT_SUPPORTED`
+       * when the server does not advertise the events extension.
        */
-      onRequest: async (serverName: string, handler: (request: ElicitRequest['params']) => Promise<ElicitResult>) => {
-        try {
-          const internalClient = await this.getConnectedClientForServer(serverName);
-          return internalClient.elicitation.onRequest(handler);
-        } catch (err) {
-          throw new MastraError(
-            {
-              id: 'MCP_CLIENT_ON_REQUEST_ELICITATION_FAILED',
-              domain: ErrorDomain.MCP,
-              category: ErrorCategory.THIRD_PARTY,
-              details: {
-                serverName,
-              },
-            },
-            err,
-          );
-        }
-      },
+      list: (serverName: string): Promise<MCPEventDescriptor[]> =>
+        wrap('MCP_CLIENT_LIST_EVENTS_FAILED', { serverName }, async () =>
+          (await this.getConnectedClientForServer(serverName)).events.list(),
+        ),
+      /**
+       * Subscribes to an event type on a server. Resolves once the server accepted the subscription.
+       *
+       * @throws {MastraError} `MCP_CLIENT_SUBSCRIBE_EVENT_FAILED`; the cause carries the events error id.
+       */
+      subscribe: (
+        serverName: string,
+        eventName: string,
+        args?: Record<string, unknown>,
+        options?: MCPEventSubscribeOptions,
+      ): Promise<MCPEventSubscription> =>
+        wrap('MCP_CLIENT_SUBSCRIBE_EVENT_FAILED', { serverName, eventName }, async () =>
+          (await this.getConnectedClientForServer(serverName)).events.subscribe(eventName, args, options),
+        ),
+      /**
+       * Handles a webhook delivery POSTed to `webhook.url`: verifies the signature, answers the
+       * server's verification handshake, and routes occurrences to their subscription. Mount it
+       * on the route that `webhook.url` points at. Returns 404 when `webhook` is not configured.
+       *
+       * @experimental SEP-3415 is a draft; this API may change.
+       */
+      handleWebhook: async (request: Request): Promise<Response> =>
+        this.webhook ? this.webhook.receiver.handle(request) : new Response(null, { status: 404 }),
+    };
+  }
+
+  /**
+   * Reads, answers and cancels MCP tasks (SEP-2663) on configured servers. Tool calls to a server
+   * with `tasks` enabled already wait for their tasks; use this to inspect or steer one directly.
+   *
+   * @experimental SEP-2663 extension; this API may change.
+   *
+   * @example
+   * ```typescript
+   * const task = await mcp.tasks.get('reports', taskId);
+   * if (task.status === 'working') await mcp.tasks.cancel('reports', taskId);
+   * ```
+   */
+  public get tasks() {
+    this.addToInstanceCache();
+    const wrap = async <T>(id: Uppercase<string>, details: Record<string, string>, run: () => Promise<T>) => {
+      try {
+        return await run();
+      } catch (error) {
+        throw new MastraError({ id, domain: ErrorDomain.MCP, category: ErrorCategory.THIRD_PARTY, details }, error);
+      }
+    };
+    return {
+      /**
+       * Returns a task's current state, including its result once completed.
+       *
+       * @throws {MastraError} `MCP_CLIENT_GET_TASK_FAILED`; the cause is a `-32602` protocol error
+       * when the server does not know the task.
+       */
+      get: (serverName: string, taskId: string, options?: { signal?: AbortSignal }): Promise<MCPDetailedTask> =>
+        wrap('MCP_CLIENT_GET_TASK_FAILED', { serverName, taskId }, async () =>
+          (await this.getConnectedClientForServer(serverName)).tasks.get(taskId, options),
+        ),
+      /**
+       * Answers input requests of an `input_required` task, keyed as in its `inputRequests`.
+       *
+       * @throws {MastraError} `MCP_CLIENT_UPDATE_TASK_FAILED`
+       */
+      update: (
+        serverName: string,
+        taskId: string,
+        inputResponses: MCPTaskInputResponses,
+        options?: { signal?: AbortSignal },
+      ): Promise<void> =>
+        wrap('MCP_CLIENT_UPDATE_TASK_FAILED', { serverName, taskId }, async () =>
+          (await this.getConnectedClientForServer(serverName)).tasks.update(taskId, inputResponses, options),
+        ),
+      /**
+       * Asks the server to stop a task. Cancellation is cooperative: the task may still complete.
+       *
+       * @throws {MastraError} `MCP_CLIENT_CANCEL_TASK_FAILED`
+       */
+      cancel: (serverName: string, taskId: string, options?: { signal?: AbortSignal }): Promise<void> =>
+        wrap('MCP_CLIENT_CANCEL_TASK_FAILED', { serverName, taskId }, async () =>
+          (await this.getConnectedClientForServer(serverName)).tasks.cancel(taskId, options),
+        ),
     };
   }
 
@@ -268,11 +452,11 @@ To fix this you have three different options:
    * // Read a specific resource
    * const content = await mcp.resources.read('weatherServer', 'file://data.json');
    *
-   * // Subscribe to resource updates
-   * await mcp.resources.subscribe('weatherServer', 'file://data.json');
+   * // Receive resource updates
    * await mcp.resources.onUpdated('weatherServer', async (params) => {
    *   console.log(`Resource updated: ${params.uri}`);
    * });
+   * await mcp.resources.subscribe('weatherServer', 'file://data.json');
    * ```
    */
   public get resources() {
@@ -292,30 +476,12 @@ To fix this you have three different options:
        * console.log(resources.weatherServer); // Array of resources
        * ```
        */
-      list: async (): Promise<Record<string, Resource[]>> => {
-        const allResources: Record<string, Resource[]> = {};
-        for (const serverName of Object.keys(this.serverConfigs)) {
-          try {
-            const internalClient = await this.getConnectedClientForServer(serverName);
-            allResources[serverName] = await internalClient.resources.list();
-          } catch (error) {
-            const mastraError = new MastraError(
-              {
-                id: 'MCP_CLIENT_LIST_RESOURCES_FAILED',
-                domain: ErrorDomain.MCP,
-                category: ErrorCategory.THIRD_PARTY,
-                details: {
-                  serverName,
-                },
-              },
-              error,
-            );
-            this.logger.trackException(mastraError);
-            this.logger.error('Failed to list resources from server:', { error: mastraError.toString() });
-          }
-        }
-        return allResources;
-      },
+      list: async (): Promise<Record<string, Resource[]>> => (await this.listResourcesWithErrors()).resources,
+      /**
+       * Lists resources while preserving per-server discovery failures.
+       * The existing `list()` method remains the success-only convenience API.
+       */
+      listWithErrors: (options?: MCPDiscoveryOptions) => this.listResourcesWithErrors(options),
       /**
        * Lists all available resource templates from all configured servers.
        *
@@ -330,30 +496,13 @@ To fix this you have three different options:
        * console.log(templates.weatherServer); // Array of resource templates
        * ```
        */
-      templates: async (): Promise<Record<string, ResourceTemplate[]>> => {
-        const allTemplates: Record<string, ResourceTemplate[]> = {};
-        for (const serverName of Object.keys(this.serverConfigs)) {
-          try {
-            const internalClient = await this.getConnectedClientForServer(serverName);
-            allTemplates[serverName] = await internalClient.resources.templates();
-          } catch (error) {
-            const mastraError = new MastraError(
-              {
-                id: 'MCP_CLIENT_LIST_RESOURCE_TEMPLATES_FAILED',
-                domain: ErrorDomain.MCP,
-                category: ErrorCategory.THIRD_PARTY,
-                details: {
-                  serverName,
-                },
-              },
-              error,
-            );
-            this.logger.trackException(mastraError);
-            this.logger.error('Failed to list resource templates from server:', { error: mastraError.toString() });
-          }
-        }
-        return allTemplates;
-      },
+      templates: async (): Promise<Record<string, ResourceTemplateType[]>> =>
+        (await this.listResourceTemplatesWithErrors()).templates,
+      /**
+       * Lists resource templates while preserving per-server discovery failures.
+       * The existing `templates()` method remains the success-only convenience API.
+       */
+      templatesWithErrors: (options?: MCPDiscoveryOptions) => this.listResourceTemplatesWithErrors(options),
       /**
        * Reads the content of a specific resource from a server.
        *
@@ -388,64 +537,53 @@ To fix this you have three different options:
         }
       },
       /**
-       * Subscribes to updates for a specific resource on a server.
+       * Subscribes to update notifications for a resource on a server. Subscriptions ride
+       * the client's single `subscriptions/listen` stream and are restored after reconnects.
        *
        * @param serverName - Name of the server
-       * @param uri - URI of the resource to subscribe to
-       * @returns Promise resolving when subscription is established
-       * @throws {MastraError} If subscription fails
+       * @param uri - URI of the resource to watch
+       * @throws {MastraError} If the server declines the subscription
        *
        * @example
        * ```typescript
-       * await mcp.resources.subscribe('weatherServer', 'file://config.json');
+       * await mcp.resources.onUpdated('weatherServer', ({ uri }) => console.log(`updated ${uri}`));
+       * await mcp.resources.subscribe('weatherServer', 'file://data.json');
        * ```
        */
-      subscribe: async (serverName: string, uri: string) => {
+      subscribe: async (serverName: string, uri: string): Promise<void> => {
         try {
           const internalClient = await this.getConnectedClientForServer(serverName);
-          return internalClient.resources.subscribe(uri);
-        } catch (error) {
+          await internalClient.resources.subscribe(uri);
+        } catch (err) {
           throw new MastraError(
             {
               id: 'MCP_CLIENT_SUBSCRIBE_RESOURCE_FAILED',
               domain: ErrorDomain.MCP,
               category: ErrorCategory.THIRD_PARTY,
-              details: {
-                serverName,
-                uri,
-              },
+              details: { serverName, uri },
             },
-            error,
+            err,
           );
         }
       },
       /**
-       * Unsubscribes from updates for a specific resource on a server.
+       * Stops update notifications for a resource previously passed to `subscribe`.
        *
        * @param serverName - Name of the server
-       * @param uri - URI of the resource to unsubscribe from
-       * @returns Promise resolving when unsubscription is complete
-       * @throws {MastraError} If unsubscription fails
-       *
-       * @example
-       * ```typescript
-       * await mcp.resources.unsubscribe('weatherServer', 'file://config.json');
-       * ```
+       * @param uri - URI of the resource
+       * @throws {MastraError} If the stream cannot be updated
        */
-      unsubscribe: async (serverName: string, uri: string) => {
+      unsubscribe: async (serverName: string, uri: string): Promise<void> => {
         try {
           const internalClient = await this.getConnectedClientForServer(serverName);
-          return internalClient.resources.unsubscribe(uri);
+          await internalClient.resources.unsubscribe(uri);
         } catch (err) {
           throw new MastraError(
             {
               id: 'MCP_CLIENT_UNSUBSCRIBE_RESOURCE_FAILED',
               domain: ErrorDomain.MCP,
               category: ErrorCategory.THIRD_PARTY,
-              details: {
-                serverName,
-                uri,
-              },
+              details: { serverName, uri },
             },
             err,
           );
@@ -453,6 +591,7 @@ To fix this you have three different options:
       },
       /**
        * Sets a notification handler for when subscribed resources are updated on a server.
+       * Updates arrive for resources passed to `subscribe`.
        *
        * @param serverName - Name of the server to monitor
        * @param handler - Callback function receiving the updated resource URI
@@ -561,30 +700,12 @@ To fix this you have three different options:
        * console.log(prompts.weatherServer); // Array of prompts
        * ```
        */
-      list: async (): Promise<Record<string, Prompt[]>> => {
-        const allPrompts: Record<string, Prompt[]> = {};
-        for (const serverName of Object.keys(this.serverConfigs)) {
-          try {
-            const internalClient = await this.getConnectedClientForServer(serverName);
-            allPrompts[serverName] = await internalClient.prompts.list();
-          } catch (error) {
-            const mastraError = new MastraError(
-              {
-                id: 'MCP_CLIENT_LIST_PROMPTS_FAILED',
-                domain: ErrorDomain.MCP,
-                category: ErrorCategory.THIRD_PARTY,
-                details: {
-                  serverName,
-                },
-              },
-              error,
-            );
-            this.logger.trackException(mastraError);
-            this.logger.error('Failed to list prompts from server:', { error: mastraError.toString() });
-          }
-        }
-        return allPrompts;
-      },
+      list: async (): Promise<Record<string, Prompt[]>> => (await this.listPromptsWithErrors()).prompts,
+      /**
+       * Lists prompts while preserving per-server discovery failures.
+       * The existing `list()` method remains the success-only convenience API.
+       */
+      listWithErrors: (options?: MCPDiscoveryOptions) => this.listPromptsWithErrors(options),
       /**
        * Retrieves a specific prompt with its messages from a server.
        *
@@ -661,6 +782,59 @@ To fix this you have three different options:
     };
   }
 
+  /**
+   * Provides access to tool-related notification operations across all configured servers.
+   *
+   * To fetch tools, use `listTools()` or `listToolsets()`.
+   *
+   * @example
+   * ```typescript
+   * // React to tool list changes on a server
+   * await mcp.tools.onListChanged('weatherServer', async () => {
+   *   console.log('Tool list changed, re-fetching...');
+   *   const tools = await mcp.listTools();
+   * });
+   * ```
+   */
+  public get tools() {
+    this.addToInstanceCache();
+    return {
+      /**
+       * Sets a notification handler for when the tool list changes on a server.
+       *
+       * @param serverName - Name of the server to monitor
+       * @param handler - Callback function invoked when tools are added/removed/modified
+       * @returns Promise resolving when handler is registered
+       * @throws {MastraError} If setting up the handler fails
+       *
+       * @example
+       * ```typescript
+       * await mcp.tools.onListChanged('weatherServer', async () => {
+       *   const tools = await mcp.listTools();
+       * });
+       * ```
+       */
+      onListChanged: async (serverName: string, handler: () => void) => {
+        try {
+          const internalClient = await this.getConnectedClientForServer(serverName);
+          await internalClient.setToolListChangedNotificationHandler(handler);
+        } catch (error) {
+          throw new MastraError(
+            {
+              id: 'MCP_CLIENT_ON_LIST_CHANGED_TOOLS_FAILED',
+              domain: ErrorDomain.MCP,
+              category: ErrorCategory.THIRD_PARTY,
+              details: {
+                serverName,
+              },
+            },
+            error,
+          );
+        }
+      },
+    };
+  }
+
   private addToInstanceCache() {
     if (!mcpClientInstances.has(this.id)) {
       mcpClientInstances.set(this.id, this);
@@ -668,7 +842,16 @@ To fix this you have three different options:
   }
 
   private makeId() {
-    const text = JSON.stringify(this.serverConfigs).normalize('NFKC');
+    // Keep existing ids when process hooks use the default behavior.
+    const text = JSON.stringify(
+      this.defaultClientInfo === undefined && this.registerProcessHooks
+        ? this.serverConfigs
+        : {
+            servers: this.serverConfigs,
+            ...(this.defaultClientInfo === undefined ? {} : { clientInfo: this.defaultClientInfo }),
+            ...(this.registerProcessHooks ? {} : { registerProcessHooks: false }),
+          },
+    ).normalize('NFKC');
     return createHash('sha256').update('MCPClient').update(text).digest('hex');
   }
 
@@ -696,7 +879,26 @@ To fix this you have three different options:
 
     this.disconnectPromise = (async () => {
       try {
-        mcpClientInstances.delete(this.id);
+        if (mcpClientInstances.get(this.id) === this) {
+          mcpClientInstances.delete(this.id);
+        }
+
+        // Tear down any in-flight authorization: each callback server owns a live
+        // loopback HTTP port, and closing it rejects the flow's waitForCode. Await
+        // the flow settlements so a disconnect during authentication does not leave
+        // a bound port or a dangling promise keeping the process alive.
+        const pendingFlows = Array.from(this.authFlowsByServer.values());
+        // Abort first so flows still in their setup phase (no callback server
+        // bound yet) unblock instead of parking on waitForCode and deadlocking
+        // the awaited settlement below.
+        for (const controller of this.authAbortControllersByServer.values()) {
+          controller.abort();
+        }
+        await Promise.allSettled(Array.from(this.authCallbackServersByServer.values()).map(server => server.close()));
+        await Promise.allSettled(pendingFlows);
+        this.authAbortControllersByServer.clear();
+        this.authCallbackServersByServer.clear();
+        this.authFlowsByServer.clear();
 
         // Disconnect all clients in the cache
         await Promise.allSettled(Array.from(this.mcpClientsById.values()).map(client => client.disconnect()));
@@ -734,6 +936,236 @@ To fix this you have three different options:
   }
 
   /**
+   * Runs the interactive OAuth authorization-code flow for a server.
+   *
+   * Requires the server to be configured with an MCPOAuthClientProvider whose
+   * redirect URL points at a loopback address. The flow:
+   *
+   * 1. Starts a loopback callback server on the redirect URL's port (falling
+   *    back to the next sequential ports when it is in use)
+   * 2. Attempts a connection so the SDK runs authorization server discovery
+   *    (identifying the client by its pre-registered id or its client metadata
+   *    URL) and delivers the authorization URL through the provider's
+   *    `onRedirectToAuthorization` callback — the host directs the user there
+   * 3. Waits for the browser to deliver the authorization code, validates the
+   *    OAuth state, exchanges the code for tokens, and reconnects
+   *
+   * Concurrent calls for the same server join the pending flow (the joiner's
+   * options are ignored — the pending flow keeps its own timeout); different
+   * servers authenticate independently. Each server needs its own provider
+   * instance: the flow pins session state on the provider, so sharing one
+   * MCPOAuthClientProvider across servers is not supported. Hosts with custom
+   * redirect handling (e.g. a web app with an HTTPS redirect URL) should
+   * drive MCPOAuthClientProvider directly instead.
+   *
+   * @param serverName - The name of the server to authenticate (must match a key in `servers`)
+   * @param options.timeoutMs - How long to wait for the browser callback (default 5 minutes)
+   * @throws {Error} If the server has no MCPOAuthClientProvider or its redirect URL is not loopback
+   *
+   * @example
+   * ```typescript
+   * if (mcp.getServerAuthState('weatherServer') === 'needs-auth') {
+   *   await mcp.authenticate('weatherServer');
+   * }
+   * ```
+   */
+  public async authenticate(serverName: string, options?: { timeoutMs?: number }): Promise<void> {
+    // Wait for an in-flight disconnect to finish before starting. disconnect()
+    // snapshots and then clears the auth-flow maps, so a flow registered during
+    // that window would have its abort controller and callback server wiped
+    // without being closed, orphaning the loopback port. Swallow a rejected
+    // disconnect: it must not surface as an authenticate() failure.
+    if (this.disconnectPromise) {
+      await this.disconnectPromise.catch(() => {});
+    }
+
+    const pendingFlow = this.authFlowsByServer.get(serverName);
+    if (pendingFlow) {
+      return pendingFlow;
+    }
+
+    // Correctness contract: nothing between here and runAuthorizationFlow's
+    // synchronous abort-controller registration may await. The disconnect-race
+    // guard above relies on this flow's map entries landing in the same tick, so
+    // that any disconnect() starting afterwards snapshots and tears them down.
+    const flow = this.runAuthorizationFlow(serverName, options).finally(() => {
+      this.authFlowsByServer.delete(serverName);
+    });
+    this.authFlowsByServer.set(serverName, flow);
+    return flow;
+  }
+
+  /**
+   * OAuth authorization state of a configured server.
+   *
+   * Returns `undefined` for servers without an authProvider and for servers
+   * that have not attempted a connection yet.
+   */
+  public getServerAuthState(serverName: string): MCPServerAuthState | undefined {
+    return this.mcpClientsById.get(serverName)?.authState;
+  }
+
+  private async runAuthorizationFlow(serverName: string, options?: { timeoutMs?: number }): Promise<void> {
+    // Register the abort controller synchronously, before the first await, so a
+    // cancel/disconnect during the setup phase (discovery, registration, port
+    // binding) can interrupt the flow rather than letting it park on waitForCode.
+    const abortController = new AbortController();
+    this.authAbortControllersByServer.set(serverName, abortController);
+    const throwIfAborted = () => {
+      if (abortController.signal.aborted) {
+        throw new Error(`Authentication for MCP server ${serverName} was cancelled.`);
+      }
+    };
+
+    // Resources acquired during setup that must be released on every exit path.
+    // Tracked here so the single outer finally can tear them down even if a
+    // fallible setup step (session begin, port binding) throws.
+    let provider: MCPOAuthClientProvider | undefined;
+    let sessionStarted = false;
+    let callbackServer: OAuthCallbackServer | undefined;
+
+    // Installed before the first fallible step so the abort-controller entry,
+    // provider session, and callback server never leak on an early throw.
+    try {
+      const config = this.getServerConfig(serverName);
+      const candidateProvider = config.authProvider;
+      if (!(candidateProvider instanceof MCPOAuthClientProvider)) {
+        throw new Error(
+          `Cannot authenticate MCP server ${serverName}: it is not configured with an MCPOAuthClientProvider.`,
+        );
+      }
+      provider = candidateProvider;
+
+      const redirectUrl = new URL(provider.redirectUrl.toString());
+      if (redirectUrl.protocol !== 'http:' || !isLoopbackHostname(redirectUrl.hostname)) {
+        throw new Error(
+          `Cannot authenticate MCP server ${serverName}: the provider's redirect URL must be a loopback address, got ${redirectUrl.origin}.`,
+        );
+      }
+
+      const state = await provider.beginAuthorizationSession();
+      sessionStarted = true;
+      // A cancel that arrived during beginAuthorizationSession() has no callback
+      // server to close yet, so bail here before binding a port and parking.
+      throwIfAborted();
+
+      callbackServer = await createOAuthCallbackServer({ redirectUrl, state });
+      // A cancel during port binding: bail before we ever wait for a code that
+      // will never arrive. The outer finally closes the freshly-bound server.
+      throwIfAborted();
+      this.authCallbackServersByServer.set(serverName, callbackServer);
+
+      // Point the authorization request at the callback URL that actually bound.
+      provider.applyResolvedRedirectUrl(callbackServer.url);
+
+      const client = await this.getClientForServer(serverName);
+      try {
+        // With valid stored tokens this simply connects; otherwise the SDK
+        // delivers the authorization URL and throws UnauthorizedError.
+        await client.connect();
+        return;
+      } catch (error) {
+        if (!(error instanceof UnauthorizedError)) {
+          throw this.handleConnectError(serverName, error, client);
+        }
+      }
+
+      const { code, iss } = await callbackServer.waitForCode(options);
+      await client.finishAuth(code, iss);
+
+      try {
+        await client.connect();
+      } catch (error) {
+        throw error instanceof UnauthorizedError ? error : this.handleConnectError(serverName, error, client);
+      }
+    } finally {
+      this.authCallbackServersByServer.delete(serverName);
+      this.authAbortControllersByServer.delete(serverName);
+      if (sessionStarted) {
+        provider?.endAuthorizationSession();
+      }
+      await callbackServer?.close();
+    }
+  }
+
+  /**
+   * Cancels a pending {@link authenticate} flow for a server.
+   *
+   * Tears down the loopback callback server immediately — the pending
+   * authenticate() call rejects. Useful when the user closed the browser
+   * without completing consent, which the host cannot observe.
+   *
+   * The resulting auth state depends on how far the flow had progressed: a flow
+   * cancelled after the server rejected the connection with a 401 stays in the
+   * `needs-auth` state so it can be retried right away, while a flow cancelled
+   * during the setup phase (before any connection was attempted) leaves the
+   * state unchanged — typically `undefined`.
+   *
+   * @param serverName - The name of the server whose flow to cancel
+   * @returns `true` if a pending flow was cancelled, `false` when no flow was pending
+   */
+  public async cancelAuthentication(serverName: string): Promise<boolean> {
+    const pendingFlow = this.authFlowsByServer.get(serverName);
+    if (!pendingFlow) {
+      return false;
+    }
+
+    // Abort first so a flow still in its setup phase (no callback server bound
+    // yet) is interrupted before it can park on waitForCode; then close the
+    // callback server if one exists, which rejects an in-progress waitForCode.
+    this.authAbortControllersByServer.get(serverName)?.abort();
+    await this.authCallbackServersByServer.get(serverName)?.close();
+    await pendingFlow.catch(() => undefined);
+    return true;
+  }
+
+  /**
+   * Returns instructions advertised by connected MCP servers during discovery.
+   *
+   * Servers that have not connected yet, or did not advertise instructions,
+   * return `undefined`.
+   */
+  public getServerInstructions(): Record<string, string | undefined> {
+    const instructions: Record<string, string | undefined> = {};
+
+    for (const serverName of Object.keys(this.serverConfigs)) {
+      instructions[serverName] = this.mcpClientsById.get(serverName)?.instructions;
+    }
+
+    return instructions;
+  }
+
+  /**
+   * Returns the identity each connected MCP server announced when the
+   * connection was established (`serverInfo`: name, version, and optionally
+   * title, description, websiteUrl, and icons), keyed by server name.
+   *
+   * A server's entry is `undefined` if it has not connected yet, or if it
+   * connected over the 2026-07-28 revision without announcing an identity, so
+   * don't use this to check connection state. Icon and website URLs come from
+   * the remote server and are not validated.
+   */
+  public getServerInfo(): Record<string, MCPServerImplementation | undefined> {
+    const info: Record<string, MCPServerImplementation | undefined> = {};
+    for (const serverName of Object.keys(this.serverConfigs)) {
+      info[serverName] = this.mcpClientsById.get(serverName)?.serverInfo;
+    }
+    return info;
+  }
+
+  /**
+   * The protocol revision negotiated with each configured server, keyed by
+   * server name. Servers that have not connected yet return `undefined`.
+   */
+  public getServerProtocolVersions(): Record<string, string | undefined> {
+    const versions: Record<string, string | undefined> = {};
+    for (const serverName of Object.keys(this.serverConfigs)) {
+      versions[serverName] = this.mcpClientsById.get(serverName)?.negotiatedProtocolVersion;
+    }
+    return versions;
+  }
+
+  /**
    * Retrieves all tools from all configured servers with namespaced names.
    *
    * Tool names are namespaced as `serverName_toolName` to prevent conflicts between servers.
@@ -754,34 +1186,71 @@ To fix this you have three different options:
    * });
    * ```
    */
-  public async listTools(): Promise<Record<string, Tool<any, any, any, any>>> {
+  public async listTools(): Promise<MCPClientTools<TServers>> {
+    const result = await this.listToolsWithErrors();
+    return result.tools;
+  }
+
+  /**
+   * Retrieves all tools from all configured servers with namespaced names,
+   * along with any per-server errors.
+   *
+   * Like listTools(), but also returns errors for servers that failed to connect
+   * or list tools. This allows callers to report specific failure reasons per server.
+   *
+   * @returns Object with successful `tools`, legacy string `errors`, and structured `errorDetails`.
+   * Transient connection failures are retried once after reconnecting the affected server.
+   *
+   * @example
+   * ```typescript
+   * const { tools, errors, errorDetails } = await mcp.listToolsWithErrors();
+   * for (const [name, err] of Object.entries(errors)) {
+   *   console.error(`Server ${name} failed: ${err}`, errorDetails[name]);
+   * }
+   * ```
+   */
+  public listToolsWithErrors(options?: MCPDiscoveryOptions<Record<string, Tool<any, any, any, any>>>): Promise<{
+    tools: MCPClientTools<TServers>;
+    errors: Record<string, string>;
+    errorDetails: Record<string, MCPDiscoveryErrorDetails>;
+    durations?: Record<string, number>;
+  }>;
+  public async listToolsWithErrors(options?: MCPDiscoveryOptions<Record<string, Tool<any, any, any, any>>>): Promise<{
+    tools: Partial<Record<string, Tool<any, any, any, any>>>;
+    errors: Record<string, string>;
+    errorDetails: Record<string, MCPDiscoveryErrorDetails>;
+    durations?: Record<string, number>;
+  }> {
     this.addToInstanceCache();
     const connectedTools: Record<string, Tool<any, any, any, any>> = {};
+    const errors: Record<string, string> = {};
+    const errorDetails: Record<string, MCPDiscoveryErrorDetails> = {};
+    const durations: Record<string, number> = {};
 
-    for (const serverName of Object.keys(this.serverConfigs)) {
-      try {
-        const tools = await this.getToolsForServer(serverName);
-        for (const [toolName, toolConfig] of Object.entries(tools)) {
-          connectedTools[`${serverName}_${toolName}`] = toolConfig;
-        }
-      } catch (error) {
-        const mastraError = new MastraError(
-          {
-            id: 'MCP_CLIENT_GET_TOOLS_FAILED',
-            domain: ErrorDomain.MCP,
-            category: ErrorCategory.THIRD_PARTY,
-            details: {
-              serverName,
-            },
-          },
-          error,
-        );
-        this.logger.trackException(mastraError);
-        this.logger.error('Failed to list tools from server:', { error: mastraError.toString() });
+    const settled = await this.discoverAcrossServers(
+      async serverName => modelVisibleTools(await this.getToolsForServer(serverName)),
+      {
+        errorId: 'MCP_CLIENT_GET_TOOLS_FAILED',
+        logMessage: 'Failed to list tools from server:',
+      },
+      options,
+    );
+
+    const keySources: NamespacedToolKeySources = new Map();
+    for (const { serverName, value, error, duration } of settled) {
+      durations[serverName] = duration;
+      if (error !== undefined) {
+        errors[serverName] = error.message;
+        errorDetails[serverName] = error;
+        continue;
+      }
+      for (const [toolName, toolConfig] of Object.entries(value)) {
+        this.setNamespacedTool(connectedTools, keySources, serverName, toolName, toolConfig);
       }
     }
 
-    return connectedTools;
+    const result = { tools: connectedTools, errors, errorDetails };
+    return options ? { ...result, durations } : result;
   }
 
   /**
@@ -807,7 +1276,7 @@ To fix this you have three different options:
    * });
    * ```
    */
-  public async listToolsets(): Promise<Record<string, Record<string, Tool<any, any, any, any>>>> {
+  public async listToolsets(): Promise<MCPClientToolsets<TServers>> {
     const result = await this.listToolsetsWithErrors();
     return result.toolsets;
   }
@@ -818,59 +1287,439 @@ To fix this you have three different options:
    * Like listToolsets(), but also returns errors for servers that failed to connect
    * or list tools. This allows callers to report specific failure reasons per server.
    *
-   * @returns Object with `toolsets` (successful servers) and `errors` (failed servers with error messages).
+   * @returns Object with successful `toolsets`, legacy string `errors`, and structured `errorDetails`.
    * Transient connection failures are retried once after reconnecting the affected server.
    *
    * @example
    * ```typescript
-   * const { toolsets, errors } = await mcp.listToolsetsWithErrors();
+   * const { toolsets, errors, errorDetails } = await mcp.listToolsetsWithErrors();
    * for (const [name, err] of Object.entries(errors)) {
-   *   console.error(`Server ${name} failed: ${err}`);
+   *   console.error(`Server ${name} failed: ${err}`, errorDetails[name]);
    * }
    * ```
    */
-  public async listToolsetsWithErrors(): Promise<{
-    toolsets: Record<string, Record<string, Tool<any, any, any, any>>>;
+  public listToolsetsWithErrors(options?: MCPDiscoveryOptions<Record<string, Tool<any, any, any, any>>>): Promise<{
+    toolsets: MCPClientToolsets<TServers>;
     errors: Record<string, string>;
+    errorDetails: Record<string, MCPDiscoveryErrorDetails>;
+    durations?: Record<string, number>;
+  }>;
+  public async listToolsetsWithErrors(options?: MCPDiscoveryOptions<Record<string, Tool<any, any, any, any>>>): Promise<{
+    toolsets: Partial<Record<string, Partial<Record<string, Tool<any, any, any, any>>>>>;
+    errors: Record<string, string>;
+    errorDetails: Record<string, MCPDiscoveryErrorDetails>;
+    durations?: Record<string, number>;
   }> {
     this.addToInstanceCache();
     const connectedToolsets: Record<string, Record<string, Tool<any, any, any, any>>> = {};
     const errors: Record<string, string> = {};
+    const errorDetails: Record<string, MCPDiscoveryErrorDetails> = {};
+    const durations: Record<string, number> = {};
 
-    for (const serverName of Object.keys(this.serverConfigs)) {
+    const settled = await this.discoverAcrossServers(
+      async serverName => modelVisibleTools(await this.getToolsForServer(serverName)),
+      {
+        errorId: 'MCP_CLIENT_GET_TOOLSETS_FAILED',
+        logMessage: 'Failed to list toolsets from server:',
+      },
+      options,
+    );
+
+    for (const { serverName, value, error, duration } of settled) {
+      durations[serverName] = duration;
+      if (error !== undefined) {
+        errors[serverName] = error.message;
+        errorDetails[serverName] = error;
+        continue;
+      }
+      connectedToolsets[serverName] = value;
+    }
+
+    const result = { toolsets: connectedToolsets, errors, errorDetails };
+    return options ? { ...result, durations } : result;
+  }
+
+  /**
+   * Discovers every configured server's tools as plain, serializable definitions.
+   *
+   * Unlike `listTools()`/`listToolsets()`, the result contains no functions or references to a
+   * live client, so it can be JSON-serialized and cached (Redis, a database, a build artifact)
+   * and reused by other processes. Rebuild an executable tool from a cached definition with
+   * {@link toolFromDefinition}, which does not reconnect.
+   *
+   * Definitions are grouped by server and keyed by the server's own tool name, without the
+   * `serverName_toolName` namespacing that `listTools()` applies.
+   *
+   * @example
+   * ```typescript
+   * // Once, at build time or on the first worker:
+   * const definitions = await mcp.listToolDefinitions();
+   * await cache.set('mcp-tools', JSON.stringify(definitions));
+   *
+   * // In every other worker, with no MCP connections opened:
+   * const definitions = JSON.parse(await cache.get('mcp-tools'));
+   * const tool = mcp.toolFromDefinition('weather', definitions.weather.getForecast);
+   * ```
+   */
+  public async listToolDefinitions(): Promise<SerializableMCPToolCatalog> {
+    const result = await this.listToolDefinitionsWithErrors();
+    return result.definitions;
+  }
+
+  /**
+   * Like {@link listToolDefinitions}, but also returns errors for servers that failed to
+   * connect instead of surfacing only the servers that succeeded.
+   *
+   * Useful when caching a catalog, since it lets you avoid persisting a partial manifest that
+   * silently omits a server which happened to be down at discovery time.
+   * `errors` remains a string map for compatibility; `errorDetails` preserves
+   * machine-readable transport status and error codes when available.
+   */
+  public async listToolDefinitionsWithErrors(
+    options?: MCPDiscoveryOptions<Record<string, SerializableMCPToolDefinition>>,
+  ): Promise<{
+    definitions: SerializableMCPToolCatalog;
+    errors: Record<string, string>;
+    errorDetails: Record<string, MCPDiscoveryErrorDetails>;
+    durations?: Record<string, number>;
+  }> {
+    this.addToInstanceCache();
+    const definitions: SerializableMCPToolCatalog = {};
+    const errors: Record<string, string> = {};
+    const errorDetails: Record<string, MCPDiscoveryErrorDetails> = {};
+    const durations: Record<string, number> = {};
+
+    const settled = await this.discoverAcrossServers(
+      async serverName => {
+        const client = await this.getConnectedClientForServer(serverName);
+        return modelVisibleDefinitions(await client.toolDefinitions());
+      },
+      {
+        errorId: 'MCP_CLIENT_GET_TOOL_DEFINITIONS_FAILED',
+        logMessage: 'Failed to list tool definitions from server:',
+      },
+      options,
+    );
+
+    for (const { serverName, value, error, duration } of settled) {
+      durations[serverName] = duration;
+      if (error !== undefined) {
+        errors[serverName] = error.message;
+        errorDetails[serverName] = error;
+        continue;
+      }
+      definitions[serverName] = value;
+    }
+
+    const result = { definitions, errors, errorDetails };
+    return options ? { ...result, durations } : result;
+  }
+
+  /**
+   * Rebuilds an executable Mastra tool from a cached {@link SerializableMCPToolDefinition}.
+   *
+   * No MCP connection is opened here — that is the point of the method. The underlying client
+   * connects lazily, the first time the returned tool is actually executed, so a worker can
+   * reconstruct an entire tool map at startup and only pay for connections to the servers whose
+   * tools the model really calls.
+   *
+   * The returned tool behaves exactly like one from `listTools()`: same strict-mode metadata,
+   * approval policy, structured content handling, in-band tool errors, progress metadata, abort
+   * signal support, and reconnect/retry behavior.
+   *
+   * @param serverName Name of the server the definition came from, as configured on this client.
+   * @param definition A definition previously obtained from {@link listToolDefinitions}.
+   */
+  public async toolFromDefinition({
+    serverName,
+    definition,
+  }: {
+    serverName: string;
+    definition: SerializableMCPToolDefinition;
+  }): Promise<Tool<any, any, any, any>> {
+    this.addToInstanceCache();
+    // getOrCreateClient constructs the client without connecting; connection is deferred to
+    // the tool's first execution.
+    const client = await this.getOrCreateClient(serverName, this.getServerConfig(serverName));
+    await loadInputSchemaMetaValidator();
+    return client.toolFromDefinition({ definition });
+  }
+
+  /**
+   * Rebuilds an entire cached catalog into a namespaced tool map, without connecting.
+   *
+   * This is the cached counterpart to `listTools()`: it produces the same `serverName_toolName`
+   * keys, so an agent's tool map can be reconstructed on a cold start from a catalog in Redis
+   * and dropped straight into the agent, with connections opened lazily per tool call.
+   *
+   * Servers present in the catalog but no longer configured on this client are skipped, so a
+   * stale cached manifest degrades gracefully instead of throwing.
+   *
+   * @example
+   * ```typescript
+   * const definitions = JSON.parse(await cache.get('mcp-tools'));
+   * const agent = new Agent({ tools: await mcp.toolsFromDefinitions({ definitions }), ... });
+   * ```
+   */
+  public async toolsFromDefinitions({
+    definitions: catalog,
+  }: {
+    definitions: SerializableMCPToolCatalog;
+  }): Promise<Record<string, Tool<any, any, any, any>>> {
+    const configuredServers = new Set(Object.keys(this.serverConfigs));
+    const tools: Record<string, Tool<any, any, any, any>> = {};
+    const keySources: NamespacedToolKeySources = new Map();
+
+    for (const [serverName, definitions] of Object.entries(catalog)) {
+      if (!configuredServers.has(serverName)) {
+        this.logger.warn('Skipping cached MCP tool definitions for a server that is no longer configured', {
+          serverName,
+        });
+        continue;
+      }
+
+      for (const [toolName, definition] of Object.entries(modelVisibleDefinitions(definitions))) {
+        try {
+          const tool = await this.toolFromDefinition({ serverName, definition });
+          this.setNamespacedTool(tools, keySources, serverName, toolName, tool);
+        } catch (error) {
+          // The client already logged which tool was skipped and why.
+          if (!(error instanceof MastraError && error.id === 'MCP_CLIENT_INVALID_TOOL_INPUT_SCHEMA')) throw error;
+        }
+      }
+    }
+
+    return tools;
+  }
+
+  private async listResourcesWithErrors(options?: MCPDiscoveryOptions): Promise<{
+    resources: Record<string, Resource[]>;
+    errors: Record<string, string>;
+    errorDetails: Record<string, MCPDiscoveryErrorDetails>;
+    durations?: Record<string, number>;
+  }> {
+    const { values, ...diagnostics } = await this.discoverValuesWithErrors(
+      async serverName => (await this.getConnectedClientForServer(serverName)).resources.list(),
+      { errorId: 'MCP_CLIENT_LIST_RESOURCES_FAILED', logMessage: 'Failed to list resources from server:' },
+      options,
+    );
+    return { resources: values, ...diagnostics };
+  }
+
+  private async listResourceTemplatesWithErrors(options?: MCPDiscoveryOptions): Promise<{
+    templates: Record<string, ResourceTemplateType[]>;
+    errors: Record<string, string>;
+    errorDetails: Record<string, MCPDiscoveryErrorDetails>;
+    durations?: Record<string, number>;
+  }> {
+    const { values, ...diagnostics } = await this.discoverValuesWithErrors(
+      async serverName => (await this.getConnectedClientForServer(serverName)).resources.templates(),
+      {
+        errorId: 'MCP_CLIENT_LIST_RESOURCE_TEMPLATES_FAILED',
+        logMessage: 'Failed to list resource templates from server:',
+      },
+      options,
+    );
+    return { templates: values, ...diagnostics };
+  }
+
+  private async listPromptsWithErrors(options?: MCPDiscoveryOptions): Promise<{
+    prompts: Record<string, Prompt[]>;
+    errors: Record<string, string>;
+    errorDetails: Record<string, MCPDiscoveryErrorDetails>;
+    durations?: Record<string, number>;
+  }> {
+    const { values, ...diagnostics } = await this.discoverValuesWithErrors(
+      async serverName => (await this.getConnectedClientForServer(serverName)).prompts.list(),
+      { errorId: 'MCP_CLIENT_LIST_PROMPTS_FAILED', logMessage: 'Failed to list prompts from server:' },
+      options,
+    );
+    return { prompts: values, ...diagnostics };
+  }
+
+  private async discoverValuesWithErrors<T>(
+    operation: (serverName: string) => Promise<T>,
+    onError: { errorId: Uppercase<string>; logMessage: string },
+    options?: MCPDiscoveryOptions,
+  ): Promise<{
+    values: Record<string, T>;
+    errors: Record<string, string>;
+    errorDetails: Record<string, MCPDiscoveryErrorDetails>;
+    durations?: Record<string, number>;
+  }> {
+    const values: Record<string, T> = {};
+    const errors: Record<string, string> = {};
+    const errorDetails: Record<string, MCPDiscoveryErrorDetails> = {};
+    const durations: Record<string, number> = {};
+    const settled = await this.discoverAcrossServers(operation, onError, options);
+
+    for (const { serverName, value, error, duration } of settled) {
+      durations[serverName] = duration;
+      if (error !== undefined) {
+        errors[serverName] = error.message;
+        errorDetails[serverName] = error;
+      } else {
+        values[serverName] = value;
+      }
+    }
+
+    const result = { values, errors, errorDetails };
+    return options ? { ...result, durations } : result;
+  }
+
+  /**
+   * Stores a tool under its `serverName_toolName` key. Server and tool names can both contain `_`,
+   * so two different pairs can produce one key (`local` + `x_status` and `local_x` + `status`).
+   * The later pair keeps the key, as before; this logs a warning instead of dropping a tool silently.
+   */
+  private setNamespacedTool(
+    tools: Record<string, Tool<any, any, any, any>>,
+    keySources: NamespacedToolKeySources,
+    serverName: string,
+    toolName: string,
+    tool: Tool<any, any, any, any>,
+  ): void {
+    const key = `${serverName}_${toolName}`;
+    const replaced = keySources.get(key);
+    if (replaced) {
+      this.logger.warn(
+        `MCP tool key "${key}" from server "${serverName}" (tool "${toolName}") replaces the tool from server "${replaced.serverName}" (tool "${replaced.toolName}"), which produces the same key. Only the tool from "${serverName}" is kept. Rename one of the servers in \`servers\` to keep both.`,
+        { key, replaced, replacedBy: { serverName, toolName } },
+      );
+    }
+    keySources.set(key, { serverName, toolName });
+    tools[key] = tool;
+  }
+
+  /**
+   * Runs a per-server discovery `operation` against every configured server
+   * concurrently, isolating and logging per-server failures. Results are
+   * returned in configuration order (`Object.keys(serverConfigs)`) so callers
+   * fold them back deterministically.
+   *
+   * Mirrors the parallel teardown in `disconnect()`: each server is bounded by
+   * its own request timeout, so total time is the slowest single server rather
+   * than the sum, and one slow or unresponsive server never stalls the others.
+   * Backs `listTools`/`listToolsets`, `resources.list`/`templates`, and
+   * `prompts.list`.
+   */
+  private async discoverAcrossServers<T>(
+    operation: (serverName: string) => Promise<T>,
+    onError: { errorId: Uppercase<string>; logMessage: string },
+    options?: MCPDiscoveryOptions<T>,
+  ): Promise<Array<ServerDiscoveryResult<T>>> {
+    const only = options?.serverNames;
+    const serverNames = Object.keys(this.serverConfigs).filter(name => !only || only.includes(name));
+    const onServerSettled = options?.onServerSettled;
+    const notifySettled = (result: ServerDiscoveryResult<T>): ServerDiscoveryResult<T> => {
+      if (!onServerSettled) return result;
+      const logCallbackError = (error: unknown) => {
+        this.logger.error('MCP onServerSettled callback threw:', {
+          serverName: result.serverName,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      };
       try {
-        const tools = await this.getToolsForServer(serverName);
-        if (tools) {
-          connectedToolsets[serverName] = tools;
+        const { serverName, ...settled } = result;
+        // The callback is typed as returning `void`, so an `async` callback's
+        // promise is not visible here. Observe it anyway: an `async` callback
+        // rejects instead of throwing, and an unobserved rejection escapes as
+        // an unhandled rejection and takes the host process down.
+        const outcome: unknown = onServerSettled(serverName, settled);
+        if (outcome && typeof (outcome as PromiseLike<void>).then === 'function') {
+          Promise.resolve(outcome).catch(logCallbackError);
         }
       } catch (error) {
+        logCallbackError(error);
+      }
+      return result;
+    };
+
+    return Promise.all(
+      serverNames.map(async (serverName): Promise<ServerDiscoveryResult<T>> =>
+        notifySettled(await this.discoverServer(serverName, operation, onError, options?.perServerTimeoutMs)),
+      ),
+    );
+  }
+
+  private async discoverServer<T>(
+    serverName: string,
+    operation: (serverName: string) => Promise<T>,
+    onError: { errorId: Uppercase<string>; logMessage: string },
+    perServerTimeoutMs: number | undefined,
+  ): Promise<ServerDiscoveryResult<T>> {
+    const startedAt = performance.now();
+    let timer: NodeJS.Timeout | undefined;
+
+    try {
+      const operationPromise = operation(serverName);
+      const value =
+        perServerTimeoutMs === undefined
+          ? await operationPromise
+          : await Promise.race([
+              operationPromise,
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                  () =>
+                    reject(
+                      Object.assign(new Error(`Discovery timed out after ${perServerTimeoutMs}ms`), {
+                        code: MCP_DISCOVERY_TIMEOUT_CODE,
+                      }),
+                    ),
+                  perServerTimeoutMs,
+                );
+                timer.unref?.();
+              }),
+            ]);
+
+      return { serverName, value, error: undefined, duration: performance.now() - startedAt };
+    } catch (error) {
+      const discoveryError = getMCPDiscoveryErrorDetails(error);
+
+      try {
         const mastraError = new MastraError(
           {
-            id: 'MCP_CLIENT_GET_TOOLSETS_FAILED',
+            id: onError.errorId,
             domain: ErrorDomain.MCP,
             category: ErrorCategory.THIRD_PARTY,
-            details: {
-              serverName,
-            },
+            details: { serverName },
           },
           error,
         );
         this.logger.trackException(mastraError);
-        this.logger.error('Failed to list toolsets from server:', { error: mastraError.toString() });
-        errors[serverName] = error instanceof Error ? error.message : String(error);
+        this.logger.error(onError.logMessage, { error: mastraError.toString() });
+      } catch {
+        // Error inspection performed by telemetry must not make aggregate
+        // discovery reject. Preserve the normalized message even when a
+        // hostile third-party Error uses throwing getters or Proxy traps.
+        const fallbackError = new MastraError({
+          id: onError.errorId,
+          domain: ErrorDomain.MCP,
+          category: ErrorCategory.THIRD_PARTY,
+          text: discoveryError.message,
+          details: { serverName },
+        });
+        this.logger.trackException(fallbackError);
+        this.logger.error(onError.logMessage, { error: fallbackError.toString() });
       }
+      return {
+        serverName,
+        value: undefined,
+        error: discoveryError,
+        duration: performance.now() - startedAt,
+      };
+    } finally {
+      clearTimeout(timer);
     }
-
-    return { toolsets: connectedToolsets, errors };
   }
 
   /**
-   * Creates MCPServerBase-compatible proxy objects for each server connection
-   * in this MCPClient.  The returned record can be spread directly into
-   * Mastra's `mcpServers` config so that external (non-Mastra) servers
-   * appear in Studio alongside native MCPServer instances.
+   * Creates `MCPServerBase` proxy objects for each server connection in this
+   * MCPClient. The returned record can be spread directly into Mastra's
+   * `mcpServers` config so that external (non-Mastra) servers appear in Studio
+   * alongside local MCPServer instances.
    *
-   * @returns Record mapping server names to MCPServerBase proxy instances
+   * @returns Record mapping server names to proxy instances
    *
    * @example
    * ```typescript
@@ -898,31 +1747,6 @@ To fix this you have three different options:
   }
 
   /**
-   * Gets current session IDs for all connected MCP clients using Streamable HTTP transport.
-   *
-   * Returns an object mapping server names to their session IDs. Only includes servers
-   * that are currently connected via Streamable HTTP transport.
-   *
-   * @returns Object mapping server names to session IDs
-   *
-   * @example
-   * ```typescript
-   * const sessions = mcp.sessionIds;
-   * console.log(sessions);
-   * // { weatherServer: 'abc-123', stockServer: 'def-456' }
-   * ```
-   */
-  get sessionIds(): Record<string, string> {
-    const sessionIds: Record<string, string> = {};
-    for (const [serverName, client] of this.mcpClientsById.entries()) {
-      if (client.sessionId) {
-        sessionIds[serverName] = client.sessionId;
-      }
-    }
-    return sessionIds;
-  }
-
-  /**
    * Gets the stderr stream of a connected stdio server.
    *
    * Only available for servers using stdio transport with `stderr: 'pipe'`.
@@ -937,7 +1761,15 @@ To fix this you have three different options:
     return client.stderr;
   }
 
-  private async getConnectedClient(name: string, config: MastraMCPServerDefinition): Promise<InternalMastraMCPClient> {
+  private getServerConfig(serverName: string): MastraMCPServerDefinition {
+    const serverConfig = this.serverConfigs[serverName];
+    if (!serverConfig) {
+      throw new Error(`Server configuration not found for name: ${serverName}`);
+    }
+    return serverConfig;
+  }
+
+  private async getOrCreateClient(name: string, config: MastraMCPServerDefinition): Promise<InternalMastraMCPClient> {
     if (this.disconnectPromise) {
       await this.disconnectPromise;
     }
@@ -953,54 +1785,79 @@ To fix this you have three different options:
       if (!existingClient) {
         throw new Error(`Client ${name} exists but is undefined`);
       }
-      await existingClient.connect();
       return existingClient;
     }
 
-    this.logger.debug('Connecting to MCP server', { name });
-
-    // Create client with server configuration including log handler
     const mcpClient = new InternalMastraMCPClient({
       name,
       server: config,
       timeout: config.timeout ?? this.defaultTimeout,
-      capabilities: config.capabilities,
+      registerProcessHooks: this.registerProcessHooks,
+      clientInfo: {
+        name: config.clientInfo?.name ?? this.defaultClientInfo?.name,
+        version: config.clientInfo?.version ?? this.defaultClientInfo?.version,
+      },
+      webhook: this.webhook,
     });
 
     mcpClient.__setLogger(this.logger);
 
     this.mcpClientsById.set(name, mcpClient);
 
+    return mcpClient;
+  }
+
+  private async getConnectedClient(name: string, config: MastraMCPServerDefinition): Promise<InternalMastraMCPClient> {
+    this.logger.debug('Connecting to MCP server', { name });
+
+    const mcpClient = await this.getOrCreateClient(name, config);
+
     try {
       await mcpClient.connect();
     } catch (e) {
-      const mastraError = new MastraError(
-        {
-          id: 'MCP_CLIENT_CONNECT_FAILED',
-          domain: ErrorDomain.MCP,
-          category: ErrorCategory.THIRD_PARTY,
-          text: `Failed to connect to MCP server ${name}: ${e instanceof Error ? e.stack || e.message : String(e)}`,
-          details: {
-            name,
-          },
-        },
-        e,
-      );
-      this.logger.trackException(mastraError);
-      this.logger.error('MCPClient errored connecting to MCP server:', { error: mastraError.toString() });
-      this.mcpClientsById.delete(name);
-      throw mastraError;
+      throw this.handleConnectError(name, e, mcpClient);
     }
     this.logger.debug('Connected to MCP server', { name });
     return mcpClient;
   }
 
-  private async getConnectedClientForServer(serverName: string): Promise<InternalMastraMCPClient> {
-    const serverConfig = this.serverConfigs[serverName];
-    if (!serverConfig) {
-      throw new Error(`Server configuration not found for name: ${serverName}`);
+  private handleConnectError(name: string, error: unknown, client: InternalMastraMCPClient): MastraError {
+    const mastraError = new MastraError(
+      {
+        id: 'MCP_CLIENT_CONNECT_FAILED',
+        domain: ErrorDomain.MCP,
+        category: ErrorCategory.THIRD_PARTY,
+        text: `Failed to connect to MCP server ${name}: ${
+          error instanceof Error ? error.stack || error.message : String(error)
+        }`,
+        details: {
+          name,
+        },
+      },
+      error,
+    );
+    this.logger.trackException(mastraError);
+    this.logger.error('MCPClient errored connecting to MCP server:', { error: mastraError.toString() });
+    // Keep the client when authorization is required: it carries the needs-auth
+    // state and the pending transport that authenticate() completes. Keep it too
+    // when a newer connect or reconnect replaced the failed one: that attempt still
+    // runs on this client, and disconnect() must be able to reach it.
+    if (
+      !(error instanceof UnauthorizedError) &&
+      !client.hasPendingConnect() &&
+      this.mcpClientsById.get(name) === client
+    ) {
+      this.mcpClientsById.delete(name);
     }
-    return this.getConnectedClient(serverName, serverConfig);
+    return mastraError;
+  }
+
+  private async getConnectedClientForServer(serverName: string): Promise<InternalMastraMCPClient> {
+    return this.getConnectedClient(serverName, this.getServerConfig(serverName));
+  }
+
+  private async getClientForServer(serverName: string): Promise<InternalMastraMCPClient> {
+    return this.getOrCreateClient(serverName, this.getServerConfig(serverName));
   }
 
   private async getToolsForServer(serverName: string): Promise<Record<string, Tool<any, any, any, any>>> {
@@ -1026,4 +1883,25 @@ To fix this you have three different options:
 
     return {};
   }
+}
+
+/**
+ * Whether a tool may be handed to the model. MCP App servers mark helpers their app calls itself
+ * with `_meta.ui.visibility` lacking `'model'`; per the MCP Apps spec, hosts must not give those
+ * to the model. They stay callable by the app through the server.
+ */
+function isModelVisible(meta: Record<string, unknown> | undefined): boolean {
+  const ui = meta?.ui;
+  const visibility = ui && typeof ui === 'object' && 'visibility' in ui ? ui.visibility : undefined;
+  return !Array.isArray(visibility) || visibility.includes('model');
+}
+
+function modelVisibleTools(tools: Record<string, Tool<any, any, any, any>>): Record<string, Tool<any, any, any, any>> {
+  return Object.fromEntries(Object.entries(tools).filter(([, tool]) => isModelVisible(tool.mcp?._meta)));
+}
+
+function modelVisibleDefinitions(
+  definitions: Record<string, SerializableMCPToolDefinition>,
+): Record<string, SerializableMCPToolDefinition> {
+  return Object.fromEntries(Object.entries(definitions).filter(([, definition]) => isModelVisible(definition._meta)));
 }

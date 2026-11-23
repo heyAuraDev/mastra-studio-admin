@@ -7,7 +7,8 @@ import { createWorkflow, createStep } from '@mastra/core/workflows';
 import { createScorer } from '@mastra/core/evals';
 import { RequestContext } from '@mastra/core/request-context';
 import { MastraEditor } from './index';
-import { randomUUID } from 'crypto';
+import { randomUUID } from 'node:crypto';
+import os from 'node:os';
 import { convertArrayToReadableStream, LanguageModelV2, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import {
   ProcessInputArgs,
@@ -26,7 +27,7 @@ import { MastraModelGateway, ProviderConfig } from '@mastra/core/llm';
 const createTestStorage = () => {
   return new LibSQLStore({
     id: `test-${randomUUID()}`,
-    url: ':memory:',
+    url: `file:${os.tmpdir()}/mastra-test-${randomUUID()}.db`,
   });
 };
 
@@ -34,7 +35,7 @@ const createTestStorage = () => {
 const createTestVector = (id: string) => {
   return new LibSQLVector({
     id,
-    url: ':memory:',
+    url: `file:${os.tmpdir()}/mastra-test-${randomUUID()}.db`,
   });
 };
 
@@ -1718,19 +1719,25 @@ describe('MastraEditor with LibSQL Integration', () => {
       const retrievedAgent = await editor.agent.getById('prompt-block-agent');
       expect(retrievedAgent).toBeInstanceOf(Agent);
 
-      // The instructions should be a function (DynamicArgument) since they contain prompt blocks
-      // Verify by calling generate with a requestContext
+      // Resolve the stored agent's runtime instructions with template variables.
       const ctx = new RequestContext([
         ['agentName', 'TestBot'],
         ['userName', 'Alice'],
       ]);
 
-      const result = await retrievedAgent!.generate('Hello!', {
-        requestContext: ctx,
-      });
-
-      expect(result).toBeDefined();
-      expect(result.text).toBeDefined();
+      const instructions = await retrievedAgent!.getInstructions({ requestContext: ctx });
+      expect(instructions).toBe(
+        'Prompt block: "Greeting Block" (ID: "greeting-block")\n' +
+          'You are a helpful assistant called TestBot.\n\n' +
+          'The user is called Alice.\n\n' +
+          'Prompt block: "Behavior Block" (ID: "behavior-block")\n' +
+          'Always be polite and concise in your responses.',
+      );
+      expect(retrievedAgent!.toRawConfig()?.instructions).toEqual([
+        { type: 'prompt_block_ref', id: 'greeting-block' },
+        { type: 'text', content: 'The user is called {{userName}}.' },
+        { type: 'prompt_block_ref', id: 'behavior-block' },
+      ]);
     });
 
     it('should resolve instructions differently based on requestContext', async () => {

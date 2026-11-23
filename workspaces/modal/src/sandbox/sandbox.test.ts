@@ -13,6 +13,7 @@ const mockSandbox = {
   exec: vi.fn(),
   terminate: vi.fn().mockResolvedValue(undefined),
   snapshotFilesystem: vi.fn().mockResolvedValue({ imageId: 'snap-123' }),
+  reloadVolumes: vi.fn().mockResolvedValue(undefined),
 };
 
 const mockSandboxes = {
@@ -50,8 +51,10 @@ vi.mock('modal', async () => {
 });
 
 // Import after mock registration
-// eslint-disable-next-line import/order
+// oxlint-disable-next-line mastra/import-order
 import { ClientClosedError, NotFoundError } from 'modal';
+// oxlint-disable-next-line mastra/import-order
+import { SandboxNotReadyError } from '@mastra/core/workspace';
 import { ModalSandbox } from './index';
 
 // ---------------------------------------------------------------------------
@@ -242,6 +245,81 @@ describe('ModalSandbox lifecycle', () => {
 // Stop-and-resume
 // ---------------------------------------------------------------------------
 
+describe('ModalSandbox volumes', () => {
+  const volume = { volumeId: 'vo-123' };
+
+  it('passes volumes to sandboxes.create()', async () => {
+    const sandbox = new ModalSandbox({ id: 'test-sb', volumes: { '/mnt/data': volume as never } });
+    await sandbox._start();
+
+    expect(mockSandboxes.create).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ volumes: { '/mnt/data': volume } }),
+    );
+  });
+
+  it('passes volumes when rebooting from a snapshot', async () => {
+    const sandbox = new ModalSandbox({ id: 'test-sb', volumes: { '/mnt/data': volume as never } });
+    await sandbox._start();
+    await sandbox._stop();
+    mockSandboxes.create.mockClear();
+    await sandbox._start();
+
+    expect(mockSandboxes.create).toHaveBeenCalledWith(
+      expect.anything(),
+      { imageId: 'snap-123' },
+      expect.objectContaining({ volumes: { '/mnt/data': volume } }),
+    );
+  });
+
+  it('omits volumes when none are configured', async () => {
+    const sandbox = new ModalSandbox({ id: 'test-sb', volumes: {} });
+    await sandbox._start();
+
+    expect(mockSandboxes.create.mock.calls[0]![2].volumes).toBeUndefined();
+  });
+
+  it('carries volumes over to clones', async () => {
+    const sandbox = new ModalSandbox({ id: 'test-sb', volumes: { '/mnt/data': volume as never } });
+    await sandbox.clone({ id: 'clone-sb' })._start();
+
+    expect(mockSandboxes.create).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ name: 'clone-sb', volumes: { '/mnt/data': volume } }),
+    );
+  });
+
+  it.each(['/mnt/data', '/mnt/data/', '/mnt/data/project'])(
+    'rejects workingDirectory %s inside a volume mount',
+    workingDirectory => {
+      expect(() => new ModalSandbox({ workingDirectory, volumes: { '/mnt/data': volume as never } })).toThrow(
+        /must be outside Volume mount/,
+      );
+    },
+  );
+
+  it('allows workingDirectory that only shares a prefix with a mount', () => {
+    expect(
+      () => new ModalSandbox({ workingDirectory: '/mnt/database', volumes: { '/mnt/data': volume as never } }),
+    ).not.toThrow();
+  });
+
+  it('reloadVolumes() delegates to the Modal sandbox', async () => {
+    const sandbox = new ModalSandbox({ id: 'test-sb', volumes: { '/mnt/data': volume as never } });
+    await sandbox._start();
+    await sandbox.reloadVolumes({ timeoutMs: 1000 });
+
+    expect(mockSandbox.reloadVolumes).toHaveBeenCalledWith({ timeoutMs: 1000 });
+  });
+
+  it('reloadVolumes() throws before the sandbox starts', async () => {
+    const sandbox = new ModalSandbox({ id: 'test-sb' });
+    await expect(sandbox.reloadVolumes()).rejects.toThrow(SandboxNotReadyError);
+  });
+});
+
 describe('ModalSandbox stop-and-resume', () => {
   it('stop() snapshots then terminates, allowing same instance to resume from snapshot', async () => {
     const first = new ModalSandbox({ id: 'resume-test', appName: 'mastra' });
@@ -355,6 +433,8 @@ describe('ModalProcessManager', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe('hello\n');
     expect(result.stderr).toBe('warning\n');
+    expect(result.killed).toBeUndefined();
+    expect(result.timedOut).toBeUndefined();
   });
 
   it('wait() returns failure for non-zero exit code', async () => {
@@ -396,6 +476,20 @@ describe('ModalProcessManager', () => {
     );
   });
 
+  it('setEnv after construction reaches subsequent spawns', async () => {
+    const proc = makeProcess(0);
+    mockSandbox.exec = vi.fn().mockResolvedValue(proc);
+
+    const sandbox = await startedSandbox();
+    sandbox.setEnv(env => ({ ...env, GH_TOKEN: 'tok_1' }));
+    await sandbox.processes.spawn('true');
+
+    expect(mockSandbox.exec).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ env: { GH_TOKEN: 'tok_1' } }),
+    );
+  });
+
   it('spawn() filters undefined values from env', async () => {
     const proc = makeProcess(0);
     mockSandbox.exec = vi.fn().mockResolvedValue(proc);
@@ -415,6 +509,47 @@ describe('ModalProcessManager', () => {
     await sandbox.processes.spawn('pwd', { cwd: '/app' });
 
     expect(mockSandbox.exec).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ workdir: '/app' }));
+  });
+
+  it('spawn() defaults workdir to the configured workingDirectory', async () => {
+    const proc = makeProcess(0);
+    mockSandbox.exec = vi.fn().mockResolvedValue(proc);
+
+    const sandbox = await startedSandbox({ workingDirectory: '/srv/app' });
+    await sandbox.processes.spawn('pwd');
+
+    expect(mockSandbox.exec).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ workdir: '/srv/app' }));
+    expect(sandbox.workingDirectory).toBe('/srv/app');
+  });
+
+  it('per-spawn cwd wins over the configured workingDirectory', async () => {
+    const proc = makeProcess(0);
+    mockSandbox.exec = vi.fn().mockResolvedValue(proc);
+
+    const sandbox = await startedSandbox({ workingDirectory: '/srv/app' });
+    await sandbox.processes.spawn('pwd', { cwd: '/app' });
+
+    expect(mockSandbox.exec).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ workdir: '/app' }));
+  });
+
+  it('workingDirectory wins over the deprecated workdir alias; alias still applies alone', async () => {
+    const both = new ModalSandbox({ workingDirectory: '/srv/app', workdir: '/legacy' });
+    expect(both.workingDirectory).toBe('/srv/app');
+
+    const aliasOnly = new ModalSandbox({ workdir: '/legacy' });
+    expect(aliasOnly.workingDirectory).toBe('/legacy');
+  });
+
+  it('spawn() omits workdir when neither cwd nor workingDirectory is set', async () => {
+    const proc = makeProcess(0);
+    mockSandbox.exec = vi.fn().mockResolvedValue(proc);
+
+    const sandbox = await startedSandbox();
+    await sandbox.processes.spawn('pwd');
+
+    const [, execParams] = mockSandbox.exec.mock.calls[0]!;
+    expect(execParams.workdir).toBeUndefined();
+    expect(sandbox.workingDirectory).toBeUndefined();
   });
 
   it('spawn() passes per-spawn timeout as timeoutMs', async () => {
@@ -462,6 +597,8 @@ describe('ModalProcessManager', () => {
     const result = await handle.wait();
     expect(result.success).toBe(false);
     expect(result.exitCode).toBe(137);
+    expect(result.killed).toBe(true);
+    expect(result.timedOut).toBe(false);
   });
 
   it('sendStdin() throws not supported', async () => {
@@ -483,6 +620,8 @@ describe('ModalProcessManager', () => {
 
     expect(result.exitCode).toBe(124);
     expect(result.success).toBe(false);
+    expect(result.killed).toBe(true);
+    expect(result.timedOut).toBe(true);
   }, 5000);
 
   it('list() returns tracked processes', async () => {
@@ -550,5 +689,57 @@ describe('ModalSandbox.retryOnDead()', () => {
 
     await expect(sandbox.processes.spawn('cmd')).rejects.toThrow('permission denied');
     expect(callCount).toBe(1);
+  });
+});
+
+describe('ModalSandbox.clone', () => {
+  it('constructs an unstarted sibling without any I/O', () => {
+    const template = new ModalSandbox({ tokenId: 'tid', tokenSecret: 'tsec', appName: 'mastra' });
+
+    const child = template.clone({ id: 'mc-project-1' });
+
+    expect(child).toBeInstanceOf(ModalSandbox);
+    expect(child).not.toBe(template);
+    expect(child.id).toBe('mc-project-1');
+    expect(child.status).toBe('pending');
+    expect(mockSandboxes.create).not.toHaveBeenCalled();
+  });
+
+  it('inherits template config and applies env override', () => {
+    const template = new ModalSandbox({ tokenId: 'tid', tokenSecret: 'tsec', appName: 'mastra', env: { BASE: '1' } });
+
+    const child = template.clone({ env: { GITHUB_TOKEN: 'ghs_abc' } });
+
+    expect(child['_constructorOptions']).toMatchObject({
+      tokenId: 'tid',
+      tokenSecret: 'tsec',
+      appName: 'mastra',
+      env: { GITHUB_TOKEN: 'ghs_abc' },
+    });
+  });
+
+  it('maps idleTimeoutMinutes to timeoutMs', () => {
+    const template = new ModalSandbox({ tokenId: 'tid', tokenSecret: 'tsec', timeoutMs: 120_000 });
+
+    const child = template.clone({ idleTimeoutMinutes: 15 });
+
+    expect(child['_constructorOptions']).toMatchObject({ timeoutMs: 900_000 });
+  });
+
+  it('applies workingDirectory override', () => {
+    const template = new ModalSandbox({ tokenId: 'tid', tokenSecret: 'tsec', workingDirectory: '/template' });
+
+    const child = template.clone({ workingDirectory: '/project' });
+
+    expect(child['_constructorOptions']).toMatchObject({ workingDirectory: '/project' });
+  });
+
+  it('inherits template defaults when no overrides are passed', () => {
+    const template = new ModalSandbox({ tokenId: 'tid', tokenSecret: 'tsec', timeoutMs: 120_000, env: { BASE: '1' } });
+
+    const child = template.clone();
+
+    expect(child.id).not.toBe(template.id);
+    expect(child['_constructorOptions']).toMatchObject({ tokenId: 'tid', timeoutMs: 120_000, env: { BASE: '1' } });
   });
 });

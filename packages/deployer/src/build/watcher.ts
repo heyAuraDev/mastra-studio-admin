@@ -1,5 +1,5 @@
 import { dirname, posix } from 'node:path';
-import { noopLogger } from '@mastra/core/logger';
+import { noopLogger } from '@internal/core/logger';
 import * as pkg from 'empathic/package';
 import type { InputOptions, OutputOptions, Plugin } from 'rollup';
 import { watch } from 'rollup';
@@ -9,6 +9,7 @@ import { getInputOptions as getBundlerInputOptions } from './bundler';
 import { aliasHono } from './plugins/hono-alias';
 import { nodeModulesExtensionResolver } from './plugins/node-modules-extension-resolver';
 import { tsConfigPaths } from './plugins/tsconfig-paths';
+import { workspaceDepsWatcher } from './plugins/workspace-deps-watcher';
 import type { BundlerOptions } from './types';
 import { getPackageName, slash } from './utils';
 import type { BundlerPlatform } from './utils';
@@ -21,24 +22,40 @@ export async function getInputOptions(
     sourcemap = false,
     bundlerOptions = {
       enableSourcemap: false,
+      // `mastra dev` never minifies — readable output matters more than size here.
+      enableMinify: false,
       enableEsmShim: true,
       externals: true,
     },
-  }: { sourcemap?: boolean; bundlerOptions?: BundlerOptions } = {},
+    analysisEntries = [entryFile],
+    outputDir: outputDirOption,
+    configEntryFile,
+  }: {
+    sourcemap?: boolean;
+    bundlerOptions?: BundlerOptions;
+    analysisEntries?: string[];
+    outputDir?: string;
+    /** File holding `new Mastra({...})`, when `entryFile` is a generated wrapper that imports it */
+    configEntryFile?: string;
+  } = {},
 ) {
   const closestPkgJson = pkg.up({ cwd: dirname(entryFile) });
   const projectRoot = closestPkgJson ? dirname(slash(closestPkgJson)) : slash(process.cwd());
   const { workspaceMap, workspaceRoot } = await getWorkspaceInformation({ mastraEntryFile: entryFile });
 
+  const outputDir = outputDirOption ? slash(outputDirOption) : posix.join(process.cwd(), '.mastra', '.build');
+
   const analyzeEntryResult = await analyzeBundle(
-    [entryFile],
+    analysisEntries,
     entryFile,
     {
-      outputDir: posix.join(process.cwd(), '.mastra', '.build'),
+      outputDir,
       projectRoot: workspaceRoot || process.cwd(),
       platform,
       isDev: true,
       bundlerOptions,
+      env,
+      configEntryFile,
     },
     noopLogger,
   );
@@ -60,7 +77,14 @@ export async function getInputOptions(
     },
     platform,
     env,
-    { sourcemap, isDev: true, workspaceRoot, projectRoot, externalsPreset: bundlerOptions?.externals === true },
+    {
+      sourcemap,
+      isDev: true,
+      workspaceRoot,
+      projectRoot,
+      externalsPreset: bundlerOptions?.externals === true,
+      configEntryFile,
+    },
   );
 
   if (Array.isArray(inputOptions.plugins)) {
@@ -88,6 +112,22 @@ export async function getInputOptions(
     inputOptions.plugins.push(aliasHono());
     // fixes imports like lodash/fp/get
     inputOptions.plugins.push(nodeModulesExtensionResolver());
+
+    const depsToOptimize = analyzeEntryResult.depsToOptimize;
+    const resolvedWorkspaceRoot = analyzeEntryResult.workspaceRoot || workspaceRoot;
+    if (depsToOptimize?.size && resolvedWorkspaceRoot) {
+      inputOptions.plugins.push(
+        workspaceDepsWatcher({
+          depsToOptimize,
+          optimizedDependencyFiles: deps,
+          workspaceMap,
+          workspaceRoot: resolvedWorkspaceRoot,
+          outputDir: analyzeEntryResult.outputDir || outputDir,
+          platform,
+          bundlerOptions,
+        }),
+      );
+    }
   }
 
   return inputOptions;

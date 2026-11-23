@@ -1,16 +1,16 @@
 import type { ReactNode } from 'react';
-import { DashboardCard } from '@/ds/components/DashboardCard';
+import { Card } from '@/ds/components/Card';
 import { cn } from '@/lib/utils';
 
 export function MetricsCardRoot({ children, className }: { children: ReactNode; className?: string }) {
   return (
-    <DashboardCard
+    <Card
       className={cn(
-        'flex-1 grid grid-rows-[4rem_1fr] min-h-72 gap-2 min-w-80 md:min-w-[22rem] lg:min-w-[24rem] xl:min-w-[26rem] 2xl:min-w-[30rem]',
+        'group/metrics-card grid min-h-72 min-w-80 flex-1 grid-rows-[auto_1fr] gap-4 px-4 py-3 2xl:min-w-120 md:min-w-88 lg:min-w-sm xl:min-w-104',
         className,
       )}
     >
       {children}
-    </DashboardCard>
+    </Card>
   );
 }

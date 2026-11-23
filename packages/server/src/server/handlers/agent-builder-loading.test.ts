@@ -21,22 +21,22 @@ describe('agent builder route loading', () => {
     vi.resetModules();
   });
 
-  it('does not load or register agent builder when importing the server routes', { timeout: 10_000 }, async () => {
+  it('registers agent builder routes without loading @mastra/agent-builder', { timeout: 10_000 }, async () => {
     const loadAgentBuilder = vi.fn(() => ({
-      agentBuilderWorkflows: {},
+      createAgentBuilderWorkflows: () => ({}),
     }));
 
     vi.doMock('@mastra/agent-builder', loadAgentBuilder);
 
     const routes = await import('../server-adapter/routes');
 
-    expect(routes.SERVER_ROUTES.some(route => route.path.startsWith('/agent-builder'))).toBe(false);
+    expect(routes.SERVER_ROUTES.some(route => route.path.startsWith('/agent-builder'))).toBe(true);
     expect(loadAgentBuilder).not.toHaveBeenCalled();
   });
 
   it('loads agent builder when an agent builder route is handled', async () => {
     const loadAgentBuilder = vi.fn(() => ({
-      agentBuilderWorkflows: {},
+      createAgentBuilderWorkflows: () => ({}),
     }));
 
     vi.doMock('@mastra/agent-builder', loadAgentBuilder);

@@ -199,7 +199,7 @@ level1
     it('should hide dotfiles by default', async () => {
       await fs.writeFile(path.join(tempDir, '.gitignore'), '');
       await fs.writeFile(path.join(tempDir, 'visible.txt'), '');
-      await fs.mkdir(path.join(tempDir, '.git'));
+      await fs.mkdir(path.join(tempDir, '.hidden'));
 
       const result = await formatAsTree(filesystem, '.');
 
@@ -209,6 +209,24 @@ visible.txt`,
       );
       expect(result.fileCount).toBe(1);
       expect(result.dirCount).toBe(0);
+    });
+
+    it('should always exclude .git directory even when showHidden is true', async () => {
+      await fs.mkdir(path.join(tempDir, '.git'));
+      await fs.mkdir(path.join(tempDir, '.git', 'objects'));
+      await fs.mkdir(path.join(tempDir, '.git', 'refs'));
+      await fs.writeFile(path.join(tempDir, '.gitignore'), '');
+      await fs.writeFile(path.join(tempDir, 'visible.txt'), '');
+
+      const result = await formatAsTree(filesystem, '.', { showHidden: true });
+
+      expect(result.tree).toContain('.gitignore');
+      expect(result.tree).toContain('visible.txt');
+      // .git directory should not appear as an entry (check lines individually)
+      const lines = result.tree.split('\n');
+      expect(lines).not.toContain('.git');
+      expect(result.tree).not.toContain('objects');
+      expect(result.tree).not.toContain('refs');
     });
 
     it('should show dotfiles when showHidden is true', async () => {
@@ -256,6 +274,51 @@ visible.txt`,
       expect(result.tree).not.toContain('dist');
       expect(result.tree).not.toContain('bundle.js');
       expect(result.fileCount).toBe(1);
+    });
+
+    it('applies .gitignore files below the listed root, relative to their directory', async () => {
+      await fs.mkdir(path.join(tempDir, 'repo', 'src'), { recursive: true });
+      await fs.mkdir(path.join(tempDir, 'repo', 'build'), { recursive: true });
+      await fs.mkdir(path.join(tempDir, 'repo', 'pkg', 'build'), { recursive: true });
+      await fs.mkdir(path.join(tempDir, 'repo', 'pkg', 'gen'), { recursive: true });
+      await fs.writeFile(path.join(tempDir, 'repo', '.gitignore'), '/build\n');
+      await fs.writeFile(path.join(tempDir, 'repo', 'pkg', '.gitignore'), 'gen/\n');
+      await fs.writeFile(path.join(tempDir, 'repo', 'src', 'app.ts'), '');
+      await fs.writeFile(path.join(tempDir, 'repo', 'build', 'out.js'), '');
+      await fs.writeFile(path.join(tempDir, 'repo', 'pkg', 'build', 'keep.ts'), '');
+      await fs.writeFile(path.join(tempDir, 'repo', 'pkg', 'gen', 'generated.ts'), '');
+
+      const result = await formatAsTree(filesystem, '.');
+
+      expect(result.paths).toEqual([
+        'repo',
+        'repo/pkg',
+        'repo/pkg/build',
+        'repo/pkg/build/keep.ts',
+        'repo/src',
+        'repo/src/app.ts',
+      ]);
+    });
+
+    it('applies the .gitignore of a directory above the listed path', async () => {
+      await fs.mkdir(path.join(tempDir, 'repo', 'channels', 'discord', 'deps'), { recursive: true });
+      await fs.writeFile(path.join(tempDir, 'repo', '.gitignore'), 'deps\n');
+      await fs.writeFile(path.join(tempDir, 'repo', 'channels', 'discord', 'bot.ts'), '');
+      await fs.writeFile(path.join(tempDir, 'repo', 'channels', 'discord', 'deps', 'lib.js'), '');
+
+      const result = await formatAsTree(filesystem, 'repo/channels');
+
+      expect(result.paths).toEqual(['discord', 'discord/bot.ts']);
+    });
+
+    it('skips node_modules without a .gitignore unless the listing points inside it', async () => {
+      await fs.mkdir(path.join(tempDir, 'node_modules', 'dep'), { recursive: true });
+      await fs.writeFile(path.join(tempDir, 'node_modules', 'dep', 'index.js'), '');
+      await fs.writeFile(path.join(tempDir, 'index.ts'), '');
+
+      expect((await formatAsTree(filesystem, '.')).paths).toEqual(['index.ts']);
+      expect((await formatAsTree(filesystem, 'node_modules')).paths).toEqual(['dep', 'dep/index.js']);
+      expect((await formatAsTree(filesystem, '.', { respectGitignore: false })).paths).toContain('node_modules');
     });
   });
 
@@ -458,6 +521,68 @@ tests
   });
 
   // ===========================================================================
+  // Concurrent prefetch
+  // ===========================================================================
+  describe('concurrent prefetch', () => {
+    it('should issue readdir calls concurrently for sibling directories', async () => {
+      // Wide tree: 10 sibling directories each with a file
+      for (let i = 0; i < 10; i++) {
+        const dir = path.join(tempDir, `dir${i}`);
+        await fs.mkdir(dir);
+        await fs.writeFile(path.join(dir, 'file.txt'), '');
+      }
+
+      let inFlight = 0;
+      let maxInFlight = 0;
+      const originalReaddir = filesystem.readdir.bind(filesystem);
+      filesystem.readdir = async (p: string, options?: any) => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise(resolve => setTimeout(resolve, 5));
+        try {
+          return await originalReaddir(p, options);
+        } finally {
+          inFlight--;
+        }
+      };
+
+      const result = await formatAsTree(filesystem, '.');
+
+      // Sibling directories at the same level should be read concurrently
+      expect(maxInFlight).toBeGreaterThan(1);
+      expect(result.dirCount).toBe(10);
+      expect(result.fileCount).toBe(10);
+    });
+
+    it('should produce deterministic sorted output regardless of readdir completion order', async () => {
+      for (const name of ['zeta', 'alpha', 'mid']) {
+        const dir = path.join(tempDir, name);
+        await fs.mkdir(dir);
+        await fs.writeFile(path.join(dir, `${name}.txt`), '');
+      }
+
+      const originalReaddir = filesystem.readdir.bind(filesystem);
+      filesystem.readdir = async (p: string, options?: any) => {
+        // Randomize completion order
+        await new Promise(resolve => setTimeout(resolve, Math.random() * 10));
+        return originalReaddir(p, options);
+      };
+
+      const result = await formatAsTree(filesystem, '.');
+
+      expect(result.tree).toBe(
+        `.
+alpha
+\talpha.txt
+mid
+\tmid.txt
+zeta
+\tzeta.txt`,
+      );
+    });
+  });
+
+  // ===========================================================================
   // dirsOnly Option (tree -d flag)
   // ===========================================================================
   describe('dirsOnly', () => {
@@ -517,16 +642,32 @@ src
       await fs.mkdir(path.join(tempDir, 'src'));
       await fs.mkdir(path.join(tempDir, 'node_modules'));
       await fs.mkdir(path.join(tempDir, 'dist'));
-      await fs.mkdir(path.join(tempDir, '.git'));
+      await fs.mkdir(path.join(tempDir, '.hidden'));
       await fs.writeFile(path.join(tempDir, 'index.ts'), '');
 
       const result = await formatAsTree(filesystem, '.', {
         exclude: ['node_modules', 'dist'],
-        showHidden: true, // Show .git to verify it's not excluded
+        showHidden: true, // Show .hidden to verify it's not excluded
       });
 
       expect(result.tree).toContain('src');
-      expect(result.tree).toContain('.git');
+      expect(result.tree).toContain('.hidden');
+      expect(result.tree).toContain('index.ts');
+      expect(result.tree).not.toContain('node_modules');
+      expect(result.tree).not.toContain('dist');
+    });
+
+    it('should support pipe-separated exclude patterns (tree -I syntax)', async () => {
+      await fs.mkdir(path.join(tempDir, 'src'));
+      await fs.mkdir(path.join(tempDir, 'node_modules'));
+      await fs.mkdir(path.join(tempDir, 'dist'));
+      await fs.writeFile(path.join(tempDir, 'index.ts'), '');
+
+      const result = await formatAsTree(filesystem, '.', {
+        exclude: 'node_modules|dist',
+      });
+
+      expect(result.tree).toContain('src');
       expect(result.tree).toContain('index.ts');
       expect(result.tree).not.toContain('node_modules');
       expect(result.tree).not.toContain('dist');
@@ -788,7 +929,7 @@ file.txt`,
       // Create relative symlink like pnpm/npm does
       await fs.symlink('../packages/core', path.join(tempDir, 'node_modules', 'core'));
 
-      const result = await formatAsTree(filesystem, '.');
+      const result = await formatAsTree(filesystem, 'node_modules');
 
       expect(result.tree).toContain('core -> ../packages/core');
     });

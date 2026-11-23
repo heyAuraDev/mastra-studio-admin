@@ -5,6 +5,7 @@ import { PropertyFilterActions } from './property-filter-actions';
 import { PropertyFilterApplied } from './property-filter-applied';
 import { PropertyFilterCreator } from './property-filter-creator';
 import type { PropertyFilterField, PropertyFilterToken } from './types';
+import { raisedSurfaceStyle } from '@/ds/primitives/raised-surface';
 
 const FIELDS: PropertyFilterField[] = [
   {
@@ -69,7 +70,7 @@ export const Creator: Story = {
     return (
       <div className="flex items-center gap-2">
         <PropertyFilterCreator fields={FIELDS} tokens={tokens} onTokensChange={setTokens} />
-        <span className="text-ui-sm text-neutral3">{tokens.length} token(s)</span>
+        <span className="text-caption text-muted-foreground">{tokens.length} token(s)</span>
       </div>
     );
   },
@@ -127,7 +128,7 @@ export const PickMultiPanelSingle: Story = {
     const field = FIELDS.find(f => f.id === 'status') as Extract<PropertyFilterField, { kind: 'pick-multi' }>;
     const { tokens, setTokens } = useTokens([{ fieldId: 'status', value: 'running' }]);
     return (
-      <div className="w-64 rounded-md border border-border1 bg-surface3 p-2">
+      <div className={`${raisedSurfaceStyle} w-64 rounded-md p-2`}>
         <PickMultiPanel
           field={field}
           tokens={tokens}
@@ -154,21 +155,24 @@ export const PickMultiPanelMulti: Story = {
     const field = FIELDS.find(f => f.id === 'tags') as Extract<PropertyFilterField, { kind: 'pick-multi' }>;
     const { tokens, setTokens } = useTokens([{ fieldId: 'tags', value: ['production'] }]);
     return (
-      <div className="w-64 rounded-md border border-border1 bg-surface3 p-2">
+      <div className={`${raisedSurfaceStyle} w-64 rounded-md p-2`}>
         <PickMultiPanel
           field={field}
           tokens={tokens}
           onChange={(fieldId, value) => {
             const shouldRemove = value === undefined || (Array.isArray(value) && value.length === 0);
-            if (shouldRemove) setTokens(prev => prev.filter(t => t.fieldId !== fieldId));
-            else
-              setTokens(prev => {
-                const existing = prev.findIndex(t => t.fieldId === fieldId);
-                if (existing === -1) return [...prev, { fieldId, value: value! }];
-                const next = [...prev];
-                next[existing] = { fieldId, value: value! };
-                return next;
-              });
+            if (shouldRemove) {
+              setTokens(prev => prev.filter(t => t.fieldId !== fieldId));
+              return;
+            }
+
+            setTokens(prev => {
+              const existing = prev.findIndex(t => t.fieldId === fieldId);
+              if (existing === -1) return [...prev, { fieldId, value }];
+              const next = [...prev];
+              next[existing] = { fieldId, value };
+              return next;
+            });
           }}
         />
       </div>
@@ -188,7 +192,7 @@ export const PickMultiPanelLoading: Story = {
       isLoading: true,
     };
     return (
-      <div className="w-64 rounded-md border border-border1 bg-surface3 p-2">
+      <div className={`${raisedSurfaceStyle} w-64 rounded-md p-2`}>
         <PickMultiPanel field={field} tokens={[]} onChange={() => {}} />
       </div>
     );

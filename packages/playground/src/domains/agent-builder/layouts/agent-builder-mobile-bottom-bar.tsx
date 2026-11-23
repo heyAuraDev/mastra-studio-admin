@@ -1,0 +1,104 @@
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { AgentIcon } from '@mastra/playground-ui/icons/AgentIcon';
+import { IconBlocks } from '@mastra/playground-ui/icons/central/IconBlocks';
+import { IconLibrary } from '@mastra/playground-ui/icons/central/IconLibrary';
+import { IconServer } from '@mastra/playground-ui/icons/central/IconServer';
+import { IconStar } from '@mastra/playground-ui/icons/central/IconStar';
+import { useLinkComponent } from '@mastra/playground-ui/lib/framework';
+import { controlStateColorTransition } from '@mastra/playground-ui/primitives/transitions';
+import { cn } from '@mastra/playground-ui/utils/cn';
+import { useMemo } from 'react';
+import { useLocation } from 'react-router';
+import { useBuilderAgentAccess } from '@/domains/agent-builder/hooks/use-builder-agent-access';
+import { useBuilderAgentFeatures } from '@/domains/agent-builder/hooks/use-builder-agent-features';
+import { usePermissions } from '@/domains/auth/hooks/use-permissions';
+
+interface MobileLink {
+  name: string;
+  url: string;
+  icon: React.ReactNode;
+}
+
+const agentsLink: MobileLink = { name: 'Agents', url: '/agent-builder/agents', icon: <AgentIcon /> };
+const skillsLink: MobileLink = {
+  name: 'Skills',
+  url: '/agent-builder/skills',
+  icon: <IconBlocks className="size-icon-lg" />,
+};
+const favoritesLink: MobileLink = {
+  name: 'Favorites',
+  url: '/agent-builder/favorite',
+  icon: <IconStar className="size-icon-lg" />,
+};
+const libraryLink: MobileLink = {
+  name: 'Library',
+  url: '/agent-builder/library',
+  icon: <IconLibrary className="size-icon-lg" />,
+};
+const infrastructureLink: MobileLink = {
+  name: 'Infra',
+  url: '/agent-builder/infrastructure',
+  icon: <IconServer className="size-icon-lg" />,
+};
+
+export function AgentBuilderMobileBottomBar() {
+  const { Link } = useLinkComponent();
+  const { pathname } = useLocation();
+  const features = useBuilderAgentFeatures();
+  const { canManageSkills, canUseFavorites } = useBuilderAgentAccess();
+  const { hasPermission } = usePermissions();
+  const canViewInfrastructure = hasPermission('infrastructure:read');
+
+  const links = useMemo(() => {
+    const result: MobileLink[] = [agentsLink];
+    if (features.skills && canManageSkills) {
+      result.push(skillsLink);
+    }
+    if (canUseFavorites) {
+      result.push(favoritesLink);
+    }
+    result.push(libraryLink);
+    if (canViewInfrastructure) {
+      result.push(infrastructureLink);
+    }
+    return result;
+  }, [features.skills, canManageSkills, canUseFavorites, canViewInfrastructure]);
+
+  return (
+    <nav
+      aria-label="Primary"
+      className="fixed inset-x-0 bottom-0 z-40 border-t border-border bg-sidebar/95 pb-[env(safe-area-inset-bottom)] backdrop-blur-sm md:hidden"
+    >
+      <ul className="grid" style={{ gridTemplateColumns: `repeat(${links.length}, minmax(0, 1fr))` }}>
+        {links.map(link => {
+          const isActive = pathname.startsWith(link.url);
+          return (
+            <li key={link.name}>
+              <Link
+                href={link.url}
+                aria-current={isActive ? 'page' : undefined}
+                className={cn(
+                  isActive ? 'text-foreground' : 'text-muted-foreground',
+                  'relative flex flex-col items-center justify-center gap-1 py-2',
+                  controlStateColorTransition,
+                  isActive
+                    ? 'before:absolute before:inset-x-0 before:-top-px before:h-0.5 before:bg-current'
+                    : 'hover:text-foreground',
+                )}
+              >
+                <span className="flex size-6 items-center justify-center" aria-hidden="true">
+                  <Txt as="span" variant="caption" className="block">
+                    {link.icon}
+                  </Txt>
+                </span>
+                <Txt as="span" variant="caption">
+                  {link.name}
+                </Txt>
+              </Link>
+            </li>
+          );
+        })}
+      </ul>
+    </nav>
+  );
+}

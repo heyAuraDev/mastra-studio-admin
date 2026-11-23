@@ -225,16 +225,19 @@ export function createSuspendResumeWorkflows(ctx: WorkflowCreatorContext) {
     const step1Action = vi.fn().mockResolvedValue({ value: 'step1-done' });
     const step2Action = vi
       .fn()
-      .mockImplementationOnce(async ({ suspend, state, setState }: any) => {
+      .mockImplementationOnce(async ({ suspend, getState, setState }: any) => {
+        const state = await getState();
         // Set state and then suspend
         await setState({ ...state, value: state.value + '-modified' });
         return suspend({ reason: 'waiting' });
       })
-      .mockImplementationOnce(async ({ state }: any) => {
+      .mockImplementationOnce(async ({ getState }: any) => {
+        const state = await getState();
         // On resume, state should be preserved
         return { result: 'resumed', stateValue: state.value };
       });
-    const step3Action = vi.fn().mockImplementation(async ({ state }: any) => {
+    const step3Action = vi.fn().mockImplementation(async ({ getState }: any) => {
+      const state = await getState();
       return { final: 'done', stateValue: state.value };
     });
 
@@ -442,6 +445,58 @@ export function createSuspendResumeWorkflows(ctx: WorkflowCreatorContext) {
     };
   }
 
+  // Test: should retain a run that suspends again and release it after completion
+  {
+    const firstStepAction = vi.fn().mockImplementation(async ({ suspend, resumeData }) => {
+      if (!resumeData) {
+        return suspend({ reason: 'waiting for first input' });
+      }
+      return { value: (resumeData as any).value };
+    });
+
+    const secondStepAction = vi.fn().mockImplementation(async ({ inputData, suspend, resumeData }) => {
+      if (!resumeData) {
+        return suspend({ reason: 'waiting for second input' });
+      }
+      return { result: `${inputData.value}:${(resumeData as any).value}` };
+    });
+
+    const firstStep = createStep({
+      id: 'first-suspend-step',
+      execute: firstStepAction,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ value: z.string() }),
+      suspendSchema: z.object({ reason: z.string() }),
+      resumeSchema: z.object({ value: z.string() }),
+    });
+
+    const secondStep = createStep({
+      id: 'second-suspend-step',
+      execute: secondStepAction,
+      inputSchema: z.object({ value: z.string() }),
+      outputSchema: z.object({ result: z.string() }),
+      suspendSchema: z.object({ reason: z.string() }),
+      resumeSchema: z.object({ value: z.string() }),
+    });
+
+    const workflow = createWorkflow({
+      id: 'repeated-suspend-resume-workflow',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ result: z.string() }),
+    });
+
+    workflow.then(firstStep).then(secondStep).commit();
+
+    workflows['repeated-suspend-resume-workflow'] = {
+      workflow,
+      mocks: { firstStepAction, secondStepAction },
+      resetMocks: () => {
+        firstStepAction.mockClear();
+        secondStepAction.mockClear();
+      },
+    };
+  }
+
   // Test: should handle suspend and resume using resumeLabel
   {
     let resumeCallCount = 0;
@@ -495,7 +550,8 @@ export function createSuspendResumeWorkflows(ctx: WorkflowCreatorContext) {
   {
     const stateValuesObserved: Array<{ step: string; state: any }> = [];
 
-    const step1Action = vi.fn().mockImplementation(async ({ state, setState, suspend, resumeData }) => {
+    const step1Action = vi.fn().mockImplementation(async ({ getState, setState, suspend, resumeData }) => {
+      const state = await getState();
       stateValuesObserved.push({ step: 'step-1', state: { ...state } });
 
       if (!resumeData) {
@@ -509,7 +565,8 @@ export function createSuspendResumeWorkflows(ctx: WorkflowCreatorContext) {
       return {};
     });
 
-    const step2Action = vi.fn().mockImplementation(async ({ state }) => {
+    const step2Action = vi.fn().mockImplementation(async ({ getState }) => {
+      const state = await getState();
       stateValuesObserved.push({ step: 'step-2', state: { ...state } });
       return { finalCount: state.count, itemCount: state.items.length };
     });
@@ -622,10 +679,9 @@ export function createSuspendResumeWorkflows(ctx: WorkflowCreatorContext) {
         // First execution - suspend
         await suspend({ waitingFor: 'user-input', originalValue: inputData.value });
         return { result: '' }; // Should not be reached
-      } else {
-        // Resume execution
-        return { result: `processed-${(resumeData as any).extraData}` };
       }
+      // Resume execution
+      return { result: `processed-${(resumeData as any).extraData}` };
     });
 
     const completeStepAction = vi.fn().mockImplementation(async ({ inputData }) => {
@@ -815,6 +871,96 @@ export function createSuspendResumeWorkflows(ctx: WorkflowCreatorContext) {
     };
   }
 
+  // Test: should be able to resume suspended nested workflow step with resumeLabel
+  {
+    const beginAction = vi.fn().mockImplementation(async ({ inputData }) => {
+      return inputData;
+    });
+    const startAction = vi.fn().mockImplementation(async ({ inputData }) => {
+      return { newValue: (inputData.startValue || 0) + 1 };
+    });
+    const otherAction = vi.fn().mockImplementation(async ({ inputData, suspend, resumeData }) => {
+      if (!resumeData) {
+        return await suspend({}, { resumeLabel: 'nested-custom-label' });
+      }
+      return { newValue: inputData.newValue, other: 26 };
+    });
+    const finalAction = vi.fn().mockImplementation(async ({ inputData }) => {
+      return { finalValue: (inputData.newValue || 0) + (inputData.other || 0) };
+    });
+    const lastAction = vi.fn().mockImplementation(async () => {
+      return { success: true };
+    });
+
+    const startStep = createStep({
+      id: 'start',
+      inputSchema: z.object({ startValue: z.number() }),
+      outputSchema: z.object({ newValue: z.number() }),
+      execute: startAction,
+    });
+
+    const otherStep = createStep({
+      id: 'other',
+      inputSchema: z.object({ newValue: z.number() }),
+      outputSchema: z.object({ newValue: z.number(), other: z.number() }),
+      execute: otherAction,
+    });
+
+    const finalStep = createStep({
+      id: 'final',
+      inputSchema: z.object({ newValue: z.number(), other: z.number() }),
+      outputSchema: z.object({ finalValue: z.number() }),
+      execute: finalAction,
+    });
+
+    const beginStep = createStep({
+      id: 'begin-step',
+      inputSchema: z.object({ startValue: z.number() }),
+      outputSchema: z.object({ startValue: z.number() }),
+      execute: beginAction,
+    });
+
+    const lastStep = createStep({
+      id: 'last-step',
+      inputSchema: z.object({ finalValue: z.number() }),
+      outputSchema: z.object({ success: z.boolean() }),
+      execute: lastAction,
+    });
+
+    const nestedWorkflow = createWorkflow({
+      id: 'resume-with-label-nested-wf-a',
+      inputSchema: z.object({ startValue: z.number() }),
+      outputSchema: z.object({ finalValue: z.number() }),
+      options: { validateInputs: false },
+    })
+      .then(startStep)
+      .then(otherStep)
+      .then(finalStep)
+      .commit();
+
+    const mainWorkflow = createWorkflow({
+      id: 'resume-with-label-nested-resume-workflow',
+      inputSchema: z.object({ startValue: z.number() }),
+      outputSchema: z.object({ success: z.boolean() }),
+      options: { validateInputs: false },
+    });
+
+    mainWorkflow.then(beginStep).then(nestedWorkflow).then(lastStep).commit();
+
+    workflows['resume-with-label-nested-resume-workflow'] = {
+      workflow: mainWorkflow,
+      nestedWorkflowId: 'resume-with-label-nested-wf-a',
+      mocks: { beginAction, startAction, otherAction, finalAction, lastAction },
+      resetMocks: () => {
+        beginAction.mockClear();
+        startAction.mockClear();
+        otherAction.mockClear();
+        finalAction.mockClear();
+        lastAction.mockClear();
+      },
+    };
+  }
+
   // Test: should handle basic suspend and resume in a dountil workflow
   {
     let iterationCount = 0;
@@ -904,7 +1050,7 @@ export function createSuspendResumeWorkflows(ctx: WorkflowCreatorContext) {
         return { value, condition };
       }
 
-      value = value + 1;
+      value += 1;
       condition = value >= 10;
 
       return { value, condition };
@@ -1378,6 +1524,43 @@ export function createSuspendResumeWorkflows(ctx: WorkflowCreatorContext) {
     };
   }
 
+  // Test: each resumed foreach item receives its own suspend payload
+  for (const concurrency of [3, 2, 1]) {
+    const approveAction = vi.fn().mockImplementation(async ({ inputData, resumeData, suspend }) => {
+      if (!resumeData) {
+        return suspend({ item: inputData.item });
+      }
+      return { item: inputData.item, approved: resumeData.approved };
+    });
+
+    const approveStep = createStep({
+      id: 'approve',
+      inputSchema: z.object({ item: z.number() }),
+      suspendSchema: z.object({ item: z.number() }),
+      resumeSchema: z.object({ approved: z.number() }),
+      outputSchema: z.object({ item: z.number(), approved: z.number() }),
+      execute: approveAction,
+    });
+
+    const workflowId = `foreach-suspend-data-concurrency-${concurrency}-workflow`;
+    const workflow = createWorkflow({
+      id: workflowId,
+      steps: [approveStep],
+      inputSchema: z.array(z.object({ item: z.number() })),
+      outputSchema: z.array(z.object({ item: z.number(), approved: z.number() })),
+    });
+
+    workflow.foreach(approveStep, { concurrency }).commit();
+
+    workflows[workflowId] = {
+      workflow,
+      mocks: { approveAction },
+      resetMocks: () => {
+        approveAction.mockClear();
+      },
+    };
+  }
+
   // Test: should handle consecutive nested workflows with suspend/resume
   {
     const step1Action = vi.fn().mockImplementation(async ({ resumeData, suspend }) => {
@@ -1691,7 +1874,7 @@ export function createSuspendResumeWorkflows(ctx: WorkflowCreatorContext) {
       // Small delay to simulate work
       await new Promise(resolve => setTimeout(resolve, 50));
 
-      value = value + 1;
+      value += 1;
       condition = value >= 10;
 
       return {
@@ -2206,11 +2389,11 @@ export function createSuspendResumeWorkflows(ctx: WorkflowCreatorContext) {
       }
       return { other: 26 };
     });
-    const finalAction = vi.fn().mockImplementation(async ({ getStepResult }) => {
+    const finalAction = vi.fn().mockImplementation(async ({ getStepResultAsync }) => {
       const startStep = { id: 'start' };
       const otherStep = { id: 'other' };
-      const startVal = getStepResult(startStep)?.newValue ?? 0;
-      const otherVal = getStepResult(otherStep)?.other ?? 0;
+      const startVal = (await getStepResultAsync(startStep))?.newValue ?? 0;
+      const otherVal = (await getStepResultAsync(otherStep))?.other ?? 0;
       return { finalValue: startVal + otherVal };
     });
     const lastAction = vi.fn().mockImplementation(async () => {
@@ -2386,11 +2569,11 @@ export function createSuspendResumeWorkflows(ctx: WorkflowCreatorContext) {
       return { other: 26 };
     });
 
-    const finalAction = vi.fn().mockImplementation(async ({ getStepResult }) => {
+    const finalAction = vi.fn().mockImplementation(async ({ getStepResultAsync }) => {
       const startStep = { id: 'start' };
       const otherStep = { id: 'other' };
-      const startVal = getStepResult(startStep)?.newValue ?? 0;
-      const otherVal = getStepResult(otherStep)?.other ?? 0;
+      const startVal = (await getStepResultAsync(startStep))?.newValue ?? 0;
+      const otherVal = (await getStepResultAsync(otherStep))?.other ?? 0;
       return { finalValue: startVal + otherVal };
     });
 
@@ -3003,6 +3186,7 @@ export function createSuspendResumeTests(ctx: WorkflowTestContext, registry?: Wo
       // First execution - should suspend
       const suspendResult = await execute(workflow, {}, { runId });
       expect(suspendResult.status).toBe('suspended');
+      expect(workflow.runs.has(runId)).toBe(true);
       expect(mocks.step1Action).toHaveBeenCalledTimes(1);
       expect(suspendResult.steps.step2).toMatchObject({
         status: 'suspended',
@@ -3017,11 +3201,45 @@ export function createSuspendResumeTests(ctx: WorkflowTestContext, registry?: Wo
       });
 
       expect(resumeResult.status).toBe('success');
+      expect(workflow.runs.has(runId)).toBe(false);
       expect(resumeResult.steps.step2).toMatchObject({
         status: 'success',
         output: { result: 'completed', userInput: 'hello from resume' },
       });
     });
+
+    it.skipIf(ctx.skipTests.resumeBasic || !ctx.resume)(
+      'should retain a run that suspends again and release it after completion',
+      async () => {
+        const { workflow, resetMocks } = registry!['repeated-suspend-resume-workflow']!;
+        resetMocks?.();
+
+        const runId = `repeated-resume-test-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+
+        const startResult = await execute(workflow, {}, { runId });
+        expect(startResult.status).toBe('suspended');
+        expect(workflow.runs.has(runId)).toBe(true);
+
+        const firstResumeResult = await ctx.resume!(workflow, {
+          runId,
+          step: 'first-suspend-step',
+          resumeData: { value: 'first' },
+        });
+        expect(firstResumeResult.status).toBe('suspended');
+        expect(workflow.runs.has(runId)).toBe(true);
+
+        const secondResumeResult = await ctx.resume!(workflow, {
+          runId,
+          step: 'second-suspend-step',
+          resumeData: { value: 'second' },
+        });
+        expect(secondResumeResult.status).toBe('success');
+        expect(workflow.runs.has(runId)).toBe(false);
+        if (secondResumeResult.status === 'success') {
+          expect(secondResumeResult.result).toEqual({ result: 'first:second' });
+        }
+      },
+    );
 
     it.skipIf(ctx.skipTests.resumeWithLabel || !ctx.resume)(
       'should handle suspend and resume using resumeLabel',
@@ -3692,6 +3910,102 @@ export function createSuspendResumeTests(ctx: WorkflowTestContext, registry?: Wo
       },
     );
 
+    // Step code reads suspendData to know what it is resuming (an agent's tool call reads its
+    // suspended sub-agent run id from it), so an item handed a sibling's payload acts on the wrong item.
+    const foreachSuspendDataExecutions = (approveAction: any) =>
+      approveAction.mock.calls.map(([{ inputData, suspendData, resumeData }]: any[]) => ({
+        item: inputData.item,
+        suspendData,
+        resumeData,
+      }));
+
+    it.skipIf(ctx.skipTests.resumeForeachSuspendData || !ctx.resume)(
+      'should give each foreach item its own suspend data when the items are resumed one by one',
+      async () => {
+        const { workflow, mocks, resetMocks } = registry!['foreach-suspend-data-concurrency-3-workflow']!;
+        resetMocks?.();
+        const runId = `foreach-suspend-data-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+
+        const startResult = await execute(workflow, [{ item: 0 }, { item: 1 }, { item: 2 }], { runId });
+        expect(startResult.status).toBe('suspended');
+
+        const order = [1, 0, 2];
+        for (const [position, index] of order.entries()) {
+          mocks.approveAction.mockClear();
+          const result = await ctx.resume!(workflow, {
+            runId,
+            forEachIndex: index,
+            resumeData: { approved: index },
+          });
+          expect(result.status).toBe(position === order.length - 1 ? 'success' : 'suspended');
+          expect(foreachSuspendDataExecutions(mocks.approveAction)).toEqual([
+            { item: index, suspendData: { item: index }, resumeData: { approved: index } },
+          ]);
+        }
+      },
+    );
+
+    it.skipIf(ctx.skipTests.resumeForeachSuspendData || !ctx.resume)(
+      'should give each foreach item its own suspend data when all items are resumed at once',
+      async () => {
+        const { workflow, mocks, resetMocks } = registry!['foreach-suspend-data-concurrency-3-workflow']!;
+        resetMocks?.();
+        const runId = `foreach-suspend-data-all-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+
+        const startResult = await execute(workflow, [{ item: 0 }, { item: 1 }, { item: 2 }], { runId });
+        expect(startResult.status).toBe('suspended');
+
+        mocks.approveAction.mockClear();
+        const result = await ctx.resume!(workflow, { runId, resumeData: { approved: 7 } });
+        expect(result.status).toBe('success');
+        expect(foreachSuspendDataExecutions(mocks.approveAction).sort((a: any, b: any) => a.item - b.item)).toEqual(
+          [0, 1, 2].map(item => ({ item, suspendData: { item }, resumeData: { approved: 7 } })),
+        );
+      },
+    );
+
+    // Item 2 is not reached before the foreach suspends, so it starts fresh during the resume.
+    it.skipIf(ctx.skipTests.resumeForeachSuspendData || !ctx.resume)(
+      'should give each suspended foreach item its own suspend data when all items are resumed before every item ran',
+      async () => {
+        const { workflow, mocks, resetMocks } = registry!['foreach-suspend-data-concurrency-2-workflow']!;
+        resetMocks?.();
+        const runId = `foreach-suspend-data-partial-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+
+        const startResult = await execute(workflow, [{ item: 0 }, { item: 1 }, { item: 2 }], { runId });
+        expect(startResult.status).toBe('suspended');
+
+        mocks.approveAction.mockClear();
+        const result = await ctx.resume!(workflow, { runId, resumeData: { approved: 7 } });
+        expect(result.status).toBe('suspended');
+        expect(foreachSuspendDataExecutions(mocks.approveAction).sort((a: any, b: any) => a.item - b.item)).toEqual([
+          { item: 0, suspendData: { item: 0 }, resumeData: { approved: 7 } },
+          { item: 1, suspendData: { item: 1 }, resumeData: { approved: 7 } },
+          { item: 2, suspendData: undefined, resumeData: undefined },
+        ]);
+      },
+    );
+
+    it.skipIf(ctx.skipTests.resumeForeachSuspendData || !ctx.resume)(
+      'should give a foreach item started after a resume no suspend data',
+      async () => {
+        const { workflow, mocks, resetMocks } = registry!['foreach-suspend-data-concurrency-1-workflow']!;
+        resetMocks?.();
+        const runId = `foreach-suspend-data-sequential-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+
+        const startResult = await execute(workflow, [{ item: 0 }, { item: 1 }, { item: 2 }], { runId });
+        expect(startResult.status).toBe('suspended');
+
+        mocks.approveAction.mockClear();
+        const result = await ctx.resume!(workflow, { runId, forEachIndex: 0, resumeData: { approved: 0 } });
+        expect(result.status).toBe('suspended');
+        expect(foreachSuspendDataExecutions(mocks.approveAction)).toEqual([
+          { item: 0, suspendData: { item: 0 }, resumeData: { approved: 0 } },
+          { item: 1, suspendData: undefined, resumeData: undefined },
+        ]);
+      },
+    );
+
     it.skipIf(ctx.skipTests.resumeNested || !ctx.resume)(
       'should be able to resume suspended nested workflow step',
       async () => {
@@ -3719,6 +4033,51 @@ export function createSuspendResumeTests(ctx: WorkflowTestContext, registry?: Wo
         const resumeResult = await ctx.resume!(workflow, {
           runId,
           step: nestedWorkflowId,
+          resumeData: { newValue: 0 },
+        });
+
+        expect(resumeResult.status).toBe('success');
+        expect(resumeResult.steps[nestedWorkflowId]).toMatchObject({
+          status: 'success',
+          output: { finalValue: 27 }, // 1 (from start) + 26 (from other)
+        });
+
+        // Verify all steps were called correctly
+        expect(mocks.startAction).toHaveBeenCalledTimes(1);
+        expect(mocks.otherAction).toHaveBeenCalledTimes(2); // Called on initial + resume
+        expect(mocks.finalAction).toHaveBeenCalledTimes(1);
+        expect(mocks.lastAction).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it.skipIf(ctx.skipTests.resumeNestedWithLabel || !ctx.resume)(
+      'should be able to resume suspended nested workflow step with label',
+      async () => {
+        const { workflow, nestedWorkflowId, mocks, resetMocks } =
+          registry!['resume-with-label-nested-resume-workflow']!;
+        resetMocks?.();
+
+        const runId = `resume-with-label-nested-resume-test-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+
+        // Start workflow - should suspend at nested workflow's 'other' step
+        const startResult = await execute(workflow, { startValue: 0 }, { runId });
+
+        expect(startResult.status).toBe('suspended');
+        expect(mocks.beginAction).toHaveBeenCalledTimes(1);
+        expect(mocks.startAction).toHaveBeenCalledTimes(1);
+        expect(mocks.otherAction).toHaveBeenCalledTimes(1);
+        expect(mocks.finalAction).toHaveBeenCalledTimes(0);
+        expect(mocks.lastAction).toHaveBeenCalledTimes(0);
+
+        expect(startResult.steps[nestedWorkflowId]).toMatchObject({
+          status: 'suspended',
+        });
+        expect(startResult.steps['last-step']).toBeUndefined();
+
+        // Resume nested workflow by specifying nested workflow ID
+        const resumeResult = await ctx.resume!(workflow, {
+          runId,
+          label: 'nested-custom-label',
           resumeData: { newValue: 0 },
         });
 
@@ -4457,7 +4816,7 @@ export function createSuspendResumeTests(ctx: WorkflowTestContext, registry?: Wo
     it.skipIf(ctx.skipTests.resumeStepExecutionPath || !ctx.resume)(
       'should not duplicate step IDs in stepExecutionPath after suspend/resume',
       async () => {
-        const { workflow, mocks, resetMocks } = registry!['basic-resume-workflow']!;
+        const { workflow, resetMocks } = registry!['basic-resume-workflow']!;
         resetMocks?.();
 
         const runId = `step-exec-path-test-${Date.now()}-${Math.random().toString(36).substring(7)}`;

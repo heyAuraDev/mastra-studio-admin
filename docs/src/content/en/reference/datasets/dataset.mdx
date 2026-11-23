@@ -1,6 +1,6 @@
 ---
 title: "Reference: Dataset class | Datasets"
-description: "Documentation for the `Dataset` class in Mastra, which provides the public API for interacting with a single dataset."
+description: "The Dataset class provides methods for item CRUD, versioning, and experiment management on a single dataset."
 packages:
   - "@mastra/core"
 ---
@@ -18,9 +18,7 @@ The `Dataset` class provides methods for item CRUD, versioning, and experiment m
 ```typescript title="src/mastra/datasets/usage.ts"
 import { Mastra } from '@mastra/core'
 
-const mastra = new Mastra({
-  /* storage config */
-})
+const mastra = new Mastra({/* storage config */})
 
 const dataset = await mastra.datasets.create({
   name: 'QA pairs',
@@ -49,9 +47,7 @@ console.log(`${summary.succeededCount}/${summary.totalItems} succeeded`)
 ```typescript title="src/mastra/datasets/versioning.ts"
 import { Mastra } from '@mastra/core'
 
-const mastra = new Mastra({
-  /* storage config */
-})
+const mastra = new Mastra({/* storage config */})
 
 const dataset = await mastra.datasets.get({ id: 'dataset-id' })
 
@@ -67,13 +63,15 @@ const history = await dataset.getItemHistory({ itemId: 'item-id' })
 
 ## Access
 
-`Dataset` isn't instantiated directly. Obtain one via `DatasetsManager`:
+Obtain a `Dataset` through `DatasetsManager`, which resolves the dataset and applies tenancy scope:
 
 ```typescript
 const dataset = await mastra.datasets.get({ id: 'dataset-id' })
 // or
 const dataset = await mastra.datasets.create({ name: 'My dataset' })
 ```
+
+`Dataset` also has a public constructor (`new Dataset(id, mastra)`) that skips the manager's lookup and tenancy scoping.
 
 ## Properties
 
@@ -93,5 +91,6 @@ For the full dataset record (name, description, schemas, version, timestamps), c
 
 - [DatasetsManager class](/reference/datasets/datasets-manager)
 - [dataset.startExperiment()](/reference/datasets/startExperiment)
+- [dataset.deleteExperiment()](/reference/datasets/deleteExperiment)
 - [dataset.addItems()](/reference/datasets/addItems)
 - [dataset.listVersions()](/reference/datasets/listVersions)

@@ -2,12 +2,14 @@ import type { Mastra } from '@mastra/core';
 import type { ToolsInput } from '@mastra/core/agent';
 import type { FGARouteConfig, MastraFGAPermissionInput } from '@mastra/core/auth/ee';
 import type { RequestContext } from '@mastra/core/request-context';
-import type { ApiRoute, ValidationErrorHook } from '@mastra/core/server';
+import type { ApiRoute, MastraMCPToolset, ValidationErrorHook } from '@mastra/core/server';
 import type * as z from 'zod/v4';
 import type { InMemoryTaskStore } from '../../a2a/store';
+import type { BuiltinMCPCapabilities } from '../../mcp/capabilities';
 import type { OpenAPIRoute } from '../openapi-utils';
 import { A2A_ROUTES } from './a2a';
-import type { AGENT_BUILDER_ROUTES } from './agent-builder';
+import { AGENT_BUILDER_ROUTES } from './agent-builder';
+import { AGENT_CONTROLLER_ROUTES } from './agent-controller';
 import { AGENTS_ROUTES } from './agents';
 import type { AgentRoutes } from './agents';
 import { AUTH_ROUTES } from './auth';
@@ -15,7 +17,9 @@ import { BACKGROUND_TASK_ROUTES } from './background-tasks';
 import { CHANNELS_ROUTES } from './channels';
 import { CONVERSATIONS_ROUTES } from './conversations';
 import { DATASETS_ROUTES } from './datasets';
+import { DYNAMIC_WORKFLOWS_ROUTES } from './dynamic-workflows';
 import { EDITOR_BUILDER_ROUTES } from './editor-builder';
+import { KNOWLEDGE_ROUTES } from './knowledge';
 import { LEGACY_ROUTES } from './legacy';
 import { LOGS_ROUTES } from './logs';
 import { MCP_ROUTES } from './mcp';
@@ -54,6 +58,8 @@ export type ServerContext = {
   abortSignal: AbortSignal;
   /** The route prefix configured for the server (e.g., '/api') */
   routePrefix?: string;
+  /** The web-standard Request object for accessing headers, cookies, etc. */
+  request?: Request;
 };
 
 /**
@@ -77,6 +83,24 @@ export type InferParams<
  * - 'mcp-sse': MCP SSE transport (handled by adapter)
  */
 export type ResponseType = 'stream' | 'json' | 'datastream-response' | 'mcp-http' | 'mcp-sse';
+
+/**
+ * Opt-in metadata that exposes a route as a tool on the built-in Mastra MCP server.
+ * The tool runs the route in-process, with the same authorization as the HTTP request.
+ */
+export interface RouteMCPConfig {
+  /** Toolset the tool belongs to. */
+  toolset: MastraMCPToolset;
+  /** MCP tool name. */
+  name: string;
+  /** Tool description shown to MCP clients. */
+  description: string;
+  /**
+   * Only offer the tool when the server supports it, for example when the observability store can run
+   * trace queries. Evaluated on each MCP request; store capabilities are cached per process after a successful lookup.
+   */
+  requires?: (capabilities: BuiltinMCPCapabilities) => boolean;
+}
 
 export type ServerRouteHandler<
   TParams = Record<string, unknown>,
@@ -120,6 +144,7 @@ export type ServerRoute<
   path: TPath;
   responseType: TResponseType;
   streamFormat?: 'sse' | 'stream'; // Only used when responseType is 'stream', defaults to 'stream'
+  sseFlushOnConnect?: boolean;
   // Method signature is bivariant in params, allowing heterogeneous route arrays
   // while still preserving specific param types on individual routes.
   handler(params: TParams & ServerContext): ReturnType<ServerRouteHandler<TParams, TResponse, TResponseType>>;
@@ -153,11 +178,42 @@ export type ServerRoute<
    */
   fga?: FGARouteConfig;
   onValidationError?: ValidationErrorHook;
+  /** Exposes this route as a tool on the built-in Mastra MCP server. */
+  mcp?: RouteMCPConfig;
+  /**
+   * `'bearer'` accepts credentials only from the `Authorization` header and always uses `server.auth`:
+   * Studio client-type routing, cookies, and the `apiKey` query parameter are ignored.
+   */
+  authTransport?: 'bearer';
   /** @internal Phantom type — not present at runtime. Used for type-level schema inference. */
   readonly __schemas?: TSchemas;
 };
 
-export const SERVER_ROUTES: readonly ServerRoute[] = [
+/**
+ * Routes the package can serve that are **not** mounted by default. An app opts in
+ * by spreading them into `server.apiRoutes`:
+ *
+ * ```ts
+ * import { KNOWLEDGE_ROUTES } from '@mastra/server/server-adapter';
+ *
+ * new Mastra({
+ *   server: { apiRoutes: [...KNOWLEDGE_ROUTES] },
+ * });
+ * ```
+ *
+ * Knowledge browsing is opt-in because it reads every page as the instance owner,
+ * so a host should decide deliberately who may call it (auth, RBAC `knowledge:read`, FGA).
+ */
+export const OPT_IN_ROUTES: readonly ServerRoute[] = [...KNOWLEDGE_ROUTES];
+
+const OPT_IN_ROUTE_SET = new Set<ServerRoute>(OPT_IN_ROUTES);
+
+/**
+ * Every route the package can serve: the routes every server mounts, plus the opt-in
+ * ones. Code generators derive from this, so a route an app registers deliberately
+ * still has types, permissions and CLI metadata.
+ */
+export const ALL_SERVER_ROUTES: readonly ServerRoute[] = [
   ...AGENTS_ROUTES,
   ...AUTH_ROUTES,
   ...WORKFLOWS_ROUTES,
@@ -170,11 +226,13 @@ export const SERVER_ROUTES: readonly ServerRoute[] = [
   ...OBSERVABILITY_ROUTES,
   ...LOGS_ROUTES,
   ...VECTORS_ROUTES,
+  ...KNOWLEDGE_ROUTES,
   ...A2A_ROUTES,
   ...WORKSPACE_ROUTES,
   ...LEGACY_ROUTES,
   ...MCP_ROUTES,
   ...STORED_AGENTS_ROUTES,
+  ...DYNAMIC_WORKFLOWS_ROUTES,
   ...STORED_MCP_CLIENTS_ROUTES,
   ...STORED_PROMPT_BLOCKS_ROUTES,
   ...STORED_SCORERS_ROUTES,
@@ -186,9 +244,17 @@ export const SERVER_ROUTES: readonly ServerRoute[] = [
   ...DATASETS_ROUTES,
   ...BACKGROUND_TASK_ROUTES,
   ...EDITOR_BUILDER_ROUTES,
+  ...AGENT_BUILDER_ROUTES,
   ...SCHEDULES_ROUTES,
   ...CHANNELS_ROUTES,
+  ...AGENT_CONTROLLER_ROUTES,
 ];
+
+/**
+ * Routes every Mastra server mounts: everything in {@link ALL_SERVER_ROUTES} except the
+ * {@link OPT_IN_ROUTES} an app has to register itself.
+ */
+export const SERVER_ROUTES: readonly ServerRoute[] = ALL_SERVER_ROUTES.filter(route => !OPT_IN_ROUTE_SET.has(route));
 
 /**
  * Union type of all individual route arrays.
@@ -207,6 +273,7 @@ export type ServerRoutes = readonly [
   ...typeof OBSERVABILITY_ROUTES,
   ...typeof LOGS_ROUTES,
   ...typeof VECTORS_ROUTES,
+  ...typeof KNOWLEDGE_ROUTES,
   ...typeof A2A_ROUTES,
   ...typeof AGENT_BUILDER_ROUTES,
   ...typeof WORKSPACE_ROUTES,
@@ -229,6 +296,9 @@ export type ServerRoutes = readonly [
 // Export route builder and OpenAPI utilities
 export { createRoute, createPublicRoute, pickParams, jsonQueryParam, wrapSchemaForQueryParams } from './route-builder';
 export { generateOpenAPIDocument } from '../openapi-utils';
+
+// Opt-in route sets, for apps that register them through `server.apiRoutes`.
+export { KNOWLEDGE_ROUTES } from './knowledge';
 
 // Export permission utilities
 export { derivePermission, extractResource, deriveAction, getEffectivePermission } from './permissions';

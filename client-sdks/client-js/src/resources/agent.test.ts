@@ -1,12 +1,23 @@
-import { formatDataStreamPart, processDataStream } from '@ai-sdk/ui-utils';
 import { createTool } from '@mastra/core/tools';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v3';
 
 import { MastraClient } from '../client';
 import type { Body } from '../route-types.generated';
-import type { ClientOptions, SendAgentSignalParams, SubscribeAgentThreadParams } from '../types';
+import type {
+  AbortAgentThreadParams,
+  ClientOptions,
+  CancelQueuedAgentMessagesParams,
+  QueueAgentMessageParams,
+  QueueAgentSignalParams,
+  SendAgentMessageParams,
+  SendAgentSignalParams,
+  SubscribeAgentThreadParams,
+} from '../types';
+import { MastraClientError } from '../types';
+import { formatDataStreamPart, processDataStream } from '../utils/ai-sdk-v4';
 import { processClientTools } from '../utils/process-client-tools';
+import { processMastraStream } from '../utils/process-mastra-stream';
 import { zodToJsonSchema } from '../utils/zod-to-json-schema';
 import { Agent } from './agent';
 
@@ -34,6 +45,267 @@ describe('Agent signal routes', () => {
     },
   };
 
+  const createSseResponse = (chunks: any[]) =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const chunk of chunks) {
+            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
+          }
+          controller.close();
+        },
+      }),
+      { headers: { 'Content-Type': 'text/event-stream' } },
+    );
+
+  const continuationToolResultMessage = (toolCallId: string, toolName: string, input: unknown, output: unknown) => ({
+    role: 'assistant',
+    content: [
+      { type: 'tool-call', toolCallId, toolName, input },
+      { type: 'tool-result', toolCallId, toolName, output: { type: 'json', value: output } },
+    ],
+  });
+
+  const mockSignalAndSubscriptionRequests = async (
+    agent: Agent,
+    runId: string,
+    subscriptionChunks: any[],
+    signalParams: SendAgentSignalParams,
+  ) => {
+    const mockRequest = vi.fn(async (path: string) => {
+      if (path.endsWith('/signals')) {
+        return { accepted: true, runId };
+      }
+
+      if (path.endsWith('/threads/subscribe')) {
+        return createSseResponse(subscriptionChunks);
+      }
+
+      throw new Error(`Unexpected request path: ${path}`);
+    });
+    agent['request'] = mockRequest as (typeof agent)['request'];
+    await agent.sendSignal(signalParams);
+    return mockRequest;
+  };
+
+  it('sends messages to the send-message route with string payloads unchanged', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue({ accepted: true, runId: 'run-123' });
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const params = {
+      message: 'hello',
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } satisfies SendAgentMessageParams;
+    const routeBody: Body<'POST /agents/:agentId/send-message'> = params;
+
+    await agent.sendMessage(params);
+
+    expect(mockRequest).toHaveBeenCalledWith('/agents/test-agent/send-message', {
+      method: 'POST',
+      body: routeBody,
+    });
+  });
+
+  it('does not throw when the consumer cancels the stream after the finish chunk', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const chunks = [
+      { type: 'start', payload: {} },
+      { type: 'text-delta', payload: { id: '1', text: 'hi' } },
+      { type: 'finish', payload: { stepResult: { reason: 'stop' }, output: { usage: {} } } },
+    ];
+    agent['request'] = vi.fn().mockResolvedValue(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            for (const chunk of chunks) {
+              controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            }
+            // Close after the consumer has had a chance to cancel so onFinish fires against a cancelled stream
+            setTimeout(() => {
+              try {
+                controller.close();
+              } catch {
+                // Cancelling the outer stream now cancels this underlying body too
+              }
+            }, 20);
+          },
+        }),
+        { headers: { 'Content-Type': 'text/event-stream' } },
+      ),
+    ) as (typeof agent)['request'];
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const response = await agent.stream([{ role: 'user', content: 'hi' }]);
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (decoder.decode(value, { stream: true }).includes('"type":"finish"')) {
+          await reader.cancel();
+          break;
+        }
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+
+    expect(unhandled).toEqual([]);
+  });
+
+  it('sends messages to the send-message route with object payloads unchanged', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue({ accepted: true, runId: 'run-123' });
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const params = {
+      message: {
+        contents: 'hello',
+        attributes: { source: 'test' },
+        metadata: { client: 'sdk' },
+        providerOptions: { mastra: { channel: 'web' } },
+      },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } satisfies SendAgentMessageParams;
+    const routeBody: Body<'POST /agents/:agentId/send-message'> = params;
+
+    await agent.sendMessage(params);
+
+    expect(mockRequest).toHaveBeenCalledWith('/agents/test-agent/send-message', {
+      method: 'POST',
+      body: routeBody,
+    });
+  });
+
+  it('queues messages to the queue-message route with parts payloads unchanged', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue({ accepted: true, runId: 'queued-run-123' });
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const params = {
+      message: [
+        { type: 'text', text: 'describe this' },
+        { type: 'file', data: 'file-data', mediaType: 'text/plain' },
+      ],
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: { streamOptions: { maxSteps: 3 } },
+    } satisfies QueueAgentMessageParams;
+    const routeBody: Body<'POST /agents/:agentId/queue-message'> = params;
+
+    await agent.queueMessage(params);
+
+    expect(mockRequest).toHaveBeenCalledWith('/agents/test-agent/queue-message', {
+      method: 'POST',
+      body: routeBody,
+    });
+  });
+
+  it('queues typed signals to the queue-signal route', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue({ accepted: true, runId: 'queued-run-123' });
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const params = {
+      signal: { type: 'reactive', tagName: 'skill', attributes: { name: 'factory-triage' }, contents: 'Triage it.' },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } satisfies QueueAgentSignalParams;
+    const routeBody: Body<'POST /agents/:agentId/queue-signal'> = params;
+
+    await agent.queueSignal(params);
+
+    expect(mockRequest).toHaveBeenCalledWith('/agents/test-agent/queue-signal', {
+      method: 'POST',
+      body: routeBody,
+    });
+  });
+
+  it('processes clientTools and requestContext in ifIdle.streamOptions when sending messages', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue({ accepted: true, runId: 'message-run-123' });
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const clientTools = {
+      testTool: {
+        id: 'testTool',
+        description: 'A test tool',
+        inputSchema: z.object({ input: z.string() }),
+        execute: vi.fn(),
+      },
+    };
+
+    const params = {
+      message: 'hello',
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: {
+        streamOptions: {
+          maxSteps: 3,
+          instructions: 'Use the tool when needed.',
+          requestContext: { userId: 'user-123' },
+          clientTools,
+        },
+      },
+    } as unknown as SendAgentMessageParams;
+
+    await agent.sendMessage(params);
+
+    expect(mockRequest).toHaveBeenCalledTimes(1);
+    const sentBody = mockRequest.mock.calls[0][1].body;
+    expect(sentBody.ifIdle.streamOptions.clientTools).toEqual(processClientTools(clientTools as any));
+    expect(sentBody.ifIdle.streamOptions.requestContext).toEqual({ userId: 'user-123' });
+    expect(sentBody.ifIdle.streamOptions.maxSteps).toBe(3);
+    expect(sentBody.ifIdle.streamOptions.instructions).toBe('Use the tool when needed.');
+    expect(agent['getSignalRuntimeOptions']({ runId: 'message-run-123' })?.clientTools).toBe(clientTools);
+  });
+
+  it('processes clientTools and requestContext in ifIdle.streamOptions when queueing messages', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue({ accepted: true, runId: 'queued-run-123' });
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const clientTools = {
+      testTool: {
+        id: 'testTool',
+        description: 'A test tool',
+        inputSchema: z.object({ input: z.string() }),
+        execute: vi.fn(),
+      },
+    };
+
+    const params = {
+      message: 'hello later',
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: {
+        streamOptions: {
+          maxSteps: 3,
+          instructions: 'Use the queued tool when needed.',
+          requestContext: { userId: 'user-123' },
+          clientTools,
+        },
+      },
+    } as unknown as QueueAgentMessageParams;
+
+    await agent.queueMessage(params);
+
+    expect(mockRequest).toHaveBeenCalledTimes(1);
+    const sentBody = mockRequest.mock.calls[0][1].body;
+    expect(sentBody.ifIdle.streamOptions.clientTools).toEqual(processClientTools(clientTools as any));
+    expect(sentBody.ifIdle.streamOptions.requestContext).toEqual({ userId: 'user-123' });
+    expect(sentBody.ifIdle.streamOptions.maxSteps).toBe(3);
+    expect(sentBody.ifIdle.streamOptions.instructions).toBe('Use the queued tool when needed.');
+    expect(agent['getSignalRuntimeOptions']({ runId: 'queued-run-123' })?.clientTools).toBe(clientTools);
+  });
+
   it('sends run-targeted signals with active behavior unchanged', async () => {
     const agent = new Agent(mockClientOptions, 'test-agent');
     const mockRequest = vi.fn().mockResolvedValue({ accepted: true, runId: 'run-123' });
@@ -51,6 +323,58 @@ describe('Agent signal routes', () => {
     expect(mockRequest).toHaveBeenCalledWith('/agents/test-agent/signals', {
       method: 'POST',
       body: routeBody,
+    });
+  });
+
+  it('approves tool calls through the subscription-native route', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue({ accepted: true, runId: 'run-123', toolCallId: 'tool-call-123' });
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const result = await agent.sendToolApproval({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      toolCallId: 'tool-call-123',
+      approved: true,
+      requestContext: { userId: 'user-123' },
+    });
+
+    expect(result).toEqual({ accepted: true, runId: 'run-123', toolCallId: 'tool-call-123' });
+    expect(mockRequest).toHaveBeenCalledWith('/agents/test-agent/send-tool-approval', {
+      method: 'POST',
+      body: {
+        resourceId: 'resource-123',
+        threadId: 'thread-123',
+        toolCallId: 'tool-call-123',
+        approved: true,
+        requestContext: { userId: 'user-123' },
+      },
+    });
+  });
+
+  it('declines tool calls through the subscription-native route', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue({ accepted: true, runId: 'run-123', toolCallId: 'tool-call-123' });
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const result = await agent.sendToolApproval({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      toolCallId: 'tool-call-123',
+      approved: false,
+      requestContext: { userId: 'user-123' },
+    });
+
+    expect(result).toEqual({ accepted: true, runId: 'run-123', toolCallId: 'tool-call-123' });
+    expect(mockRequest).toHaveBeenCalledWith('/agents/test-agent/send-tool-approval', {
+      method: 'POST',
+      body: {
+        resourceId: 'resource-123',
+        threadId: 'thread-123',
+        toolCallId: 'tool-call-123',
+        approved: false,
+        requestContext: { userId: 'user-123' },
+      },
     });
   });
 
@@ -82,6 +406,98 @@ describe('Agent signal routes', () => {
     });
   });
 
+  it('processes clientTools and requestContext in ifIdle.streamOptions when sending thread signals', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue({ accepted: true, runId: 'run-123' });
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const clientTools = {
+      testTool: {
+        id: 'testTool',
+        description: 'A test tool',
+        inputSchema: z.object({ input: z.string() }),
+        execute: vi.fn(),
+      },
+    };
+
+    const params = {
+      signal: { type: 'user-message', contents: 'hello' },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: {
+        streamOptions: {
+          maxSteps: 3,
+          instructions: 'Use the tool when needed.',
+          requestContext: { userId: 'user-123' },
+          clientTools,
+        },
+      },
+    } as unknown as SendAgentSignalParams;
+
+    await agent.sendSignal(params);
+
+    expect(mockRequest).toHaveBeenCalledTimes(1);
+    const sentBody = mockRequest.mock.calls[0][1].body;
+    expect(sentBody.ifIdle.streamOptions.clientTools).toEqual(processClientTools(clientTools as any));
+    expect(sentBody.ifIdle.streamOptions.requestContext).toEqual({ userId: 'user-123' });
+    expect(sentBody.ifIdle.streamOptions.maxSteps).toBe(3);
+    expect(sentBody.ifIdle.streamOptions.instructions).toBe('Use the tool when needed.');
+    expect(sentBody.signal).toEqual(params.signal);
+    expect(sentBody.resourceId).toBe('resource-123');
+    expect(sentBody.threadId).toBe('thread-123');
+  });
+
+  it('cleans provisional runtime options if sending a signal fails before a run id is returned', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent-cleanup-fail');
+    const mockRequest = vi.fn().mockRejectedValue(new Error('network down'));
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    await expect(
+      agent.sendSignal({
+        signal: { type: 'user-message', contents: 'hello' },
+        resourceId: 'resource-cleanup-fail',
+        threadId: 'thread-cleanup-fail',
+        ifIdle: {
+          streamOptions: {
+            maxSteps: 3,
+          },
+        },
+      } as SendAgentSignalParams),
+    ).rejects.toThrow('network down');
+
+    expect(
+      agent['getSignalRuntimeOptions']({ resourceId: 'resource-cleanup-fail', threadId: 'thread-cleanup-fail' }),
+    ).toBeUndefined();
+  });
+
+  it('expires runtime options if a subscribed finish is never received', async () => {
+    vi.useFakeTimers();
+    try {
+      const agent = new Agent(mockClientOptions, 'test-agent-cleanup-ttl');
+      const mockRequest = vi.fn().mockResolvedValue({ accepted: true, runId: 'run-cleanup-ttl' });
+      agent['request'] = mockRequest as (typeof agent)['request'];
+
+      await agent.sendSignal({
+        signal: { type: 'user-message', contents: 'hello' },
+        resourceId: 'resource-cleanup-ttl',
+        threadId: 'thread-cleanup-ttl',
+        ifIdle: {
+          streamOptions: {
+            maxSteps: 3,
+          },
+        },
+      } as SendAgentSignalParams);
+
+      expect(agent['getSignalRuntimeOptions']({ runId: 'run-cleanup-ttl' })).toEqual({ maxSteps: 3 });
+
+      vi.advanceTimersByTime(5 * 60 * 1000);
+
+      expect(agent['getSignalRuntimeOptions']({ runId: 'run-cleanup-ttl' })).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('subscribes to threads with the same body shape as the server route', async () => {
     const agent = new Agent(mockClientOptions, 'test-agent');
     const response = new Response(new ReadableStream());
@@ -102,6 +518,1312 @@ describe('Agent signal routes', () => {
       stream: true,
     });
   });
+
+  it('delivers history and retained outcomes through the subscription SSE parser', async () => {
+    const chunks = [
+      {
+        type: 'thread-history',
+        runId: '',
+        from: 'AGENT',
+        payload: { messages: [], hasMore: false, activeRunId: null },
+      },
+      { type: 'thread-run-status', runId: 'finished-run', from: 'AGENT', payload: { status: 'success' } },
+      { type: 'thread-run-status', runId: 'failed-run', from: 'AGENT', payload: { status: 'failed' } },
+    ];
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    agent['request'] = vi.fn().mockResolvedValue(createSseResponse(chunks));
+    const subscription = await agent.subscribeToThread({
+      threadId: 'thread-123',
+      withInitialHistory: true,
+      withRunStatus: true,
+    });
+    const received: unknown[] = [];
+    await subscription.processDataStream({
+      onChunk: chunk => {
+        received.push(chunk);
+      },
+    });
+    expect(received).toEqual(chunks);
+    subscription.unsubscribe();
+  });
+
+  it.each([undefined, false, true])('forwards run outcomes only when opted in (%s)', async withRunStatus => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue(createSseResponse([]));
+    agent['request'] = mockRequest;
+    const subscription = await agent.subscribeToThread({ threadId: 'thread-123', withRunStatus });
+    expect(mockRequest).toHaveBeenCalledWith('/agents/test-agent/threads/subscribe', {
+      method: 'POST',
+      body: { resourceId: undefined, threadId: 'thread-123', ...(withRunStatus ? { withRunStatus: true } : {}) },
+      stream: true,
+    });
+    subscription.unsubscribe();
+  });
+
+  it('forwards withInitialHistory when requested', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue(new Response(new ReadableStream()));
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    await agent.subscribeToThread({ threadId: 'thread-123', withInitialHistory: { perPage: 20 } });
+
+    expect(mockRequest).toHaveBeenCalledWith('/agents/test-agent/threads/subscribe', {
+      method: 'POST',
+      body: { resourceId: undefined, threadId: 'thread-123', withInitialHistory: { perPage: 20 } },
+      stream: true,
+    });
+  });
+
+  it('only forwards thread coordinates in the subscribe request body', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const response = new Response(new ReadableStream());
+    const mockRequest = vi.fn().mockResolvedValue(response);
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    await agent.subscribeToThread({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } as SubscribeAgentThreadParams);
+
+    expect(mockRequest.mock.calls[0][1].body).toEqual({ resourceId: 'resource-123', threadId: 'thread-123' });
+  });
+
+  it.each([undefined, false, true])('aborts thread runs with clearPendingSignals=%s', async clearPendingSignals => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue({ aborted: true });
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const params = {
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ...(clearPendingSignals === undefined ? {} : { clearPendingSignals }),
+      expectedRunId: 'run-a',
+    } satisfies AbortAgentThreadParams;
+    const routeBody: Body<'POST /agents/:agentId/threads/abort'> = params;
+
+    await expect(agent.abortThread(params)).resolves.toEqual({ aborted: true });
+
+    expect(mockRequest).toHaveBeenCalledWith('/agents/test-agent/threads/abort', {
+      method: 'POST',
+      body: routeBody,
+    });
+  });
+
+  it('cancels selected pending signals through the thread route', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue({ cancelledSignalIds: ['first'] });
+    agent['request'] = mockRequest as (typeof agent)['request'];
+    const params = {
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      signalIds: ['first', 'missing', 'first'],
+    } satisfies CancelQueuedAgentMessagesParams;
+    const routeBody: Body<'POST /agents/:agentId/threads/signals/cancel'> = params;
+    await expect(agent.cancelQueuedMessages(params)).resolves.toEqual({ cancelledSignalIds: ['first'] });
+    expect(mockRequest).toHaveBeenCalledWith('/agents/test-agent/threads/signals/cancel', {
+      method: 'POST',
+      body: routeBody,
+    });
+  });
+
+  it('unsubscribes a thread subscription without aborting the shared client signal', async () => {
+    const sharedAbort = new AbortController();
+    const agent = new Agent({ ...mockClientOptions, abortSignal: sharedAbort.signal }, 'test-agent');
+    const cancel = vi.fn();
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        cancel,
+      }),
+    );
+    const mockRequest = vi.fn().mockResolvedValue(response);
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const subscription = await agent.subscribeToThread({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } as SubscribeAgentThreadParams);
+    const processing = subscription.processDataStream({ onChunk: vi.fn() });
+
+    subscription.unsubscribe();
+
+    await expect(processing).resolves.toBeUndefined();
+    expect(sharedAbort.signal.aborted).toBe(false);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([undefined, false, true])(
+    'keeps subscription abort separate from unsubscribe with clearPendingSignals=%s',
+    async clearPendingSignals => {
+      const agent = new Agent(mockClientOptions, 'test-agent');
+      const response = new Response(new ReadableStream());
+      const mockRequest = vi.fn(async (path: string) => {
+        if (path.endsWith('/threads/subscribe')) return response;
+        if (path.endsWith('/threads/abort')) return { aborted: true };
+        throw new Error(`Unexpected request path: ${path}`);
+      });
+      agent['request'] = mockRequest as (typeof agent)['request'];
+
+      const subscription = await agent.subscribeToThread({
+        resourceId: 'resource-123',
+        threadId: 'thread-123',
+      } as SubscribeAgentThreadParams);
+
+      await expect(
+        subscription.abort(clearPendingSignals === undefined ? undefined : { clearPendingSignals }),
+      ).resolves.toBe(true);
+      expect(mockRequest).toHaveBeenLastCalledWith('/agents/test-agent/threads/abort', {
+        method: 'POST',
+        body: {
+          resourceId: 'resource-123',
+          threadId: 'thread-123',
+          ...(clearPendingSignals === undefined ? {} : { clearPendingSignals }),
+        },
+      });
+      expect(response.body?.locked).toBe(false);
+    },
+  );
+
+  it('executes clientTools after tool-calls finish and continues with tool-result messages', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+
+    const assistantMessages = [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'call-1', toolName: 'myTool', args: { x: 'hi' } }],
+      },
+    ];
+    const toolCallChunk = {
+      type: 'tool-call',
+      runId: 'run-abc',
+      payload: { toolCallId: 'call-1', toolName: 'myTool', args: { x: 'hi' } },
+    };
+    const finishChunk = {
+      type: 'finish',
+      runId: 'run-abc',
+      payload: {
+        stepResult: { reason: 'tool-calls' },
+        messages: { nonUser: assistantMessages },
+      },
+    };
+    const streamUntilIdleSpy = vi.spyOn(agent, 'streamUntilIdle');
+    const sendToolApprovalSpy = vi
+      .spyOn(agent, 'sendToolApproval')
+      .mockResolvedValue({ accepted: true, runId: 'continuation-run' } as never);
+
+    const executeSpy = vi.fn(async () => ({ ok: true }));
+    const clientTools = {
+      myTool: {
+        id: 'myTool',
+        description: 'tool',
+        inputSchema: z.object({ x: z.string() }),
+        execute: executeSpy,
+      },
+    };
+
+    await mockSignalAndSubscriptionRequests(agent, 'run-abc', [toolCallChunk, finishChunk], {
+      signal: { type: 'user-message', contents: 'hello' },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: { streamOptions: { clientTools } },
+    } as SendAgentSignalParams);
+
+    const subscribed = await agent.subscribeToThread({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } as SubscribeAgentThreadParams);
+
+    const received: any[] = [];
+    await subscribed.processDataStream({
+      onChunk: async chunk => {
+        received.push(chunk);
+      },
+    });
+
+    // The client tool ran with the streamed args only once the run finished with tool-calls.
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect((executeSpy.mock.calls[0] as any[])[0]).toEqual({ x: 'hi' });
+
+    // A synthetic tool-result chunk was emitted after the finish chunk.
+    const finishIndex = received.findIndex(c => c.type === 'finish');
+    const toolResultIndex = received.findIndex(c => c.type === 'tool-result');
+    expect(toolResultIndex).toBeGreaterThan(finishIndex);
+    const toolResultChunk = received[toolResultIndex];
+    expect(toolResultChunk.payload).toEqual({
+      type: 'tool-result',
+      toolCallId: 'call-1',
+      toolName: 'myTool',
+      args: { x: 'hi' },
+      result: { ok: true },
+    });
+
+    // Thread-backed continuations only send the browser tool result; memory already has the assistant tool-call message.
+    expect(streamUntilIdleSpy).not.toHaveBeenCalled();
+    expect(sendToolApprovalSpy).toHaveBeenCalled();
+    const continuationCall = sendToolApprovalSpy.mock.calls.at(-1) as [any];
+    expect(continuationCall[0].messages).toEqual([
+      continuationToolResultMessage('call-1', 'myTool', { x: 'hi' }, { ok: true }),
+    ]);
+    expect(continuationCall[0].streamOptions?.memory).toEqual({ thread: 'thread-123', resource: 'resource-123' });
+  });
+
+  it('resolves client tools through clientToolsResolver for signals-path execution', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+
+    const toolCallChunk = {
+      type: 'tool-call',
+      runId: 'run-resolver',
+      payload: { toolCallId: 'call-1', toolName: 'myTool', args: { x: 'hi' } },
+    };
+    const finishChunk = {
+      type: 'finish',
+      runId: 'run-resolver',
+      payload: {
+        stepResult: { reason: 'tool-calls' },
+        messages: { nonUser: [] },
+      },
+    };
+    vi.spyOn(agent, 'sendToolApproval').mockResolvedValue({ accepted: true, runId: 'continuation-run' } as never);
+
+    const staleExecuteSpy = vi.fn(async () => ({ stale: true }));
+    const freshExecuteSpy = vi.fn(async () => ({ fresh: true }));
+    const makeTool = (execute: (...args: any[]) => Promise<any>) => ({
+      myTool: {
+        id: 'myTool',
+        description: 'tool',
+        inputSchema: z.object({ x: z.string() }),
+        execute,
+      },
+    });
+    const staleClientTools = makeTool(staleExecuteSpy);
+    const freshClientTools = makeTool(freshExecuteSpy);
+    const clientToolsResolver = vi.fn(() => freshClientTools);
+
+    const mockRequest = await mockSignalAndSubscriptionRequests(agent, 'run-resolver', [toolCallChunk, finishChunk], {
+      signal: { type: 'user-message', contents: 'hello' },
+      resourceId: 'resource-resolver',
+      threadId: 'thread-resolver',
+      ifIdle: { streamOptions: { clientTools: staleClientTools, clientToolsResolver } },
+    } as SendAgentSignalParams);
+
+    // The resolver never crosses the wire; the serialized tools come from the resolver.
+    const signalBody = (mockRequest.mock.calls[0] as any[])[1].body;
+    expect(signalBody.ifIdle.streamOptions.clientToolsResolver).toBeUndefined();
+    expect(signalBody.ifIdle.streamOptions.clientTools).toEqual(processClientTools(freshClientTools as any));
+
+    const subscribed = await agent.subscribeToThread({
+      resourceId: 'resource-resolver',
+      threadId: 'thread-resolver',
+    } as SubscribeAgentThreadParams);
+
+    await subscribed.processDataStream({ onChunk: async () => {} });
+
+    // Execution used the resolver's fresh tools, not the tools captured at send time.
+    expect(freshExecuteSpy).toHaveBeenCalledTimes(1);
+    expect(staleExecuteSpy).not.toHaveBeenCalled();
+  });
+
+  it('applies client tool toModelOutput and attaches it to the continuation tool-result providerOptions', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+
+    const assistantMessages = [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool-call', toolCallId: 'call-1', toolName: 'screenshotTool', args: { url: 'https://a.com' } },
+        ],
+      },
+    ];
+    const toolCallChunk = {
+      type: 'tool-call',
+      runId: 'run-abc',
+      payload: { toolCallId: 'call-1', toolName: 'screenshotTool', args: { url: 'https://a.com' } },
+    };
+    const finishChunk = {
+      type: 'finish',
+      runId: 'run-abc',
+      payload: {
+        stepResult: { reason: 'tool-calls' },
+        messages: { nonUser: assistantMessages },
+      },
+    };
+    const sendToolApprovalSpy = vi
+      .spyOn(agent, 'sendToolApproval')
+      .mockResolvedValue({ accepted: true, runId: 'continuation-run' } as never);
+
+    const clientTools = {
+      screenshotTool: {
+        id: 'screenshotTool',
+        description: 'Take a screenshot',
+        inputSchema: z.object({ url: z.string() }),
+        execute: vi.fn(async () => ({ ok: true, _b64: 'base64imagedata' })),
+        toModelOutput: (output: unknown) => ({
+          type: 'content',
+          value: [
+            { type: 'text', text: 'Here is the current screenshot.' },
+            { type: 'media', data: (output as { _b64: string })._b64, mediaType: 'image/jpeg' },
+          ],
+        }),
+      },
+    };
+
+    await mockSignalAndSubscriptionRequests(agent, 'run-abc', [toolCallChunk, finishChunk], {
+      signal: { type: 'user-message', contents: 'take a screenshot' },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: { streamOptions: { clientTools } },
+    } as SendAgentSignalParams);
+
+    const subscribed = await agent.subscribeToThread({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } as SubscribeAgentThreadParams);
+
+    await subscribed.processDataStream({ onChunk: vi.fn() });
+
+    expect(sendToolApprovalSpy).toHaveBeenCalled();
+    const [continuation] = sendToolApprovalSpy.mock.calls.at(-1) as [any];
+    const toolResultPart = continuation.messages[0].content.find((p: any) => p.type === 'tool-result');
+
+    // Raw result preserved in output for storage/app logic
+    expect(toolResultPart.output).toEqual({ type: 'json', value: { ok: true, _b64: 'base64imagedata' } });
+    // Transformed output travels via providerOptions for the next model call
+    expect(toolResultPart.providerOptions).toEqual({
+      mastra: {
+        modelOutput: {
+          type: 'content',
+          value: [
+            { type: 'text', text: 'Here is the current screenshot.' },
+            { type: 'media', data: 'base64imagedata', mediaType: 'image/jpeg' },
+          ],
+        },
+      },
+    });
+  });
+
+  it('continues with the raw result and no providerOptions when client tool toModelOutput throws', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+
+    const assistantMessages = [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool-call', toolCallId: 'call-1', toolName: 'screenshotTool', args: { url: 'https://a.com' } },
+        ],
+      },
+    ];
+    const toolCallChunk = {
+      type: 'tool-call',
+      runId: 'run-abc',
+      payload: { toolCallId: 'call-1', toolName: 'screenshotTool', args: { url: 'https://a.com' } },
+    };
+    const finishChunk = {
+      type: 'finish',
+      runId: 'run-abc',
+      payload: {
+        stepResult: { reason: 'tool-calls' },
+        messages: { nonUser: assistantMessages },
+      },
+    };
+    const sendToolApprovalSpy = vi
+      .spyOn(agent, 'sendToolApproval')
+      .mockResolvedValue({ accepted: true, runId: 'continuation-run' } as never);
+
+    const clientTools = {
+      screenshotTool: {
+        id: 'screenshotTool',
+        description: 'Take a screenshot',
+        inputSchema: z.object({ url: z.string() }),
+        execute: vi.fn(async () => ({ ok: true, _b64: 'base64imagedata' })),
+        toModelOutput: () => {
+          throw new Error('toModelOutput failed');
+        },
+      },
+    };
+
+    await mockSignalAndSubscriptionRequests(agent, 'run-abc', [toolCallChunk, finishChunk], {
+      signal: { type: 'user-message', contents: 'take a screenshot' },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: { streamOptions: { clientTools } },
+    } as SendAgentSignalParams);
+
+    const subscribed = await agent.subscribeToThread({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } as SubscribeAgentThreadParams);
+
+    await subscribed.processDataStream({ onChunk: vi.fn() });
+
+    // The continuation is still sent even though toModelOutput threw.
+    expect(sendToolApprovalSpy).toHaveBeenCalled();
+    const [continuation] = sendToolApprovalSpy.mock.calls.at(-1) as [any];
+    const toolResultPart = continuation.messages[0].content.find((p: any) => p.type === 'tool-result');
+
+    // Raw result is preserved; the failed transform is simply omitted.
+    expect(toolResultPart.output).toEqual({ type: 'json', value: { ok: true, _b64: 'base64imagedata' } });
+    expect(toolResultPart.providerOptions).toBeUndefined();
+  });
+
+  it('keeps clientTools available across subscribed continuation runs', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const chunks = [
+      {
+        type: 'tool-call',
+        runId: 'run-initial',
+        payload: { toolCallId: 'call-1', toolName: 'myTool', args: { value: 'first' } },
+      },
+      {
+        type: 'finish',
+        runId: 'run-initial',
+        payload: {
+          stepResult: { reason: 'tool-calls' },
+          messages: {
+            nonUser: [
+              {
+                role: 'assistant',
+                content: [{ type: 'tool-call', toolCallId: 'call-1', toolName: 'myTool', args: { value: 'first' } }],
+              },
+            ],
+          },
+        },
+      },
+      {
+        type: 'tool-call',
+        runId: 'run-continuation',
+        payload: { toolCallId: 'call-2', toolName: 'myTool', args: { value: 'second' } },
+      },
+      {
+        type: 'finish',
+        runId: 'run-continuation',
+        payload: {
+          stepResult: { reason: 'tool-calls' },
+          messages: {
+            nonUser: [
+              {
+                role: 'assistant',
+                content: [{ type: 'tool-call', toolCallId: 'call-2', toolName: 'myTool', args: { value: 'second' } }],
+              },
+            ],
+          },
+        },
+      },
+    ];
+    const sendToolApprovalSpy = vi
+      .spyOn(agent, 'sendToolApproval')
+      .mockResolvedValueOnce({ accepted: true, runId: 'run-continuation' } as never)
+      .mockResolvedValueOnce({ accepted: true, runId: 'run-final' } as never);
+    const executeSpy = vi.fn(async ({ value }: { value: string }) => ({ value }));
+    const clientTools = {
+      myTool: { id: 'myTool', description: 'tool', inputSchema: z.object({ value: z.string() }), execute: executeSpy },
+    };
+
+    await mockSignalAndSubscriptionRequests(agent, 'run-initial', chunks, {
+      signal: { type: 'user-message', contents: 'hello' },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: { streamOptions: { clientTools } },
+    } as SendAgentSignalParams);
+
+    const subscribed = await agent.subscribeToThread({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } as SubscribeAgentThreadParams);
+
+    const received: any[] = [];
+    await subscribed.processDataStream({ onChunk: async chunk => void received.push(chunk) });
+
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+    expect(executeSpy.mock.calls.map(call => call[0])).toEqual([{ value: 'first' }, { value: 'second' }]);
+    expect(sendToolApprovalSpy).toHaveBeenCalledTimes(2);
+    expect(received.filter(chunk => chunk.type === 'tool-result').map(chunk => chunk.payload.toolCallId)).toEqual([
+      'call-1',
+      'call-2',
+    ]);
+  });
+
+  it('sends all same-tool client results from a subscribed tool-call finish', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const chunks = [
+      {
+        type: 'tool-call',
+        runId: 'run-initial',
+        payload: { toolCallId: 'call-1', toolName: 'myTool', args: { value: 'first' } },
+      },
+      {
+        type: 'tool-call',
+        runId: 'run-initial',
+        payload: { toolCallId: 'call-2', toolName: 'myTool', args: { value: 'second' } },
+      },
+      {
+        type: 'finish',
+        runId: 'run-initial',
+        payload: {
+          stepResult: { reason: 'tool-calls' },
+          messages: {
+            nonUser: [
+              {
+                role: 'assistant',
+                content: [
+                  { type: 'tool-call', toolCallId: 'call-1', toolName: 'myTool', args: { value: 'first' } },
+                  { type: 'tool-call', toolCallId: 'call-2', toolName: 'myTool', args: { value: 'second' } },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    ];
+    const sendToolApprovalSpy = vi
+      .spyOn(agent, 'sendToolApproval')
+      .mockResolvedValueOnce({ accepted: true, runId: 'run-continuation' } as never);
+    const executeSpy = vi.fn(async ({ value }: { value: string }) => ({ value }));
+    const clientTools = {
+      myTool: { id: 'myTool', description: 'tool', inputSchema: z.object({ value: z.string() }), execute: executeSpy },
+    };
+
+    await mockSignalAndSubscriptionRequests(agent, 'run-initial', chunks, {
+      signal: { type: 'user-message', contents: 'hello' },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: { streamOptions: { clientTools } },
+    } as SendAgentSignalParams);
+
+    const subscribed = await agent.subscribeToThread({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } as SubscribeAgentThreadParams);
+
+    const received: any[] = [];
+    await subscribed.processDataStream({ onChunk: async chunk => void received.push(chunk) });
+
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+    expect(executeSpy.mock.calls.map(call => call[0])).toEqual([{ value: 'first' }, { value: 'second' }]);
+    expect(received.filter(chunk => chunk.type === 'tool-result').map(chunk => chunk.payload.toolCallId)).toEqual([
+      'call-1',
+      'call-2',
+    ]);
+    const [continuationCall] = sendToolApprovalSpy.mock.calls.at(-1) as [any];
+    expect(continuationCall.messages).toEqual([
+      continuationToolResultMessage('call-1', 'myTool', { value: 'first' }, { value: 'first' }),
+      continuationToolResultMessage('call-2', 'myTool', { value: 'second' }, { value: 'second' }),
+    ]);
+  });
+
+  it('preserves assistant non-user messages for stateless client-tool continuations', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const assistantMessages = [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'call-1', toolName: 'myTool', args: { x: 'hi' } }],
+      },
+    ];
+    const chunks = [
+      {
+        type: 'tool-call',
+        runId: 'run-stateless',
+        payload: { toolCallId: 'call-1', toolName: 'myTool', args: { x: 'hi' } },
+      },
+      {
+        type: 'finish',
+        runId: 'run-stateless',
+        payload: { stepResult: { reason: 'tool-calls' }, messages: { nonUser: assistantMessages } },
+      },
+    ];
+    const streamUntilIdleSpy = vi.spyOn(agent, 'streamUntilIdle');
+    const sendToolApprovalSpy = vi
+      .spyOn(agent, 'sendToolApproval')
+      .mockResolvedValue({ accepted: true, runId: 'continuation-run' } as never);
+    const clientTools = {
+      myTool: {
+        id: 'myTool',
+        description: 'tool',
+        inputSchema: z.object({ x: z.string() }),
+        execute: vi.fn(async () => ({ ok: true })),
+      },
+    };
+
+    await mockSignalAndSubscriptionRequests(agent, 'run-stateless', chunks, {
+      signal: { type: 'user-message', contents: 'hello' },
+      ifIdle: { streamOptions: { clientTools } },
+    } as SendAgentSignalParams);
+
+    const subscribed = await agent.subscribeToThread({} as SubscribeAgentThreadParams);
+    await subscribed.processDataStream({ onChunk: async () => {} });
+
+    expect(streamUntilIdleSpy).not.toHaveBeenCalled();
+    const [continuation] = sendToolApprovalSpy.mock.calls.at(-1) as [any];
+    expect(continuation.messages).toEqual([
+      ...assistantMessages,
+      continuationToolResultMessage('call-1', 'myTool', { x: 'hi' }, { ok: true }),
+    ]);
+    expect(continuation.streamOptions?.memory).toBeUndefined();
+  });
+
+  it('executes multiple client tools after one tool-calls finish', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const assistantMessages = [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool-call', toolCallId: 'call-1', toolName: 'firstTool', args: { value: 'one' } },
+          { type: 'tool-call', toolCallId: 'call-2', toolName: 'secondTool', args: { value: 'two' } },
+        ],
+      },
+    ];
+    const chunks = [
+      {
+        type: 'tool-call',
+        runId: 'run-multi',
+        payload: { toolCallId: 'call-1', toolName: 'firstTool', args: { value: 'one' } },
+      },
+      {
+        type: 'tool-call',
+        runId: 'run-multi',
+        payload: { toolCallId: 'call-2', toolName: 'secondTool', args: { value: 'two' } },
+      },
+      {
+        type: 'finish',
+        runId: 'run-multi',
+        payload: { stepResult: { reason: 'tool-calls' }, messages: { nonUser: assistantMessages } },
+      },
+    ];
+    const streamUntilIdleSpy = vi.spyOn(agent, 'streamUntilIdle');
+    const sendToolApprovalSpy = vi
+      .spyOn(agent, 'sendToolApproval')
+      .mockResolvedValue({ accepted: true, runId: 'continuation-run' } as never);
+    const firstExecute = vi.fn(async () => ({ first: true }));
+    const secondExecute = vi.fn(async () => ({ second: true }));
+    const clientTools = {
+      firstTool: { id: 'firstTool', description: 'first', inputSchema: z.object({}), execute: firstExecute },
+      secondTool: { id: 'secondTool', description: 'second', inputSchema: z.object({}), execute: secondExecute },
+    };
+
+    await mockSignalAndSubscriptionRequests(agent, 'run-multi', chunks, {
+      signal: { type: 'user-message', contents: 'hello' },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: { streamOptions: { clientTools } },
+    } as SendAgentSignalParams);
+
+    const subscribed = await agent.subscribeToThread({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } as SubscribeAgentThreadParams);
+
+    const received: any[] = [];
+    await subscribed.processDataStream({ onChunk: async chunk => void received.push(chunk) });
+
+    expect(firstExecute).toHaveBeenCalledTimes(1);
+    expect(secondExecute).toHaveBeenCalledTimes(1);
+    expect(received.filter(chunk => chunk.type === 'tool-result')).toHaveLength(2);
+    expect(streamUntilIdleSpy).not.toHaveBeenCalled();
+    const [continuation] = sendToolApprovalSpy.mock.calls.at(-1) as [any];
+    const continuationMessages = continuation.messages;
+    expect(continuationMessages).toEqual([
+      continuationToolResultMessage('call-1', 'firstTool', { value: 'one' }, { first: true }),
+      continuationToolResultMessage('call-2', 'secondTool', { value: 'two' }, { second: true }),
+    ]);
+  });
+
+  it('ignores unknown tools without starting a continuation', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const chunks = [
+      {
+        type: 'tool-call',
+        runId: 'run-unknown',
+        payload: { toolCallId: 'call-unknown', toolName: 'serverOnlyTool', args: {} },
+      },
+      {
+        type: 'finish',
+        runId: 'run-unknown',
+        payload: {
+          stepResult: { reason: 'tool-calls' },
+          messages: {
+            nonUser: [
+              {
+                role: 'assistant',
+                content: [{ type: 'tool-call', toolCallId: 'call-unknown', toolName: 'serverOnlyTool', args: {} }],
+              },
+            ],
+          },
+        },
+      },
+    ];
+    const streamUntilIdleSpy = vi.spyOn(agent, 'streamUntilIdle');
+    const sendToolApprovalSpy = vi
+      .spyOn(agent, 'sendToolApproval')
+      .mockResolvedValue({ accepted: true, runId: 'continuation-run' } as never);
+    const executeSpy = vi.fn(async () => ({ ok: true }));
+    const clientTools = {
+      myTool: { id: 'myTool', description: 'known', inputSchema: z.object({}), execute: executeSpy },
+    };
+
+    await mockSignalAndSubscriptionRequests(agent, 'run-unknown', chunks, {
+      signal: { type: 'user-message', contents: 'hello' },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: { streamOptions: { clientTools } },
+    } as SendAgentSignalParams);
+
+    const subscribed = await agent.subscribeToThread({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } as SubscribeAgentThreadParams);
+
+    const received: any[] = [];
+    await subscribed.processDataStream({ onChunk: async chunk => void received.push(chunk) });
+
+    expect(executeSpy).not.toHaveBeenCalled();
+    expect(streamUntilIdleSpy).not.toHaveBeenCalled();
+    expect(sendToolApprovalSpy).not.toHaveBeenCalled();
+    expect(received.find(chunk => chunk.type === 'tool-result')).toBeUndefined();
+  });
+
+  it('emits error tool-results when client tool execution throws', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const assistantMessages = [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'call-error', toolName: 'myTool', args: {} }],
+      },
+    ];
+    const chunks = [
+      { type: 'tool-call', runId: 'run-error', payload: { toolCallId: 'call-error', toolName: 'myTool', args: {} } },
+      {
+        type: 'finish',
+        runId: 'run-error',
+        payload: { stepResult: { reason: 'tool-calls' }, messages: { nonUser: assistantMessages } },
+      },
+    ];
+    const streamUntilIdleSpy = vi.spyOn(agent, 'streamUntilIdle');
+    const sendToolApprovalSpy = vi
+      .spyOn(agent, 'sendToolApproval')
+      .mockResolvedValue({ accepted: true, runId: 'continuation-run' } as never);
+
+    const clientTools = {
+      myTool: {
+        id: 'myTool',
+        description: 'throws',
+        inputSchema: z.object({}),
+        execute: vi.fn(async () => {
+          throw new Error('boom');
+        }),
+      },
+    };
+
+    await mockSignalAndSubscriptionRequests(agent, 'run-error', chunks, {
+      signal: { type: 'user-message', contents: 'hello' },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: { streamOptions: { clientTools } },
+    } as SendAgentSignalParams);
+
+    const subscribed = await agent.subscribeToThread({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } as SubscribeAgentThreadParams);
+
+    const received: any[] = [];
+    await subscribed.processDataStream({ onChunk: async chunk => void received.push(chunk) });
+
+    const toolResult = received.find(chunk => chunk.type === 'tool-result');
+    expect(toolResult?.payload).toEqual({
+      type: 'tool-result',
+      toolCallId: 'call-error',
+      toolName: 'myTool',
+      args: {},
+      result: { error: 'Error: boom' },
+    });
+    expect(streamUntilIdleSpy).not.toHaveBeenCalled();
+    const [continuation] = sendToolApprovalSpy.mock.calls.at(-1) as [any];
+    const continuationMessages = continuation.messages;
+    expect(continuationMessages.at(-1)).toEqual(
+      continuationToolResultMessage('call-error', 'myTool', {}, { error: 'Error: boom' }),
+    );
+  });
+
+  it('scopes pending client tool calls by runId', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const assistantMessages = [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'call-a', toolName: 'myTool', args: { run: 'a' } }],
+      },
+    ];
+    const chunks = [
+      {
+        type: 'tool-call',
+        runId: 'run-a',
+        payload: { toolCallId: 'call-a', toolName: 'myTool', args: { run: 'a' } },
+      },
+      {
+        type: 'finish',
+        runId: 'run-b',
+        payload: {
+          stepResult: { reason: 'tool-calls' },
+          messages: {
+            nonUser: [
+              {
+                role: 'assistant',
+                content: [{ type: 'tool-call', toolCallId: 'call-b', toolName: 'myTool', args: { run: 'b' } }],
+              },
+            ],
+          },
+        },
+      },
+      {
+        type: 'finish',
+        runId: 'run-a',
+        payload: { stepResult: { reason: 'tool-calls' }, messages: { nonUser: assistantMessages } },
+      },
+    ];
+    const streamUntilIdleSpy = vi.spyOn(agent, 'streamUntilIdle');
+    const sendToolApprovalSpy = vi
+      .spyOn(agent, 'sendToolApproval')
+      .mockResolvedValue({ accepted: true, runId: 'continuation-run' } as never);
+    const executeSpy = vi.fn(async args => ({ args }));
+    const clientTools = {
+      myTool: { id: 'myTool', description: 'tool', inputSchema: z.object({}), execute: executeSpy },
+    };
+
+    await mockSignalAndSubscriptionRequests(agent, 'run-a', chunks, {
+      signal: { type: 'user-message', contents: 'hello' },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: { streamOptions: { clientTools } },
+    } as SendAgentSignalParams);
+
+    const subscribed = await agent.subscribeToThread({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } as SubscribeAgentThreadParams);
+
+    await subscribed.processDataStream({ onChunk: async () => {} });
+
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect((executeSpy.mock.calls[0] as any[])[0]).toEqual({ run: 'a' });
+    expect(streamUntilIdleSpy).not.toHaveBeenCalled();
+    const [continuation] = sendToolApprovalSpy.mock.calls.at(-1) as [any];
+    const continuationMessages = continuation.messages;
+    expect(continuationMessages).toEqual([
+      continuationToolResultMessage('call-a', 'myTool', { run: 'a' }, { args: { run: 'a' } }),
+    ]);
+  });
+
+  it('continues receiving later run chunks through the same subscription stream', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const assistantMessages = [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'call-1', toolName: 'myTool', args: {} }],
+      },
+    ];
+    const continuationTextChunk = { type: 'text-delta', runId: 'run-continuation', payload: { text: 'done' } };
+    const continuationFinishChunk = {
+      type: 'finish',
+      runId: 'run-continuation',
+      payload: { stepResult: { reason: 'stop' }, messages: { nonUser: [] } },
+    };
+    const chunks = [
+      { type: 'tool-call', runId: 'run-first', payload: { toolCallId: 'call-1', toolName: 'myTool', args: {} } },
+      {
+        type: 'finish',
+        runId: 'run-first',
+        payload: { stepResult: { reason: 'tool-calls' }, messages: { nonUser: assistantMessages } },
+      },
+      continuationTextChunk,
+      continuationFinishChunk,
+    ];
+    const streamUntilIdleSpy = vi.spyOn(agent, 'streamUntilIdle');
+    const sendToolApprovalSpy = vi
+      .spyOn(agent, 'sendToolApproval')
+      .mockResolvedValue({ accepted: true, runId: 'continuation-run' } as never);
+
+    const clientTools = {
+      myTool: {
+        id: 'myTool',
+        description: 'tool',
+        inputSchema: z.object({}),
+        execute: vi.fn(async () => ({ ok: true })),
+      },
+    };
+
+    await mockSignalAndSubscriptionRequests(agent, 'run-first', chunks, {
+      signal: { type: 'user-message', contents: 'hello' },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: { streamOptions: { clientTools } },
+    } as SendAgentSignalParams);
+
+    const subscribed = await agent.subscribeToThread({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } as SubscribeAgentThreadParams);
+
+    const received: any[] = [];
+    await subscribed.processDataStream({ onChunk: async chunk => void received.push(chunk) });
+
+    expect(streamUntilIdleSpy).not.toHaveBeenCalled();
+    expect(sendToolApprovalSpy).toHaveBeenCalledTimes(1);
+    expect(received).toContainEqual(continuationTextChunk);
+    expect(received).toContainEqual(continuationFinishChunk);
+  });
+
+  it('uses send-owned runtime options for subscribed client-tool execution and continuation', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const assistantMessages = [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'call-latest', toolName: 'latestTool', args: {} }],
+      },
+    ];
+    const chunks = [
+      {
+        type: 'tool-call',
+        runId: 'run-latest',
+        payload: { toolCallId: 'call-latest', toolName: 'latestTool', args: {} },
+      },
+      {
+        type: 'finish',
+        runId: 'run-latest',
+        payload: { stepResult: { reason: 'tool-calls' }, messages: { nonUser: assistantMessages } },
+      },
+    ];
+    const streamUntilIdleSpy = vi.spyOn(agent, 'streamUntilIdle');
+    const sendToolApprovalSpy = vi
+      .spyOn(agent, 'sendToolApproval')
+      .mockResolvedValue({ accepted: true, runId: 'continuation-run' } as never);
+    const executeSpy = vi.fn(async (_args, context: any) => ({ userId: context.requestContext.userId }));
+    const clientTools = {
+      latestTool: { id: 'latestTool', description: 'latest', inputSchema: z.object({}), execute: executeSpy },
+    };
+
+    await mockSignalAndSubscriptionRequests(agent, 'run-latest', chunks, {
+      signal: { type: 'user-message', contents: 'hello' },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: {
+        streamOptions: {
+          clientTools,
+          requestContext: { userId: 'latest-user' } as any,
+          maxSteps: 7,
+          instructions: 'latest instructions',
+        },
+      },
+    } as SendAgentSignalParams);
+
+    const subscribed = await agent.subscribeToThread({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } as SubscribeAgentThreadParams);
+
+    await subscribed.processDataStream({ onChunk: async () => {} });
+
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(executeSpy.mock.results[0]).toBeDefined();
+    const [, executeContext] = executeSpy.mock.calls[0] as any[];
+    expect(executeContext.requestContext).toEqual({ userId: 'latest-user' });
+    expect(streamUntilIdleSpy).not.toHaveBeenCalled();
+    const [continuationArg] = sendToolApprovalSpy.mock.calls.at(-1) as [any];
+    expect(continuationArg.streamOptions).toEqual(
+      expect.objectContaining({
+        maxSteps: 7,
+        instructions: 'latest instructions',
+        requestContext: { userId: 'latest-user' },
+        clientTools: processClientTools(clientTools as any),
+      }),
+    );
+  });
+
+  it('preserves subscribed client-tool observability payloads', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const observability = {
+      traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+    };
+    const assistantMessages = [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'call-observe', toolName: 'observeTool', args: {} }],
+      },
+    ];
+    const chunks = [
+      {
+        type: 'tool-call',
+        runId: 'run-observe',
+        payload: { toolCallId: 'call-observe', toolName: 'observeTool', args: {}, observability },
+      },
+      {
+        type: 'finish',
+        runId: 'run-observe',
+        payload: { stepResult: { reason: 'tool-calls' }, messages: { nonUser: assistantMessages } },
+      },
+    ];
+    const streamUntilIdleSpy = vi.spyOn(agent, 'streamUntilIdle');
+    const sendToolApprovalSpy = vi
+      .spyOn(agent, 'sendToolApproval')
+      .mockResolvedValue({ accepted: true, runId: 'continuation-run' } as never);
+    const executeSpy = vi.fn(async (_args, context: any) => {
+      await context.observe.span('client work', async () => null);
+      return { ok: true };
+    });
+    const clientTools = {
+      observeTool: { id: 'observeTool', description: 'observe', inputSchema: z.object({}), execute: executeSpy },
+    };
+
+    await mockSignalAndSubscriptionRequests(agent, 'run-observe', chunks, {
+      signal: { type: 'user-message', contents: 'hello' },
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+      ifIdle: { streamOptions: { clientTools } },
+    } as SendAgentSignalParams);
+
+    const subscribed = await agent.subscribeToThread({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } as SubscribeAgentThreadParams);
+
+    const received: any[] = [];
+    await subscribed.processDataStream({ onChunk: async chunk => void received.push(chunk) });
+
+    const toolResult = received.find(chunk => chunk.type === 'tool-result');
+    expect(toolResult?.payload.__mastraObservability).toEqual(
+      expect.objectContaining({
+        parentContext: observability,
+        payload: expect.objectContaining({ toolName: 'observeTool' }),
+      }),
+    );
+    expect(streamUntilIdleSpy).not.toHaveBeenCalled();
+    const [continuation] = sendToolApprovalSpy.mock.calls.at(-1) as [any];
+    const continuationMessages = continuation.messages;
+    const continuationToolContent = continuationMessages.at(-1).content[1];
+    expect(continuationToolContent).toEqual({
+      type: 'tool-result',
+      toolCallId: 'call-observe',
+      toolName: 'observeTool',
+      output: { type: 'json', value: { ok: true } },
+      __mastraObservability: toolResult.payload.__mastraObservability,
+    });
+  });
+
+  it('does not execute client tools when no clientTools are provided', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+
+    const toolCallChunk = {
+      type: 'tool-call',
+      runId: 'run-abc',
+      payload: { toolCallId: 'call-1', toolName: 'myTool', args: {} },
+    };
+    agent['request'] = vi.fn().mockResolvedValue(createSseResponse([toolCallChunk])) as (typeof agent)['request'];
+    const streamUntilIdleSpy = vi.spyOn(agent, 'streamUntilIdle');
+    const sendToolApprovalSpy = vi
+      .spyOn(agent, 'sendToolApproval')
+      .mockResolvedValue({ accepted: true, runId: 'continuation-run' } as never);
+
+    const subscribed = await agent.subscribeToThread({
+      resourceId: 'resource-123',
+      threadId: 'thread-123',
+    } as SubscribeAgentThreadParams);
+
+    const received: any[] = [];
+    await subscribed.processDataStream({
+      onChunk: async chunk => {
+        received.push(chunk);
+      },
+    });
+
+    // No client tools, so no continuation and no synthetic tool-result.
+    expect(streamUntilIdleSpy).not.toHaveBeenCalled();
+    expect(sendToolApprovalSpy).not.toHaveBeenCalled();
+    expect(received.find(c => c.type === 'tool-result')).toBeUndefined();
+  });
+
+  it('can reconnect when processing a thread subscription stream ends', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const firstChunk = { type: 'text-delta', runId: 'run-1', from: 'AGENT', payload: { id: 'text-1', text: 'first' } };
+    const secondChunk = {
+      type: 'text-delta',
+      runId: 'run-2',
+      from: 'AGENT',
+      payload: { id: 'text-2', text: 'second' },
+    };
+    const encode = (chunk: unknown) => new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`);
+    const mockRequest = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(encode(firstChunk));
+              controller.close();
+            },
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(encode(secondChunk));
+              controller.close();
+            },
+          }),
+        ),
+      );
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const response = await agent.subscribeToThread({ resourceId: 'resource-123', threadId: 'thread-123' });
+    const onChunk = vi.fn().mockResolvedValue(undefined);
+
+    await response.processDataStream({ onChunk, reconnect: { maxRetries: 1, delayMs: 0 } });
+
+    expect(mockRequest).toHaveBeenCalledTimes(2);
+    expect(onChunk).toHaveBeenNthCalledWith(1, firstChunk);
+    expect(onChunk).toHaveBeenNthCalledWith(2, secondChunk);
+  });
+
+  it('does not reconnect when the onChunk callback throws', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const firstChunk = { type: 'text-delta', runId: 'run-1', from: 'AGENT', payload: { id: 'text-1', text: 'first' } };
+    const encode = (chunk: unknown) => new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`);
+    const mockRequest = vi.fn().mockResolvedValue(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(encode(firstChunk));
+            controller.close();
+          },
+        }),
+      ),
+    );
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const response = await agent.subscribeToThread({ resourceId: 'resource-123', threadId: 'thread-123' });
+    const callbackError = new Error('boom from onChunk');
+    const onChunk = vi.fn().mockRejectedValue(callbackError);
+
+    // Consumer should receive the original error they threw, unwrapped.
+    await expect(response.processDataStream({ onChunk, reconnect: { maxRetries: 5, delayMs: 0 } })).rejects.toBe(
+      callbackError,
+    );
+
+    expect(mockRequest).toHaveBeenCalledTimes(1);
+    expect(onChunk).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries failed resubscribe requests within the reconnect limit', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent');
+    const firstChunk = { type: 'text-delta', runId: 'run-1', from: 'AGENT', payload: { id: 'text-1', text: 'first' } };
+    const secondChunk = {
+      type: 'text-delta',
+      runId: 'run-2',
+      from: 'AGENT',
+      payload: { id: 'text-2', text: 'second' },
+    };
+    const encode = (chunk: unknown) => new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`);
+    const responseFor = (chunk: unknown) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(encode(chunk));
+            controller.close();
+          },
+        }),
+      );
+    const mockRequest = vi
+      .fn()
+      .mockResolvedValueOnce(responseFor(firstChunk))
+      .mockRejectedValueOnce(new Error('temporary reconnect failure'))
+      .mockResolvedValueOnce(responseFor(secondChunk));
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    const response = await agent.subscribeToThread({ resourceId: 'resource-123', threadId: 'thread-123' });
+    const onChunk = vi.fn();
+
+    await response.processDataStream({ onChunk, reconnect: { maxRetries: 2, delayMs: 0 } });
+
+    expect(mockRequest).toHaveBeenCalledTimes(3);
+    expect(onChunk).toHaveBeenNthCalledWith(1, firstChunk);
+    expect(onChunk).toHaveBeenNthCalledWith(2, secondChunk);
+  });
+
+  describe('thread subscription reconnect on terminal HTTP errors', () => {
+    const chunk = { type: 'text-delta', runId: 'run-1', from: 'AGENT', payload: { id: 'text-1', text: 'first' } };
+    const encode = (value: unknown) => new TextEncoder().encode(`data: ${JSON.stringify(value)}\n\n`);
+    const endedStream = () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(encode(chunk));
+            controller.close();
+          },
+        }),
+      );
+
+    it.each([401, 403, 404])('stops reconnecting and rejects with the original %s error', async status => {
+      const agent = new Agent(mockClientOptions, 'test-agent');
+      const denied = new MastraClientError(status, 'Denied', `HTTP error! status: ${status}`);
+      const mockRequest = vi.fn().mockResolvedValueOnce(endedStream()).mockRejectedValue(denied);
+      agent['request'] = mockRequest as (typeof agent)['request'];
+
+      const response = await agent.subscribeToThread({ resourceId: 'resource-123', threadId: 'thread-123' });
+
+      await expect(
+        response.processDataStream({ onChunk: vi.fn(), reconnect: { maxRetries: Infinity, delayMs: 0 } }),
+      ).rejects.toBe(denied);
+      expect(mockRequest).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([408, 429, 503])('keeps retrying %s errors within the reconnect limit', async status => {
+      const agent = new Agent(mockClientOptions, 'test-agent');
+      const mockRequest = vi
+        .fn()
+        .mockResolvedValueOnce(endedStream())
+        .mockRejectedValueOnce(new MastraClientError(status, 'Retry later', `HTTP error! status: ${status}`))
+        .mockResolvedValueOnce(endedStream());
+      agent['request'] = mockRequest as (typeof agent)['request'];
+
+      const response = await agent.subscribeToThread({ resourceId: 'resource-123', threadId: 'thread-123' });
+      const onChunk = vi.fn();
+
+      await response.processDataStream({ onChunk, reconnect: { maxRetries: 2, delayMs: 0 } });
+
+      expect(mockRequest).toHaveBeenCalledTimes(3);
+      expect(onChunk).toHaveBeenCalledTimes(2);
+    });
+
+    it('resolves quietly when a denial arrives after unsubscribe', async () => {
+      const agent = new Agent(mockClientOptions, 'test-agent');
+      let rejectResubscribe!: (error: unknown) => void;
+      let resubscribeStarted!: () => void;
+      const started = new Promise<void>(resolve => {
+        resubscribeStarted = resolve;
+      });
+      const mockRequest = vi
+        .fn()
+        .mockResolvedValueOnce(endedStream())
+        .mockImplementationOnce(
+          () =>
+            new Promise((_, reject) => {
+              rejectResubscribe = reject;
+              resubscribeStarted();
+            }),
+        );
+      agent['request'] = mockRequest as (typeof agent)['request'];
+
+      const response = await agent.subscribeToThread({ resourceId: 'resource-123', threadId: 'thread-123' });
+      const processing = response.processDataStream({
+        onChunk: vi.fn(),
+        reconnect: { maxRetries: Infinity, delayMs: 0 },
+      });
+
+      await started;
+      response.unsubscribe();
+      rejectResubscribe(new MastraClientError(401, 'Unauthorized', 'HTTP error! status: 401'));
+
+      await expect(processing).resolves.toBeUndefined();
+      expect(mockRequest).toHaveBeenCalledTimes(2);
+    });
+  });
 });
 
 describe('Agent.stream', () => {
@@ -117,6 +1839,16 @@ describe('Agent.stream', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     global.fetch = vi.fn();
+  });
+
+  it('serializes a request-scoped model override', async () => {
+    const agent = new TestAgent(mockClientOptions, 'test-agent');
+    const mockRequest = vi.fn().mockResolvedValue(new Response('data: [DONE]\n\n', { status: 200 }));
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    await agent.stream('test message', { model: 'google/gemini-2.5-flash' });
+
+    expect(mockRequest.mock.calls[0][1].body.model).toBe('google/gemini-2.5-flash');
   });
 
   it('should transform params.structuredOutput.schema using zodToJsonSchema when provided', async () => {
@@ -373,6 +2105,59 @@ describe('Agent Voice Resource', () => {
     expect(versionedAgent).toBeInstanceOf(Agent);
   });
 
+  it('should list suspended runs with suspendedAt as an ISO string', async () => {
+    const suspendedAt = new Date('2026-06-12T10:00:00.000Z');
+    mockFetchResponse({
+      runs: [
+        {
+          runId: 'run-123',
+          status: 'suspended',
+          threadId: 'thread-123',
+          resourceId: 'resource-123',
+          suspendedAt: suspendedAt.toISOString(),
+          toolCalls: [
+            { toolCallId: 'tool-call-123', toolName: 'findUserTool', args: { name: 'Dero' }, requiresApproval: true },
+          ],
+        },
+      ],
+      total: 1,
+    });
+
+    const result = await agent.listSuspendedRuns();
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      `${clientOptions.baseUrl}/api/agents/test-agent/suspended-runs`,
+      expect.objectContaining({
+        headers: expect.objectContaining(clientOptions.headers),
+      }),
+    );
+    expect(result.total).toBe(1);
+    expect(result.runs[0]!.runId).toBe('run-123');
+    expect(result.runs[0]!.suspendedAt).toBe(suspendedAt.toISOString());
+    expect(result.runs[0]!.toolCalls[0]!.requiresApproval).toBe(true);
+  });
+
+  it('should pass suspended-run filters as query params', async () => {
+    mockFetchResponse({ runs: [], total: 0 });
+
+    const fromDate = new Date('2026-01-01T00:00:00.000Z');
+    await agent.listSuspendedRuns({
+      threadId: 'thread-123',
+      resourceId: 'resource-123',
+      fromDate,
+      perPage: 5,
+      page: 1,
+    });
+
+    const requestedUrl = new URL((global.fetch as any).mock.calls[0][0]);
+    expect(requestedUrl.pathname).toBe('/api/agents/test-agent/suspended-runs');
+    expect(requestedUrl.searchParams.get('threadId')).toBe('thread-123');
+    expect(requestedUrl.searchParams.get('resourceId')).toBe('resource-123');
+    expect(requestedUrl.searchParams.get('fromDate')).toBe(fromDate.toISOString());
+    expect(requestedUrl.searchParams.get('perPage')).toBe('5');
+    expect(requestedUrl.searchParams.get('page')).toBe('1');
+  });
+
   it('should get available speakers', async () => {
     const mockResponse = [{ voiceId: 'speaker1' }];
     mockFetchResponse(mockResponse);
@@ -431,6 +2216,7 @@ describe('Agent Voice Resource', () => {
       `${clientOptions.baseUrl}/api/agents/test-agent/voice/speak`,
       expect.objectContaining({
         method: 'POST',
+        body: JSON.stringify({ text: 'test', options: { speaker: 'speaker1' } }),
         headers: expect.objectContaining(clientOptions.headers),
       }),
     );
@@ -597,6 +2383,24 @@ describe('Agent Client Methods', () => {
         headers: expect.objectContaining(clientOptions.headers),
       }),
     );
+  });
+
+  it('should read a submitted plan with the agent version and request context', async () => {
+    global.fetch = vi.fn();
+    const path = '.mastracode/plans/add-dark-mode.md';
+    const mockResponse = { path, content: '# Add dark mode' };
+    const requestContext = { tenantId: 'tenant-123' };
+    mockFetchResponse(mockResponse);
+
+    const versionedAgent = client.getAgent('test-agent', { versionId: 'version-123' });
+    const result = await versionedAgent.readPlan(path, requestContext);
+
+    expect(result).toEqual(mockResponse);
+    const requestedUrl = new URL((global.fetch as any).mock.calls[0][0]);
+    expect(requestedUrl.pathname).toBe('/api/agents/test-agent/plans/file');
+    expect(requestedUrl.searchParams.get('path')).toBe(path);
+    expect(requestedUrl.searchParams.get('versionId')).toBe('version-123');
+    expect(requestedUrl.searchParams.get('requestContext')).toBe(btoa(JSON.stringify(requestContext)));
   });
 
   it('should list override versions for a code agent', async () => {
@@ -997,12 +2801,14 @@ describe('Agent.processStreamResponse client-tool synthetic chunks', () => {
     baseUrl: 'https://api.test.com',
   };
 
-  function makeStreamingResponse(chunks: unknown[]): Response {
+  function makeStreamingResponse(chunks: Array<unknown | Uint8Array>): Response {
     const encoder = new TextEncoder();
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         for (const chunk of chunks) {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+          controller.enqueue(
+            chunk instanceof Uint8Array ? chunk : encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`),
+          );
         }
         controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
         controller.close();
@@ -1123,6 +2929,67 @@ describe('Agent.processStreamResponse client-tool synthetic chunks', () => {
     expect(mockRequest).toHaveBeenCalledTimes(2);
   });
 
+  it('preserves multi-byte characters split across network chunks', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent-id');
+    const encoder = new TextEncoder();
+    const event = encoder.encode(`data: ${JSON.stringify({ type: 'text-delta', payload: { text: 'Mañana' } })}\n\n`);
+    const splitAt = event.indexOf(0xc3) + 1;
+    const response = makeStreamingResponse([event.slice(0, splitAt), event.slice(splitAt)]);
+    const mockRequest = vi.fn().mockResolvedValue(response);
+    agent['request'] = mockRequest as (typeof agent)['request'];
+
+    let outerController!: ReadableStreamDefaultController<Uint8Array>;
+    const outerStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        outerController = controller;
+      },
+    });
+
+    const processPromise = agent.processStreamResponse(
+      { messages: [{ role: 'user', content: 'hi' }] },
+      outerController,
+    );
+
+    const captured = await readAllText(outerStream);
+    await processPromise;
+
+    expect(parseSseDataLines(captured)).toContainEqual({
+      type: 'text-delta',
+      payload: { text: 'Mañana' },
+    });
+  });
+
+  it('preserves SSE separators between complete network writes for processMastraStream', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent-id');
+    const firstChunk = { type: 'text-delta', payload: { text: 'first' } };
+    const secondChunk = { type: 'text-delta', payload: { text: 'second' } };
+    agent['request'] = vi
+      .fn()
+      .mockResolvedValue(makeStreamingResponse([firstChunk, secondChunk])) as (typeof agent)['request'];
+
+    let outerController!: ReadableStreamDefaultController<Uint8Array>;
+    const outerStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        outerController = controller;
+      },
+    });
+
+    const processPromise = agent.processStreamResponse(
+      { messages: [{ role: 'user', content: 'hi' }] },
+      outerController,
+    );
+    const receivedChunks: unknown[] = [];
+    await processMastraStream({
+      stream: outerStream,
+      onChunk: chunk => {
+        receivedChunks.push(chunk);
+      },
+    });
+    await processPromise;
+
+    expect(receivedChunks).toEqual([firstChunk, secondChunk]);
+  });
+
   it('uses the observed stream runId for synthetic chunks on the public stream API', async () => {
     const agent = new Agent(mockClientOptions, 'test-agent-id');
 
@@ -1179,6 +3046,64 @@ describe('Agent.processStreamResponse client-tool synthetic chunks', () => {
         toolName: 'testTool',
         result: { ok: true },
       },
+    });
+  });
+
+  it('uses streamed tool arguments when the final tool-call chunk has empty arguments', async () => {
+    const agent = new Agent(mockClientOptions, 'test-agent-id');
+    const onToolCall = vi.fn().mockResolvedValue({ ok: true });
+
+    const stream = makeStreamingResponse([
+      { type: 'step-start', runId: 'run-streamed-call', payload: { messageId: 'msg-streamed-call' } },
+      {
+        type: 'tool-call-input-streaming-start',
+        runId: 'run-streamed-call',
+        payload: {
+          toolCallId: 'tool-call-streamed',
+          toolName: 'testTool',
+          args: {},
+        },
+      },
+      {
+        type: 'tool-call-delta',
+        runId: 'run-streamed-call',
+        payload: {
+          toolCallId: 'tool-call-streamed',
+          toolName: 'testTool',
+          argsTextDelta: '{"step":{"type":"agent","id":"answer","agentId":"support-agent"}}',
+        },
+      },
+      {
+        type: 'tool-call',
+        runId: 'run-streamed-call',
+        payload: {
+          toolCallId: 'tool-call-streamed',
+          toolName: 'testTool',
+          args: {},
+        },
+      },
+      { type: 'finish', runId: 'run-streamed-call', payload: { stepResult: { reason: 'tool-calls' } } },
+    ]).body!;
+
+    const updates: any[] = [];
+    await (agent as any).processChatResponse_vNext({
+      stream,
+      update: (update: any) => updates.push(update),
+      onToolCall,
+      lastMessage: undefined,
+    });
+
+    expect(onToolCall).toHaveBeenCalledWith({
+      toolCall: expect.objectContaining({
+        toolCallId: 'tool-call-streamed',
+        toolName: 'testTool',
+        args: { step: { type: 'agent', id: 'answer', agentId: 'support-agent' } },
+      }),
+    });
+    expect(updates.at(-1).message.toolInvocations[0]).toMatchObject({
+      state: 'result',
+      args: { step: { type: 'agent', id: 'answer', agentId: 'support-agent' } },
+      result: { ok: true },
     });
   });
 

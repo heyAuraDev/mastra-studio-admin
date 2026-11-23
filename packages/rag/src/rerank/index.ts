@@ -115,10 +115,24 @@ async function executeRerank({
     ...options.weights,
   };
 
+  for (const [name, weight] of Object.entries(weights)) {
+    if (!Number.isFinite(weight) || weight < 0 || weight > 1) {
+      const err = new Error(`Weights must be finite numbers between 0 and 1. Got ${name}: ${weight}`);
+      rerankSpan?.error({ error: err, endSpan: true });
+      throw err;
+    }
+  }
+
   //weights must add up to 1
   const sum = Object.values(weights).reduce((acc: Big, w: number) => acc.plus(w.toString()), new Big(0));
   if (!sum.eq(1)) {
-    const err = new Error(`Weights must add up to 1. Got ${sum} from ${weights}`);
+    const err = new Error(`Weights must add up to 1. Got ${sum} from ${JSON.stringify(weights)}`);
+    rerankSpan?.error({ error: err, endSpan: true });
+    throw err;
+  }
+
+  if (!Number.isInteger(topK) || topK < 0) {
+    const err = new Error(`topK must be a nonnegative integer. Got ${topK}`);
     rerankSpan?.error({ error: err, endSpan: true });
     throw err;
   }
@@ -128,45 +142,51 @@ async function executeRerank({
   const queryAnalysis = queryEmbedding ? analyzeQueryEmbedding(queryEmbedding) : null;
 
   // Get scores for each result
-  const scoredResults = await Promise.all(
-    results.map(async (result, index) => {
-      // Get semantic score from chosen provider
-      let semanticScore = 0;
-      if (result?.metadata?.text) {
-        semanticScore = await scorer.getRelevanceScore(query, result?.metadata?.text);
-      }
+  let scoredResults: RerankResult[];
+  try {
+    scoredResults = await Promise.all(
+      results.map(async (result, index) => {
+        // Get semantic score from chosen provider
+        let semanticScore = 0;
+        if (result?.metadata?.text) {
+          semanticScore = await scorer.getRelevanceScore(query, result?.metadata?.text);
+        }
 
-      // Get existing vector score from result
-      const vectorScore = result.score;
+        // Get existing vector score from result
+        const vectorScore = result.score;
 
-      // Get score of vector based on position in original list
-      const positionScore = calculatePositionScore(index, resultLength);
+        // Get score of vector based on position in original list
+        const positionScore = calculatePositionScore(index, resultLength);
 
-      // Combine scores using weights for each component
-      let finalScore =
-        weights.semantic * semanticScore + weights.vector * vectorScore + weights.position * positionScore;
+        // Combine scores using weights for each component
+        let finalScore =
+          weights.semantic * semanticScore + weights.vector * vectorScore + weights.position * positionScore;
 
-      if (queryAnalysis) {
-        finalScore = adjustScores(finalScore, queryAnalysis);
-      }
+        if (queryAnalysis) {
+          finalScore = adjustScores(finalScore, queryAnalysis);
+        }
 
-      return {
-        result,
-        score: finalScore,
-        details: {
-          semantic: semanticScore,
-          vector: vectorScore,
-          position: positionScore,
-          ...(queryAnalysis && {
-            queryAnalysis: {
-              magnitude: queryAnalysis.magnitude,
-              dominantFeatures: queryAnalysis.dominantFeatures,
-            },
-          }),
-        },
-      };
-    }),
-  );
+        return {
+          result,
+          score: finalScore,
+          details: {
+            semantic: semanticScore,
+            vector: vectorScore,
+            position: positionScore,
+            ...(queryAnalysis && {
+              queryAnalysis: {
+                magnitude: queryAnalysis.magnitude,
+                dominantFeatures: queryAnalysis.dominantFeatures,
+              },
+            }),
+          },
+        };
+      }),
+    );
+  } catch (err) {
+    rerankSpan?.error({ error: err as Error, endSpan: true });
+    throw err;
+  }
 
   // Sort by score and take top K
   const final = scoredResults.sort((a, b) => b.score - a.score).slice(0, topK);

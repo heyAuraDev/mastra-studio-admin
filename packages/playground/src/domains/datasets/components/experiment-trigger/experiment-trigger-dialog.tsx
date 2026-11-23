@@ -1,131 +1,33 @@
-import {
-  Button,
-  Spinner,
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-  DialogBody,
-  DialogFooter,
-} from '@mastra/playground-ui';
-import { format } from 'date-fns';
-import { useRef, useState } from 'react';
-import { toast } from 'sonner';
-import { useDatasetMutations } from '../../hooks/use-dataset-mutations';
-import { ScorerSelector } from './scorer-selector';
-import type { TargetType } from './target-selector';
-import { TargetSelector } from './target-selector';
+import { useState } from 'react';
+import type { ExperimentTriggerInitialValues } from './experiment-trigger-options';
+import { NewExperimentDialog } from './new-experiment-dialog';
 
-export interface ExperimentTriggerDialogProps {
-  datasetId: string;
-  version?: number;
+export interface ExperimentTriggerDialogProps extends ExperimentTriggerInitialValues {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSuccess?: (experimentId: string) => void;
 }
 
-export function ExperimentTriggerDialog({
-  datasetId,
-  version,
-  open,
-  onOpenChange,
-  onSuccess,
-}: ExperimentTriggerDialogProps) {
-  const contentRef = useRef<HTMLDivElement>(null);
-  const [targetType, setTargetType] = useState<TargetType | ''>('');
-  const [targetId, setTargetId] = useState<string>('');
-  const [selectedScorers, setSelectedScorers] = useState<string[]>([]);
+/**
+ * A fresh form on every open, while the closing dialog keeps its state through its exit animation: the
+ * form remounts once the dialog has finished closing. Its key also carries the initial values, so a form
+ * mounted while closed starts from the values the caller passes for the next open.
+ */
+export function ExperimentTriggerDialog({ open, onOpenChange, onSuccess, ...initial }: ExperimentTriggerDialogProps) {
+  const [closedCount, setClosedCount] = useState(0);
 
-  const { triggerExperiment } = useDatasetMutations();
-
-  const canRun = targetType && targetId;
-  const isRunning = triggerExperiment.isPending;
-
-  const handleRun = async () => {
-    if (!canRun) return;
-
-    try {
-      const result = await triggerExperiment.mutateAsync({
-        datasetId,
-        targetType,
-        targetId,
-        scorerIds: selectedScorers.length > 0 ? selectedScorers : undefined,
-        version,
-      });
-
-      toast.success('Experiment triggered successfully');
-      onOpenChange(false);
-      onSuccess?.(result.experimentId);
-
-      // Reset state
-      setTargetType('');
-      setTargetId('');
-      setSelectedScorers([]);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to trigger experiment';
-      toast.error(message);
-    }
-  };
-
-  const handleClose = () => {
-    if (!isRunning) {
-      onOpenChange(false);
-      // Reset state on close
-      setTargetType('');
-      setTargetId('');
-      setSelectedScorers([]);
-    }
+  const handleOpenChangeComplete = (isOpen: boolean) => {
+    if (!isOpen) setClosedCount(count => count + 1);
   };
 
   return (
-    <Dialog open={open} onOpenChange={handleClose}>
-      <DialogContent ref={contentRef}>
-        <DialogHeader>
-          <DialogTitle>Run Experiment</DialogTitle>
-          <DialogDescription>
-            {version
-              ? `Execute items from ${format(new Date(version), 'MMM d, yyyy')} version against a target.`
-              : 'Execute all items in this dataset against a target.'}
-          </DialogDescription>
-        </DialogHeader>
-
-        <DialogBody className="grid gap-6">
-          <TargetSelector
-            targetType={targetType}
-            setTargetType={setTargetType}
-            targetId={targetId}
-            setTargetId={setTargetId}
-            container={contentRef}
-          />
-
-          {/* Only show scorer selector for agent/workflow targets */}
-          {targetType && targetType !== 'scorer' && (
-            <ScorerSelector
-              selectedScorers={selectedScorers}
-              setSelectedScorers={setSelectedScorers}
-              disabled={isRunning}
-              container={contentRef}
-            />
-          )}
-        </DialogBody>
-
-        <DialogFooter className="px-6 pt-4">
-          <Button onClick={handleClose} disabled={isRunning}>
-            Cancel
-          </Button>
-          <Button variant="primary" onClick={handleRun} disabled={!canRun || isRunning}>
-            {isRunning ? (
-              <>
-                <Spinner className="w-4 h-4" />
-                Running...
-              </>
-            ) : (
-              'Run'
-            )}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    <NewExperimentDialog
+      key={`${closedCount}:${JSON.stringify(initial)}`}
+      open={open}
+      onOpenChange={onOpenChange}
+      onOpenChangeComplete={handleOpenChangeComplete}
+      onSuccess={onSuccess}
+      {...initial}
+    />
   );
 }

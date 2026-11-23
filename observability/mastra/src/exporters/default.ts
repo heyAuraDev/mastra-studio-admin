@@ -7,6 +7,8 @@ import type {
   LogEvent,
   ScoreEvent,
   FeedbackEvent,
+  FeedbackReplacementEvent,
+  FeedbackReviewStatusEvent,
   ObservabilityDropEvent,
   ObservabilityDropReason,
   ObservabilityDropSignal,
@@ -25,6 +27,8 @@ import type { BaseExporterConfig } from './base';
 import { BaseExporter } from './base';
 import { EventBuffer } from './event-buffer';
 import type { BufferedEvent, RetryCount, UpdateSpanPartial } from './event-buffer';
+import { KeyedQueue } from './keyed-queue';
+import { resolveStorageAnnotation, updateStorageFeedbackReviewStatus } from './storage-annotation';
 
 /**
  * Configuration for the DefaultExporter's batching, retry, and strategy behavior.
@@ -71,6 +75,15 @@ function resolveTracingStorageStrategy(
 
 type Resolve = (value: void | PromiseLike<void>) => void;
 
+type FlushResult = {
+  failed: boolean;
+  retryAttempt?: number;
+};
+
+const FLUSH_SUCCEEDED: FlushResult = { failed: false };
+/** Max join/write rounds a single flush() makes before it returns under continuous traffic */
+const MAX_FLUSH_ROUNDS = 3;
+
 /**
  * @deprecated Use `MastraStorageExporter` from `@mastra/observability` instead.
  * This class is preserved unchanged so existing integrations (including code
@@ -92,6 +105,10 @@ export class DefaultExporter extends BaseExporter {
   #observabilityStorage?: ObservabilityStorage;
   #resolvedStrategy?: TracingStorageStrategy;
   #flushTimer?: NodeJS.Timeout;
+  /** Storage writes (timer, size trigger, or flush()) that haven't finished yet */
+  #inFlightFlushes = new Set<Promise<void>>();
+  #pendingAnnotations = new Set<Promise<void>>();
+  #feedbackWrites = new KeyedQueue();
   #emitDropEvent?: (event: ObservabilityDropEvent) => void;
 
   // Signals whose storage methods threw "not implemented" — skip on future flushes
@@ -201,17 +218,46 @@ export class DefaultExporter extends BaseExporter {
   /**
    * Schedules a flush using setTimeout
    */
-  private scheduleFlush(): void {
+  private scheduleFlush(delayMs = this.#config.maxBatchWaitMs!): void {
     if (this.#flushTimer) {
       clearTimeout(this.#flushTimer);
     }
     this.#flushTimer = setTimeout(() => {
-      this.flushBuffer().catch(error => {
+      this.#flushTimer = undefined;
+      this.trackFlushBuffer().catch(error => {
         this.logger.error('Scheduled flush failed', {
           error: error instanceof Error ? error.message : String(error),
         });
       });
-    }, this.#config.maxBatchWaitMs);
+    }, delayMs);
+  }
+
+  private retryDelay(retryAttempt: number): number {
+    return this.#config.retryDelayMs! * 2 ** (retryAttempt - 1);
+  }
+
+  private retryAttempt(events: BufferedEvent[]): number | undefined {
+    return events.reduce<number | undefined>((earliestAttempt, event) => {
+      if (event.retryCount > this.#config.maxRetries!) return earliestAttempt;
+      return earliestAttempt === undefined ? event.retryCount : Math.min(earliestAttempt, event.retryCount);
+    }, undefined);
+  }
+
+  private logStorageFailure(
+    signal: ObservabilityDropSignal,
+    events: BufferedEvent[],
+    retryAttempt: number | undefined,
+    error: unknown,
+  ): void {
+    this.logger.warn('Failed to persist observability events', {
+      signal,
+      eventCount: events.length,
+      retryAttempt:
+        retryAttempt ?? events.reduce((latestAttempt, event) => Math.max(latestAttempt, event.retryCount), 0),
+      maxRetries: this.#config.maxRetries,
+      ...(retryAttempt === undefined ? {} : { nextRetryDelayMs: this.retryDelay(retryAttempt) }),
+      error: error instanceof Error ? error.message : String(error),
+    });
   }
 
   /**
@@ -221,7 +267,7 @@ export class DefaultExporter extends BaseExporter {
    */
   private async handleBatchedFlush(): Promise<void> {
     if (this.shouldFlush()) {
-      await this.flushBuffer();
+      await this.trackFlushBuffer();
     } else if (this.#eventBuffer.totalSize === 1) {
       this.scheduleFlush();
     }
@@ -274,15 +320,16 @@ export class DefaultExporter extends BaseExporter {
     signal: ObservabilityDropSignal,
     events: T[],
     storageCall: (events: T[]) => Promise<void>,
-  ): Promise<void> {
-    if (events.length === 0) return;
+  ): Promise<FlushResult> {
+    if (events.length === 0) return FLUSH_SUCCEEDED;
     if (this.#unsupportedSignals.has(signal)) {
       this.emitDrop(signal, 'unsupported-storage', events.length);
-      return;
+      return { failed: true };
     }
 
     try {
       await storageCall(events);
+      return FLUSH_SUCCEEDED;
     } catch (error) {
       if (
         error instanceof MastraError &&
@@ -292,10 +339,14 @@ export class DefaultExporter extends BaseExporter {
         this.logger.warn(error.message);
         this.#unsupportedSignals.add(signal);
         this.emitDrop(signal, 'unsupported-storage', events.length, error);
-      } else {
-        const dropped = this.#eventBuffer.reAddCreates(events);
-        this.emitDrop(signal, 'retry-exhausted', dropped.length, error);
+        return { failed: true };
       }
+
+      const dropped = this.#eventBuffer.reAddCreates(events);
+      const retryAttempt = this.retryAttempt(events);
+      this.logStorageFailure(signal, events, retryAttempt, error);
+      this.emitDrop(signal, 'retry-exhausted', dropped.length, error);
+      return { failed: true, retryAttempt };
     }
   }
 
@@ -307,12 +358,12 @@ export class DefaultExporter extends BaseExporter {
     events: (TracingEvent & RetryCount)[],
     deferredUpdates: BufferedEvent[],
     isEnd: boolean,
-  ): Promise<void> {
+  ): Promise<FlushResult> {
     const deferredCountAtEntry = deferredUpdates.length;
-    if (events.length === 0) return;
+    if (events.length === 0) return FLUSH_SUCCEEDED;
     if (this.#unsupportedSignals.has('tracing')) {
       this.emitDrop('tracing', 'unsupported-storage', events.length);
-      return;
+      return { failed: true };
     }
 
     const partials: UpdateSpanPartial[] = [];
@@ -329,13 +380,14 @@ export class DefaultExporter extends BaseExporter {
       }
     }
 
-    if (partials.length === 0) return;
+    if (partials.length === 0) return FLUSH_SUCCEEDED;
 
     try {
       await this.#observabilityStorage!.batchUpdateSpans({ records: partials });
       if (isEnd) {
         this.#eventBuffer.endFinishedSpans({ records: partials });
       }
+      return FLUSH_SUCCEEDED;
     } catch (error) {
       if (
         error instanceof MastraError &&
@@ -346,19 +398,33 @@ export class DefaultExporter extends BaseExporter {
         this.#unsupportedSignals.add('tracing');
         deferredUpdates.length = 0;
         this.emitDrop('tracing', 'unsupported-storage', events.length + deferredCountAtEntry, error);
-      } else {
-        // `events` includes both partials-bound and newly-deferred entries, so
-        // re-adding it would double-add the newly-deferred ones if they stayed
-        // in deferredUpdates. Splice off only what this call appended — entries
-        // from a prior flushSpanUpdates call must survive.
-        const newlyDeferred = deferredUpdates.length - deferredCountAtEntry;
-        if (newlyDeferred > 0) {
-          deferredUpdates.splice(deferredUpdates.length - newlyDeferred, newlyDeferred);
-        }
-        const dropped = this.#eventBuffer.reAddUpdates(events);
-        this.emitDrop('tracing', 'retry-exhausted', dropped.length, error);
+        return { failed: true };
       }
+
+      // `events` includes both partials-bound and newly-deferred entries, so
+      // re-adding it would double-add the newly-deferred ones if they stayed
+      // in deferredUpdates. Splice off only what this call appended — entries
+      // from a prior flushSpanUpdates call must survive.
+      const newlyDeferred = deferredUpdates.length - deferredCountAtEntry;
+      if (newlyDeferred > 0) {
+        deferredUpdates.splice(deferredUpdates.length - newlyDeferred, newlyDeferred);
+      }
+      const dropped = this.#eventBuffer.reAddUpdates(events);
+      const retryAttempt = this.retryAttempt(events);
+      this.logStorageFailure('tracing', events, retryAttempt, error);
+      this.emitDrop('tracing', 'retry-exhausted', dropped.length, error);
+      return { failed: true, retryAttempt };
     }
+  }
+
+  /**
+   * Runs flushBuffer() and tracks its promise so flush() can wait for writes
+   * that a timer or size trigger started on their own.
+   */
+  private trackFlushBuffer(): Promise<void> {
+    const promise = this.flushBuffer().finally(() => this.#inFlightFlushes.delete(promise));
+    this.#inFlightFlushes.add(promise);
+    return promise;
   }
 
   /**
@@ -438,9 +504,12 @@ export class DefaultExporter extends BaseExporter {
     }
 
     // Flush all creates in parallel — signals are independent
-    await Promise.all([
+    const flushResults = await Promise.all([
       this.flushCreates('feedback', createFeedbackEvents, events =>
-        this.#observabilityStorage!.batchCreateFeedback({ feedbacks: events.map(f => buildFeedbackRecord(f)) }),
+        this.#observabilityStorage!.batchCreateFeedback({
+          feedbacks: events.map(f => buildFeedbackRecord(f)),
+          onConflict: 'ignore',
+        }),
       ),
       this.flushCreates('log', createLogEvents, events =>
         this.#observabilityStorage!.batchCreateLogs({ logs: events.map(l => buildLogRecord(l)) }),
@@ -461,27 +530,39 @@ export class DefaultExporter extends BaseExporter {
     // Flush span updates and ends — check span existence, defer if not yet created
     const deferredUpdates: BufferedEvent[] = [];
 
-    await this.flushSpanUpdates(updateSpanEvents, deferredUpdates, false);
-    await this.flushSpanUpdates(endSpanEvents, deferredUpdates, true);
+    flushResults.push(await this.flushSpanUpdates(updateSpanEvents, deferredUpdates, false));
+    flushResults.push(await this.flushSpanUpdates(endSpanEvents, deferredUpdates, true));
 
+    let deferredDropCount = 0;
     if (deferredUpdates.length > 0) {
       if (this.#unsupportedSignals.has('tracing')) {
-        this.emitDrop('tracing', 'unsupported-storage', deferredUpdates.length);
+        deferredDropCount = deferredUpdates.length;
+        this.emitDrop('tracing', 'unsupported-storage', deferredDropCount);
         deferredUpdates.length = 0;
       } else {
         const dropped = this.#eventBuffer.reAddUpdates(deferredUpdates);
-        this.emitDrop('tracing', 'retry-exhausted', dropped.length);
+        deferredDropCount = dropped.length;
+        this.emitDrop('tracing', 'retry-exhausted', deferredDropCount);
       }
     }
 
-    const elapsed = Date.now() - startTime;
-    this.logger.debug('Batch flushed', {
-      strategy: this.#resolvedStrategy,
-      batchSize,
-      durationMs: elapsed,
-      deferredUpdates: deferredUpdates.length > 0 ? deferredUpdates.length : undefined,
-    });
-    return; // Success
+    const retryAttempt = flushResults.reduce<number | undefined>((earliestAttempt, result) => {
+      if (result.retryAttempt === undefined) return earliestAttempt;
+      return earliestAttempt === undefined ? result.retryAttempt : Math.min(earliestAttempt, result.retryAttempt);
+    }, undefined);
+    if (retryAttempt !== undefined) {
+      this.scheduleFlush(this.retryDelay(retryAttempt));
+    }
+
+    if (!flushResults.some(result => result.failed) && deferredDropCount === 0) {
+      const elapsed = Date.now() - startTime;
+      this.logger.debug('Batch flushed', {
+        strategy: this.#resolvedStrategy,
+        batchSize,
+        durationMs: elapsed,
+        deferredUpdates: deferredUpdates.length > 0 ? deferredUpdates.length : undefined,
+      });
+    }
   }
 
   async _exportTracingEvent(event: TracingEvent): Promise<void> {
@@ -529,25 +610,75 @@ export class DefaultExporter extends BaseExporter {
     await this.handleBatchedFlush();
   }
 
-  /**
-   * Handle score events — buffer for batch flush.
-   */
-  async onScoreEvent(event: ScoreEvent): Promise<void> {
-    await this.waitForInit();
-    if (!this.#observabilityStorage) return;
-
-    this.#eventBuffer.addEvent(event);
-    await this.handleBatchedFlush();
+  onScoreEvent(event: ScoreEvent): Promise<void> {
+    return this.enqueueAnnotation(event);
   }
 
-  /**
-   * Handle feedback events — buffer for batch flush.
-   */
-  async onFeedbackEvent(event: FeedbackEvent): Promise<void> {
+  onFeedbackReviewStatusEvent(event: FeedbackReviewStatusEvent): Promise<void> {
+    return this.enqueueAnnotation(event);
+  }
+
+  onFeedbackReplacementEvent(event: FeedbackReplacementEvent): Promise<void> {
+    return this.enqueueAnnotation(event);
+  }
+
+  onFeedbackEvent(event: FeedbackEvent): Promise<void> {
+    return this.enqueueAnnotation(event);
+  }
+
+  private enqueueAnnotation(
+    event: ScoreEvent | FeedbackEvent | FeedbackReplacementEvent | FeedbackReviewStatusEvent,
+  ): Promise<void> {
+    const feedbackId = event.type === 'score' ? undefined : event.feedback.feedbackId;
+    const pending = feedbackId
+      ? this.#feedbackWrites.enqueue(feedbackId, () => this.storeAnnotation(event))
+      : this.storeAnnotation(event);
+    this.#pendingAnnotations.add(pending);
+    void pending.then(
+      () => this.#pendingAnnotations.delete(pending),
+      () => this.#pendingAnnotations.delete(pending),
+    );
+    return pending;
+  }
+
+  private async storeAnnotation(
+    event: ScoreEvent | FeedbackEvent | FeedbackReplacementEvent | FeedbackReviewStatusEvent,
+  ): Promise<void> {
     await this.waitForInit();
     if (!this.#observabilityStorage) return;
-
-    this.#eventBuffer.addEvent(event);
+    if (event.type === 'feedback_review_status') {
+      // Earlier creates may be buffered or already writing. Do not call public
+      // flush(): it waits on this annotation and would deadlock.
+      await this.flushBufferedEvents();
+      await updateStorageFeedbackReviewStatus(this.#observabilityStorage, event.feedback, this.logger);
+      return;
+    }
+    const resolved = await resolveStorageAnnotation(event, this.#observabilityStorage, async () => {
+      // Flush buffered spans before retrying; the bus waits for this handler before its buffer drain.
+      await Promise.allSettled([...this.#inFlightFlushes]);
+      if (this.#eventBuffer.totalSize) await this.trackFlushBuffer();
+    });
+    if (!resolved) {
+      const record = event.type === 'score' ? event.score : event.feedback;
+      this.logger.warn('Storage export dropped because the target trace/span was not found', {
+        eventType: event.type,
+        traceId: record.traceId,
+        spanId: record.spanId,
+      });
+      return;
+    }
+    if (resolved.type === 'feedback_replacement') {
+      if (
+        typeof this.#observabilityStorage.replaceFeedback !== 'function' ||
+        !this.#observabilityStorage.getFeatures?.()?.includes('feedback-replacement')
+      ) {
+        this.logger.warn('Storage exporter skipped feedback replacement: upgrade the storage adapter and @mastra/core');
+        return;
+      }
+      await this.#observabilityStorage.replaceFeedback({ feedback: buildFeedbackRecord(resolved) });
+      return;
+    }
+    this.#eventBuffer.addEvent(resolved);
     await this.handleBatchedFlush();
   }
 
@@ -557,12 +688,37 @@ export class DefaultExporter extends BaseExporter {
    * are exported before the runtime instance is terminated.
    */
   async flush(): Promise<void> {
-    if (this.#eventBuffer.totalSize > 0) {
-      this.logger.debug('Flushing buffered events', {
-        bufferedEvents: this.#eventBuffer.totalSize,
-      });
-      await this.flushBuffer();
+    await Promise.allSettled([...this.#pendingAnnotations]);
+    await this.flushBufferedEvents();
+  }
+
+  private async flushBufferedEvents(): Promise<void> {
+    // A timer or size trigger may have taken a batch out of the buffer and still be
+    // writing it, so an empty buffer doesn't mean the data reached storage. Each round
+    // joins those writes first (they can defer span updates back into the buffer), then
+    // writes whatever the buffer holds. Writes that start while we work get a few more
+    // rounds, then we stop taking on new work so flush() stays bounded under non-stop
+    // traffic (same cap as ObservabilityBus), but we still join the writes already running
+    // so nothing is mid-write when we return. A batch that failed is left to its retry
+    // timer, as before.
+    for (let round = 0; round < MAX_FLUSH_ROUNDS; round++) {
+      if (this.#inFlightFlushes.size > 0) {
+        await Promise.allSettled([...this.#inFlightFlushes]);
+      }
+      if (this.#eventBuffer.totalSize > 0) {
+        this.logger.debug('Flushing buffered events', {
+          bufferedEvents: this.#eventBuffer.totalSize,
+        });
+        await this.trackFlushBuffer();
+      }
+      if (this.#inFlightFlushes.size === 0) {
+        return;
+      }
     }
+    await Promise.allSettled([...this.#inFlightFlushes]);
+    this.logger.warn(`flush() stopped after ${MAX_FLUSH_ROUNDS} rounds; new writes kept starting`, {
+      bufferedEventsLeftBehind: this.#eventBuffer.totalSize,
+    });
   }
 
   async shutdown(): Promise<void> {
@@ -574,6 +730,11 @@ export class DefaultExporter extends BaseExporter {
 
     // Flush any remaining events
     await this.flush();
+
+    if (this.#flushTimer) {
+      clearTimeout(this.#flushTimer);
+      this.#flushTimer = undefined;
+    }
 
     this.logger.info('DefaultExporter shutdown complete');
   }

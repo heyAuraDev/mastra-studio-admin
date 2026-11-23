@@ -1,7 +1,7 @@
 import type { ObservabilityContext } from '@mastra/core/observability';
 import { SpanType } from '@mastra/core/observability';
 import type { MastraVector, MastraEmbeddingModel, QueryResult, QueryVectorParams } from '@mastra/core/vector';
-import { embedV1, embedV2, embedV3 } from '@mastra/core/vector';
+import { embedV1, embedV2, embedV3, embedV4 } from '@mastra/core/vector';
 import type { VectorFilter } from '@mastra/core/vector/filter';
 import type { DatabaseConfig, ProviderOptions } from '../tools/types';
 
@@ -29,6 +29,8 @@ enum DatabaseType {
   Pinecone = 'pinecone',
   PgVector = 'pgvector',
   Chroma = 'chroma',
+  MongoDB = 'mongodb',
+  Turbopuffer = 'turbopuffer',
 }
 
 const DATABASE_TYPE_MAP = Object.keys(DatabaseType);
@@ -64,7 +66,9 @@ export const vectorQuerySearch = async ({
 
   let embeddingResult;
   try {
-    if (model.specificationVersion === 'v3') {
+    if (model.specificationVersion === 'v4') {
+      embeddingResult = await embedV4({ model, value: queryText, maxRetries, providerOptions });
+    } else if (model.specificationVersion === 'v3') {
       embeddingResult = await embedV3({
         model: model,
         value: queryText,
@@ -184,6 +188,20 @@ const databaseSpecificParams = (databaseConfig: DatabaseConfig) => {
       }
       if (databaseConfig.chroma.whereDocument) {
         databaseSpecificParams.whereDocument = databaseConfig.chroma.whereDocument;
+      }
+    }
+
+    // MongoDB-specific configurations
+    if (databaseConfig.mongodb) {
+      if (databaseConfig.mongodb.numCandidates !== undefined) {
+        databaseSpecificParams.numCandidates = databaseConfig.mongodb.numCandidates;
+      }
+    }
+
+    // Turbopuffer-specific configurations
+    if (databaseConfig.turbopuffer) {
+      if (databaseConfig.turbopuffer.consistency !== undefined) {
+        databaseSpecificParams.consistency = databaseConfig.turbopuffer.consistency;
       }
     }
 

@@ -1,34 +1,29 @@
-import { jsonLanguage } from '@codemirror/lang-json';
-import {
-  useCodemirrorTheme,
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-  Input,
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-  Txt,
-  Icon,
-  useCopyToClipboard,
-  formatJSON,
-  isValidJson,
-  cn,
-} from '@mastra/playground-ui';
-import CodeMirror from '@uiw/react-codemirror';
-import { ChevronDown, Braces, CopyIcon, SaveIcon, CheckIcon } from 'lucide-react';
+import { CodeEditor } from '@mastra/playground-ui/components/CodeEditor';
+import { Field, FieldError, FieldLabel } from '@mastra/playground-ui/components/Field';
+import { Input } from '@mastra/playground-ui/components/Input';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@mastra/playground-ui/components/Tooltip';
+import { useCopyToClipboard } from '@mastra/playground-ui/hooks/use-copy-to-clipboard';
+import { IconCheckmark2Medium } from '@mastra/playground-ui/icons/central/IconCheckmark2Medium';
+import { IconCodeBrackets } from '@mastra/playground-ui/icons/central/IconCodeBrackets';
+import { IconFloppyDisk1 } from '@mastra/playground-ui/icons/central/IconFloppyDisk1';
+import { IconSquareBehindSquare1 } from '@mastra/playground-ui/icons/central/IconSquareBehindSquare1';
+import { Icon } from '@mastra/playground-ui/icons/Icon';
+import { controlStateColorTransition } from '@mastra/playground-ui/primitives/transitions';
+import { quietTextHover } from '@mastra/playground-ui/primitives/typography';
+import { cn } from '@mastra/playground-ui/utils/cn';
+import { formatJSON, isValidJson } from '@mastra/playground-ui/utils/formatting';
 import { useEffect, useState } from 'react';
 import { useAgentSettings } from '@/domains/agents/context/agent-context';
 
-export const AgentAdvancedSettings = () => {
+export interface AgentAdvancedSettingsBodyProps {
+  canEdit?: boolean;
+}
+
+export const AgentAdvancedSettingsBody = ({ canEdit = true }: AgentAdvancedSettingsBodyProps) => {
   const { settings, setSettings } = useAgentSettings();
-  const [isOpen, setIsOpen] = useState(false);
   const [providerOptionsValue, setProviderOptionsValue] = useState('');
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  const theme = useCodemirrorTheme();
 
   const { handleCopy } = useCopyToClipboard({ text: providerOptionsValue });
 
@@ -80,224 +75,205 @@ export const AgentAdvancedSettings = () => {
     }
   };
 
-  const collapsibleClassName = 'rounded-lg border border-border1 bg-surface3 overflow-clip';
-  const collapsibleTriggerClassName =
-    'text-neutral3 text-ui-lg font-medium flex items-center gap-2 w-full p-2.5 justify-between';
-  const collapsibleContentClassName = 'bg-surface2 p-2.5 @container/collapsible';
-  const buttonClass = 'text-neutral3 hover:text-neutral6';
+  const buttonClass = cn(quietTextHover, controlStateColorTransition);
 
   return (
     <TooltipProvider>
-      <Collapsible className={collapsibleClassName} open={isOpen} onOpenChange={setIsOpen}>
-        <CollapsibleTrigger className={collapsibleTriggerClassName}>
-          Advanced Settings
-          <Icon className={cn('transition-transform', isOpen ? 'rotate-0' : '-rotate-90')}>
-            <ChevronDown />
-          </Icon>
-        </CollapsibleTrigger>
-        <CollapsibleContent className={collapsibleContentClassName}>
-          <div className="grid grid-cols-1 gap-2 pb-2 @xs/collapsible:grid-cols-2">
-            <div className="space-y-1">
-              <Txt as="label" className="text-neutral3" variant="ui-sm" htmlFor="frequency-penalty">
-                Frequency Penalty
-              </Txt>
-              <Input
-                id="frequency-penalty"
-                type="number"
-                step="0.1"
-                min="-1"
-                max="1"
-                value={settings?.modelSettings?.frequencyPenalty ?? ''}
-                onChange={e =>
-                  setSettings({
-                    ...settings,
-                    modelSettings: {
-                      ...settings?.modelSettings,
-                      frequencyPenalty: e.target.value ? Number(e.target.value) : undefined,
-                    },
-                  })
-                }
-              />
-            </div>
-
-            <div className="space-y-1">
-              <Txt as="label" className="text-neutral3" variant="ui-sm" htmlFor="presence-penalty">
-                Presence Penalty
-              </Txt>
-              <Input
-                id="presence-penalty"
-                type="number"
-                step="0.1"
-                min="-1"
-                max="1"
-                value={settings?.modelSettings?.presencePenalty ?? ''}
-                onChange={e =>
-                  setSettings({
-                    ...settings,
-                    modelSettings: {
-                      ...settings?.modelSettings,
-                      presencePenalty: e.target.value ? Number(e.target.value) : undefined,
-                    },
-                  })
-                }
-              />
-            </div>
-
-            <div className="space-y-1">
-              <Txt as="label" className="text-neutral3" variant="ui-sm" htmlFor="top-k">
-                Top K
-              </Txt>
-              <Input
-                id="top-k"
-                type="number"
-                value={settings?.modelSettings?.topK || ''}
-                onChange={e =>
-                  setSettings({
-                    ...settings,
-                    modelSettings: {
-                      ...settings?.modelSettings,
-                      topK: e.target.value ? Number(e.target.value) : undefined,
-                    },
-                  })
-                }
-              />
-            </div>
-
-            <div className="space-y-1">
-              <Txt as="label" className="text-neutral3" variant="ui-sm" htmlFor="max-tokens">
-                Max Tokens
-              </Txt>
-              <Input
-                id="max-tokens"
-                type="number"
-                value={settings?.modelSettings?.maxTokens || ''}
-                onChange={e =>
-                  setSettings({
-                    ...settings,
-                    modelSettings: {
-                      ...settings?.modelSettings,
-                      maxTokens: e.target.value ? Number(e.target.value) : undefined,
-                    },
-                  })
-                }
-              />
-            </div>
-
-            <div className="space-y-1">
-              <Txt as="label" className="text-neutral3" variant="ui-sm" htmlFor="max-steps">
-                Max Steps
-              </Txt>
-              <Input
-                id="max-steps"
-                type="number"
-                value={settings?.modelSettings?.maxSteps || ''}
-                onChange={e =>
-                  setSettings({
-                    ...settings,
-                    modelSettings: {
-                      ...settings?.modelSettings,
-                      maxSteps: e.target.value ? Number(e.target.value) : undefined,
-                    },
-                  })
-                }
-              />
-            </div>
-
-            <div className="space-y-1">
-              <Txt as="label" className="text-neutral3" variant="ui-sm" htmlFor="max-retries">
-                Max Retries
-              </Txt>
-              <Input
-                id="max-retries"
-                type="number"
-                value={settings?.modelSettings?.maxRetries || ''}
-                onChange={e =>
-                  setSettings({
-                    ...settings,
-                    modelSettings: {
-                      ...settings?.modelSettings,
-                      maxRetries: e.target.value ? Number(e.target.value) : undefined,
-                    },
-                  })
-                }
-              />
-            </div>
-
-            <div className="space-y-1">
-              <Txt as="label" className="text-neutral3" variant="ui-sm" htmlFor="seed">
-                Seed
-              </Txt>
-              <Input
-                id="seed"
-                type="number"
-                value={settings?.modelSettings?.seed || ''}
-                onChange={e =>
-                  setSettings({
-                    ...settings,
-                    modelSettings: {
-                      ...settings?.modelSettings,
-                      seed: e.target.value ? Number(e.target.value) : undefined,
-                    },
-                  })
-                }
-              />
-            </div>
-          </div>
-
-          <div className="space-y-1">
-            <div className="flex justify-between items-center">
-              <Txt as="label" className="text-neutral3" variant="ui-sm" htmlFor="provider-options">
-                Provider Options
-              </Txt>
-
-              <div className="flex items-center gap-2">
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <button onClick={formatProviderOptions} className={buttonClass}>
-                      <Icon>
-                        <Braces />
-                      </Icon>
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent>Format the Provider Options JSON</TooltipContent>
-                </Tooltip>
-
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <button onClick={handleCopy} className={buttonClass}>
-                      <Icon>
-                        <CopyIcon />
-                      </Icon>
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent>Copy Provider Options</TooltipContent>
-                </Tooltip>
-
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <button onClick={saveProviderOptions} className={buttonClass}>
-                      <Icon>{saved ? <CheckIcon /> : <SaveIcon />}</Icon>
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent>{saved ? 'Saved' : 'Save Provider Options'}</TooltipContent>
-                </Tooltip>
-              </div>
-            </div>
-            <CodeMirror
-              value={providerOptionsValue}
-              onChange={setProviderOptionsValue}
-              theme={theme}
-              extensions={[jsonLanguage]}
-              className="h-dropdown-max-height overflow-scroll rounded-lg border bg-transparent shadow-sm transition-colors p-2"
+      <div className="@container/advanced">
+        <div className="grid grid-cols-1 gap-2 pb-2 @xs/advanced:grid-cols-2">
+          <Field>
+            <FieldLabel>Frequency Penalty</FieldLabel>
+            <Input
+              type="number"
+              step="0.1"
+              min="-1"
+              max="1"
+              readOnly={!canEdit}
+              value={settings?.modelSettings?.frequencyPenalty ?? ''}
+              onChange={e =>
+                setSettings({
+                  ...settings,
+                  modelSettings: {
+                    ...settings?.modelSettings,
+                    frequencyPenalty: e.target.value ? Number(e.target.value) : undefined,
+                  },
+                })
+              }
             />
-            {error && (
-              <Txt variant="ui-md" className="text-accent2">
-                {error}
-              </Txt>
-            )}
+          </Field>
+
+          <Field>
+            <FieldLabel>Presence Penalty</FieldLabel>
+            <Input
+              type="number"
+              step="0.1"
+              min="-1"
+              max="1"
+              readOnly={!canEdit}
+              value={settings?.modelSettings?.presencePenalty ?? ''}
+              onChange={e =>
+                setSettings({
+                  ...settings,
+                  modelSettings: {
+                    ...settings?.modelSettings,
+                    presencePenalty: e.target.value ? Number(e.target.value) : undefined,
+                  },
+                })
+              }
+            />
+          </Field>
+
+          <Field>
+            <FieldLabel>Top K</FieldLabel>
+            <Input
+              type="number"
+              readOnly={!canEdit}
+              value={settings?.modelSettings?.topK || ''}
+              onChange={e =>
+                setSettings({
+                  ...settings,
+                  modelSettings: {
+                    ...settings?.modelSettings,
+                    topK: e.target.value ? Number(e.target.value) : undefined,
+                  },
+                })
+              }
+            />
+          </Field>
+
+          <Field>
+            <FieldLabel>Max Tokens</FieldLabel>
+            <Input
+              type="number"
+              readOnly={!canEdit}
+              value={settings?.modelSettings?.maxTokens || ''}
+              onChange={e =>
+                setSettings({
+                  ...settings,
+                  modelSettings: {
+                    ...settings?.modelSettings,
+                    maxTokens: e.target.value ? Number(e.target.value) : undefined,
+                  },
+                })
+              }
+            />
+          </Field>
+
+          <Field>
+            <FieldLabel>Max Steps</FieldLabel>
+            <Input
+              type="number"
+              readOnly={!canEdit}
+              value={settings?.modelSettings?.maxSteps || ''}
+              onChange={e =>
+                setSettings({
+                  ...settings,
+                  modelSettings: {
+                    ...settings?.modelSettings,
+                    maxSteps: e.target.value ? Number(e.target.value) : undefined,
+                  },
+                })
+              }
+            />
+          </Field>
+
+          <Field>
+            <FieldLabel>Max Retries</FieldLabel>
+            <Input
+              type="number"
+              readOnly={!canEdit}
+              value={settings?.modelSettings?.maxRetries || ''}
+              onChange={e =>
+                setSettings({
+                  ...settings,
+                  modelSettings: {
+                    ...settings?.modelSettings,
+                    maxRetries: e.target.value ? Number(e.target.value) : undefined,
+                  },
+                })
+              }
+            />
+          </Field>
+
+          <Field>
+            <FieldLabel>Seed</FieldLabel>
+            <Input
+              type="number"
+              readOnly={!canEdit}
+              value={settings?.modelSettings?.seed || ''}
+              onChange={e =>
+                setSettings({
+                  ...settings,
+                  modelSettings: {
+                    ...settings?.modelSettings,
+                    seed: e.target.value ? Number(e.target.value) : undefined,
+                  },
+                })
+              }
+            />
+          </Field>
+        </div>
+
+        <Field invalid={Boolean(error)} className="gap-1">
+          <div className="flex items-center justify-between">
+            <FieldLabel>Provider Options</FieldLabel>
+
+            <div className="flex items-center gap-2">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    onClick={formatProviderOptions}
+                    className={buttonClass}
+                    aria-label="Format provider options"
+                  >
+                    <Icon>
+                      <IconCodeBrackets />
+                    </Icon>
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>Format the provider options JSON</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button type="button" onClick={handleCopy} className={buttonClass} aria-label="Copy provider options">
+                    <Icon>
+                      <IconSquareBehindSquare1 />
+                    </Icon>
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>Copy provider options</TooltipContent>
+              </Tooltip>
+
+              {canEdit && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      onClick={saveProviderOptions}
+                      className={buttonClass}
+                      aria-label="Save provider options"
+                    >
+                      <Icon>{saved ? <IconCheckmark2Medium /> : <IconFloppyDisk1 />}</Icon>
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>{saved ? 'Saved' : 'Save provider options'}</TooltipContent>
+                </Tooltip>
+              )}
+            </div>
           </div>
-        </CollapsibleContent>
-      </Collapsible>
+          <CodeEditor
+            value={providerOptionsValue}
+            onChange={setProviderOptionsValue}
+            language="json"
+            editable={canEdit}
+            showCopyButton={false}
+            className="h-75"
+          />
+          <FieldError>{error}</FieldError>
+        </Field>
+      </div>
     </TooltipProvider>
   );
 };

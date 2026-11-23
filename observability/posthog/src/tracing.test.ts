@@ -1,12 +1,14 @@
-import type { AnyExportedSpan } from '@mastra/core/observability';
+import type { AnyExportedSpan, ExportedFeedback, FeedbackEvent } from '@mastra/core/observability';
 import { SpanType, TracingEventType } from '@mastra/core/observability';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+import { __setObservabilityFeaturesForTest } from './features';
 import type { PosthogExporterConfig } from './tracing';
 import { PosthogExporter } from './tracing';
 
 // Mock PostHog client
 const mockCapture = vi.fn();
+const mockLegacyCapture = vi.fn();
 const mockShutdown = vi.fn();
 const mockPostHogConstructor = vi.fn();
 
@@ -16,7 +18,8 @@ vi.mock('posthog-node', () => {
       constructor(...args: any[]) {
         mockPostHogConstructor(...args);
       }
-      capture = mockCapture;
+      captureAi = mockCapture;
+      capture = mockLegacyCapture;
       shutdown = mockShutdown;
     },
   };
@@ -44,6 +47,9 @@ describe('PosthogExporter', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
+    // Default to the older pairing, where MODEL_GENERATION is the model call.
+    // The MODEL_INFERENCE mapping is covered in its own describe block.
+    __setObservabilityFeaturesForTest(undefined);
   });
 
   afterEach(async () => {
@@ -168,6 +174,22 @@ describe('PosthogExporter', () => {
       );
     });
 
+    it('sends events through the dedicated AI capture endpoint, never the analytics endpoint', async () => {
+      exporter = new TestPosthogExporter(validConfig);
+
+      await exporter.exportTracingEvent({
+        type: TracingEventType.SPAN_STARTED,
+        exportedSpan: mockSpan,
+      });
+      await exporter.exportTracingEvent({
+        type: TracingEventType.SPAN_ENDED,
+        exportedSpan: mockSpan,
+      });
+
+      expect(mockCapture).toHaveBeenCalledTimes(1);
+      expect(mockLegacyCapture).not.toHaveBeenCalled();
+    });
+
     it('should cleanup span from cache after capture', async () => {
       exporter = new TestPosthogExporter(validConfig);
 
@@ -197,6 +219,44 @@ describe('PosthogExporter', () => {
   });
 
   // --- Distinct ID Resolution Tests ---
+  describe('MCP server request caller context', () => {
+    const traceparent = '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01';
+
+    it('keeps the caller context on the $ai_trace event of a served MCP request', async () => {
+      exporter = new TestPosthogExporter(validConfig);
+      const span = createSpan({
+        type: SpanType.MCP_SERVER_REQUEST,
+        name: 'tools/call echo',
+        attributes: {
+          mcpMethod: 'tools/call',
+          mcpServer: 'orders',
+          callerTraceparent: traceparent,
+          callerTracestate: 'v=1',
+        },
+      } as Partial<AnyExportedSpan>);
+
+      await exporter.exportTracingEvent({ type: TracingEventType.SPAN_STARTED, exportedSpan: span });
+      await exporter.exportTracingEvent({ type: TracingEventType.SPAN_ENDED, exportedSpan: span });
+
+      expect(mockCapture).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: '$ai_trace',
+          properties: expect.objectContaining({ callerTraceparent: traceparent, callerTracestate: 'v=1' }),
+        }),
+      );
+    });
+
+    it('adds no caller properties to other root spans', async () => {
+      exporter = new TestPosthogExporter(validConfig);
+      const span = createSpan({ type: SpanType.AGENT_RUN, attributes: { callerTraceparent: traceparent } as any });
+
+      await exporter.exportTracingEvent({ type: TracingEventType.SPAN_STARTED, exportedSpan: span });
+      await exporter.exportTracingEvent({ type: TracingEventType.SPAN_ENDED, exportedSpan: span });
+
+      expect(mockCapture.mock.calls[0]![0].properties).not.toHaveProperty('callerTraceparent');
+    });
+  });
+
   describe('Distinct ID Resolution', () => {
     it('should use userId from metadata if present', async () => {
       exporter = new TestPosthogExporter(validConfig);
@@ -271,6 +331,337 @@ describe('PosthogExporter', () => {
       await exportSpanLifecycle(exporter, generation);
 
       expect(mockCapture).toHaveBeenCalledWith(expect.objectContaining({ event: '$ai_generation' }));
+    });
+
+    describe('with MODEL_INFERENCE spans', () => {
+      beforeEach(() => {
+        __setObservabilityFeaturesForTest(new Set(['model-inference-span']));
+      });
+
+      const traceId = 'trace-inference';
+      const usage = { inputTokens: 10, outputTokens: 5 };
+      const generationMessages = [
+        { role: 'system', content: 'You are helpful' },
+        { role: 'user', content: 'Weather in Paris and Rome?' },
+      ];
+      const generation = createSpan({
+        id: 'generation',
+        traceId,
+        parentSpanId: 'agent-run',
+        type: SpanType.MODEL_GENERATION,
+        input: { messages: generationMessages },
+        attributes: {
+          model: 'gpt-4o',
+          provider: 'openai',
+          usage: { inputTokens: 20, outputTokens: 10 },
+          tools: [
+            { type: 'function', name: 'a' },
+            { type: 'function', name: 'hidden' },
+          ],
+        },
+      });
+
+      interface ToolCallFixture {
+        id: string;
+        name: string;
+        args: Record<string, unknown>;
+        result?: unknown;
+        error?: string;
+        /**
+         * Export as a provider-executed PROVIDER_TOOL_CALL span. `success` is
+         * omitted when the span ended without a result.
+         */
+        provider?: { success?: boolean };
+        /** Milliseconds after the step started that the tool started. */
+        startedAfter: number;
+      }
+      interface CallFixture {
+        offered: string[];
+        text?: string;
+        toolCalls?: ToolCallFixture[];
+      }
+
+      /**
+       * Exports generation → step → inference (+ tools) per call in the order the
+       * loop emits them: the inference ends, then its tools run, then the step ends.
+       */
+      async function exportGeneration(calls: CallFixture[]) {
+        const { output: _output, endTime: _endTime, ...startedGeneration } = generation;
+        await exporter.exportTracingEvent({
+          type: TracingEventType.SPAN_STARTED,
+          exportedSpan: startedGeneration as AnyExportedSpan,
+        });
+        for (const [step, call] of calls.entries()) {
+          const stepSpan = createSpan({
+            id: `step-${step}`,
+            traceId,
+            parentSpanId: generation.id,
+            type: SpanType.MODEL_STEP,
+          });
+          await exporter.exportTracingEvent({ type: TracingEventType.SPAN_STARTED, exportedSpan: stepSpan });
+          const inferenceSpan = createSpan({
+            id: `inference-${step}`,
+            traceId,
+            parentSpanId: stepSpan.id,
+            type: SpanType.MODEL_INFERENCE,
+            output: {
+              text: call.text ?? '',
+              toolCalls: (call.toolCalls ?? []).map(tc => ({ toolCallId: tc.id, toolName: tc.name, args: tc.args })),
+            },
+            attributes: {
+              model: 'gpt-4o',
+              provider: 'openai',
+              usage,
+              tools: call.offered.map(name => ({ type: 'function', name })),
+            },
+          });
+          await exporter.exportTracingEvent({ type: TracingEventType.SPAN_STARTED, exportedSpan: inferenceSpan });
+          await exporter.exportTracingEvent({ type: TracingEventType.SPAN_ENDED, exportedSpan: inferenceSpan });
+          // Tools run in parallel; they end in array order but started at `startedAfter`.
+          const toolSpans = (call.toolCalls ?? []).map(tc =>
+            createSpan({
+              id: `tool-${tc.id}`,
+              traceId,
+              parentSpanId: stepSpan.id,
+              type: tc.provider ? SpanType.PROVIDER_TOOL_CALL : SpanType.TOOL_CALL,
+              name: `tool: '${tc.name}'`,
+              startTime: new Date(stepSpan.startTime.getTime() + tc.startedAfter),
+              input: tc.args,
+              output: tc.result,
+              ...(tc.error ? { errorInfo: { message: tc.error } } : {}),
+              attributes: {
+                toolCallId: tc.id,
+                ...(tc.provider?.success !== undefined ? { success: tc.provider.success } : {}),
+              },
+            }),
+          );
+          for (const toolSpan of toolSpans) {
+            await exporter.exportTracingEvent({ type: TracingEventType.SPAN_STARTED, exportedSpan: toolSpan });
+          }
+          for (const toolSpan of toolSpans) {
+            await exporter.exportTracingEvent({ type: TracingEventType.SPAN_ENDED, exportedSpan: toolSpan });
+          }
+          await exporter.exportTracingEvent({ type: TracingEventType.SPAN_ENDED, exportedSpan: stepSpan });
+        }
+        await exporter.exportTracingEvent({ type: TracingEventType.SPAN_ENDED, exportedSpan: generation });
+      }
+
+      const captured = (event: string) =>
+        mockCapture.mock.calls.map(([message]) => message).filter(message => message.event === event);
+
+      const systemAndUser = [
+        { role: 'system', content: [{ type: 'text', text: 'You are helpful' }] },
+        { role: 'user', content: [{ type: 'text', text: 'Weather in Paris and Rome?' }] },
+      ];
+
+      it('should export one $ai_generation per provider call with the tools sent on that call', async () => {
+        await exportGeneration([
+          { offered: ['a'], text: 'answer 0' },
+          { offered: ['hidden'], text: 'answer 1' },
+        ]);
+
+        const generations = captured('$ai_generation');
+        expect(generations.map(message => message.properties.$ai_generation_id)).toEqual([
+          'inference-0',
+          'inference-1',
+        ]);
+        expect(generations.map(message => message.properties.$ai_tools.map((tool: any) => tool.function.name))).toEqual(
+          [['a'], ['hidden']],
+        );
+        expect(generations[0].properties).toMatchObject({
+          $ai_model: 'gpt-4o',
+          $ai_provider: 'openai',
+          $ai_input_tokens: 10,
+          $ai_output_tokens: 5,
+          $ai_parent_id: 'step-0',
+          $ai_input: systemAndUser,
+          $ai_output_choices: [{ role: 'assistant', content: [{ type: 'text', text: 'answer 0' }] }],
+        });
+      });
+
+      it('should give each call the conversation it received, with full tool arguments and results', async () => {
+        await exportGeneration([
+          {
+            offered: ['weather'],
+            toolCalls: [
+              { id: 'call-1', name: 'weather', args: { city: 'Paris' }, result: { tempC: 21 }, startedAfter: 0 },
+            ],
+          },
+          {
+            offered: ['weather'],
+            toolCalls: [
+              { id: 'call-2', name: 'weather', args: { city: 'Rome' }, result: { tempC: 25 }, startedAfter: 0 },
+            ],
+          },
+          { offered: ['weather'], text: 'Paris is 21C, Rome is 25C.' },
+        ]);
+
+        const firstCallTurns = [
+          {
+            role: 'assistant',
+            content: [{ type: 'tool-call', id: 'call-1', function: { name: 'weather', arguments: { city: 'Paris' } } }],
+          },
+          {
+            role: 'tool',
+            content: [{ type: 'tool-result', toolCallId: 'call-1', toolName: 'weather', output: { tempC: 21 } }],
+          },
+        ];
+        const secondCallTurns = [
+          {
+            role: 'assistant',
+            content: [{ type: 'tool-call', id: 'call-2', function: { name: 'weather', arguments: { city: 'Rome' } } }],
+          },
+          {
+            role: 'tool',
+            content: [{ type: 'tool-result', toolCallId: 'call-2', toolName: 'weather', output: { tempC: 25 } }],
+          },
+        ];
+        expect(captured('$ai_generation').map(message => message.properties.$ai_input)).toEqual([
+          systemAndUser,
+          [...systemAndUser, ...firstCallTurns],
+          [...systemAndUser, ...firstCallTurns, ...secondCallTurns],
+        ]);
+      });
+
+      it('should order the results of parallel tool calls by when each tool started', async () => {
+        await exportGeneration([
+          {
+            offered: ['weather'],
+            toolCalls: [
+              { id: 'paris', name: 'weather', args: { city: 'Paris' }, result: { tempC: 21 }, startedAfter: 20 },
+              { id: 'rome', name: 'weather', args: { city: 'Rome' }, error: 'Rome is unavailable', startedAfter: 10 },
+            ],
+          },
+          { offered: ['weather'], text: 'Paris is 21C.' },
+        ]);
+
+        const secondInput = captured('$ai_generation')[1].properties.$ai_input;
+        expect(secondInput.slice(2)).toEqual([
+          {
+            role: 'assistant',
+            content: [
+              { type: 'tool-call', id: 'paris', function: { name: 'weather', arguments: { city: 'Paris' } } },
+              { type: 'tool-call', id: 'rome', function: { name: 'weather', arguments: { city: 'Rome' } } },
+            ],
+          },
+          {
+            role: 'tool',
+            content: [
+              {
+                type: 'tool-result',
+                toolCallId: 'rome',
+                toolName: 'weather',
+                output: 'Rome is unavailable',
+                isError: true,
+              },
+            ],
+          },
+          {
+            role: 'tool',
+            content: [{ type: 'tool-result', toolCallId: 'paris', toolName: 'weather', output: { tempC: 21 } }],
+          },
+        ]);
+      });
+
+      it('should include the results of provider-executed tools, marking failures as errors', async () => {
+        await exportGeneration([
+          {
+            offered: ['web_search'],
+            toolCalls: [
+              {
+                id: 'search-ok',
+                name: 'web_search',
+                args: { query: 'Paris weather' },
+                result: { results: ['21C'] },
+                provider: { success: true },
+                startedAfter: 0,
+              },
+              {
+                id: 'search-failed',
+                name: 'web_search',
+                args: { query: 'Rome weather' },
+                result: { error: 'rate limited' },
+                provider: { success: false },
+                startedAfter: 10,
+              },
+            ],
+          },
+          { offered: ['web_search'], text: 'Paris is 21C.' },
+        ]);
+
+        const secondInput = captured('$ai_generation')[1].properties.$ai_input;
+        expect(secondInput.slice(3)).toEqual([
+          {
+            role: 'tool',
+            content: [
+              {
+                type: 'tool-result',
+                toolCallId: 'search-ok',
+                toolName: 'web_search',
+                output: { results: ['21C'] },
+              },
+            ],
+          },
+          {
+            role: 'tool',
+            content: [
+              {
+                type: 'tool-result',
+                toolCallId: 'search-failed',
+                toolName: 'web_search',
+                output: { error: 'rate limited' },
+                isError: true,
+              },
+            ],
+          },
+        ]);
+      });
+
+      it('should skip provider-executed tool spans that ended without a result', async () => {
+        await exportGeneration([
+          {
+            offered: ['web_search'],
+            toolCalls: [
+              { id: 'search', name: 'web_search', args: { query: 'Paris weather' }, provider: {}, startedAfter: 0 },
+            ],
+          },
+          { offered: ['web_search'], text: 'No results.' },
+        ]);
+
+        const secondInput = captured('$ai_generation')[1].properties.$ai_input;
+        expect(secondInput.map((message: { role: string }) => message.role)).toEqual(['system', 'user', 'assistant']);
+      });
+
+      it('should export the wrapping MODEL_GENERATION as $ai_span that keeps the run usage', async () => {
+        await exportGeneration([
+          { offered: ['a'], text: 'answer 0' },
+          { offered: ['hidden'], text: 'answer 1' },
+        ]);
+
+        const generationSpan = captured('$ai_span').find(message => message.properties.$ai_span_id === 'generation');
+        expect(generationSpan).toBeDefined();
+        // PostHog only adds up $ai_input_tokens / $ai_output_tokens on $ai_generation events.
+        expect(generationSpan.properties.usage).toEqual({ inputTokens: 20, outputTokens: 10 });
+        expect(generationSpan.properties).not.toHaveProperty('$ai_input_tokens');
+        expect(generationSpan.properties).not.toHaveProperty('$ai_generation_id');
+      });
+
+      it('should keep MODEL_GENERATION as $ai_generation with an older @mastra/observability', async () => {
+        __setObservabilityFeaturesForTest(undefined);
+        const legacy = createSpan({
+          id: 'legacy-generation',
+          traceId,
+          parentSpanId: 'agent-run',
+          type: SpanType.MODEL_GENERATION,
+          attributes: { model: 'gpt-4o', provider: 'openai', usage },
+        });
+        await exportSpanLifecycle(exporter, legacy);
+
+        expect(captured('$ai_generation').map(message => message.properties.$ai_generation_id)).toEqual([
+          'legacy-generation',
+        ]);
+        expect(captured('$ai_generation')[0].properties).toMatchObject({ $ai_input_tokens: 10, $ai_output_tokens: 5 });
+      });
     });
 
     it('should map MODEL_STEP to $ai_span (non-root)', async () => {
@@ -408,6 +799,57 @@ describe('PosthogExporter', () => {
           ],
         },
       ]);
+    });
+
+    it('should map tool definitions to $ai_tools in OpenAI format', async () => {
+      const generation = createSpan({
+        type: SpanType.MODEL_GENERATION,
+        parentSpanId: 'parent-1',
+        attributes: {
+          model: 'gpt-4o',
+          provider: 'openai',
+          tools: [
+            {
+              type: 'function',
+              name: 'get_weather',
+              description: 'Get the weather for a city',
+              parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+            },
+            { type: 'provider-defined', name: 'web_search', id: 'anthropic.web_search_20250305' },
+          ],
+        },
+      });
+
+      await exportSpanLifecycle(exporter, generation);
+
+      const props = mockCapture.mock.calls[0][0].properties;
+      expect(props.$ai_tools).toEqual([
+        {
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            description: 'Get the weather for a city',
+            parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+          },
+        },
+        { type: 'provider-defined', name: 'web_search', id: 'anthropic.web_search_20250305' },
+      ]);
+    });
+
+    it.each([
+      ['absent', { model: 'gpt-4o', provider: 'openai' }],
+      ['empty', { model: 'gpt-4o', provider: 'openai', tools: [] }],
+    ])('should not set $ai_tools when tool definitions are %s', async (_case, attributes) => {
+      const generation = createSpan({
+        type: SpanType.MODEL_GENERATION,
+        parentSpanId: 'parent-1',
+        attributes,
+      });
+
+      await exportSpanLifecycle(exporter, generation);
+
+      const props = mockCapture.mock.calls[0][0].properties;
+      expect(props).not.toHaveProperty('$ai_tools');
     });
 
     it('should handle minimal LLM attributes gracefully with defaults', async () => {
@@ -1073,6 +1515,221 @@ describe('PosthogExporter', () => {
       expect(props).not.toHaveProperty('should-not-appear');
     });
   });
+
+  describe('Group Analytics', () => {
+    beforeEach(() => {
+      exporter = new TestPosthogExporter(validConfig);
+    });
+
+    it('should mirror metadata.$groups to top-level groups on child spans', async () => {
+      const child = createSpan({
+        type: SpanType.MODEL_GENERATION,
+        parentSpanId: 'parent-1',
+        metadata: { $groups: { publication: 'publication-1' } },
+      });
+
+      await exportSpanLifecycle(exporter, child);
+
+      expect(mockCapture).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: '$ai_generation',
+          groups: { publication: 'publication-1' },
+          properties: expect.objectContaining({ $groups: { publication: 'publication-1' } }),
+        }),
+      );
+    });
+
+    it('should mirror metadata.$groups to top-level groups on root spans ($ai_trace)', async () => {
+      const root = createSpan({
+        type: SpanType.AGENT_RUN,
+        isRootSpan: true,
+        metadata: { $groups: { publication: 'publication-1' } },
+      });
+
+      await exportSpanLifecycle(exporter, root);
+
+      expect(mockCapture).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: '$ai_trace',
+          groups: { publication: 'publication-1' },
+        }),
+      );
+    });
+
+    it('should mirror metadata.$groups to top-level groups on event spans', async () => {
+      const eventSpan = createSpan({
+        isEvent: true,
+        metadata: { $groups: { publication: 'publication-1' } },
+      });
+
+      await exporter.exportTracingEvent({
+        type: TracingEventType.SPAN_STARTED,
+        exportedSpan: eventSpan,
+      });
+
+      expect(mockCapture).toHaveBeenCalledWith(
+        expect.objectContaining({
+          groups: { publication: 'publication-1' },
+        }),
+      );
+    });
+
+    it('should not set top-level groups when metadata.$groups is absent', async () => {
+      const child = createSpan({
+        type: SpanType.MODEL_GENERATION,
+        parentSpanId: 'parent-1',
+        metadata: { userId: 'user-1' },
+      });
+
+      await exportSpanLifecycle(exporter, child);
+
+      expect(mockCapture.mock.calls[0][0]).not.toHaveProperty('groups');
+    });
+  });
+
+  describe('Feedback Events', () => {
+    beforeEach(() => {
+      exporter = new TestPosthogExporter(validConfig);
+    });
+
+    it('should emit $ai_feedback with full property mapping', async () => {
+      await exporter.onFeedbackEvent(
+        createFeedbackEvent({
+          traceId: 'trace-1',
+          spanId: 'span-1',
+          comment: 'wrong answer',
+          feedbackSource: 'user',
+          feedbackUserId: 'user-1',
+          sourceId: 'message-1',
+          metadata: { userId: 'meta-user', sessionId: 'session-1', environment: 'prod' },
+        }),
+      );
+
+      expect(mockCapture).toHaveBeenCalledWith({
+        distinctId: 'user-1',
+        event: '$ai_feedback',
+        properties: {
+          $ai_trace_id: 'trace-1',
+          $ai_feedback_text: 'wrong answer',
+          feedback_id: 'feedback-1',
+          feedback_type: 'thumbs',
+          feedback_value: 'down',
+          feedback_source: 'user',
+          span_id: 'span-1',
+          source_id: 'message-1',
+          $ai_session_id: 'session-1',
+          environment: 'prod',
+        },
+        timestamp: expect.any(Date),
+      });
+    });
+
+    it('should fall back to the stringified value when comment is absent', async () => {
+      await exporter.onFeedbackEvent(createFeedbackEvent({ feedbackType: 'rating', value: 4 }));
+
+      expect(mockCapture).toHaveBeenCalledWith(
+        expect.objectContaining({
+          properties: expect.objectContaining({ $ai_feedback_text: '4', feedback_value: 4 }),
+        }),
+      );
+    });
+
+    it('should drop feedback with no traceId', async () => {
+      await exporter.onFeedbackEvent(createFeedbackEvent({ traceId: undefined }));
+
+      expect(mockCapture).not.toHaveBeenCalled();
+    });
+
+    it('should resolve distinctId with feedbackUserId > userId > metadata.userId > defaultDistinctId > anonymous', async () => {
+      await exporter.onFeedbackEvent(
+        createFeedbackEvent({ feedbackUserId: 'primary', userId: 'legacy', metadata: { userId: 'meta' } }),
+      );
+      expect(mockCapture).toHaveBeenLastCalledWith(expect.objectContaining({ distinctId: 'primary' }));
+
+      await exporter.onFeedbackEvent(createFeedbackEvent({ userId: 'legacy', metadata: { userId: 'meta' } }));
+      expect(mockCapture).toHaveBeenLastCalledWith(expect.objectContaining({ distinctId: 'legacy' }));
+
+      await exporter.onFeedbackEvent(createFeedbackEvent({ metadata: { userId: 'meta' } }));
+      expect(mockCapture).toHaveBeenLastCalledWith(expect.objectContaining({ distinctId: 'meta' }));
+
+      await exporter.onFeedbackEvent(
+        createFeedbackEvent({ feedbackUserId: null, userId: 'legacy', metadata: { userId: 'meta' } }),
+      );
+      expect(mockCapture).toHaveBeenLastCalledWith(expect.objectContaining({ distinctId: 'anonymous' }));
+
+      await exporter.onFeedbackEvent(createFeedbackEvent());
+      expect(mockCapture).toHaveBeenLastCalledWith(expect.objectContaining({ distinctId: 'anonymous' }));
+    });
+
+    it('should use defaultDistinctId when feedback has no user', async () => {
+      exporter = new TestPosthogExporter({ ...validConfig, defaultDistinctId: 'default-user' });
+
+      await exporter.onFeedbackEvent(createFeedbackEvent());
+
+      expect(mockCapture).toHaveBeenCalledWith(expect.objectContaining({ distinctId: 'default-user' }));
+    });
+
+    it('should not capture when the exporter is disabled', async () => {
+      const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      exporter = new TestPosthogExporter({ apiKey: '' });
+      consoleSpy.mockRestore();
+
+      await exporter.onFeedbackEvent(createFeedbackEvent());
+
+      expect(mockCapture).not.toHaveBeenCalled();
+    });
+
+    it('should convert a serialized string timestamp to a Date', async () => {
+      await exporter.onFeedbackEvent(createFeedbackEvent({ timestamp: '2026-07-22T10:00:00.000Z' as unknown as Date }));
+
+      expect(mockCapture).toHaveBeenCalledWith(
+        expect.objectContaining({ timestamp: new Date('2026-07-22T10:00:00.000Z') }),
+      );
+    });
+
+    it('should mirror metadata.$groups to top-level groups', async () => {
+      await exporter.onFeedbackEvent(createFeedbackEvent({ metadata: { $groups: { publication: 'publication-1' } } }));
+
+      expect(mockCapture).toHaveBeenCalledWith(
+        expect.objectContaining({
+          groups: { publication: 'publication-1' },
+          properties: expect.objectContaining({ $groups: { publication: 'publication-1' } }),
+        }),
+      );
+    });
+
+    it('should not let custom metadata overwrite natively mapped properties', async () => {
+      await exporter.onFeedbackEvent(
+        createFeedbackEvent({
+          traceId: 'trace-1',
+          metadata: { $ai_trace_id: 'spoofed-trace', feedback_type: 'spoofed-type', environment: 'prod' },
+        }),
+      );
+
+      expect(mockCapture).toHaveBeenCalledWith(
+        expect.objectContaining({
+          properties: expect.objectContaining({
+            $ai_trace_id: 'trace-1',
+            feedback_type: 'thumbs',
+            environment: 'prod',
+          }),
+        }),
+      );
+    });
+
+    it('should log instead of throwing when capture fails', async () => {
+      const errorSpy = vi.spyOn(exporter['logger'], 'error');
+      mockCapture.mockImplementationOnce(() => {
+        throw new Error('capture failed');
+      });
+
+      await expect(exporter.onFeedbackEvent(createFeedbackEvent())).resolves.toBeUndefined();
+      expect(errorSpy).toHaveBeenCalledWith(
+        'PostHog exporter: failed to submit feedback',
+        expect.objectContaining({ error: expect.any(Error), feedbackId: 'feedback-1' }),
+      );
+    });
+  });
 });
 
 // --- Test Helper Functions ---
@@ -1097,6 +1754,23 @@ function createSpan(overrides: Partial<AnyExportedSpan> = {}): AnyExportedSpan {
     attributes: {},
     metadata: {},
     ...overrides,
+  };
+}
+
+/**
+ * Helper to create feedback events with defaults
+ */
+function createFeedbackEvent(overrides: Partial<ExportedFeedback> = {}): FeedbackEvent {
+  return {
+    type: 'feedback',
+    feedback: {
+      feedbackId: 'feedback-1',
+      timestamp: new Date(),
+      traceId: 'trace-1',
+      feedbackType: 'thumbs',
+      value: 'down',
+      ...overrides,
+    },
   };
 }
 

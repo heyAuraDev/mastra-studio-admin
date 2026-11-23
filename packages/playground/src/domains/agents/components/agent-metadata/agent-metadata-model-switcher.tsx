@@ -1,9 +1,19 @@
 import type { UpdateModelParams } from '@mastra/client-js';
-import { Notice, Button, Spinner } from '@mastra/playground-ui';
-import { RotateCcw } from 'lucide-react';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { Notice } from '@mastra/playground-ui/components/Notice';
+import { Spinner } from '@mastra/playground-ui/components/Spinner';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { cleanProviderId } from '@mastra/playground-ui/domains/llm';
+import { IconArrowRotateCounterClockwise } from '@mastra/playground-ui/icons/central/IconArrowRotateCounterClockwise';
+import { IconLock } from '@mastra/playground-ui/icons/central/IconLock';
+import { raisedSurfaceStyle } from '@mastra/playground-ui/primitives/raised-surface';
+import { cn } from '@mastra/playground-ui/utils/cn';
+import { useLLMProviders } from '@mastra/react/hooks/llm';
 import { useState, useEffect, useMemo } from 'react';
 import { useModelReset } from '../../context/model-reset-context';
-import { LLMProviders, LLMModels, useLLMProviders, cleanProviderId, findProviderById } from '@/domains/llm';
+import { useBuilderModelPolicy } from '@/domains/agent-builder';
+import { useAgentBuilderAllowedModels } from '@/domains/agent-builder/hooks/use-agent-builder-allowed-models';
+import { LLMProviders, LLMModels, findProviderById } from '@/domains/llm';
 
 export interface AgentMetadataModelSwitcherProps {
   defaultProvider: string;
@@ -31,6 +41,8 @@ export const AgentMetadataModelSwitcher = ({
   const [modelOpen, setModelOpen] = useState(false);
 
   const { data: dataProviders, isLoading: providersLoading } = useLLMProviders();
+  const policy = useBuilderModelPolicy();
+  const { models: allowedModels } = useAgentBuilderAllowedModels();
 
   const providers = useMemo(() => dataProviders?.providers || [], [dataProviders]);
 
@@ -54,11 +66,13 @@ export const AgentMetadataModelSwitcher = ({
       setLoading(true);
       try {
         const result = await updateModel({
-          provider: fullProviderId as UpdateModelParams['provider'],
+          provider: fullProviderId,
           modelId,
         });
         console.info('Model updated:', result);
       } catch (error) {
+        setSelectedModel(defaultModel);
+        setSelectedProvider(defaultProvider || '');
         console.error('Failed to update model:', error);
       } finally {
         setLoading(false);
@@ -103,7 +117,7 @@ export const AgentMetadataModelSwitcher = ({
         const fullOriginalProviderId = resolvedOriginalProvider?.id || originalProvider;
         if (fullOriginalProviderId && originalModel) {
           updateModel({
-            provider: fullOriginalProviderId as UpdateModelParams['provider'],
+            provider: fullOriginalProviderId,
             modelId: originalModel,
           }).catch(error => {
             console.error('Failed to reset model:', error);
@@ -134,7 +148,9 @@ export const AgentMetadataModelSwitcher = ({
     return (
       <div className="flex items-center gap-2">
         <Spinner />
-        <span className="text-sm text-gray-500">Loading providers...</span>
+        <Txt as="span" tone="muted">
+          Loading providers...
+        </Txt>
       </div>
     );
   }
@@ -161,9 +177,39 @@ export const AgentMetadataModelSwitcher = ({
 
   const currentProvider = findProviderById(providers, currentModelProvider);
 
+  // Admin locked the picker — surface a non-interactive chip instead.
+  if (policy.active && policy.pickerVisible === false) {
+    const lockedLabel =
+      policy.default && policy.default.provider && policy.default.modelId
+        ? `${policy.default.provider}/${policy.default.modelId}`
+        : selectedProvider && selectedModel
+          ? `${selectedProvider}/${selectedModel}`
+          : 'Locked by admin';
+    return (
+      <div
+        className={cn(raisedSurfaceStyle, 'flex items-center gap-2 rounded-md px-3 py-2')}
+        data-testid="agent-metadata-model-locked"
+      >
+        <IconLock className="size-icon-md shrink-0 text-muted-foreground" />
+        <Txt as="span" variant="caption" tone="ink" className="truncate">
+          {lockedLabel}
+        </Txt>
+        <Txt as="span" variant="meta" tone="muted" className="ml-auto shrink-0">
+          Set by admin
+        </Txt>
+      </div>
+    );
+  }
+
+  const stale =
+    Boolean(currentModelProvider && selectedModel) &&
+    policy.active &&
+    policy.allowed !== undefined &&
+    !allowedModels.some(m => cleanProviderId(m.provider) === currentModelProvider && m.model === selectedModel);
+
   return (
     <div className="@container">
-      <div className="flex flex-col @xs:flex-row items-stretch @xs:items-center gap-2 w-full">
+      <div className="flex w-full flex-col items-stretch gap-2 @xs:flex-row @xs:items-center">
         <div className="w-full @xs:w-2/5">
           <LLMProviders
             value={currentModelProvider}
@@ -185,23 +231,35 @@ export const AgentMetadataModelSwitcher = ({
 
         <Button
           variant="default"
-          size="md"
+          size="icon-md"
           onClick={handleReset}
           disabled={loading}
-          className="flex items-center gap-1.5 text-xs whitespace-nowrap border-0!"
-          title="Reset to original model"
+          tooltip="Reset to original model"
         >
-          <RotateCcw className="w-3.5 h-3.5" />
+          <IconArrowRotateCounterClockwise />
         </Button>
       </div>
 
+      {stale && (
+        <div className="p-2 pt-2" data-testid="agent-metadata-model-stale-warning">
+          <Notice variant="warning" title="Model not allowed">
+            <Notice.Message>
+              <code className="rounded bg-fill-hover px-1 py-0.5">
+                {selectedProvider}/{selectedModel}
+              </code>{' '}
+              is no longer allowed by the admin policy. Pick a different model to save changes.
+            </Notice.Message>
+          </Notice>
+        </div>
+      )}
+
       {/* Show warning if selected provider is not connected */}
       {currentProvider && !currentProvider.connected && (
-        <div className="pt-2 p-2">
+        <div className="p-2 pt-2">
           <Notice variant="warning" title="Provider not connected">
             <Notice.Message>
               Set the{' '}
-              <code className="px-1 py-0.5 bg-yellow-100 dark:bg-yellow-900/50 rounded">
+              <code className="rounded bg-fill-hover px-1 py-0.5">
                 {Array.isArray(currentProvider.envVar) ? currentProvider.envVar.join(', ') : currentProvider.envVar}
               </code>{' '}
               environment{' '}

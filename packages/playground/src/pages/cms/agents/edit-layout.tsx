@@ -1,17 +1,35 @@
-import { Notice, Badge, Button, MainContentLayout, Spinner } from '@mastra/playground-ui';
-import { Check, Save } from 'lucide-react';
+import type { AgentVersionResponse, GetAgentResponse } from '@mastra/client-js';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { EmptyState } from '@mastra/playground-ui/components/EmptyState';
+import { Notice } from '@mastra/playground-ui/components/Notice';
+import { PageLayout } from '@mastra/playground-ui/components/PageLayout';
+import { Spinner } from '@mastra/playground-ui/components/Spinner';
+import { useEntityRequestContext } from '@mastra/playground-ui/domains/request-context/hooks/use-entity-request-context';
+import { IconArrowInbox } from '@mastra/playground-ui/icons/central/IconArrowInbox';
+import { IconCheckmark2Medium } from '@mastra/playground-ui/icons/central/IconCheckmark2Medium';
+import { IconEyeOpen } from '@mastra/playground-ui/icons/central/IconEyeOpen';
+import { IconFloppyDisk1 } from '@mastra/playground-ui/icons/central/IconFloppyDisk1';
+import { IconPullRequest } from '@mastra/playground-ui/icons/central/IconPullRequest';
+import { IconRocket } from '@mastra/playground-ui/icons/central/IconRocket';
+import { useLinkComponent } from '@mastra/playground-ui/lib/framework';
+import { useAgent, useAgentVersion, useAgentVersions, useStoredAgent } from '@mastra/react/hooks/agents';
 import { useCallback, useEffect, useMemo } from 'react';
 import { Outlet, useLocation, useNavigate, useParams, useSearchParams } from 'react-router';
+import { PageBreadcrumbs } from '@/components/ui/page-breadcrumbs';
 import { AgentCmsFormShell } from '@/domains/agents/components/agent-cms-form-shell';
+import { getCodeAgentOverrideSections } from '@/domains/agents/components/agent-cms-sidebar/agent-cms-sections';
 import { AgentVersionPanel } from '@/domains/agents/components/agent-version-panel';
-import { useAgent } from '@/domains/agents/hooks/use-agent';
 import { useAgentCmsForm } from '@/domains/agents/hooks/use-agent-cms-form';
-import { useAgentVersion, useAgentVersions } from '@/domains/agents/hooks/use-agent-versions';
-import { useStoredAgent } from '@/domains/agents/hooks/use-stored-agents';
+import { isCodeBackedAgent } from '@/domains/agents/utils/agent-source';
 import { mapAgentResponseToDataSource } from '@/domains/agents/utils/compute-agent-initial-values';
 import type { AgentDataSource } from '@/domains/agents/utils/compute-agent-initial-values';
-import { useLinkComponent } from '@/lib/framework';
-import { RouteHeaderActions } from '@/lib/route-header';
+import { getEditorOwnership } from '@/domains/agents/utils/editor-ownership';
+import { CmsEditHeaderActions } from '@/domains/cms/components/cms-edit-header-actions';
+import { useEditorSource } from '@/domains/configuration/hooks/use-editor-source';
+import { agentCrumb, navCrumb } from '@/domains/navigation/crumbs';
+import { useMastraPlatform } from '@/lib/mastra-platform/hooks/use-mastra-platform';
+
+const crumbs = [navCrumb('/agents'), agentCrumb];
 
 function EditFormContent({
   agentId,
@@ -28,10 +46,12 @@ function EditFormContent({
   latestVersionId,
   hideVersionPanel = false,
   isCodeAgentOverride = false,
+  isCodeSourceAgent = false,
+  editorConfig,
 }: {
   agentId: string;
   selectedVersionId: string | null;
-  versionData?: ReturnType<typeof useAgentVersion>['data'];
+  versionData?: AgentVersionResponse;
   readOnly?: boolean;
   form: ReturnType<typeof useAgentCmsForm>['form'];
   handlePublish: ReturnType<typeof useAgentCmsForm>['handlePublish'];
@@ -43,6 +63,8 @@ function EditFormContent({
   latestVersionId?: string;
   hideVersionPanel?: boolean;
   isCodeAgentOverride?: boolean;
+  isCodeSourceAgent?: boolean;
+  editorConfig?: NonNullable<GetAgentResponse>['editor'];
 }) {
   const [, setSearchParams] = useSearchParams();
   const { pathname } = useLocation();
@@ -54,17 +76,18 @@ function EditFormContent({
     <Notice variant="info" title="This is a previous version" className="mb-4">
       <Notice.Message>You are seeing a specific version of the agent.</Notice.Message>
       <div className="flex items-center gap-2">
-        <Button type="button" variant="default" size="sm" onClick={() => setSearchParams({})}>
+        <Button icon={<IconEyeOpen />} type="button" variant="default" size="sm" onClick={() => setSearchParams({})}>
           View latest version
         </Button>
         <Button
+          icon={<IconRocket />}
           type="button"
           variant="default"
           size="sm"
           onClick={() => void handlePublish(selectedVersionId ?? undefined)}
           disabled={selectedVersionId === activeVersionId}
         >
-          Publish This Version
+          Publish this version
         </Button>
       </div>
     </Notice>
@@ -78,6 +101,7 @@ function EditFormContent({
       activeVersionId={activeVersionId}
     />
   );
+  const isEditorLocked = getEditorOwnership(isCodeAgentOverride, editorConfig).isFullyLocked;
 
   return (
     <AgentCmsFormShell
@@ -90,13 +114,23 @@ function EditFormContent({
       handleSaveDraft={handleSaveDraft}
       readOnly={readOnly}
       isCodeAgentOverride={isCodeAgentOverride}
+      isCodeSourceAgent={isCodeSourceAgent}
+      editorConfig={editorConfig}
       basePath={`/cms/agents/${agentId}/edit`}
       currentPath={pathname}
       banner={banner}
       versionId={selectedVersionId ?? undefined}
       rightPanel={rightPanel}
     >
-      <Outlet />
+      {isEditorLocked ? (
+        <div className="p-4">
+          <Notice variant="info" title="Editing disabled">
+            <Notice.Message>This code-defined agent has disabled Studio editing.</Notice.Message>
+          </Notice>
+        </div>
+      ) : (
+        <Outlet />
+      )}
     </AgentCmsFormShell>
   );
 }
@@ -108,42 +142,66 @@ function EditLayoutWrapper() {
   const { hash, pathname, search } = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const selectedVersionId = searchParams.get('versionId');
+  const { isMastraPlatform, mastraPlatformApiEndpoint, mastraPlatformProjectId } = useMastraPlatform();
 
   // Fetch the code/merged agent (GET /agents/:id) to determine source
-  const { data: codeAgent, isLoading: isLoadingCodeAgent } = useAgent(agentId);
+  const { data: codeAgent, isLoading: isLoadingCodeAgent } = useAgent({
+    agentId: agentId,
+    requestContext: useEntityRequestContext('agent', agentId!)[0],
+    queryOptions: { enabled: Boolean(agentId) },
+  });
 
   // Fetch versions first — this endpoint returns an empty array for code-only agents
   const { data: versionsData } = useAgentVersions({
-    agentId: agentId ?? '',
+    agentId,
     params: { orderBy: { direction: 'DESC' } },
+    queryOptions: { enabled: Boolean(agentId) },
   });
 
   // Only fetch stored agent details when versions exist (avoids 404 for code-only agents)
   const hasVersions = (versionsData?.versions?.length ?? 0) > 0;
-  const { data: storedAgent, isLoading: isLoadingStoredAgent } = useStoredAgent(agentId, {
+  const { data: storedAgent, isLoading: isLoadingStoredAgent } = useStoredAgent({
+    agentId: agentId,
     status: 'draft',
-    enabled: hasVersions,
+    queryOptions: { enabled: Boolean(agentId) && hasVersions },
   });
 
-  // A code agent override is when the underlying agent is code-defined,
+  // A code agent override is when the underlying agent is defined in code or in an agent folder,
   // regardless of whether a stored override record already exists
-  const isCodeAgentOverride = codeAgent?.source === 'code';
+  const isCodeAgentOverride = isCodeBackedAgent(codeAgent);
+  const codeAgentOverrideSections = useMemo(
+    () => (isCodeAgentOverride ? getCodeAgentOverrideSections(codeAgent?.editor) : []),
+    [codeAgent?.editor, isCodeAgentOverride],
+  );
   const agent = storedAgent ?? null;
   const isLoading = isLoadingCodeAgent || (hasVersions && isLoadingStoredAgent);
 
-  // Redirect code agent overrides from the Identity page to Instructions
+  // Redirect code agent overrides away from non-editable sections.
   const basePath = `/cms/agents/${agentId}/edit`;
   const isOnIdentityPage = pathname === basePath || pathname === `${basePath}/`;
   useEffect(() => {
-    if (isCodeAgentOverride && isOnIdentityPage) {
+    if (!isCodeAgentOverride || codeAgentOverrideSections.length === 0) return;
+
+    const isAllowedPath = codeAgentOverrideSections.some(section => pathname === `${basePath}${section.pathSuffix}`);
+    if (isOnIdentityPage || !isAllowedPath) {
       // eslint-disable-next-line @typescript-eslint/no-floating-promises
-      routerNavigate(`${basePath}/instruction-blocks${search}${hash}`, { replace: true });
+      routerNavigate(`${basePath}${codeAgentOverrideSections[0].pathSuffix}${search}${hash}`, { replace: true });
     }
-  }, [isCodeAgentOverride, isOnIdentityPage, routerNavigate, basePath, search, hash]);
+  }, [
+    codeAgentOverrideSections,
+    isCodeAgentOverride,
+    isOnIdentityPage,
+    pathname,
+    routerNavigate,
+    basePath,
+    search,
+    hash,
+  ]);
 
   const { data: versionData } = useAgentVersion({
     agentId: agentId ?? '',
     versionId: selectedVersionId ?? '',
+    queryOptions: { enabled: !!agentId && !!selectedVersionId },
   });
 
   const activeVersionId = agent?.activeVersionId;
@@ -156,15 +214,25 @@ function EditLayoutWrapper() {
     if (isViewingVersion && versionData) return versionData;
     if (agent) return agent;
     if (codeAgent) return mapAgentResponseToDataSource(codeAgent);
-    return {} as AgentDataSource;
+    return {};
   }, [isViewingVersion, versionData, agent, codeAgent]);
 
-  const { form, handlePublish, handleSaveDraft, isSubmitting, isSavingDraft, isDirty } = useAgentCmsForm({
+  const {
+    form,
+    handlePublish,
+    handleSaveDraft,
+    handleDownloadJson,
+    handleOpenPr,
+    isSubmitting,
+    isSavingDraft,
+    isDirty,
+  } = useAgentCmsForm({
     mode: 'edit',
     agentId: agentId ?? '',
     dataSource,
     isCodeAgentOverride,
     hasStoredOverride: isCodeAgentOverride && !!storedAgent,
+    editorConfig: codeAgent?.editor,
     onSuccess: id => navigate(paths.agentLink(id)),
   });
 
@@ -189,54 +257,99 @@ function EditLayoutWrapper() {
 
   const isNotFound = !isLoading && !agent && !codeAgent;
   const isReady = !isLoading && !!agentId && (!!agent || !!codeAgent);
+  const isCodeAgentEditable = !getEditorOwnership(isCodeAgentOverride, codeAgent?.editor).isFullyLocked;
+  const editorSource = useEditorSource();
+  const showCodeModeActions = isCodeAgentOverride && editorSource === 'code';
+  const canOpenPr = isCodeAgentEditable && isMastraPlatform && !!mastraPlatformApiEndpoint && !!mastraPlatformProjectId;
+  const openPrTitle = canOpenPr
+    ? 'Open a pull request with this agent override JSON'
+    : 'Open PR is available on Mastra-hosted projects with GitHub App support';
 
-  return (
-    <MainContentLayout>
-      {isReady && (
-        <RouteHeaderActions owner="cms-agent-edit">
-          <div className="flex items-center gap-2">
-            {hasDraft && <Badge variant="info">Unpublished changes</Badge>}
-            <Button onClick={() => void handleSaveDraft()} disabled={!isDirty || isSavingDraft || isSubmitting}>
-              {isSavingDraft ? (
-                <>
-                  <Spinner className="h-4 w-4" />
-                  Saving...
-                </>
-              ) : (
-                <>
-                  <Save />
-                  Save
-                </>
-              )}
+  const actions = isReady && (
+    <CmsEditHeaderActions hasDraft={hasDraft}>
+      {showCodeModeActions ? (
+        isCodeAgentEditable ? (
+          <>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void handleDownloadJson()}
+              disabled={isSavingDraft || isSubmitting}
+              icon={<IconArrowInbox />}
+            >
+              Download JSON
             </Button>
             <Button
               variant="primary"
-              onClick={() => void handlePublishVersion()}
-              disabled={
-                isViewingPreviousVersion
-                  ? selectedVersionId === activeVersionId || isSubmitting || isSavingDraft
-                  : !hasDraft || isSubmitting || isSavingDraft
-              }
+              size="sm"
+              disabled={!canOpenPr || isSavingDraft || isSubmitting}
+              title={openPrTitle}
+              onClick={() => {
+                if (!mastraPlatformApiEndpoint || !mastraPlatformProjectId) return;
+                void handleOpenPr({
+                  platformApiEndpoint: mastraPlatformApiEndpoint,
+                  projectId: mastraPlatformProjectId,
+                });
+              }}
             >
-              {isSubmitting ? (
-                <>
-                  <Spinner className="h-4 w-4" />
-                  Publishing...
-                </>
-              ) : (
-                <>
-                  <Check />
-                  {isViewingPreviousVersion ? 'Publish This Version' : 'Publish'}
-                </>
-              )}
+              <IconPullRequest />
+              Open PR
             </Button>
-          </div>
-        </RouteHeaderActions>
+          </>
+        ) : null
+      ) : !isCodeAgentEditable ? null : (
+        <>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void handleSaveDraft()}
+            disabled={!isDirty || isSavingDraft || isSubmitting}
+          >
+            {isSavingDraft ? (
+              <>
+                <Spinner className="h-4 w-4" />
+                Saving...
+              </>
+            ) : (
+              <>
+                <IconFloppyDisk1 />
+                Save
+              </>
+            )}
+          </Button>
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={() => void handlePublishVersion()}
+            disabled={
+              isViewingPreviousVersion
+                ? selectedVersionId === activeVersionId || isSubmitting || isSavingDraft
+                : !hasDraft || isSubmitting || isSavingDraft
+            }
+          >
+            {isSubmitting ? (
+              <>
+                <Spinner className="h-4 w-4" />
+                Publishing...
+              </>
+            ) : (
+              <>
+                <IconCheckmark2Medium />
+                {isViewingPreviousVersion ? 'Publish this version' : 'Publish'}
+              </>
+            )}
+          </Button>
+        </>
       )}
+    </CmsEditHeaderActions>
+  );
 
+  return (
+    <PageLayout variant="page" body="fixed" breadcrumbs={<PageBreadcrumbs crumbs={crumbs} />} headerActions={actions}>
+      <h1 className="sr-only">{agentId}</h1>
       {isNotFound ? (
         <>
-          <div className="flex items-center justify-center h-full text-neutral3">Agent not found</div>
+          <EmptyState variant="fill" titleSlot="Agent not found" />
           <div className="hidden">
             <EditFormContent
               agentId={agentId ?? ''}
@@ -251,6 +364,7 @@ function EditLayoutWrapper() {
               onVersionSelect={handleVersionSelect}
               activeVersionId={activeVersionId}
               latestVersionId={latestVersion?.id}
+              editorConfig={undefined}
             />
           </div>
         </>
@@ -259,6 +373,7 @@ function EditLayoutWrapper() {
           agentId={agentId ?? ''}
           selectedVersionId={selectedVersionId}
           versionData={versionData}
+          readOnly={!isCodeAgentEditable}
           form={form}
           handlePublish={handlePublish}
           handleSaveDraft={handleSaveDraft}
@@ -269,9 +384,11 @@ function EditLayoutWrapper() {
           latestVersionId={latestVersion?.id}
           hideVersionPanel={isCodeAgentOverride && !storedAgent}
           isCodeAgentOverride={isCodeAgentOverride}
+          isCodeSourceAgent={showCodeModeActions}
+          editorConfig={codeAgent?.editor}
         />
       )}
-    </MainContentLayout>
+    </PageLayout>
   );
 }
 

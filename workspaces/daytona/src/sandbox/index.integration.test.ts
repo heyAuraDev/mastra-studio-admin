@@ -11,7 +11,7 @@
  * - GCS_SERVICE_ACCOUNT_KEY, TEST_GCS_BUCKET: For GCS mount tests
  */
 
-import { Daytona } from '@daytonaio/sdk';
+import { Daytona } from '@daytona/sdk';
 import { createSandboxTestSuite } from '@internal/workspace-test-utils';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
@@ -831,6 +831,67 @@ describe.skipIf(!process.env.DAYTONA_API_KEY || !hasS3Credentials)('DaytonaSandb
 
     await sandbox2.executeCommand('rm', [testFile]);
     await sandbox2._destroy();
+  }, 300000);
+});
+
+/**
+ * Computer-use (desktop) smoke tests.
+ *
+ * Verifies the `computer` capability against a real Daytona sandbox:
+ * desktop processes start lazily, screenshots return PNG bytes, mouse input
+ * reaches the desktop, and the noVNC live view URL resolves.
+ */
+describe.skipIf(!process.env.DAYTONA_API_KEY)('DaytonaSandbox Computer Use', () => {
+  let sandbox: DaytonaSandbox;
+
+  beforeEach(() => {
+    sandbox = new DaytonaSandbox({
+      id: `test-computer-${Date.now()}`,
+      timeout: 60000,
+      computerUse: true,
+    });
+  });
+
+  afterEach(async () => {
+    if (sandbox) {
+      try {
+        await sandbox._destroy();
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+  });
+
+  it('captures a PNG screenshot and reports screen geometry', async () => {
+    await sandbox._start();
+
+    const shot = await sandbox.computer!.screenshot();
+    expect(shot.mediaType).toBe('image/png');
+    // PNG magic bytes: \x89 P N G
+    expect(Array.from(shot.data.slice(0, 4))).toEqual([0x89, 0x50, 0x4e, 0x47]);
+
+    const size = await sandbox.computer!.getScreenSize();
+    expect(size.width).toBeGreaterThan(0);
+    expect(size.height).toBeGreaterThan(0);
+  }, 300000);
+
+  it('mouse input reaches the desktop (move → cursor position round-trip)', async () => {
+    await sandbox._start();
+
+    await sandbox.computer!.moveMouse(101, 102);
+    const position = await sandbox.computer!.getCursorPosition();
+
+    expect(position.x).toBe(101);
+    expect(position.y).toBe(102);
+  }, 300000);
+
+  it('streamUrl resolves a live noVNC viewer URL', async () => {
+    await sandbox._start();
+
+    const url = await sandbox.computer!.streamUrl!();
+
+    expect(url).toBeTruthy();
+    expect(url).toMatch(/^https?:\/\//);
   }, 300000);
 });
 

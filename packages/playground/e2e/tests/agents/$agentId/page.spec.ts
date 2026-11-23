@@ -1,72 +1,103 @@
 import { test, expect } from '@playwright/test';
 import { resetStorage } from '../../__utils__/reset-storage';
-import { expectRouteDocsLink } from '../../__utils__/route-header';
 
-test.afterEach(async () => {
-  await resetStorage();
-});
+test.describe('Agent detail page', () => {
+  test.afterEach(async () => {
+    await resetStorage();
+  });
 
-test('overall layout information', async ({ page }) => {
-  await page.goto('/agents/weather-agent/chat/1234');
-
-  // Header
-  await expect(page).toHaveTitle(/Mastra Studio/);
-  await expectRouteDocsLink(page, 'Agents documentation', 'https://mastra.ai/en/docs/agents/overview');
-  const breadcrumb = page.locator('header>nav');
-  expect(breadcrumb).toMatchAriaSnapshot();
-
-  // Thread history (with memory)
-  const newChatButton = await page.locator('a:has-text("New Chat")');
-  await expect(newChatButton).toBeVisible();
-  await expect(newChatButton).toHaveAttribute('href', /agents\/weather-agent\/chat\/.*/);
-  await expect(page.locator('text=Your conversations will appear here once you start chatting!')).toBeVisible();
-
-  // Information side panel
-  await expect(page.locator('h2:has-text("Weather Agent")')).toBeVisible();
-  await expect(page.locator('button:has-text("weather-agent")')).toBeVisible();
-  const overviewPane = await page.locator('button:has-text("Overview")');
-  await expect(overviewPane).toHaveAttribute('aria-selected', 'true');
-  const modelSettingsPane = await page.locator('button:has-text("Model Settings")');
-  await expect(modelSettingsPane).toHaveAttribute('aria-selected', 'false');
-  const memoryPane = await page.locator('button:has-text("Memory")');
-  await expect(memoryPane).toHaveAttribute('aria-selected', 'false');
-});
-
-test.describe('agent panels', () => {
-  test.describe('overview', () => {
-    test('general information', async ({ page }) => {
+  test.describe('when an agent chat page is visited', () => {
+    test('renders the layout, thread history, and links through to agent settings', async ({ page }) => {
       await page.goto('/agents/weather-agent/chat/1234');
-      const overview = await page.getByLabel('Overview');
-      await expect(overview).toBeVisible();
-      await expect(overview).toMatchAriaSnapshot();
+
+      await expect(page).toHaveTitle(/Mastra Studio/);
+
+      // Thread history: either stored threads or the empty state on a fresh database
+      const emptyHistory = page.getByText('Your conversations will appear here');
+      await expect(page.getByTestId('thread-list').or(emptyHistory)).toBeAttached();
+      // With no threads yet the panel folds itself away; open it to reach New Thread.
+      if (await emptyHistory.count()) await page.getByRole('button', { name: 'Expand panel' }).click();
+
+      // Thread sidebar
+      const newChatButton = page.locator('a:has-text("New Thread")');
+      await expect(newChatButton).toBeVisible();
+      await expect(newChatButton).toHaveAttribute('href', /agents\/weather-agent\/threads\/.*/);
+
+      // The overview lives in a side panel toggled from the route header (starts collapsed)
+      await expect(page.getByRole('link', { name: 'Chat' })).toHaveAttribute('aria-current', 'page');
+      await page.getByTestId('agent-overview-panel-toggle').click();
+      await expect(page.getByTestId('agent-overview-panel')).toBeVisible();
+      await expect(page.getByRole('heading', { name: /^Tools/ })).toBeVisible({ timeout: 10000 });
+      await expect(page.getByRole('link', { name: 'weatherInfo' })).toHaveAttribute(
+        'href',
+        // The chip opens the tool drawer over the agent page you're on.
+        /\/agents\/weather-agent\/threads\/[^/?]+\?tool=weatherInfo$/,
+      );
     });
   });
 
-  test.describe('model settings', () => {
+  test.describe('when the legacy settings URL is visited', () => {
+    test('redirects to chat and the overview panel toggles with the ] shortcut', async ({ page }) => {
+      await page.goto('/agents/weather-agent/settings');
+
+      await expect(page).toHaveURL(/\/agents\/weather-agent\/threads\/new$/);
+      // The shortcut is bound by the agent page; wait for its header toggle before pressing.
+      await expect(page.getByTestId('agent-overview-panel-toggle')).toBeVisible();
+      const overview = page.getByTestId('agent-overview-panel');
+      await expect(overview).not.toBeVisible();
+
+      // The composer auto-focuses and swallows `]` as text, so move focus out of it first.
+      const composer = page.getByPlaceholder('Enter your message');
+      await expect(composer).toBeFocused();
+      await composer.blur();
+
+      await page.keyboard.press(']');
+      await expect(overview).toBeVisible();
+      await expect(page.getByRole('heading', { name: 'System Prompt' })).toBeVisible({ timeout: 10000 });
+      await expect(overview).toMatchAriaSnapshot();
+
+      await page.keyboard.press(']');
+      await expect(overview).not.toBeVisible();
+    });
+  });
+
+  test.describe('when the composer model settings popover is opened', () => {
     test.beforeEach(async ({ page }) => {
       await page.goto('/agents/weather-agent/chat/new');
-      await page.click('text=Model settings');
+      await page.getByTestId('composer-model-settings-trigger').click();
     });
 
-    test('model trigger modes', async ({ page }) => {
+    test('shows the available model trigger modes with stream subscription as default', async ({ page }) => {
       const generateRadio = page.getByRole('radio', { name: 'Generate' });
-      await page.click('text=Model settings');
 
       await expect(generateRadio).toBeVisible();
       await expect(generateRadio).toHaveAttribute('aria-checked', 'false');
-      const streamRadio = page.getByRole('radio', { name: 'Stream' });
+      const streamSubscriptionRadio = page.getByRole('radio', { name: 'Stream subscription (default)' });
+      await expect(streamSubscriptionRadio).toBeVisible();
+      await expect(streamSubscriptionRadio).toHaveAttribute('aria-checked', 'true');
+
+      const streamRadio = page.getByRole('radio', { name: 'Stream', exact: true });
       await expect(streamRadio).toBeVisible();
-      await expect(streamRadio).toHaveAttribute('aria-checked', 'true');
+      await expect(streamRadio).toHaveAttribute('aria-checked', 'false');
 
       const networkRadio = page.getByRole('radio', { name: 'Network' });
       await expect(networkRadio).toBeVisible();
     });
 
-    test('verfied persistent model settings', async ({ page }) => {
+    test('persists model settings across a reload', async ({ page }) => {
+      // Reload the same saved chat: /threads/new creates a fresh identity on each visit.
+      const threadId = 'model-settings-reload';
+      const response = await page.request.post('/api/memory/threads?agentId=weather-agent', {
+        data: { threadId, resourceId: 'weather-agent', title: 'Model settings reload' },
+      });
+      expect(response.ok()).toBeTruthy();
+      await page.goto(`/agents/weather-agent/threads/${threadId}`);
+      await page.getByTestId('composer-model-settings-trigger').click();
+
       // Arrange
-      await page.isVisible('text=Chat Method');
+      await expect(page.getByText('Chat Method', { exact: true })).toBeVisible();
       await page.click('text=Generate');
-      await page.click('text=Advanced Settings');
+      await page.click('text=Advanced settings');
       await page.getByLabel('Top K').fill('9');
       await page.getByLabel('Frequency Penalty').fill('0.7');
       await page.getByLabel('Presence Penalty').fill('0.6');
@@ -76,8 +107,8 @@ test.describe('agent panels', () => {
 
       // Act
       await page.reload();
-      await page.click('text=Model settings');
-      await page.click('text=Advanced Settings');
+      await page.getByTestId('composer-model-settings-trigger').click();
+      await page.click('text=Advanced settings');
 
       // Assert
       await expect(page.getByLabel('Top K')).toHaveValue('9');
@@ -88,11 +119,11 @@ test.describe('agent panels', () => {
       await expect(page.getByLabel('Max Retries')).toHaveValue('2');
     });
 
-    test('resets the form values when pressing "reset" button', async ({ page }) => {
+    test('resets the form values when pressing the "reset" button', async ({ page }) => {
       // Arrange
       await page.isVisible('text=Chat Method');
       await page.click('text=Generate');
-      await page.click('text=Advanced Settings');
+      await page.click('text=Advanced settings');
       await page.getByLabel('Top K').fill('9');
       await page.getByLabel('Frequency Penalty').fill('0.7');
       await page.getByLabel('Presence Penalty').fill('0.6');
@@ -100,15 +131,21 @@ test.describe('agent panels', () => {
       await page.getByLabel('Max Steps').fill('3');
       await page.getByLabel('Max Retries').fill('2');
 
+      // Close the Advanced settings dialog before clicking Reset (Reset lives in the composer popover)
+      await page.keyboard.press('Escape');
+
       // Act
       await page.click('text=Reset');
 
-      // Assert - values reset to defaults (maxSteps: 5, maxRetries: 2 are fallback defaults)
+      // Reopen Advanced settings to inspect the reset field values
+      await page.click('text=Advanced settings');
+
+      // Assert - values reset to defaults (maxSteps: 15, maxRetries: 2 are fallback defaults)
       await expect(page.getByLabel('Top K')).toHaveValue('');
       await expect(page.getByLabel('Frequency Penalty')).toHaveValue('');
       await expect(page.getByLabel('Presence Penalty')).toHaveValue('');
       await expect(page.getByLabel('Max Tokens')).toHaveValue('');
-      await expect(page.getByLabel('Max Steps')).toHaveValue('5');
+      await expect(page.getByLabel('Max Steps')).toHaveValue('15');
       await expect(page.getByLabel('Max Retries')).toHaveValue('2');
     });
   });

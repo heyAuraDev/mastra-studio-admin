@@ -1,0 +1,245 @@
+# MastraCode web host
+
+`mastracode/web` wires environment-specific storage, authentication, integrations, event bus, and sandboxes into [`@mastra/factory`](../factory/README.md). React code belongs in [`factory-ui`](../factory-ui/README.md).
+
+This is a separate pnpm project with its own lockfile and `link:` dependencies to monorepo packages.
+
+## Setup
+
+From the repository root:
+
+```shell
+pnpm install
+pnpm --dir mastracode/web install
+pnpm factory:build
+```
+
+`factory:build` runs this package's `prebuild`, which builds the linked monorepo packages required by the host. `pnpm factory:dev` doesn't build them, so run `pnpm factory:build` again after pulling changes to those packages.
+
+## Development
+
+### Guided setup
+
+From the repository root, run the guided setup for Factory development:
+
+```shell
+pnpm factory:dev
+```
+
+On the first run, the setup prompts you to:
+
+1. Sign in to Mastra and select an organization, project, and environment.
+2. Select local LibSQL, local PostgreSQL, or a platform-managed PostgreSQL database.
+3. Select a local or platform sandbox.
+
+Selecting local PostgreSQL starts the Docker services. Docker isn't required for LibSQL or a platform-managed database.
+
+The setup stores non-secret selections in `.factory/settings.json`. It writes resolved runtime values, including an organization-scoped platform key, to `mastracode/web/.env`. Both files are ignored by Git. Later runs reuse this configuration and start the API on port `4111` and the Vite UI on port `5173`.
+
+To select different resources, delete `.factory/settings.json` and run `pnpm factory:dev` again. The setup replaces the environment values it manages and preserves unrelated values in `mastracode/web/.env`.
+
+The linked monorepo packages must already be built. Run the commands under [Setup](#setup) first after a fresh checkout.
+
+### Configure local onboarding manually
+
+Create a [GitHub App](https://github.com/settings/apps/new) with URLs matching the mode you will run:
+
+| Setting      | Integrated mode                              | Split UI mode                                |
+| ------------ | -------------------------------------------- | -------------------------------------------- |
+| Homepage URL | `http://localhost:5873`                      | `http://localhost:5173`                      |
+| Callback URL | `http://localhost:5873/auth/github/callback` | `http://localhost:5173/auth/github/callback` |
+| Setup URL    | `http://localhost:5873/auth/github/callback` | `http://localhost:5173/auth/github/callback` |
+
+Do not mix modes. Nothing runs on port `5173` in integrated mode.
+
+Configure the app:
+
+1. Grant **Contents**, **Issues**, and **Pull requests** read/write access and **Metadata** read-only access.
+2. Clear **Webhook → Active** for local development.
+3. Generate a client secret and private key.
+4. Add these values to `mastracode/web/.env`:
+
+```dotenv
+GITHUB_APP_ID=
+GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"
+GITHUB_APP_CLIENT_ID=
+GITHUB_APP_CLIENT_SECRET=
+GITHUB_APP_SLUG=
+GITHUB_APP_WEBHOOK_SECRET=
+```
+
+Generate the state-signing secret with `openssl rand -hex 32` and use it for `GITHUB_APP_WEBHOOK_SECRET`. Use escaped `\n` characters in the private key. Restart the server after changing `.env`.
+
+See [`.env.schema`](./.env.schema) for other environment variables.
+
+### Integrated mode
+
+Use this for backend work and production-like checks:
+
+```shell
+pnpm --dir mastracode/web dev
+```
+
+Open `http://localhost:5873`.
+
+### Split UI mode
+
+Use this for UI work. One command starts the Docker services, builds the
+workspace packages the UI depends on, then runs the API on :4111 and Vite on
+:5173:
+
+```shell
+pnpm --dir mastracode/web dev:ui
+```
+
+Open `http://localhost:5173`. To restart one side without losing the other,
+start the Docker services with `pnpm --dir mastracode/web db:up`, then run
+`pnpm --dir mastracode/web api` and `pnpm --filter ./mastracode/factory-ui dev`
+in separate terminals.
+
+### Slack channels (optional)
+
+Slack sends events to public HTTPS origins only, so a local server needs a
+tunnel. The steps below assume integrated mode, where the server listens on
+`5873`. Install [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
+(`brew install cloudflared`).
+
+#### 1. Start a tunnel
+
+```shell
+cloudflared tunnel --url http://127.0.0.1:5873
+```
+
+Any HTTPS tunnel can be used. The command above starts a temporary Cloudflare
+Quick Tunnel without an account or config file. Keep it running and copy the
+`trycloudflare.com` hostname it prints; that hostname is valid until you stop
+the command.
+
+If you have a Cloudflare account and a domain, use a named tunnel with a stable
+hostname instead. Then the Slack manifest can keep the same public URL across
+local restarts instead of being updated for every new Quick Tunnel hostname.
+
+#### 2. Create the Slack app
+
+Generate a manifest for the tunnel URL:
+
+```shell
+pnpm --dir mastracode/web slack:manifest \
+  --url https://your-tunnel-hostname \
+  --name "Mastra Factory (dev)" \
+  --copy
+```
+
+At [api.slack.com/apps](https://api.slack.com/apps), choose **Create New App →
+From a manifest** and paste the manifest from your clipboard.
+
+Install it to your workspace. Copy the app credentials from **Basic Information → App Credentials** and the bot token from **OAuth & Permissions** into `.env`:
+
+```dotenv
+MASTRACODE_CHANNELS_PUBLIC_URL=https://your-tunnel-hostname
+SLACK_APP_SIGNING_SECRET=
+SLACK_APP_CLIENT_ID=
+SLACK_APP_CLIENT_SECRET=
+SLACK_APP_BOT_TOKEN=
+```
+
+Restart the dev server — varlock reads `.env` at startup.
+
+#### 3. Link your account
+
+DM the bot. It replies with a Connect card; that flow binds your Slack identity
+to your Mastra user, and messages then run as you.
+
+A quick tunnel gets a new hostname each run. When it changes, replace the
+hostname in `MASTRACODE_CHANNELS_PUBLIC_URL` and in the Slack app's **Event
+Subscriptions**, **Interactivity & Shortcuts**, and **OAuth & Permissions** settings.
+
+### Optional local services
+
+To test PostgreSQL and Redis:
+
+```shell
+pnpm --dir mastracode/web db:up
+```
+
+Add these values to `mastracode/web/.env` and restart the server:
+
+```dotenv
+DATABASE_URL=postgres://user:pass@localhost:54329/mastracode_web
+REDIS_URL=redis://localhost:63799
+```
+
+### Recall embedder
+
+With `DATABASE_URL` set, memory recall embeds thread text locally with fastembed on the server. To embed with a hosted model instead, set `FACTORY_EMBEDDER` in `mastracode/web/.env` to a `provider/model` embedding id, along with that provider's key:
+
+```dotenv
+FACTORY_EMBEDDER=openai/text-embedding-3-small
+OPENAI_API_KEY=...
+```
+
+Other providers work the same way, for example `google/gemini-embedding-001` with `GOOGLE_GENERATIVE_AI_API_KEY`. A Mastra gateway id such as `mastra/openai/text-embedding-3-small` reads `MASTRA_GATEWAY_API_KEY`. The server fails to start when the key is missing. Thread text is sent to the embedding provider.
+
+A server `MASTRA_GATEWAY_API_KEY` also lets every account run `mastra/` chat models on your gateway credits, when the account hasn't connected its own gateway key. To keep the embedding key out of chat, use a provider id instead: accounts never use the server's provider keys.
+
+Vector indexes are named by dimension, so a model with a different dimension starts with an empty index: recall doesn't find content observed before the switch. Earlier content isn't re-embedded. Don't switch between two models with the same dimension on one vector store, including from the default fastembed to a 384-dimension model: their vectors would share an index, can't be compared, and recall would return wrong results without an error.
+
+### Amazon Bedrock
+
+Bedrock authenticates with the server's AWS credentials, not a key each account saves. With sign-in enabled, turn it on for every account by adding these values to `mastracode/web/.env`:
+
+```dotenv
+FACTORY_DEPLOYMENT_MODEL_PROVIDERS=amazon-bedrock
+AWS_REGION=us-east-1
+# A Bedrock API key, or AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY, AWS_PROFILE, an ECS task role, or EKS IRSA
+AWS_BEARER_TOKEN_BEDROCK=...
+```
+
+On EC2, an instance profile alone isn't detected. Add a profile to `~/.aws/config` with `credential_source = Ec2InstanceMetadata` and set `AWS_PROFILE` to that profile.
+
+Every signed-in account can then run Bedrock models, billed to that AWS account. Settings show Bedrock as **From deployment** and offer no key field. Without `FACTORY_DEPLOYMENT_MODEL_PROVIDERS`, Bedrock stays hidden and runs fail with a message that tells the operator what to set. Local mode without sign-in uses any AWS credentials in the environment, as before.
+
+### Google Vertex AI
+
+Vertex AI authenticates with the server's Google Cloud Application Default Credentials (ADC). With sign-in enabled, add these values to `mastracode/web/.env`:
+
+```dotenv
+FACTORY_DEPLOYMENT_MODEL_PROVIDERS=google-vertex
+GOOGLE_VERTEX_PROJECT=my-google-cloud-project
+GOOGLE_VERTEX_LOCATION=us-central1
+```
+
+For local development, create ADC credentials with:
+
+```shell
+gcloud auth application-default login
+```
+
+Deployments can instead use a service account or a Google Cloud runtime identity. Every signed-in account can then run Vertex AI models using the configured project and location. Settings show Vertex AI as **From deployment** and offer no key field.
+
+### Mastra Connect tools
+
+Sessions in web chat, Slack and on work items get the [Mastra Connect](https://mastra.ai/docs/mastra-platform/connect) tools of every connection attached to your Platform project, MCP servers included, for example to answer questions about Linear in a Slack thread. Attach connections in Mastra Platform, on the project's **Connect** page. **Settings → Tools** shows which ones sessions get. Platform deploys already have the credentials. Locally, set `MASTRA_PROJECT_ID` and `MASTRA_PLATFORM_SECRET_KEY` in `mastracode/web/.env`. Every user and organization on the server shares the project's connections. See `@mastra/factory`'s README for which tools are left out.
+
+## Tests
+
+```shell
+pnpm --dir mastracode/web test
+pnpm --dir mastracode/web check
+```
+
+UI tests live in `factory-ui`; backend tests live in `factory`.
+
+## Build and run
+
+```shell
+pnpm --dir mastracode/web build
+pnpm --dir mastracode/web start
+```
+
+## Deploy
+
+```shell
+mastra auth login
+pnpm --dir mastracode/web deploy
+```

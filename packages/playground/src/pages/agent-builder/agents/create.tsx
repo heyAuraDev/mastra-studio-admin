@@ -1,12 +1,12 @@
-import { Button } from '@mastra/playground-ui';
-import { ArrowLeftIcon } from 'lucide-react';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { IconArrowLeft } from '@mastra/playground-ui/icons/central/IconArrowLeft';
+import { useAgents, useStoredSkills } from '@mastra/react/hooks/agents';
+import { useTools } from '@mastra/react/hooks/tools';
+import { useWorkflows } from '@mastra/react/hooks/workflows';
 import { Navigate, useNavigate } from 'react-router';
 import { useBuilderAgentAccess, useBuilderAgentFeatures } from '@/domains/agent-builder';
 import { AgentBuilderStarter } from '@/domains/agent-builder/components/agent-starter/agent-builder-starter';
-import { useAgents } from '@/domains/agents/hooks/use-agents';
-import { useStoredSkills } from '@/domains/agents/hooks/use-stored-skills';
-import { useTools } from '@/domains/tools/hooks/use-all-tools';
-import { useWorkflows } from '@/domains/workflows/hooks/use-workflows';
+import { useAgentBuilderAllowedModels } from '@/domains/agent-builder/hooks/use-agent-builder-allowed-models';
 
 const AGENT_BUILDER_AGENTS_ROUTE = '/agent-builder/agents';
 
@@ -18,16 +18,20 @@ export default function AgentBuilderCreate() {
   // edit page can dispatch the initial message with a tools- and skills-aware schema on
   // its very first render instead of waiting for the queries to resolve.
   const features = useBuilderAgentFeatures();
-  useTools({ enabled: canWrite && features.tools });
-  useAgents({ enabled: canWrite && features.agents });
-  useWorkflows({ enabled: canWrite && features.workflows });
-  useStoredSkills({ enabled: canWrite && features.skills });
+  useTools({ queryOptions: { enabled: canWrite && features.tools } });
+  useAgents({ queryOptions: { enabled: canWrite && features.agents } });
+  useWorkflows({ queryOptions: { enabled: canWrite && features.workflows } });
+  useStoredSkills({ queryOptions: { enabled: canWrite && features.skills } });
+  // Prefetch and seed the ['builder-available-models'] cache (return value
+  // ignored) so the starter/model picker render instantly instead of waiting on
+  // the cold gateway-backed request when this page or the edit page mounts.
+  useAgentBuilderAllowedModels({ enabled: canWrite });
 
   if (!canWrite) return <Navigate to={AGENT_BUILDER_AGENTS_ROUTE} replace />;
 
   return (
     <>
-      <div className="absolute top-3 left-3 md:top-6 md:left-6 z-10">
+      <div className="absolute top-3 left-3 z-10 md:top-6 md:left-6">
         <Button
           size="icon-sm"
           variant="ghost"
@@ -36,10 +40,10 @@ export default function AgentBuilderCreate() {
               viewTransition: true,
             })
           }
-          className="rounded-full"
           tooltip="Agents list"
+          data-testid="agent-builder-back-to-list"
         >
-          <ArrowLeftIcon />
+          <IconArrowLeft />
         </Button>
       </div>
 

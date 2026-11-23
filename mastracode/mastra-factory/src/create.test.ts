@@ -1,0 +1,836 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import type { PosthogAnalytics } from 'mastra/dist/analytics/index.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const clack = vi.hoisted(() => ({
+  intro: vi.fn(),
+  outro: vi.fn(),
+  note: vi.fn(),
+  cancel: vi.fn(),
+  text: vi.fn(),
+  password: vi.fn(),
+  select: vi.fn(),
+  isCancel: (value: unknown) => value === Symbol.for('clack.cancel'),
+  log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), message: vi.fn(), error: vi.fn() },
+  spinner: () => ({ start: vi.fn(), stop: vi.fn() }),
+}));
+
+const tinyexec = vi.hoisted(() => ({
+  x: vi.fn(),
+}));
+
+const platform = vi.hoisted(() => ({
+  createServerProject: vi.fn(),
+  ensureProductionEnvironment: vi.fn(),
+  mintOrgApiKey: vi.fn(),
+  attachNeonDatabase: vi.fn(),
+  waitForDatabaseReady: vi.fn(),
+  getDatabaseConnection: vi.fn(),
+  PlatformApiError: class PlatformApiError extends Error {
+    readonly status: number;
+    constructor(status: number, message: string) {
+      super(message);
+      this.status = status;
+    }
+  },
+}));
+
+const cliAuth = vi.hoisted(() => ({
+  getToken: vi.fn(),
+  loadCredentials: vi.fn(),
+  LoginCancelledError: class LoginCancelledError extends Error {},
+  resolveCurrentOrg: vi.fn(),
+  fetchOrgs: vi.fn(),
+  MASTRA_PLATFORM_API_URL: 'https://platform.example.test',
+}));
+
+vi.mock('@clack/prompts', () => clack);
+vi.mock('tinyexec', () => tinyexec);
+vi.mock('./platform.js', () => platform);
+vi.mock('mastra/internal/auth', () => cliAuth);
+
+import { create, PLATFORM_TEMPLATE_REPO } from './create.js';
+import { detectPackageManager, getInstallArgs } from './utils/pm.js';
+
+const analytics = { trackEvent: () => {}, shutdown: async () => {} } as unknown as PosthogAnalytics;
+
+const ENV_EXAMPLE = `# Mastra Factory environment.
+
+# MASTRACODE_PUBLIC_URL=
+
+# APP_DATABASE_URL=
+
+# FACTORY_CREDENTIAL_ENCRYPTION_KEY=
+# FACTORY_CREDENTIAL_ENCRYPTION_KEY_ID=v1
+# FACTORY_CREDENTIAL_ENCRYPTION_PREVIOUS_KEYS=
+
+# ANTHROPIC_API_KEY=
+# OPENAI_API_KEY=
+
+# WORKOS_API_KEY=
+# WORKOS_CLIENT_ID=
+
+# GITHUB_APP_ID=
+`;
+
+let workDir: string;
+let templateDir: string;
+const originalCwd = process.cwd();
+
+beforeEach(() => {
+  vi.clearAllMocks();
+
+  // Sensible default: platform provisioning succeeds. Tests can override.
+  cliAuth.loadCredentials.mockResolvedValue({ token: 'cached' });
+  cliAuth.getToken.mockResolvedValue('wos-token');
+  cliAuth.resolveCurrentOrg.mockResolvedValue({ orgId: 'org_123', orgName: 'Acme' });
+  cliAuth.fetchOrgs.mockResolvedValue([
+    { id: 'org_123', name: 'Acme', role: 'admin', isCurrent: true },
+    { id: 'org_456', name: 'Beta', role: 'member', isCurrent: false },
+  ]);
+  platform.createServerProject.mockResolvedValue({ id: 'proj_abc', slug: 'my-factory', name: 'my-factory' });
+  platform.mintOrgApiKey.mockResolvedValue('sk_live_test');
+  platform.ensureProductionEnvironment.mockResolvedValue('env_production');
+  platform.attachNeonDatabase.mockResolvedValue({ id: 'db_1', status: 'provisioning', error: null });
+  platform.waitForDatabaseReady.mockResolvedValue({ id: 'db_1', status: 'ready', error: null });
+  platform.getDatabaseConnection.mockResolvedValue({
+    envVars: [{ name: 'DATABASE_URL', value: 'postgres://user:pass@host/neon', secret: true }],
+  });
+
+  // realpath: macOS tmpdir is a symlink and cwd-relative paths resolve it.
+  workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'sf-create-test-')));
+  templateDir = path.join(workDir, 'template-fixture');
+  fs.mkdirSync(templateDir);
+  fs.writeFileSync(
+    path.join(templateDir, 'package.json'),
+    `${JSON.stringify({ name: 'mastra-factory', version: '0.1.0', private: true }, null, 2)}\n`,
+  );
+  fs.writeFileSync(path.join(templateDir, '.env.example'), ENV_EXAMPLE);
+  process.chdir(workDir);
+
+  tinyexec.x.mockImplementation(async (command: string, args: string[]) => {
+    if (command === 'npx' && args[0] === 'degit') {
+      fs.cpSync(templateDir, args[2]!, { recursive: true });
+    }
+    return { stdout: '', stderr: '', exitCode: 0, killed: false };
+  });
+});
+
+afterEach(() => {
+  process.chdir(originalCwd);
+  fs.rmSync(workDir, { recursive: true, force: true });
+});
+
+describe('create --no-platform', () => {
+  it('scaffolds a project with a generated encryption key in .env and shows the next steps', async () => {
+    await create({
+      projectName: 'my-factory',
+      template: PLATFORM_TEMPLATE_REPO,
+      noPlatform: true,
+      analytics,
+    });
+
+    const projectPath = path.join(workDir, 'my-factory');
+    const env = fs.readFileSync(path.join(projectPath, '.env'), 'utf8');
+
+    // With --no-platform the CLI writes only a generated credential
+    // encryption key; everything else stays a commented placeholder (an
+    // active `KEY=` would load as the empty string and poison
+    // `process.env.X ?? default` fallbacks).
+    const key = /^FACTORY_CREDENTIAL_ENCRYPTION_KEY=(.+)$/m.exec(env)?.[1];
+    expect(Buffer.from(key!, 'base64')).toHaveLength(32);
+    expect(env).toBe(
+      ENV_EXAMPLE.replace('# FACTORY_CREDENTIAL_ENCRYPTION_KEY=', `FACTORY_CREDENTIAL_ENCRYPTION_KEY=${key}`),
+    );
+    expect(env.match(/^[A-Z][A-Z0-9_]*=/gm)).toEqual(['FACTORY_CREDENTIAL_ENCRYPTION_KEY=']);
+
+    // Project renamed and installed.
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectPath, 'package.json'), 'utf8'));
+    expect(pkg.name).toBe('my-factory');
+    const packageManager = detectPackageManager();
+    expect(tinyexec.x).toHaveBeenCalledWith(packageManager, getInstallArgs(packageManager), {
+      throwOnError: true,
+      nodeOptions: { cwd: projectPath },
+    });
+
+    // Git repo always initialized.
+    expect(tinyexec.x).toHaveBeenCalledWith('git', ['init', '-q'], {
+      throwOnError: true,
+      nodeOptions: { cwd: projectPath },
+    });
+
+    // Platform helpers never called with --no-platform.
+    expect(cliAuth.getToken).not.toHaveBeenCalled();
+    expect(platform.createServerProject).not.toHaveBeenCalled();
+
+    // Next steps show the integrated Factory UI on the Mastra server port.
+    expect(clack.note).toHaveBeenCalledWith(expect.stringContaining('Your Mastra Factory is ready!'), 'Next steps');
+    expect(clack.note).toHaveBeenCalledWith(expect.stringContaining('http://localhost:4111'), 'Next steps');
+    expect(clack.note).not.toHaveBeenCalledWith(expect.stringContaining('http://localhost:5173'), 'Next steps');
+    expect(clack.note).not.toHaveBeenCalledWith(expect.stringContaining('Mastra Studio'), 'Next steps');
+  });
+
+  it('fails the run when the template clone fails, without a success outro', async () => {
+    tinyexec.x.mockRejectedValue(new Error('remote unreachable'));
+
+    await expect(
+      create({ projectName: 'my-factory', template: PLATFORM_TEMPLATE_REPO, noPlatform: true, analytics }),
+    ).rejects.toThrow(/Failed to clone repository/);
+
+    expect(tinyexec.x).not.toHaveBeenCalledWith(expect.any(String), ['install'], expect.anything());
+    expect(clack.note).not.toHaveBeenCalled();
+    expect(clack.outro).not.toHaveBeenCalled();
+  });
+
+  it('preserves an existing project directory passed as an argument', async () => {
+    const projectPath = path.join(workDir, 'existing-factory');
+    const markerPath = path.join(projectPath, 'keep.txt');
+    fs.mkdirSync(projectPath);
+    fs.writeFileSync(markerPath, 'keep me');
+    tinyexec.x.mockRejectedValue(new Error('remote unreachable'));
+
+    await expect(
+      create({ projectName: 'existing-factory', template: PLATFORM_TEMPLATE_REPO, noPlatform: true, analytics }),
+    ).rejects.toThrow(/Directory existing-factory already exists and isn't empty/);
+
+    expect(fs.readFileSync(markerPath, 'utf8')).toBe('keep me');
+    expect(tinyexec.x).not.toHaveBeenCalled();
+    expect(clack.note).not.toHaveBeenCalled();
+    expect(clack.outro).not.toHaveBeenCalled();
+  });
+
+  it('scaffolds into an existing empty directory passed as an argument', async () => {
+    fs.mkdirSync(path.join(workDir, 'empty-factory'));
+
+    await create({ projectName: 'empty-factory', template: PLATFORM_TEMPLATE_REPO, noPlatform: true, analytics });
+
+    const pkg = JSON.parse(fs.readFileSync(path.join(workDir, 'empty-factory', 'package.json'), 'utf8'));
+    expect(pkg.name).toBe('empty-factory');
+  });
+
+  it('scaffolds into the current directory for a blank name, keeping the directory itself', async () => {
+    const cwd = path.join(workDir, 'my-great-mastra-project');
+    fs.mkdirSync(cwd);
+    process.chdir(cwd);
+    const inode = fs.statSync(cwd).ino;
+
+    await create({ projectName: '', template: PLATFORM_TEMPLATE_REPO, noPlatform: true, analytics });
+
+    expect(fs.statSync(cwd).ino).toBe(inode);
+    const degitTarget = tinyexec.x.mock.calls.find(
+      ([command, args]) => command === 'npx' && args[0] === 'degit',
+    )?.[1][2];
+    expect(path.dirname(path.dirname(degitTarget!))).toBe(cwd);
+    expect(fs.readdirSync(cwd).filter(entry => entry.startsWith('.create-factory-'))).toEqual([]);
+    const pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8'));
+    expect(pkg.name).toBe('my-great-mastra-project');
+    expect(fs.existsSync(path.join(cwd, '.env'))).toBe(true);
+    expect(clack.note).not.toHaveBeenCalledWith(expect.stringMatching(/\bcd\b/), 'Next steps');
+  });
+
+  it('prompts for a name that defaults to an empty current directory', async () => {
+    const cwd = path.join(workDir, 'my-great-mastra-project');
+    fs.mkdirSync(cwd);
+    process.chdir(cwd);
+    let blankAnswerError: string | undefined = 'not validated';
+    clack.text.mockImplementationOnce(async (prompt: { validate: (value: string) => string | undefined }) => {
+      blankAnswerError = prompt.validate('');
+      return '';
+    });
+
+    await create({ template: PLATFORM_TEMPLATE_REPO, noPlatform: true, analytics });
+
+    const prompt = clack.text.mock.calls[0]![0];
+    expect(prompt.placeholder).toBe('my-great-mastra-project');
+    expect(prompt.message).toContain('Press Enter to use the current directory (my-great-mastra-project)');
+    expect(blankAnswerError).toBeUndefined();
+    expect(JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8')).name).toBe('my-great-mastra-project');
+  });
+
+  it('requires a name at the prompt when the current directory is not empty', async () => {
+    clack.text.mockResolvedValueOnce('named-factory');
+
+    await create({ template: PLATFORM_TEMPLATE_REPO, noPlatform: true, analytics });
+
+    const prompt = clack.text.mock.calls[0]![0];
+    expect(prompt.placeholder).toBe('my-mastra-factory');
+    expect(prompt.validate('')).toMatch(/current directory isn't empty/);
+    expect(prompt.validate('template-fixture')).toMatch(/already exists and isn't empty/);
+    fs.writeFileSync(path.join(workDir, 'a-file'), '');
+    expect(prompt.validate('a-file/child')).toMatch(/can't be used as a project directory/);
+    expect(fs.existsSync(path.join(workDir, 'named-factory', 'package.json'))).toBe(true);
+  });
+
+  it('fails the run when dependency install fails, without a success outro', async () => {
+    tinyexec.x.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'npx' && args[0] === 'degit') {
+        fs.cpSync(templateDir, args[2]!, { recursive: true });
+      }
+      if (args[0] === 'install') throw new Error('npm install exited with code 1');
+    });
+
+    await expect(
+      create({ projectName: 'my-factory', template: PLATFORM_TEMPLATE_REPO, noPlatform: true, analytics }),
+    ).rejects.toThrow(/retry manually/);
+
+    expect(clack.note).not.toHaveBeenCalled();
+    expect(clack.outro).not.toHaveBeenCalled();
+  });
+});
+
+describe('create template selection', () => {
+  const degitRepo = () =>
+    tinyexec.x.mock.calls.find(([command, args]) => command === 'npx' && args[0] === 'degit')?.[1][1];
+
+  it('scaffolds the platform template by default', async () => {
+    await create({ projectName: 'my-factory', analytics });
+
+    expect(degitRepo()).toBe('mastra-ai/template-factory');
+    expect(platform.createServerProject).toHaveBeenCalled();
+  });
+
+  it('scaffolds the self-hosted template with --no-platform', async () => {
+    await create({ projectName: 'my-factory', noPlatform: true, analytics });
+
+    expect(degitRepo()).toBe('mastra-ai/template-factory-self-hosted');
+    expect(cliAuth.getToken).not.toHaveBeenCalled();
+  });
+
+  it('generates a different encryption key for each project', async () => {
+    await create({ projectName: 'factory-a', noPlatform: true, analytics });
+    await create({ projectName: 'factory-b', noPlatform: true, analytics });
+
+    const keyOf = (name: string) =>
+      /^FACTORY_CREDENTIAL_ENCRYPTION_KEY=(.+)$/m.exec(fs.readFileSync(path.join(workDir, name, '.env'), 'utf8'))?.[1];
+    expect(keyOf('factory-a')).toBeTruthy();
+    expect(keyOf('factory-a')).not.toBe(keyOf('factory-b'));
+  });
+
+  it('keeps an encryption key the template already sets', async () => {
+    fs.writeFileSync(path.join(templateDir, '.env.example'), 'FACTORY_CREDENTIAL_ENCRYPTION_KEY=preset\n');
+    await create({ projectName: 'my-factory', noPlatform: true, analytics });
+
+    expect(fs.readFileSync(path.join(workDir, 'my-factory', '.env'), 'utf8')).toBe(
+      'FACTORY_CREDENTIAL_ENCRYPTION_KEY=preset\n',
+    );
+  });
+
+  it('adds no encryption key when the template does not declare one', async () => {
+    fs.writeFileSync(path.join(templateDir, '.env.example'), '# OPENAI_API_KEY=\n');
+    await create({ projectName: 'my-factory', noPlatform: true, analytics });
+
+    expect(fs.readFileSync(path.join(workDir, 'my-factory', '.env'), 'utf8')).toBe('# OPENAI_API_KEY=\n');
+  });
+
+  it('uses an explicit --template over the --no-platform default', async () => {
+    await create({
+      projectName: 'my-factory',
+      template: 'https://github.com/acme/custom-factory',
+      noPlatform: true,
+      analytics,
+    });
+
+    expect(degitRepo()).toBe('acme/custom-factory');
+  });
+});
+
+describe('create --tag', () => {
+  const distTags: Record<string, Record<string, string>> = {
+    mastra: { latest: '1.5.0', alpha: '1.6.0-alpha.2', beta: '1.6.0-beta.1' },
+    '@mastra/core': { latest: '1.5.1', alpha: '1.6.0-alpha.3' },
+    '@mastra/factory': { latest: '0.4.3', alpha: '0.4.4-alpha.3' },
+    // No alpha release published for this package.
+    '@mastra/pg': { latest: '1.2.0' },
+  };
+
+  beforeEach(() => {
+    fs.writeFileSync(
+      path.join(templateDir, 'package.json'),
+      `${JSON.stringify(
+        {
+          name: 'template-factory',
+          dependencies: {
+            '@mastra/core': 'latest',
+            '@mastra/factory': 'latest',
+            '@mastra/pg': 'latest',
+            zod: '^4.4.3',
+          },
+          devDependencies: { '@types/node': 'latest', mastra: 'latest', typescript: '^6.0.3' },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    tinyexec.x.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'npx' && args[0] === 'degit') {
+        fs.cpSync(templateDir, args[2]!, { recursive: true });
+      }
+      if (command === 'npm' && args[0] === 'view') {
+        const tags = distTags[args[1]!];
+        if (!tags) throw new Error('404 Not Found');
+        return { stdout: JSON.stringify(tags), stderr: '', exitCode: 0, killed: false };
+      }
+      return { stdout: '', stderr: '', exitCode: 0, killed: false };
+    });
+  });
+
+  const readPkg = () => JSON.parse(fs.readFileSync(path.join(workDir, 'my-factory', 'package.json'), 'utf8'));
+
+  it('pins Mastra packages to their alpha versions before installing, keeping the rest of package.json', async () => {
+    await create({ projectName: 'my-factory', noPlatform: true, versionTag: 'alpha', analytics });
+
+    const pkg = readPkg();
+    expect(pkg.name).toBe('my-factory');
+    expect(pkg.dependencies).toEqual({
+      '@mastra/core': '1.6.0-alpha.3',
+      '@mastra/factory': '0.4.4-alpha.3',
+      '@mastra/pg': 'latest',
+      zod: '^4.4.3',
+    });
+    expect(pkg.devDependencies).toEqual({ '@types/node': 'latest', mastra: '1.6.0-alpha.2', typescript: '^6.0.3' });
+    expect(clack.log.warn).toHaveBeenCalledWith(expect.stringContaining('@mastra/pg'));
+
+    // Only Mastra packages are looked up, and pinning happens before install.
+    const viewedPackages = tinyexec.x.mock.calls
+      .filter(([command, args]) => command === 'npm' && args[0] === 'view')
+      .map(([, args]) => args[1]);
+    expect(viewedPackages.sort()).toEqual(['@mastra/core', '@mastra/factory', '@mastra/pg', 'mastra']);
+    const packageManager = detectPackageManager();
+    const installIndex = tinyexec.x.mock.calls.findIndex(
+      ([command, args]) => command === packageManager && args[0] === 'install',
+    );
+    const lastViewIndex = tinyexec.x.mock.calls.findLastIndex(
+      ([command, args]) => command === 'npm' && args[0] === 'view',
+    );
+    expect(lastViewIndex).toBeLessThan(installIndex);
+  });
+
+  it('pins Mastra packages to their latest stable versions', async () => {
+    await create({ projectName: 'my-factory', noPlatform: true, versionTag: 'latest', analytics });
+
+    const pkg = readPkg();
+    expect(pkg.dependencies['@mastra/core']).toBe('1.5.1');
+    expect(pkg.dependencies['@mastra/pg']).toBe('1.2.0');
+    expect(pkg.devDependencies.mastra).toBe('1.5.0');
+    expect(clack.log.warn).not.toHaveBeenCalled();
+  });
+
+  it('lets npm install prereleases whose peer ranges exclude newer prereleases', async () => {
+    vi.stubEnv('npm_config_user_agent', 'npm/11.0.0 node/v22.0.0');
+    try {
+      await create({ projectName: 'my-factory', noPlatform: true, versionTag: 'alpha', analytics });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+
+    expect(fs.readFileSync(path.join(workDir, 'my-factory', '.npmrc'), 'utf8')).toBe('legacy-peer-deps=true\n');
+  });
+
+  it('pins optional dependencies, keeps unrelated entries, and looks tags up from the project', async () => {
+    fs.writeFileSync(
+      path.join(templateDir, 'package.json'),
+      JSON.stringify({
+        name: 'mastra-factory',
+        dependencies: { constructor: 'npm:zod@4.4.3' },
+        optionalDependencies: { '@mastra/core': 'latest' },
+      }),
+    );
+
+    await create({ projectName: 'my-factory', noPlatform: true, versionTag: 'alpha', analytics });
+
+    const pkg = readPkg();
+    expect(pkg.dependencies).toEqual({ constructor: 'npm:zod@4.4.3' });
+    expect(pkg.optionalDependencies).toEqual({ '@mastra/core': '1.6.0-alpha.3' });
+    expect(tinyexec.x).toHaveBeenCalledWith(
+      'npm',
+      ['view', '@mastra/core', 'dist-tags', '--json'],
+      expect.objectContaining({ nodeOptions: { cwd: path.join(workDir, 'my-factory') } }),
+    );
+  });
+
+  it.each([
+    ['alpha', 'alpha'],
+    ['my-private-tag', 'custom'],
+  ])('reports the %s tag to analytics as %s', async (versionTag, reported) => {
+    const trackEvent = vi.fn();
+    const trackingAnalytics = { trackEvent, shutdown: async () => {} } as unknown as PosthogAnalytics;
+
+    await create({ projectName: 'my-factory', noPlatform: true, versionTag, analytics: trackingAnalytics }).catch(
+      () => {},
+    );
+
+    expect(trackEvent).toHaveBeenCalledWith('sf_create_started', expect.objectContaining({ version_tag: reported }));
+    expect(JSON.stringify(trackEvent.mock.calls)).not.toContain('my-private-tag');
+  });
+
+  it('pins any dist-tag, not just latest and alpha', async () => {
+    vi.stubEnv('npm_config_user_agent', 'npm/11.0.0 node/v22.0.0');
+    try {
+      await create({ projectName: 'my-factory', noPlatform: true, versionTag: 'beta', analytics });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+
+    const pkg = readPkg();
+    expect(pkg.devDependencies.mastra).toBe('1.6.0-beta.1');
+    expect(pkg.dependencies['@mastra/core']).toBe('latest');
+    expect(clack.log.warn).toHaveBeenCalledWith(expect.stringContaining('No "beta" release found for @mastra/core'));
+    expect(fs.readFileSync(path.join(workDir, 'my-factory', '.npmrc'), 'utf8')).toBe('legacy-peer-deps=true\n');
+  });
+
+  it.each([
+    ['latest on npm', 'npm/11.0.0 node/v22.0.0', 'latest'],
+    ['alpha on pnpm', 'pnpm/10.0.0 npm/? node/v22.0.0', 'alpha'],
+  ] as const)('keeps strict peer resolution for %s', async (_name, userAgent, versionTag) => {
+    vi.stubEnv('npm_config_user_agent', userAgent);
+    try {
+      await create({ projectName: 'my-factory', noPlatform: true, versionTag, analytics });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+
+    expect(fs.existsSync(path.join(workDir, 'my-factory', '.npmrc'))).toBe(false);
+  });
+
+  it('leaves the template versions alone without a version tag', async () => {
+    await create({ projectName: 'my-factory', noPlatform: true, analytics });
+
+    expect(readPkg().dependencies['@mastra/core']).toBe('latest');
+    expect(tinyexec.x).not.toHaveBeenCalledWith('npm', expect.arrayContaining(['view']), expect.anything());
+  });
+
+  it('fails before installing when no Mastra package is published under the tag', async () => {
+    await expect(
+      create({ projectName: 'my-factory', noPlatform: true, versionTag: 'does-not-exist', analytics }),
+    ).rejects.toThrow(
+      'No Mastra packages are published under the "does-not-exist" tag. Run `cd my-factory && npm view @mastra/core dist-tags` to see the available tags.',
+    );
+    const packageManager = detectPackageManager();
+    expect(tinyexec.x).not.toHaveBeenCalledWith(packageManager, getInstallArgs(packageManager), expect.anything());
+  });
+
+  it('fails before installing when a registry lookup fails, instead of mixing release channels', async () => {
+    tinyexec.x.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'npx' && args[0] === 'degit') fs.cpSync(templateDir, args[2]!, { recursive: true });
+      if (command === 'npm' && args[0] === 'view') {
+        if (args[1] === '@mastra/factory') throw new Error('E503 Service Unavailable');
+        return { stdout: JSON.stringify(distTags[args[1]!]), stderr: '', exitCode: 0, killed: false };
+      }
+      return { stdout: '', stderr: '', exitCode: 0, killed: false };
+    });
+
+    await expect(
+      create({ projectName: 'my-factory', noPlatform: true, versionTag: 'alpha', analytics }),
+    ).rejects.toThrow(
+      'Could not look up the "alpha" versions of @mastra/factory. Run `cd my-factory && npm view @mastra/factory dist-tags` to check that the registry is reachable and the tag exists.',
+    );
+    expect(readPkg().dependencies['@mastra/core']).toBe('latest');
+    const packageManager = detectPackageManager();
+    expect(tinyexec.x).not.toHaveBeenCalledWith(packageManager, getInstallArgs(packageManager), expect.anything());
+  });
+});
+
+describe('create (platform provisioning)', () => {
+  it('writes platform credentials to .env and shows the "Platform connected" outro', async () => {
+    await create({ projectName: 'my-factory', template: PLATFORM_TEMPLATE_REPO, analytics });
+
+    const projectPath = path.join(workDir, 'my-factory');
+    const env = fs.readFileSync(path.join(projectPath, '.env'), 'utf8');
+
+    // All five platform keys present with real values; the shared API URL is
+    // no longer written (consumers default to the production platform URL).
+    expect(env).not.toMatch(/^MASTRA_SHARED_API_URL=/m);
+    expect(env).toMatch(/^MASTRA_ORGANIZATION_ID=org_123$/m);
+    expect(env).toMatch(/^MASTRA_PROJECT_ID=proj_abc$/m);
+    expect(env).toMatch(/^MASTRA_PLATFORM_SECRET_KEY=sk_live_test$/m);
+    expect(env).not.toMatch(/^MASTRA_PLATFORM_ACCESS_TOKEN=/m);
+    expect(env).toMatch(/^DATABASE_URL=postgres:\/\/user:pass@host\/neon$/m);
+
+    expect(env).toMatch(/^MASTRA_ENVIRONMENT_ID=env_production$/m);
+    expect(platform.ensureProductionEnvironment).toHaveBeenCalledWith({
+      token: 'wos-token',
+      orgId: 'org_123',
+      projectId: 'proj_abc',
+      region: 'us',
+    });
+
+    // Other .env.example placeholders untouched.
+    expect(env).toContain('# ANTHROPIC_API_KEY=');
+    expect(env).toContain('# WORKOS_API_KEY=');
+
+    // Platform pipeline hit in order.
+    expect(cliAuth.getToken).toHaveBeenCalledTimes(1);
+    expect(cliAuth.resolveCurrentOrg).toHaveBeenCalledWith('wos-token', { forcePrompt: true });
+    // Region defaults to us without prompting.
+    expect(clack.select).not.toHaveBeenCalled();
+    expect(platform.createServerProject).toHaveBeenCalledWith({
+      token: 'wos-token',
+      orgId: 'org_123',
+      name: 'my-factory',
+      region: 'us',
+    });
+    expect(platform.mintOrgApiKey).toHaveBeenCalledWith({
+      token: 'wos-token',
+      orgId: 'org_123',
+      keyName: 'create-factory: my-factory',
+    });
+    expect(platform.attachNeonDatabase).toHaveBeenCalledWith({
+      token: 'wos-token',
+      orgId: 'org_123',
+      projectId: 'proj_abc',
+      name: 'my-factory',
+      regionId: 'aws-us-west-2',
+    });
+
+    // Success outro summarizes the provisioned infra so the user isn't
+    // surprised by what now exists in their platform org.
+    const note = clack.note.mock.calls[0]![0] as string;
+    expect(note).toContain('Provisioned on Mastra platform');
+    expect(note).toContain('my-factory');
+    expect(note).toContain('Acme');
+    expect(note).toContain('Postgres database');
+    expect(note).toContain('Sandboxes (code agent sessions run here)');
+    expect(note).toContain('Manage your project at');
+    expect(note).toContain('https://projects.mastra.ai');
+  });
+
+  it('preserves the minted secret key when environment setup fails', async () => {
+    platform.ensureProductionEnvironment.mockRejectedValue(new platform.PlatformApiError(403, 'forbidden'));
+    await create({ projectName: 'my-factory', template: PLATFORM_TEMPLATE_REPO, analytics });
+    const env = fs.readFileSync(path.join(workDir, 'my-factory', '.env'), 'utf8');
+    expect(env).toMatch(/^MASTRA_PLATFORM_SECRET_KEY=sk_live_test$/m);
+    expect(env).toMatch(/^MASTRA_PROJECT_ID=proj_abc$/m);
+    expect(env).not.toMatch(/^MASTRA_ENVIRONMENT_ID=/m);
+    expect(platform.attachNeonDatabase).not.toHaveBeenCalled();
+    expect(clack.note.mock.calls[0]![0]).toContain('Platform provisioning failed');
+  });
+
+  it('surfaces a Neon 403 as a "need admin role" hint without failing the run', async () => {
+    platform.attachNeonDatabase.mockRejectedValue(
+      new platform.PlatformApiError(403, 'Attaching a database requires the admin role in your organization.'),
+    );
+
+    await create({ projectName: 'my-factory', template: PLATFORM_TEMPLATE_REPO, analytics });
+
+    const note = clack.note.mock.calls[0]![0] as string;
+    expect(note).toContain('Platform provisioning failed');
+    expect(note).toContain('admin role');
+
+    // Everything minted before the 403 should still be persisted so the
+    // one-time `sk_` secret isn't lost. Only DATABASE_URL is missing.
+    const env = fs.readFileSync(path.join(workDir, 'my-factory', '.env'), 'utf8');
+    expect(env).toMatch(/^MASTRA_PROJECT_ID=proj_abc$/m);
+    expect(env).toMatch(/^MASTRA_PLATFORM_SECRET_KEY=sk_live_test$/m);
+    expect(env).not.toMatch(/^DATABASE_URL=/m);
+  });
+
+  it('persists the sk_ secret to .env when Neon provisioning fails after the key is minted', async () => {
+    // Regression: previously, a Neon failure aborted before writeEnv ran, so
+    // the freshly-minted (one-time) `sk_` key was thrown away.
+    platform.waitForDatabaseReady.mockRejectedValue(
+      new platform.PlatformApiError(504, 'Neon database is still provisioning after 60s.'),
+    );
+
+    await create({ projectName: 'my-factory', template: PLATFORM_TEMPLATE_REPO, analytics });
+
+    const env = fs.readFileSync(path.join(workDir, 'my-factory', '.env'), 'utf8');
+    expect(env).not.toMatch(/^MASTRA_SHARED_API_URL=/m);
+    expect(env).toMatch(/^MASTRA_ORGANIZATION_ID=org_123$/m);
+    expect(env).toMatch(/^MASTRA_PROJECT_ID=proj_abc$/m);
+    expect(env).toMatch(/^MASTRA_PLATFORM_SECRET_KEY=sk_live_test$/m);
+    expect(env).not.toMatch(/^DATABASE_URL=/m);
+
+    const note = clack.note.mock.calls[0]![0] as string;
+    expect(note).toContain('Platform provisioning failed');
+    expect(note).toContain('still provisioning');
+  });
+
+  it('passes --region eu to project creation and the database region', async () => {
+    await create({
+      projectName: 'my-factory',
+      template: PLATFORM_TEMPLATE_REPO,
+      region: 'eu',
+      analytics,
+    });
+
+    expect(clack.select).not.toHaveBeenCalled();
+    expect(platform.createServerProject).toHaveBeenCalledWith(expect.objectContaining({ region: 'eu' }));
+    expect(platform.ensureProductionEnvironment).toHaveBeenCalledWith(expect.objectContaining({ region: 'eu' }));
+    expect(platform.attachNeonDatabase).toHaveBeenCalledWith({
+      token: 'wos-token',
+      orgId: 'org_123',
+      projectId: 'proj_abc',
+      name: 'my-factory',
+      regionId: 'aws-eu-central-1',
+    });
+  });
+
+  it('rejects unsupported --region values before scaffolding', async () => {
+    await expect(
+      create({
+        projectName: 'my-factory',
+        template: PLATFORM_TEMPLATE_REPO,
+        region: 'aws-us-east-2',
+        analytics,
+      }),
+    ).rejects.toThrow('Invalid --region "aws-us-east-2". Expected one of: eu, us.');
+
+    expect(tinyexec.x).not.toHaveBeenCalled();
+    expect(platform.createServerProject).not.toHaveBeenCalled();
+  });
+
+  it('--org <name> skips the interactive picker and resolves via fetchOrgs', async () => {
+    await create({
+      projectName: 'my-factory',
+      template: PLATFORM_TEMPLATE_REPO,
+      org: 'Beta',
+      analytics,
+    });
+
+    expect(cliAuth.fetchOrgs).toHaveBeenCalledTimes(1);
+    expect(cliAuth.resolveCurrentOrg).not.toHaveBeenCalled();
+    expect(platform.createServerProject).toHaveBeenCalledWith(expect.objectContaining({ orgId: 'org_456' }));
+  });
+
+  it('asks for confirmation before opening browser authentication', async () => {
+    vi.stubEnv('MASTRA_API_TOKEN', '');
+    cliAuth.loadCredentials.mockResolvedValue(null);
+    clack.text.mockResolvedValue('');
+
+    await create({ projectName: 'my-factory', template: PLATFORM_TEMPLATE_REPO, analytics });
+
+    expect(clack.text).toHaveBeenCalledWith({
+      message: 'Mastra account is required, press enter to continue...',
+      defaultValue: '',
+    });
+    expect(clack.text.mock.invocationCallOrder[0]!).toBeLessThan(cliAuth.getToken.mock.invocationCallOrder[0]!);
+    vi.unstubAllEnvs();
+  });
+
+  it('cancels the process when Ctrl+C is pressed at the authentication confirmation', async () => {
+    vi.stubEnv('MASTRA_API_TOKEN', '');
+    cliAuth.loadCredentials.mockResolvedValue(null);
+    clack.text.mockResolvedValue(Symbol.for('clack.cancel'));
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => {
+      throw new Error('process exited');
+    });
+
+    try {
+      await create({ projectName: 'my-factory', template: PLATFORM_TEMPLATE_REPO, analytics });
+
+      expect(clack.cancel).toHaveBeenCalledWith('Operation cancelled');
+      expect(exit).toHaveBeenCalledWith(0);
+      expect(cliAuth.getToken).not.toHaveBeenCalled();
+    } finally {
+      exit.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('allows any key to skip while waiting for platform authentication', async () => {
+    await create({ projectName: 'my-factory', template: PLATFORM_TEMPLATE_REPO, analytics });
+
+    expect(clack.text).not.toHaveBeenCalled();
+    expect(cliAuth.getToken).toHaveBeenCalledWith(undefined, { skipOnInput: true, source: 'create-factory' });
+    expect(clack.note).toHaveBeenCalledWith(expect.stringContaining('Provisioned on Mastra platform'), 'Next steps');
+  });
+
+  it('treats keyboard cancellation as skipped platform setup', async () => {
+    cliAuth.getToken.mockRejectedValue(new cliAuth.LoginCancelledError());
+
+    await create({ projectName: 'my-factory', template: PLATFORM_TEMPLATE_REPO, analytics });
+
+    expect(platform.createServerProject).not.toHaveBeenCalled();
+    expect(clack.log.info).toHaveBeenCalledWith('Skipping Mastra platform setup.');
+    const note = clack.note.mock.calls[0]![0] as string;
+    expect(note).toContain('Skipped Mastra platform setup');
+    expect(note).not.toContain('Platform provisioning failed');
+  });
+
+  it('--org fails with a clear message when no org matches', async () => {
+    await create({
+      projectName: 'my-factory',
+      template: PLATFORM_TEMPLATE_REPO,
+      org: 'does-not-exist',
+      analytics,
+    });
+
+    const note = clack.note.mock.calls[0]![0] as string;
+    expect(note).toContain('Platform provisioning failed');
+    expect(note).toContain('No organization matched --org');
+    expect(platform.createServerProject).not.toHaveBeenCalled();
+  });
+});
+
+describe('create — .env safety before git commit', () => {
+  it('adds .env to .gitignore before the initial commit so platform secrets are never staged', async () => {
+    // Template ships no .gitignore of its own.
+    await create({ projectName: 'my-factory', template: PLATFORM_TEMPLATE_REPO, analytics });
+
+    const projectPath = path.join(workDir, 'my-factory');
+    const gitignore = fs.readFileSync(path.join(projectPath, '.gitignore'), 'utf8');
+    expect(gitignore).toMatch(/^\.env$/m);
+
+    // Ordering matters: `git add -A` runs AFTER we mutate .gitignore. Otherwise
+    // the freshly-provisioned MASTRA_PLATFORM_SECRET_KEY / DATABASE_URL would
+    // land in the initial commit.
+    const runCalls = tinyexec.x.mock.calls as Array<[string, string[]]>;
+    const gitAddIndex = runCalls.findIndex(call => call[0] === 'git' && call[1][0] === 'add');
+    expect(gitAddIndex).toBeGreaterThanOrEqual(0);
+    // Sanity: gitignore has the .env line at commit time (we already asserted
+    // the file contents above, and no subsequent write happens between the
+    // .gitignore edit and `git add -A`).
+    expect(fs.readFileSync(path.join(projectPath, '.gitignore'), 'utf8')).toMatch(/^\.env$/m);
+  });
+
+  it('leaves an existing .gitignore alone when .env is already covered', async () => {
+    // Fixture template with a .gitignore that already ignores .env via glob.
+    const existing = 'node_modules\n.env*\ndist\n';
+    fs.writeFileSync(path.join(templateDir, '.gitignore'), existing);
+
+    await create({ projectName: 'my-factory', template: PLATFORM_TEMPLATE_REPO, analytics });
+
+    const gitignore = fs.readFileSync(path.join(workDir, 'my-factory', '.gitignore'), 'utf8');
+    // Content unchanged — no duplicate `.env` appended.
+    expect(gitignore).toBe(existing);
+  });
+
+  it('preserves existing .gitignore entries and appends .env when missing', async () => {
+    const existing = 'node_modules\ndist\n';
+    fs.writeFileSync(path.join(templateDir, '.gitignore'), existing);
+
+    await create({ projectName: 'my-factory', template: PLATFORM_TEMPLATE_REPO, analytics });
+
+    const gitignore = fs.readFileSync(path.join(workDir, 'my-factory', '.gitignore'), 'utf8');
+    expect(gitignore).toContain('node_modules');
+    expect(gitignore).toContain('dist');
+    expect(gitignore).toMatch(/^\.env$/m);
+  });
+
+  it('skips git init when .gitignore cannot be updated so .env secrets are never staged', async () => {
+    // Make the scaffolded `.gitignore` a directory so it can't be read or
+    // written. A read-only file (chmod 0o444) is not enough: CI may run as
+    // root, which ignores permission bits and lets the append succeed.
+    tinyexec.x.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'npx' && args[0] === 'degit') {
+        fs.cpSync(templateDir, args[2]!, { recursive: true });
+        fs.mkdirSync(path.join(args[2]!, '.gitignore'));
+      }
+      return { stdout: '', stderr: '', exitCode: 0, killed: false };
+    });
+
+    await create({ projectName: 'my-factory', template: PLATFORM_TEMPLATE_REPO, analytics });
+
+    const runCalls = tinyexec.x.mock.calls as Array<[string, string[]]>;
+    const anyGit = runCalls.some(call => call[0] === 'git');
+    expect(anyGit).toBe(false);
+
+    // User was warned about it.
+    const warns = clack.log.warn.mock.calls.flat().join('\n');
+    expect(warns).toMatch(/\.gitignore/);
+    expect(warns).toMatch(/Skipping git init/i);
+  });
+});

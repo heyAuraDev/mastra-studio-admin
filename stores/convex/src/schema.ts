@@ -159,6 +159,8 @@ export const mastraSchedulesTable = defineTable({
   metadata: v.optional(v.union(v.string(), v.null())),
   owner_type: v.optional(v.union(v.string(), v.null())),
   owner_id: v.optional(v.union(v.string(), v.null())),
+  run_at: v.optional(v.union(v.number(), v.null())),
+  end_at: v.optional(v.union(v.number(), v.null())),
   workflow_id: v.optional(v.union(v.string(), v.null())),
 })
   .index('by_record_id', ['id'])
@@ -263,6 +265,15 @@ export const mastraBackgroundTasksTable = defineTable({
   startedAt: v.union(v.string(), v.null()),
   suspendedAt: v.union(v.string(), v.null()),
   completedAt: v.union(v.string(), v.null()),
+  // Optional so that documents written before execution leases existed, which
+  // have no `ownerId`/`leaseExpiresAt` key at all, still validate. Convex
+  // checks every existing document against the schema on push, and a required
+  // field would reject those documents and fail `convex deploy`.
+  ownerId: v.optional(v.union(v.string(), v.null())),
+  leaseExpiresAt: v.optional(v.union(v.string(), v.null())),
+  // Optional for the same reason: rows written before these fields existed.
+  expiresAt: v.optional(v.union(v.string(), v.null())),
+  metadata: v.optional(v.union(v.string(), v.null())),
 })
   .index('by_record_id', ['id'])
   .index('by_status_created', ['status', 'createdAt'])
@@ -273,6 +284,67 @@ export const mastraBackgroundTasksTable = defineTable({
   .index('by_resource', ['resource_id'])
   .index('by_tool', ['tool_name'])
   .index('by_created', ['createdAt']);
+
+/**
+ * Observational memory table - stores observational memory generations.
+ *
+ * Fields mirror @mastra/core's OBSERVATIONAL_MEMORY_SCHEMA (storage/constants.ts).
+ * The schema is defined explicitly (not via buildTableFromSchema) because the
+ * core export is intentionally excluded from TABLE_SCHEMAS (OM is optional) and
+ * older cores in the peer range may not export it at all.
+ *
+ * Serialization conventions:
+ * - Timestamps are ISO strings.
+ * - `config`, `metadata`, and `bufferedObservationChunks` are JSON strings
+ *   because user-influenced payloads can contain Convex-reserved field names
+ *   such as `$schema` (same reasoning as mastraSchedulesTable).
+ * - Nullable fields accept explicit null so cleared state can travel over JSON.
+ *
+ * Records are keyed by `lookupKey` ('thread:{id}' or 'resource:{id}'); the
+ * latest generation is the highest `generationCount` per lookupKey, served by
+ * the by_lookup_key index in descending order.
+ */
+export const mastraObservationalMemoryTable = defineTable({
+  id: v.string(),
+  lookupKey: v.string(),
+  scope: v.string(),
+  // Nullable in core's OBSERVATIONAL_MEMORY_SCHEMA; the adapter always writes it.
+  resourceId: v.optional(v.union(v.string(), v.null())),
+  threadId: v.optional(v.union(v.string(), v.null())),
+  activeObservations: v.string(),
+  activeObservationsPendingUpdate: v.optional(v.union(v.string(), v.null())),
+  originType: v.string(),
+  config: v.string(),
+  generationCount: v.number(),
+  lastObservedAt: v.optional(v.union(v.string(), v.null())),
+  lastReflectionAt: v.optional(v.union(v.string(), v.null())),
+  pendingMessageTokens: v.number(),
+  totalTokensObserved: v.number(),
+  observationTokenCount: v.number(),
+  isObserving: v.boolean(),
+  isReflecting: v.boolean(),
+  observedMessageIds: v.optional(v.union(v.array(v.string()), v.null())),
+  observedTimezone: v.optional(v.union(v.string(), v.null())),
+  bufferedObservations: v.optional(v.union(v.string(), v.null())),
+  bufferedObservationTokens: v.optional(v.union(v.number(), v.null())),
+  bufferedMessageIds: v.optional(v.union(v.array(v.string()), v.null())),
+  bufferedReflection: v.optional(v.union(v.string(), v.null())),
+  bufferedReflectionTokens: v.optional(v.union(v.number(), v.null())),
+  bufferedReflectionInputTokens: v.optional(v.union(v.number(), v.null())),
+  reflectedObservationLineCount: v.optional(v.union(v.number(), v.null())),
+  bufferedObservationChunks: v.optional(v.union(v.string(), v.null())),
+  isBufferingObservation: v.boolean(),
+  isBufferingReflection: v.boolean(),
+  lastBufferedAtTokens: v.number(),
+  lastBufferedAtTime: v.optional(v.union(v.string(), v.null())),
+  metadata: v.optional(v.union(v.string(), v.null())),
+  // Set to the successor's id when a reflection retires this generation; never cleared.
+  supersededBy: v.optional(v.union(v.string(), v.null())),
+  createdAt: v.string(),
+  updatedAt: v.string(),
+})
+  .index('by_record_id', ['id'])
+  .index('by_lookup_key', ['lookupKey', 'generationCount']);
 
 // ============================================================================
 // Vector Tables - Not in core schemas (vector-specific)
@@ -427,3 +499,8 @@ export {
 export const TABLE_VECTOR_INDEXES = 'mastra_vector_indexes';
 export const TABLE_VECTORS = 'mastra_vectors';
 export const TABLE_DOCUMENTS = 'mastra_documents';
+
+// Observational memory table name. Defined locally (not imported from core)
+// because this file is bundled into the user's Convex deployment and must not
+// rely on value exports that older @mastra/core versions in the peer range lack.
+export const TABLE_OBSERVATIONAL_MEMORY = 'mastra_observational_memory';

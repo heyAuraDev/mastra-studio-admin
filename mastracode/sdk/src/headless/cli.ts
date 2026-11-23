@@ -1,0 +1,372 @@
+/**
+ * CLI adapter for headless MastraCode runs.
+ *
+ * This is the only headless layer that touches the process: it parses argv,
+ * reads stdin, bootstraps MastraCode via `createMastraCode`, drives `runMC`,
+ * renders events/results to stdout/stderr through the pure formatters, maps the
+ * result to an exit code, and owns teardown + `process.exit`.
+ */
+import { existsSync } from 'node:fs';
+import type { Writable } from 'node:stream';
+import { parseArgs } from 'node:util';
+
+import { resolveSubagentsSetting } from '../agents/subagents/index.js';
+import { createMastraCode } from '../index.js';
+import { activateModePackInSettings, resolveModePackArg, resolvePackSelection } from '../onboarding/pack-activation.js';
+import { listBuiltinModePacks } from '../onboarding/packs.js';
+import { loadSettings, resolveModelDefaults, saveSettings } from '../onboarding/settings.js';
+import {
+  createProcessMemoryDiagnosticsFromEnvironment,
+  startConfiguredProcessMemoryDiagnostics,
+  stopProcessMemoryDiagnosticsWithTimeout,
+} from '../process-memory-diagnostics.js';
+import { setupDebugLogging } from '../utils/debug-log.js';
+import { releaseAllThreadLocks } from '../utils/thread-lock.js';
+
+import { buildParseArgsOptions, FLAGS, renderFlagUsage } from './flags.js';
+import { createHumanFormatState, formatHuman, formatJsonl, isJsonlEvent, renderJsonResult } from './format.js';
+import { permissionModeToPolicy } from './policy.js';
+import { runMC } from './run-mc.js';
+import type { PermissionMode, RunMode, ThinkingLevel } from './types.js';
+
+/** Consolidated output mode (replaces the old `--format` + `--output-format`). */
+export type OutputMode = 'human' | 'json' | 'jsonl';
+
+export interface HeadlessArgs {
+  prompt?: string;
+  /** Timeout in seconds (CLI surface); converted to ms before `runMC`. */
+  timeout?: number;
+  output: OutputMode;
+  continue_: boolean;
+  model?: string;
+  pack?: string;
+  mode?: RunMode;
+  thinkingLevel?: ThinkingLevel;
+  settings?: string;
+  thread?: string;
+  title?: string;
+  cloneThread: boolean;
+  resourceId?: string;
+  /** Max agentic turns before the run aborts with exit code 1. */
+  maxTurns?: number;
+  /** Named permission mode resolving to a built-in policy. Defaults to `auto`. */
+  permissionMode?: PermissionMode;
+}
+
+const parseArgsOptions = buildParseArgsOptions();
+const STOP_NOTIFICATION_DISPATCH_TIMEOUT_MS = 2_000;
+
+/**
+ * Returns true if `argv` selects headless mode. This must agree with what
+ * {@link parseHeadlessArgs} (and `runMCCli`) accept as a prompt: `--prompt`/`-p`
+ * or a bare positional prompt (e.g. `mastracode "Fix the bug"`). Note that a
+ * prompt piped via stdin without a flag is handled separately by the caller.
+ */
+export function hasHeadlessFlag(argv: string[]): boolean {
+  if (argv.some(a => a === '--prompt' || a === '-p')) return true;
+  try {
+    const { values, positionals } = parseArgs({
+      args: argv.slice(2),
+      options: parseArgsOptions,
+      strict: false,
+      allowPositionals: true,
+    });
+    // A positional prompt only counts when not asking for help.
+    return positionals.length > 0 && !values.help;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Parse CLI arguments for headless mode. The flag table in `flags.ts` is the
+ * single source of truth: each flag carries its own coercion/validation, so this
+ * function just walks {@link FLAGS} and assembles the typed {@link HeadlessArgs}.
+ */
+export function parseHeadlessArgs(argv: string[]): HeadlessArgs {
+  const { values, positionals } = parseArgs({
+    args: argv.slice(2),
+    options: parseArgsOptions,
+    strict: false,
+    allowPositionals: true,
+  });
+
+  // Seed defaults; per-flag values below override these.
+  const args: HeadlessArgs = {
+    output: 'human',
+    continue_: false,
+    cloneThread: false,
+  };
+  const sink = args as unknown as Record<string, unknown>;
+
+  for (const flag of FLAGS) {
+    if (!flag.field) continue; // e.g. --help, handled by the caller
+    const raw = values[flag.key];
+    if (raw === undefined) continue;
+
+    if (flag.type === 'boolean') {
+      sink[flag.field] = Boolean(raw);
+    } else if (typeof raw === 'string') {
+      sink[flag.field] = flag.coerce ? flag.coerce(raw) : raw;
+    }
+  }
+
+  // A bare positional acts as the prompt when --prompt/-p is absent.
+  if (args.prompt === undefined && positionals[0] !== undefined) {
+    args.prompt = positionals[0];
+  }
+
+  if (args.continue_ && args.thread) {
+    throw new Error('--continue and --thread cannot be used together');
+  }
+
+  return args;
+}
+
+export function printHeadlessUsage(): void {
+  process.stdout.write(`
+Usage: mastracode --prompt <text> [options]
+
+Headless (non-interactive) mode options:
+${renderFlagUsage()}
+
+Thread behavior:
+  By default, a new thread is created for each run.
+  Use --continue to resume the most recent thread, or --thread to target a specific one.
+  Use --clone-thread to branch off a copy before running.
+
+Settings file:
+  Uses the same settings.json as the interactive TUI. Pass --settings to use
+  a custom settings file (e.g., settings-ci.json for CI). All model, pack,
+  subagent, and OM configuration is resolved from settings at startup.
+
+Exit codes:
+  0  Agent completed successfully
+  1  Error, aborted, or max turns reached
+  2  Timeout
+
+Examples:
+  mastracode --prompt "Fix the bug in auth.ts"
+  mastracode --prompt "Add tests" --timeout 300 --output json
+  mastracode --prompt "Refactor" --output jsonl
+  mastracode --prompt "Review this PR" --permission-mode deny --max-turns 10
+  mastracode --settings ./settings-ci.json --prompt "Run tests"
+  mastracode -c --prompt "Continue where you left off"
+  echo "Summarize the repo" | mastracode --prompt -
+`);
+}
+
+/**
+ * Wait until everything written to `stream` has been handed to the OS, since
+ * `process.exit()` drops writes a pipe has not accepted yet. Resolves `false`
+ * if the stream fails or closes first; never rejects or hangs on a gone reader.
+ */
+export function flushWritable(stream: Writable): Promise<boolean> {
+  if (stream.destroyed || stream.errored) return Promise.resolve(false);
+  if (stream.writableLength === 0) return Promise.resolve(true);
+  return new Promise(resolve => {
+    // Left attached: a stream can emit `error` after failing pending callbacks.
+    stream.once('error', () => resolve(false));
+    stream.once('close', () => resolve(false));
+    stream.write('', error => resolve(!error));
+  });
+}
+
+/**
+ * Headless CLI entry point: parse arguments, read stdin, initialize MastraCode,
+ * run via `runMC`, render output, and exit with the mapped code.
+ */
+export async function runMCCli(
+  predrainedInput?: string | null,
+  options?: { coAuthor?: { name?: string; email?: string } },
+): Promise<never> {
+  if (process.argv.includes('--help') || process.argv.includes('-h')) {
+    printHeadlessUsage();
+    process.exit(0);
+  }
+
+  let args: HeadlessArgs;
+  try {
+    args = parseHeadlessArgs(process.argv);
+  } catch (e) {
+    process.stderr.write(`Error: ${(e as Error).message}\n`);
+    process.exit(1);
+  }
+
+  let prompt = args.prompt;
+  if (predrainedInput !== undefined) {
+    prompt = predrainedInput ?? '';
+  } else if (prompt === '-' || (!prompt && !process.stdin.isTTY)) {
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) {
+      chunks.push(chunk as Buffer);
+    }
+    prompt = Buffer.concat(chunks).toString('utf-8').trim();
+  }
+
+  if (!prompt) {
+    printHeadlessUsage();
+    process.stderr.write('Error: --prompt is required (or pipe via stdin)\n');
+    process.exit(1);
+  }
+
+  if (args.settings && !existsSync(args.settings)) {
+    process.stderr.write(`Error: Settings file not found: ${args.settings}\n`);
+    process.exit(1);
+  }
+
+  // Resolve --pack up front: an unknown pack fails fast with the valid list,
+  // before MastraCode boots. The selection itself is resolved inside runMC
+  // after thread selection, because a resumed thread restores its persisted
+  // mode — the mode that decides whether the pack has a model for this run.
+  // Activation (which mirrors /models → Activate and becomes the global
+  // default pack in settings) is saved via onApplied only once the pack has
+  // actually been applied to the session — a rejected pack must not change
+  // the persisted default on its way out.
+  const settings = loadSettings(args.settings);
+  let packId: string | undefined;
+  if (args.pack !== undefined) {
+    const resolved = resolveModePackArg(settings, args.pack);
+    if ('error' in resolved) {
+      process.stderr.write(`Error: ${resolved.error}\n`);
+      process.exit(1);
+    }
+    packId = resolved.packId;
+  }
+
+  const diagnosticsSetup = createProcessMemoryDiagnosticsFromEnvironment(process.env);
+  const processMemoryDiagnostics = await startConfiguredProcessMemoryDiagnostics(diagnosticsSetup, warning => {
+    process.stderr.write(`Warning: ${warning}\n`);
+  });
+
+  let boot: Awaited<ReturnType<typeof createMastraCode>> | undefined;
+  // Default to a non-zero exit so an unexpected throw before the run resolves
+  // still surfaces as a failure to the caller / CI.
+  let exitCode = 1;
+  try {
+    boot = await createMastraCode({
+      settingsPath: args.settings,
+      coAuthor: options?.coAuthor,
+      subagents: resolveSubagentsSetting(settings.preferences.subagentsEnabled),
+      // Headless approves submit_plan without starting a goal.
+      planApprovalStartsGoal: false,
+    });
+    const { controller, session, mcpManager } = boot;
+
+    const effectiveDefaults = resolveModelDefaults(settings, listBuiltinModePacks());
+
+    if (mcpManager?.hasServers()) {
+      try {
+        await mcpManager.initInBackground();
+      } catch (err) {
+        process.stderr.write(`Warning: MCP server initialization failed: ${(err as Error).message ?? err}\n`);
+      }
+    }
+
+    setupDebugLogging();
+
+    const humanState = createHumanFormatState();
+    const run = runMC({
+      controller,
+      session,
+      prompt,
+      model: args.model,
+      mode: args.mode,
+      modeDefaults: effectiveDefaults,
+      ...(packId
+        ? {
+            pack: {
+              id: packId,
+              resolve: (modeId: string) => resolvePackSelection(settings, packId, modeId),
+              onApplied: () => {
+                activateModePackInSettings(settings, packId);
+                saveSettings(settings, args.settings);
+              },
+            },
+          }
+        : {}),
+      thinkingLevel: args.thinkingLevel,
+      thread: { id: args.thread, continueLatest: args.continue_, clone: args.cloneThread },
+      resourceId: args.resourceId,
+      title: args.title,
+      timeoutMs: args.timeout ? args.timeout * 1000 : undefined,
+      maxTurns: args.maxTurns,
+      policy: args.permissionMode ? permissionModeToPolicy(args.permissionMode) : undefined,
+    });
+
+    // Stream live events for human + jsonl modes. (json mode prints only the final object.)
+    for await (const event of run) {
+      if (args.output === 'human') {
+        const out = formatHuman(event, humanState);
+        if (out.stdout) process.stdout.write(out.stdout);
+        if (out.stderr) process.stderr.write(out.stderr);
+      } else if (args.output === 'jsonl' && isJsonlEvent(event)) {
+        process.stdout.write(JSON.stringify(formatJsonl(event)) + '\n');
+      }
+    }
+
+    const result = await run.result;
+    exitCode = result.exitCode;
+
+    if (args.output === 'json') {
+      process.stdout.write(renderJsonResult(result));
+    } else if (args.output === 'jsonl') {
+      process.stdout.write(JSON.stringify({ type: 'result', ...result }) + '\n');
+    }
+
+    if (result.status === 'timeout') {
+      process.stderr.write(`\nTimeout elapsed. Aborted.\n`);
+    } else if (result.error && args.output === 'human') {
+      process.stderr.write(`Error: ${result.error.message}\n`);
+    }
+  } catch (err) {
+    process.stderr.write(`Error: ${(err as Error).message ?? err}\n`);
+    exitCode = 1;
+  } finally {
+    // --- Teardown (always runs, even on a thrown error) ---
+    releaseAllThreadLocks();
+    if (boot) {
+      // Stop plugin-contributed signal providers (and the plugin reload listener)
+      // before quiescing workers: a provider that keeps polling past this point
+      // could dispatch into a controller that is shutting down. Release thread
+      // claims first so a restarted process need not wait out this teardown.
+      try {
+        boot.releaseThreadClaims();
+      } catch {
+        // Best-effort — the process is exiting.
+      }
+      try {
+        boot.stopPluginSignalProviders();
+      } catch {
+        // Best-effort — the process is exiting.
+      }
+      const { controller, mcpManager } = boot;
+      // Release notification dispatch leases before the pubsub that holds them
+      // closes. Headless has no shutdown deadline, so don't let a stalled
+      // in-flight dispatch hold up exit.
+      await Promise.race([
+        boot.stopNotificationDispatch?.().catch(() => {}),
+        new Promise<void>(resolve => setTimeout(resolve, STOP_NOTIFICATION_DISPATCH_TIMEOUT_MS).unref()),
+      ]);
+      await Promise.allSettled([
+        mcpManager?.disconnect(),
+        controller.getMastra()?.stopWorkers(),
+        controller.stopIntervals(),
+      ]);
+      // The signals pubsub is Mastra's event bus, so close it after the workers
+      // stop. Call close() on the object; a detached method loses `this` and
+      // rejects silently, leaving socket files behind.
+      const signalsPubSub = boot.signalsPubSub as { close?: () => Promise<void> | void } | undefined;
+      await Promise.allSettled([signalsPubSub?.close?.()]);
+    }
+    await stopProcessMemoryDiagnosticsWithTimeout(processMemoryDiagnostics, warning => {
+      process.stderr.write(`Warning: ${warning}\n`);
+    });
+  }
+
+  // Let piped output (the final result line in particular) reach the reader
+  // before exiting. Output that never arrived must not count as success.
+  const [stdoutFlushed] = await Promise.all([flushWritable(process.stdout), flushWritable(process.stderr)]);
+  if (!stdoutFlushed && exitCode === 0) exitCode = 1;
+  process.exit(exitCode);
+}

@@ -41,6 +41,14 @@ export function extractLines(
   const start = Math.max(1, startLine ?? 1);
   const end = Math.min(totalLines, endLine ?? totalLines);
 
+  if (start > end) {
+    return {
+      content: '',
+      lines: { start: 0, end: 0 },
+      totalLines,
+    };
+  }
+
   // Extract the requested range (convert to 0-indexed)
   const extractedLines = allLines.slice(start - 1, end);
 
@@ -197,11 +205,10 @@ export function replaceString(
     // Replace all occurrences - split/join doesn't interpret $ patterns
     const result = content.split(oldString).join(newString);
     return { content: result, replacements: count };
-  } else {
-    // Replace first (and only) occurrence - use escaped string
-    const result = content.replace(oldString, escapedNewString);
-    return { content: result, replacements: 1 };
   }
+  // Replace first (and only) occurrence - use escaped string
+  const result = content.replace(oldString, escapedNewString);
+  return { content: result, replacements: 1 };
 }
 
 /**

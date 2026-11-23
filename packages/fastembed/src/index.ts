@@ -1,13 +1,10 @@
-import fsp from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
 import { customProvider as customProviderV2 } from '@internal/ai-sdk-v5';
 import { customProvider as customProviderLegacy } from '@internal/ai-sdk-v4';
 import type { EmbeddingModelV3 } from '@internal/ai-v6';
 import type { EmbeddingModel as EmbeddingModelV2 } from '@internal/ai-sdk-v5';
 import type { EmbeddingModel as EmbeddingModelV1 } from '@internal/ai-sdk-v4';
 import { customProvider as customProviderV3 } from '@internal/ai-v6';
-import { FlagEmbedding, EmbeddingModel } from './fastembed.js';
+import { getCachedModel, warmupFastEmbedModels, type FastEmbedModelType } from './model-cache.js';
 
 export {
   EmbeddingModel,
@@ -22,28 +19,17 @@ export type { EmbeddingModel as EmbeddingModelV1 } from '@internal/ai-sdk-v4';
 export type { EmbeddingModel as EmbeddingModelV2 } from '@internal/ai-sdk-v5';
 export type { EmbeddingModel as EmbeddingModelV3 } from '@internal/ai-v6';
 
-async function getModelCachePath() {
-  const cachePath = path.join(os.homedir(), '.cache', 'mastra', 'fastembed-models');
-  await fsp.mkdir(cachePath, { recursive: true });
-  return cachePath;
-}
-
 /**
  * Pre-download fastembed models without creating ONNX sessions.
  * Call this before running tests in parallel to avoid concurrent download races.
  */
 export async function warmup() {
-  const cacheDir = await getModelCachePath();
-  await FlagEmbedding.retrieveModel(EmbeddingModel.BGESmallENV15, cacheDir, false);
-  await FlagEmbedding.retrieveModel(EmbeddingModel.BGEBaseENV15, cacheDir, false);
+  await warmupFastEmbedModels();
 }
 
 // Shared function to generate embeddings using fastembed
-async function generateEmbeddings(values: string[], modelType: 'BGESmallENV15' | 'BGEBaseENV15') {
-  const model = await FlagEmbedding.init({
-    model: EmbeddingModel[modelType],
-    cacheDir: await getModelCachePath(),
-  });
+async function generateEmbeddings(values: string[], modelType: FastEmbedModelType) {
+  const model = await getCachedModel(modelType);
 
   // model.embed() returns an AsyncGenerator that processes texts in batches (default size 256)
   const embeddings = model.embed(values);
@@ -56,11 +42,48 @@ async function generateEmbeddings(values: string[], modelType: 'BGESmallENV15' |
   }
 
   if (allResults.length === 0) throw new Error('No embeddings generated');
+  if (allResults.length !== values.length) {
+    throw new Error(`Expected ${values.length} embeddings but received ${allResults.length}`);
+  }
 
   return {
     embeddings: allResults,
   };
 }
+
+// E5 models are asymmetric: queries and passages must be embedded with different prefixes.
+function applyPrefix(values: string[], prefix?: 'query' | 'passage') {
+  return prefix ? values.map(value => `${prefix}: ${value}`) : values;
+}
+
+// V3 models can report warnings, so surface inputs that the model's token window silently truncates.
+async function generateEmbeddingsWithWarnings(
+  values: string[],
+  modelType: FastEmbedModelType,
+  prefix?: 'query' | 'passage',
+) {
+  const inputs = applyPrefix(values, prefix);
+  const result = await generateEmbeddings(inputs, modelType);
+  const model = await getCachedModel(modelType);
+  const { count, maxLength } = await model.countTruncated(inputs);
+  const warnings =
+    count > 0
+      ? [
+          {
+            type: 'other' as const,
+            message: `${count} of ${inputs.length} inputs exceed the model's ${maxLength}-token window and were truncated; text beyond it does not affect the embedding. Use smaller chunks to embed the full text.`,
+          },
+        ]
+      : [];
+  return { ...result, warnings };
+}
+
+/**
+ * The token window of every fastembed model here. Set as `maxInputTokens` on each model object:
+ * Mastra's semantic recall reads it to size message chunks, so long messages are split instead of
+ * having everything past the window silently dropped from the embedding.
+ */
+const FASTEMBED_INPUT_LIMIT = { maxInputTokens: 512 } as const;
 
 // Legacy v1 provider for backwards compatibility
 const fastEmbedLegacyProvider = customProviderLegacy({
@@ -71,6 +94,7 @@ const fastEmbedLegacyProvider = customProviderLegacy({
       modelId: 'bge-small-en-v1.5',
       maxEmbeddingsPerCall: 256,
       supportsParallelCalls: true,
+      ...FASTEMBED_INPUT_LIMIT,
       async doEmbed({ values }) {
         return generateEmbeddings(values, 'BGESmallENV15');
       },
@@ -81,6 +105,7 @@ const fastEmbedLegacyProvider = customProviderLegacy({
       modelId: 'bge-base-en-v1.5',
       maxEmbeddingsPerCall: 256,
       supportsParallelCalls: true,
+      ...FASTEMBED_INPUT_LIMIT,
       async doEmbed({ values }) {
         return generateEmbeddings(values, 'BGEBaseENV15');
       },
@@ -97,6 +122,7 @@ const fastEmbedProviderV2 = customProviderV2({
       modelId: 'bge-small-en-v1.5',
       maxEmbeddingsPerCall: 256,
       supportsParallelCalls: true,
+      ...FASTEMBED_INPUT_LIMIT,
       async doEmbed({ values }) {
         return generateEmbeddings(values, 'BGESmallENV15');
       },
@@ -107,6 +133,7 @@ const fastEmbedProviderV2 = customProviderV2({
       modelId: 'bge-base-en-v1.5',
       maxEmbeddingsPerCall: 256,
       supportsParallelCalls: true,
+      ...FASTEMBED_INPUT_LIMIT,
       async doEmbed({ values }) {
         return generateEmbeddings(values, 'BGEBaseENV15');
       },
@@ -123,9 +150,9 @@ const fastEmbedProviderV3 = customProviderV3({
       modelId: 'bge-small-en-v1.5',
       maxEmbeddingsPerCall: 256,
       supportsParallelCalls: true,
+      ...FASTEMBED_INPUT_LIMIT,
       async doEmbed({ values }) {
-        const result = await generateEmbeddings(values, 'BGESmallENV15');
-        return { ...result, warnings: [] };
+        return generateEmbeddingsWithWarnings(values, 'BGESmallENV15');
       },
     },
     'bge-base-en-v1.5': {
@@ -134,9 +161,31 @@ const fastEmbedProviderV3 = customProviderV3({
       modelId: 'bge-base-en-v1.5',
       maxEmbeddingsPerCall: 256,
       supportsParallelCalls: true,
+      ...FASTEMBED_INPUT_LIMIT,
       async doEmbed({ values }) {
-        const result = await generateEmbeddings(values, 'BGEBaseENV15');
-        return { ...result, warnings: [] };
+        return generateEmbeddingsWithWarnings(values, 'BGEBaseENV15');
+      },
+    },
+    'multilingual-e5-large-query': {
+      specificationVersion: 'v3',
+      provider: 'fastembed',
+      modelId: 'multilingual-e5-large-query',
+      maxEmbeddingsPerCall: 256,
+      supportsParallelCalls: true,
+      ...FASTEMBED_INPUT_LIMIT,
+      async doEmbed({ values }) {
+        return generateEmbeddingsWithWarnings(values, 'MLE5Large', 'query');
+      },
+    },
+    'multilingual-e5-large-passage': {
+      specificationVersion: 'v3',
+      provider: 'fastembed',
+      modelId: 'multilingual-e5-large-passage',
+      maxEmbeddingsPerCall: 256,
+      supportsParallelCalls: true,
+      ...FASTEMBED_INPUT_LIMIT,
+      async doEmbed({ values }) {
+        return generateEmbeddingsWithWarnings(values, 'MLE5Large', 'passage');
       },
     },
   },
@@ -145,6 +194,8 @@ const fastEmbedProviderV3 = customProviderV3({
 export const fastembed: EmbeddingModelV3 & {
   small: EmbeddingModelV3;
   base: EmbeddingModelV3;
+  multilingualE5LargeQuery: EmbeddingModelV3;
+  multilingualE5LargePassage: EmbeddingModelV3;
   smallV2: EmbeddingModelV2<string>;
   baseV2: EmbeddingModelV2<string>;
   smallLegacy: EmbeddingModelV1<string>;
@@ -152,6 +203,8 @@ export const fastembed: EmbeddingModelV3 & {
 } = Object.assign(fastEmbedProviderV3.embeddingModel(`bge-small-en-v1.5`), {
   small: fastEmbedProviderV3.embeddingModel(`bge-small-en-v1.5`),
   base: fastEmbedProviderV3.embeddingModel(`bge-base-en-v1.5`),
+  multilingualE5LargeQuery: fastEmbedProviderV3.embeddingModel(`multilingual-e5-large-query`),
+  multilingualE5LargePassage: fastEmbedProviderV3.embeddingModel(`multilingual-e5-large-passage`),
   smallV2: fastEmbedProviderV2.textEmbeddingModel(`bge-small-en-v1.5`),
   baseV2: fastEmbedProviderV2.textEmbeddingModel(`bge-base-en-v1.5`),
   smallLegacy: fastEmbedLegacyProvider.textEmbeddingModel(`bge-small-en-v1.5`),

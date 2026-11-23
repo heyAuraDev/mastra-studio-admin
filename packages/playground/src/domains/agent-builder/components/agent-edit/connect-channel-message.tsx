@@ -1,0 +1,105 @@
+import { Badge } from '@mastra/playground-ui/components/Badge';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { IconPlugin1 } from '@mastra/playground-ui/icons/central/IconPlugin1';
+import { IconSettingsSliderHor } from '@mastra/playground-ui/icons/central/IconSettingsSliderHor';
+import { useChannelInstallations, useChannelPlatforms } from '@mastra/react/hooks/agents';
+import { useState } from 'react';
+import { ChannelDialog } from './publish-channel-dialogs/channel-dialog';
+import { PlatformIcon } from '@/domains/agents/components/agent-channels/platform-icons';
+import { useConnectChannelAction } from '@/domains/agents/hooks/use-connect-channel-action';
+import { useReconcilePendingInstallOnFocus } from '@/domains/agents/hooks/use-reconcile-pending-install-on-focus';
+
+export interface ConnectChannelMessageProps {
+  platformId: string;
+  agentId: string | undefined;
+}
+
+export function ConnectChannelMessage({ platformId, agentId }: ConnectChannelMessageProps) {
+  const { data: platforms = [], isLoading: arePlatformsLoading } = useChannelPlatforms();
+  const platform = platforms.find(p => p.id === platformId);
+  const { data: installations = [] } = useChannelInstallations({
+    platform: platformId,
+    agentId: agentId ?? '',
+    queryOptions: { enabled: Boolean(platformId && agentId) },
+  });
+  const installation = installations.find(i => i.status === 'active');
+  const hasPendingInstall = installations.some(i => i.status === 'pending');
+  useReconcilePendingInstallOnFocus({ platform: platformId, agentId: agentId ?? '', hasPendingInstall });
+  const { connect, isConnecting } = useConnectChannelAction(platformId);
+  const [dialogOpen, setDialogOpen] = useState(false);
+
+  if (!agentId || arePlatformsLoading || !platform) {
+    return null;
+  }
+
+  const handleConnect = () => {
+    connect(agentId);
+  };
+
+  return (
+    <>
+      <div
+        className="flex items-center gap-3 rounded-xl border border-1 p-3"
+        data-testid={`agent-builder-chat-connect-channel-${platformId}`}
+      >
+        <PlatformIcon platform={platform.id} className="h-5 w-5 shrink-0" />
+        <Txt as="p" variant="body" tone="muted" className="flex-1">
+          {platform.name}
+        </Txt>
+        {!platform.isConfigured ? (
+          <Badge variant="warning" size="sm" indicator="dot">
+            Not configured
+          </Badge>
+        ) : installation ? (
+          <Badge variant="success" size="sm" indicator="dot">
+            Connected
+          </Badge>
+        ) : null}
+
+        {!platform.isConfigured ? (
+          <Button
+            icon={<IconSettingsSliderHor />}
+            size="sm"
+            variant="ghost"
+            disabled
+            data-testid={`agent-builder-chat-connect-channel-${platformId}-button`}
+          >
+            Not configured
+          </Button>
+        ) : installation ? (
+          <Button
+            icon={<IconSettingsSliderHor />}
+            size="sm"
+            variant="default"
+            onClick={() => setDialogOpen(true)}
+            data-testid={`agent-builder-chat-connect-channel-${platformId}-button`}
+          >
+            Manage
+          </Button>
+        ) : (
+          <Button
+            icon={<IconPlugin1 />}
+            size="sm"
+            variant="default"
+            onClick={handleConnect}
+            disabled={isConnecting}
+            data-testid={`agent-builder-chat-connect-channel-${platformId}-button`}
+          >
+            {isConnecting ? 'Connecting…' : platformId === 'slack' ? 'Continue with Slack' : `Connect ${platform.name}`}
+          </Button>
+        )}
+      </div>
+
+      {dialogOpen ? (
+        <ChannelDialog
+          platform={platform}
+          agentId={agentId}
+          installation={installation}
+          open
+          onOpenChange={setDialogOpen}
+        />
+      ) : null}
+    </>
+  );
+}

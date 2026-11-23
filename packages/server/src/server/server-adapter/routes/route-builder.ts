@@ -3,7 +3,7 @@ import type { ValidationErrorHook } from '@mastra/core/server';
 import type { ZodRawShape, ZodTypeAny } from 'zod/v4';
 import { z, ZodObject, ZodOptional, ZodNullable, ZodArray, ZodRecord } from 'zod/v4';
 import { generateRouteOpenAPI } from '../openapi-utils';
-import type { InferParams, ResponseType, RouteSchemas, ServerRoute, ServerRouteHandler } from './index';
+import type { InferParams, ResponseType, RouteMCPConfig, RouteSchemas, ServerRoute, ServerRouteHandler } from './index';
 
 /**
  * Extracts parameters matching a Zod schema's shape from a params object.
@@ -152,6 +152,7 @@ interface RouteConfig<
   path: TPath;
   responseType: TResponseType;
   streamFormat?: 'sse' | 'stream'; // Only used when responseType is 'stream'
+  sseFlushOnConnect?: boolean;
   handler: ServerRouteHandler<
     InferParams<TPathSchema, TQuerySchema, TBodySchema>,
     TResponseSchema extends z.ZodTypeAny ? z.infer<TResponseSchema> : unknown,
@@ -181,6 +182,10 @@ interface RouteConfig<
    */
   fga?: FGARouteConfig;
   onValidationError?: ValidationErrorHook;
+  /** Exposes this route as a tool on the built-in Mastra MCP server. */
+  mcp?: RouteMCPConfig;
+  /** Accept credentials only from the `Authorization` header (see `ServerRoute.authTransport`). */
+  authTransport?: 'bearer';
 }
 
 /**
@@ -259,7 +264,7 @@ export function createRoute<
   RouteSchemas<TPathSchema, TQuerySchema, TBodySchema, TResponseSchema>,
   TMethod,
   TPath
-> {
+> & { readonly _mastraSchemaRoute: true } {
   const { summary, description, tags, deprecated, requiresAuth, requiresPermission, onValidationError, ...baseRoute } =
     config;
 
@@ -283,6 +288,7 @@ export function createRoute<
 
   return {
     ...baseRoute,
+    _mastraSchemaRoute: true,
     openapi,
     deprecated,
     requiresAuth,
@@ -347,7 +353,7 @@ export function createPublicRoute<
   RouteSchemas<TPathSchema, TQuerySchema, TBodySchema, TResponseSchema>,
   TMethod,
   TPath
-> {
+> & { readonly _mastraSchemaRoute: true } {
   return createRoute({
     ...config,
     requiresAuth: false,

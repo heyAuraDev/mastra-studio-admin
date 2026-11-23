@@ -1,3 +1,4 @@
+import { Txt } from '@/ds/components/Txt';
 import { cn } from '@/lib/utils';
 
 export type TextAndIconProps = {
@@ -7,15 +8,17 @@ export type TextAndIconProps = {
 
 export function TextAndIcon({ children, className }: TextAndIconProps) {
   return (
-    <span
+    <Txt
+      as="span"
+      variant="caption"
+      tone="muted"
       className={cn(
-        'flex items-center gap-1',
-        '[&_svg]:w-[1.1em] [&_svg]:h-[1.1em] [&_svg]:opacity-50 [&_svg]:shrink-0',
-        '[&_img]:w-[1.2em] [&_img]:h-[1.2em] [&_img]:opacity-50 [&_img]:shrink-0',
+        'inline-flex items-center gap-1',
+        '[&>svg]:size-icon-sm [&>svg]:shrink-0 [&>svg]:opacity-50',
         className,
       )}
     >
       {children}
-    </span>
+    </Txt>
   );
 }

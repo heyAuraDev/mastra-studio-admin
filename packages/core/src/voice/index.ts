@@ -1,4 +1,9 @@
-export * from './voice';
-export * from './composite-voice';
-export * from './default-voice';
-export * from './aisdk';
+export { AISDKSpeech, AISDKTranscription, CompositeVoice, DefaultVoice, MastraVoice } from '@internal/voice';
+export type {
+  IMastraVoice,
+  RequestContext,
+  ToolsInput,
+  VoiceConfig,
+  VoiceEventMap,
+  VoiceEventType,
+} from '@internal/voice';

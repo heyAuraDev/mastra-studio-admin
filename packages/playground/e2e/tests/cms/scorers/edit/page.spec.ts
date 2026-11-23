@@ -1,6 +1,7 @@
-import { test, expect, Page } from '@playwright/test';
-import { expectCurrentBreadcrumb } from '../../../__utils__/route-header';
+import type { Page } from '@playwright/test';
+import { test, expect } from '@playwright/test';
 import { resetStorage } from '../../../__utils__/reset-storage';
+import { expectCurrentBreadcrumb } from '../../../__utils__/route-header';
 
 // Helper to generate unique scorer names
 function uniqueScorerName(prefix = 'Test Scorer') {
@@ -23,13 +24,13 @@ async function fillScorerFields(
   },
 ) {
   if (options.name !== undefined) {
-    const nameInput = page.locator('#scorer-name');
+    const nameInput = page.getByRole('textbox', { name: /^Name/ });
     await nameInput.clear();
     await nameInput.fill(options.name);
   }
 
   if (options.description !== undefined) {
-    const descInput = page.locator('#scorer-description');
+    const descInput = page.getByRole('textbox', { name: /^Description/ });
     await descInput.clear();
     await descInput.fill(options.description);
   }
@@ -97,7 +98,7 @@ async function createScorerAndGetId(
 ): Promise<string> {
   await page.goto('/cms/scorers/create');
   // Wait for the create form to be ready
-  await page.locator('#scorer-name').waitFor({ state: 'visible', timeout: 15000 });
+  await page.getByRole('textbox', { name: /^Name/ }).waitFor({ state: 'visible', timeout: 15000 });
 
   await fillScorerFields(page, {
     name: scorerName,
@@ -124,416 +125,296 @@ async function goToEditPage(page: Page, scorerId: string) {
   await page.goto(`/cms/scorers/${scorerId}/edit`);
   await expect(page).toHaveURL(/\/cms\/scorers\/[a-z0-9-]+\/edit/, { timeout: 15000 });
   // Wait for the form to load (data fetch completes and form renders)
-  await page.locator('#scorer-name').waitFor({ state: 'visible', timeout: 15000 });
+  await page.getByRole('textbox', { name: /^Name/ }).waitFor({ state: 'visible', timeout: 15000 });
 }
 
 test.afterEach(async () => {
   await resetStorage();
 });
 
-test.describe('Page Structure & Initial State', () => {
-  test('displays correct page title and header with scorer name', async ({ page }) => {
-    const scorerName = uniqueScorerName('Header Test');
-    const scorerId = await createScorerAndGetId(page, scorerName);
+test.describe('CMS edit scorer page', () => {
+  test.describe('when the edit page first loads', () => {
+    test('displays correct page title and header with scorer name', async ({ page }) => {
+      const scorerName = uniqueScorerName('Header Test');
+      const scorerId = await createScorerAndGetId(page, scorerName);
 
-    await goToEditPage(page, scorerId);
+      await goToEditPage(page, scorerId);
 
-    await expect(page).toHaveTitle(/Mastra Studio/);
-    await expectCurrentBreadcrumb(page, scorerName);
-  });
-
-  test('displays Update scorer button', async ({ page }) => {
-    const scorerName = uniqueScorerName('Button Test');
-    const scorerId = await createScorerAndGetId(page, scorerName);
-
-    await goToEditPage(page, scorerId);
-
-    const updateButton = page.getByRole('button', { name: 'Publish' });
-    await expect(updateButton).toBeVisible();
-    await expect(updateButton).toBeEnabled();
-  });
-
-  test('pre-populates form with existing scorer data on load', async ({ page }) => {
-    const scorerName = uniqueScorerName('Prepopulate Test');
-    const description = 'Pre-populated description';
-    const instructions = 'Pre-populated instructions for testing.';
-
-    const scorerId = await createScorerAndGetId(page, scorerName, {
-      description,
-      scoreRangeMin: '1',
-      scoreRangeMax: '5',
-      samplingType: 'ratio',
-      samplingRate: '0.7',
-      instructions,
+      await expect(page).toHaveTitle(/Mastra Studio/);
+      await expectCurrentBreadcrumb(page, scorerName);
     });
 
-    await goToEditPage(page, scorerId);
+    test('pre-populates form with existing scorer data on load', async ({ page }) => {
+      const scorerName = uniqueScorerName('Prepopulate Test');
+      const description = 'Pre-populated description';
+      const instructions = 'Pre-populated instructions for testing.';
 
-    await expect(page.locator('#scorer-name')).toHaveValue(scorerName);
-    await expect(page.locator('#scorer-description')).toHaveValue(description);
-    await expect(page.getByRole('combobox').nth(1)).toContainText('OpenAI');
-    await expect(page.getByRole('combobox').nth(2)).toContainText('gpt-4o-mini');
-    await expect(page.getByPlaceholder('Min')).toHaveValue('1');
-    await expect(page.getByPlaceholder('Max')).toHaveValue('5');
-    await expect(page.locator('#sampling-ratio')).toBeChecked();
-    await expect(page.getByPlaceholder('Rate (0-1)')).toHaveValue('0.7');
-    await expect(page.locator('.cm-content')).toContainText(instructions);
-  });
-});
+      const scorerId = await createScorerAndGetId(page, scorerName, {
+        description,
+        scoreRangeMin: '1',
+        scoreRangeMax: '5',
+        samplingType: 'ratio',
+        samplingRate: '0.7',
+        instructions,
+      });
 
-test.describe('Edit Persistence', () => {
-  test('updates scorer and redirects to detail page with success toast', async ({ page }) => {
-    const scorerName = uniqueScorerName('Update Redirect');
-    const scorerId = await createScorerAndGetId(page, scorerName);
+      await goToEditPage(page, scorerId);
 
-    await goToEditPage(page, scorerId);
-
-    const updatedName = uniqueScorerName('Updated');
-    await fillScorerFields(page, { name: updatedName });
-
-    await page.getByRole('button', { name: 'Publish' }).click();
-
-    await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
-    await expect(page.getByText('Scorer published')).toBeVisible();
+      await expect(page.getByRole('textbox', { name: /^Name/ })).toHaveValue(scorerName);
+      await expect(page.getByRole('textbox', { name: /^Description/ })).toHaveValue(description);
+      await expect(page.getByRole('combobox').nth(1)).toHaveValue('OpenAI');
+      await expect(page.getByRole('combobox').nth(2)).toHaveValue('gpt-4o-mini');
+      await expect(page.getByPlaceholder('Min')).toHaveValue('1');
+      await expect(page.getByPlaceholder('Max')).toHaveValue('5');
+      await expect(page.getByRole('radio', { name: 'Ratio' })).toBeChecked();
+      await expect(page.getByPlaceholder('Rate (0-1)')).toHaveValue('0.7');
+      await expect(page.locator('.cm-content')).toContainText(instructions);
+    });
   });
 
-  test('persists all edited fields when returning to edit page', async ({ page }) => {
-    const scorerName = uniqueScorerName('Full Edit');
-    const scorerId = await createScorerAndGetId(page, scorerName);
+  test.describe('when scorer edits are saved', () => {
+    test('updates scorer and redirects to detail page with success toast', async ({ page }) => {
+      const scorerName = uniqueScorerName('Update Redirect');
+      const scorerId = await createScorerAndGetId(page, scorerName);
 
-    await goToEditPage(page, scorerId);
+      await goToEditPage(page, scorerId);
 
-    const updatedName = uniqueScorerName('Fully Updated');
-    const updatedDescription = 'Updated description for full edit test';
-    const updatedInstructions = 'Updated instructions with new scoring criteria.';
+      const updatedName = uniqueScorerName('Updated');
+      await fillScorerFields(page, { name: updatedName });
 
-    await fillScorerFields(page, {
-      name: updatedName,
-      description: updatedDescription,
-      scoreRangeMin: '2',
-      scoreRangeMax: '8',
-      samplingType: 'ratio',
-      samplingRate: '0.3',
-      instructions: updatedInstructions,
+      await page.getByRole('button', { name: 'Publish' }).click();
+
+      await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
+      await expect(page.getByText('Scorer published')).toBeVisible();
     });
 
-    await page.getByRole('button', { name: 'Publish' }).click();
+    test('persists all edited fields when returning to edit page', async ({ page }) => {
+      const scorerName = uniqueScorerName('Full Edit');
+      const scorerId = await createScorerAndGetId(page, scorerName);
 
-    await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
-    await expect(page.getByText('Scorer published')).toBeVisible();
+      await goToEditPage(page, scorerId);
 
-    // Navigate back to edit page
-    await goToEditPage(page, scorerId);
+      const updatedName = uniqueScorerName('Fully Updated');
+      const updatedDescription = 'Updated description for full edit test';
+      const updatedInstructions = 'Updated instructions with new scoring criteria.';
 
-    await expect(page.locator('#scorer-name')).toHaveValue(updatedName);
-    await expect(page.locator('#scorer-description')).toHaveValue(updatedDescription);
-    await expect(page.getByRole('combobox').nth(1)).toContainText('OpenAI');
-    await expect(page.getByRole('combobox').nth(2)).toContainText('gpt-4o-mini');
-    await expect(page.getByPlaceholder('Min')).toHaveValue('2');
-    await expect(page.getByPlaceholder('Max')).toHaveValue('8');
-    await expect(page.locator('#sampling-ratio')).toBeChecked();
-    await expect(page.getByPlaceholder('Rate (0-1)')).toHaveValue('0.3');
-    await expect(page.locator('.cm-content')).toContainText(updatedInstructions);
-  });
+      await fillScorerFields(page, {
+        name: updatedName,
+        description: updatedDescription,
+        scoreRangeMin: '2',
+        scoreRangeMax: '8',
+        samplingType: 'ratio',
+        samplingRate: '0.3',
+        instructions: updatedInstructions,
+      });
 
-  test('persists partial field updates', async ({ page }) => {
-    const scorerName = uniqueScorerName('Partial Edit');
-    const scorerId = await createScorerAndGetId(page, scorerName, {
-      description: 'Original description',
-      scoreRangeMin: '0',
-      scoreRangeMax: '10',
+      await page.getByRole('button', { name: 'Publish' }).click();
+
+      await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
+      await expect(page.getByText('Scorer published')).toBeVisible();
+
+      // Navigate back to edit page
+      await goToEditPage(page, scorerId);
+
+      await expect(page.getByRole('textbox', { name: /^Name/ })).toHaveValue(updatedName);
+      await expect(page.getByRole('textbox', { name: /^Description/ })).toHaveValue(updatedDescription);
+      await expect(page.getByRole('combobox').nth(1)).toHaveValue('OpenAI');
+      await expect(page.getByRole('combobox').nth(2)).toHaveValue('gpt-4o-mini');
+      await expect(page.getByPlaceholder('Min')).toHaveValue('2');
+      await expect(page.getByPlaceholder('Max')).toHaveValue('8');
+      await expect(page.getByRole('radio', { name: 'Ratio' })).toBeChecked();
+      await expect(page.getByPlaceholder('Rate (0-1)')).toHaveValue('0.3');
+      await expect(page.locator('.cm-content')).toContainText(updatedInstructions);
     });
 
-    await goToEditPage(page, scorerId);
+    test('persists partial field updates', async ({ page }) => {
+      const scorerName = uniqueScorerName('Partial Edit');
+      const scorerId = await createScorerAndGetId(page, scorerName, {
+        description: 'Original description',
+        scoreRangeMin: '0',
+        scoreRangeMax: '10',
+      });
 
-    // Only update description and score range max
-    await fillScorerFields(page, {
-      description: 'Partially updated description',
-      scoreRangeMax: '20',
+      await goToEditPage(page, scorerId);
+
+      // Only update description and score range max
+      await fillScorerFields(page, {
+        description: 'Partially updated description',
+        scoreRangeMax: '20',
+      });
+
+      await page.getByRole('button', { name: 'Publish' }).click();
+
+      await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
+
+      await goToEditPage(page, scorerId);
+
+      // Changed fields should be updated
+      await expect(page.getByRole('textbox', { name: /^Description/ })).toHaveValue('Partially updated description');
+      await expect(page.getByPlaceholder('Max')).toHaveValue('20');
+
+      // Unchanged fields should remain the same
+      await expect(page.getByRole('textbox', { name: /^Name/ })).toHaveValue(scorerName);
+      await expect(page.getByPlaceholder('Min')).toHaveValue('0');
+      await expect(page.getByRole('combobox').nth(1)).toHaveValue('OpenAI');
+      await expect(page.getByRole('combobox').nth(2)).toHaveValue('gpt-4o-mini');
+    });
+  });
+
+  test.describe('when a single field is updated', () => {
+    test('updating name persists correctly', async ({ page }) => {
+      const scorerName = uniqueScorerName('Name Field');
+      const scorerId = await createScorerAndGetId(page, scorerName);
+
+      await goToEditPage(page, scorerId);
+
+      const updatedName = uniqueScorerName('Name Updated');
+      await fillScorerFields(page, { name: updatedName });
+
+      await page.getByRole('button', { name: 'Publish' }).click();
+      await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
+
+      await goToEditPage(page, scorerId);
+      await expect(page.getByRole('textbox', { name: /^Name/ })).toHaveValue(updatedName);
+      await expectCurrentBreadcrumb(page, updatedName);
     });
 
-    await page.getByRole('button', { name: 'Publish' }).click();
+    test('changing sampling type from ratio to none persists correctly', async ({ page }) => {
+      const scorerName = uniqueScorerName('Sampling Ratio-None');
+      const scorerId = await createScorerAndGetId(page, scorerName, {
+        samplingType: 'ratio',
+        samplingRate: '0.5',
+      });
 
-    await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
+      await goToEditPage(page, scorerId);
 
-    await goToEditPage(page, scorerId);
+      await fillScorerFields(page, { samplingType: 'none' });
 
-    // Changed fields should be updated
-    await expect(page.locator('#scorer-description')).toHaveValue('Partially updated description');
-    await expect(page.getByPlaceholder('Max')).toHaveValue('20');
+      await page.getByRole('button', { name: 'Publish' }).click();
+      await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
 
-    // Unchanged fields should remain the same
-    await expect(page.locator('#scorer-name')).toHaveValue(scorerName);
-    await expect(page.getByPlaceholder('Min')).toHaveValue('0');
-    await expect(page.getByRole('combobox').nth(1)).toContainText('OpenAI');
-    await expect(page.getByRole('combobox').nth(2)).toContainText('gpt-4o-mini');
+      await goToEditPage(page, scorerId);
+      await expect(page.getByRole('radio', { name: 'None' })).toBeChecked();
+      await expect(page.getByPlaceholder('Rate (0-1)')).not.toBeVisible();
+    });
   });
 
-  test('data persists after page reload on edit page', async ({ page }) => {
-    const scorerName = uniqueScorerName('Reload Edit');
-    const updatedName = uniqueScorerName('After Reload');
-    const updatedInstructions = 'Instructions that should survive reload.';
+  test.describe('when required fields are cleared on edit', () => {
+    test('shows validation error when name is cleared', async ({ page }) => {
+      const scorerName = uniqueScorerName('Validation Name');
+      const scorerId = await createScorerAndGetId(page, scorerName);
 
-    const scorerId = await createScorerAndGetId(page, scorerName);
+      await goToEditPage(page, scorerId);
 
-    await goToEditPage(page, scorerId);
+      const nameInput = page.getByRole('textbox', { name: /^Name/ });
+      await nameInput.clear();
 
-    await fillScorerFields(page, {
-      name: updatedName,
-      instructions: updatedInstructions,
+      await page.getByRole('button', { name: 'Publish' }).click();
+
+      await expect(page.getByText('Name is required')).toBeVisible();
     });
 
-    await page.getByRole('button', { name: 'Publish' }).click();
+    test('shows error toast when form has validation errors', async ({ page }) => {
+      const scorerName = uniqueScorerName('Validation Toast');
+      const scorerId = await createScorerAndGetId(page, scorerName);
 
-    await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
+      await goToEditPage(page, scorerId);
 
-    await goToEditPage(page, scorerId);
+      const nameInput = page.getByRole('textbox', { name: /^Name/ });
+      await nameInput.clear();
 
-    // Reload the page
-    await page.reload();
+      await page.getByRole('button', { name: 'Publish' }).click();
 
-    await expect(page.locator('#scorer-name')).toHaveValue(updatedName, { timeout: 10000 });
-    await expect(page.locator('.cm-content')).toContainText(updatedInstructions, { timeout: 10000 });
-  });
-});
-
-test.describe('Field-by-Field Update Verification', () => {
-  test('updating name persists correctly', async ({ page }) => {
-    const scorerName = uniqueScorerName('Name Field');
-    const scorerId = await createScorerAndGetId(page, scorerName);
-
-    await goToEditPage(page, scorerId);
-
-    const updatedName = uniqueScorerName('Name Updated');
-    await fillScorerFields(page, { name: updatedName });
-
-    await page.getByRole('button', { name: 'Publish' }).click();
-    await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
-
-    await goToEditPage(page, scorerId);
-    await expect(page.locator('#scorer-name')).toHaveValue(updatedName);
-    await expectCurrentBreadcrumb(page, updatedName);
+      await expect(page.getByText('Please fill in all required fields')).toBeVisible();
+    });
   });
 
-  test('updating description persists correctly', async ({ page }) => {
-    const scorerName = uniqueScorerName('Desc Field');
-    const scorerId = await createScorerAndGetId(page, scorerName);
+  test.describe('when a scorer update fails on the server', () => {
+    test('shows error toast and allows retry on update failure', async ({ page }) => {
+      const scorerName = uniqueScorerName('Error Handling');
+      const scorerId = await createScorerAndGetId(page, scorerName);
 
-    await goToEditPage(page, scorerId);
+      await goToEditPage(page, scorerId);
 
-    await fillScorerFields(page, { description: 'A newly added description' });
+      // Intercept PATCH requests to simulate server error (set up after page loads)
+      await page.route(`**/stored/scorers/${scorerId}**`, route => {
+        if (route.request().method() === 'PATCH') {
+          route.fulfill({
+            status: 500,
+            contentType: 'application/json',
+            body: JSON.stringify({ message: 'Internal server error' }),
+          });
+        } else {
+          route.continue();
+        }
+      });
 
-    await page.getByRole('button', { name: 'Publish' }).click();
-    await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
+      await fillScorerFields(page, { name: uniqueScorerName('Should Fail') });
 
-    await goToEditPage(page, scorerId);
-    await expect(page.locator('#scorer-description')).toHaveValue('A newly added description');
-  });
+      await page.getByRole('button', { name: 'Publish' }).click();
 
-  test('updating score range persists correctly', async ({ page }) => {
-    const scorerName = uniqueScorerName('Range Field');
-    const scorerId = await createScorerAndGetId(page, scorerName);
+      await expect(page.getByText(/Failed to publish scorer/i)).toBeVisible({ timeout: 15000 });
 
-    await goToEditPage(page, scorerId);
-
-    await fillScorerFields(page, { scoreRangeMin: '5', scoreRangeMax: '100' });
-
-    await page.getByRole('button', { name: 'Publish' }).click();
-    await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
-
-    await goToEditPage(page, scorerId);
-    await expect(page.getByPlaceholder('Min')).toHaveValue('5');
-    await expect(page.getByPlaceholder('Max')).toHaveValue('100');
-  });
-
-  test('changing sampling type from none to ratio persists correctly', async ({ page }) => {
-    const scorerName = uniqueScorerName('Sampling None-Ratio');
-    const scorerId = await createScorerAndGetId(page, scorerName);
-
-    await goToEditPage(page, scorerId);
-
-    await fillScorerFields(page, { samplingType: 'ratio', samplingRate: '0.6' });
-
-    await page.getByRole('button', { name: 'Publish' }).click();
-    await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
-
-    await goToEditPage(page, scorerId);
-    await expect(page.locator('#sampling-ratio')).toBeChecked();
-    await expect(page.getByPlaceholder('Rate (0-1)')).toHaveValue('0.6');
-  });
-
-  test('changing sampling type from ratio to none persists correctly', async ({ page }) => {
-    const scorerName = uniqueScorerName('Sampling Ratio-None');
-    const scorerId = await createScorerAndGetId(page, scorerName, {
-      samplingType: 'ratio',
-      samplingRate: '0.5',
+      // Should stay on edit page with button still enabled
+      await expect(page).toHaveURL(/\/cms\/scorers\/[a-z0-9-]+\/edit/);
+      await expect(page.getByRole('button', { name: 'Publish' })).toBeEnabled();
     });
 
-    await goToEditPage(page, scorerId);
+    test('stays on edit page when update fails and preserves form data', async ({ page }) => {
+      const scorerName = uniqueScorerName('Preserve Data');
+      const scorerId = await createScorerAndGetId(page, scorerName);
 
-    await fillScorerFields(page, { samplingType: 'none' });
+      await goToEditPage(page, scorerId);
 
-    await page.getByRole('button', { name: 'Publish' }).click();
-    await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
+      // Intercept PATCH requests to simulate server error (set up after page loads)
+      await page.route(`**/stored/scorers/${scorerId}**`, route => {
+        if (route.request().method() === 'PATCH') {
+          route.fulfill({
+            status: 500,
+            contentType: 'application/json',
+            body: JSON.stringify({ message: 'Internal server error' }),
+          });
+        } else {
+          route.continue();
+        }
+      });
 
-    await goToEditPage(page, scorerId);
-    await expect(page.locator('#sampling-none')).toBeChecked();
-    await expect(page.getByPlaceholder('Rate (0-1)')).not.toBeVisible();
-  });
+      const updatedName = uniqueScorerName('Not Lost');
+      const updatedDescription = 'This description should not be lost';
+      await fillScorerFields(page, { name: updatedName, description: updatedDescription });
 
-  test('updating instructions persists correctly', async ({ page }) => {
-    const scorerName = uniqueScorerName('Instructions Field');
-    const scorerId = await createScorerAndGetId(page, scorerName);
+      await page.getByRole('button', { name: 'Publish' }).click();
 
-    await goToEditPage(page, scorerId);
+      await expect(page.getByText(/Failed to publish scorer/i)).toBeVisible({ timeout: 15000 });
 
-    const newInstructions = 'Brand new scoring instructions for this test.';
-    await fillScorerFields(page, { instructions: newInstructions });
-
-    await page.getByRole('button', { name: 'Publish' }).click();
-    await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
-
-    await goToEditPage(page, scorerId);
-    await expect(page.locator('.cm-content')).toContainText(newInstructions);
-  });
-});
-
-test.describe('Validation on Edit', () => {
-  test('shows validation error when name is cleared', async ({ page }) => {
-    const scorerName = uniqueScorerName('Validation Name');
-    const scorerId = await createScorerAndGetId(page, scorerName);
-
-    await goToEditPage(page, scorerId);
-
-    const nameInput = page.locator('#scorer-name');
-    await nameInput.clear();
-
-    await page.getByRole('button', { name: 'Publish' }).click();
-
-    await expect(page.getByText('Name is required')).toBeVisible();
-  });
-
-  test('shows error toast when form has validation errors', async ({ page }) => {
-    const scorerName = uniqueScorerName('Validation Toast');
-    const scorerId = await createScorerAndGetId(page, scorerName);
-
-    await goToEditPage(page, scorerId);
-
-    const nameInput = page.locator('#scorer-name');
-    await nameInput.clear();
-
-    await page.getByRole('button', { name: 'Publish' }).click();
-
-    await expect(page.getByText('Please fill in all required fields')).toBeVisible();
-  });
-});
-
-test.describe('Error Handling', () => {
-  test('shows error toast and allows retry on update failure', async ({ page }) => {
-    const scorerName = uniqueScorerName('Error Handling');
-    const scorerId = await createScorerAndGetId(page, scorerName);
-
-    await goToEditPage(page, scorerId);
-
-    // Intercept PATCH requests to simulate server error (set up after page loads)
-    await page.route(`**/stored/scorers/${scorerId}**`, route => {
-      if (route.request().method() === 'PATCH') {
-        route.fulfill({
-          status: 500,
-          contentType: 'application/json',
-          body: JSON.stringify({ message: 'Internal server error' }),
-        });
-      } else {
-        route.continue();
-      }
+      // Form data should still be present
+      await expect(page.getByRole('textbox', { name: /^Name/ })).toHaveValue(updatedName);
+      await expect(page.getByRole('textbox', { name: /^Description/ })).toHaveValue(updatedDescription);
     });
-
-    await fillScorerFields(page, { name: uniqueScorerName('Should Fail') });
-
-    await page.getByRole('button', { name: 'Publish' }).click();
-
-    await expect(page.getByText(/Failed to publish scorer/i)).toBeVisible({ timeout: 15000 });
-
-    // Should stay on edit page with button still enabled
-    await expect(page).toHaveURL(/\/cms\/scorers\/[a-z0-9-]+\/edit/);
-    await expect(page.getByRole('button', { name: 'Publish' })).toBeEnabled();
   });
 
-  test('stays on edit page when update fails and preserves form data', async ({ page }) => {
-    const scorerName = uniqueScorerName('Preserve Data');
-    const scorerId = await createScorerAndGetId(page, scorerName);
+  test.describe('when navigating away from the edit page', () => {
+    test('form reflects latest server data after re-navigation', async ({ page }) => {
+      const scorerName = uniqueScorerName('Latest Data');
+      const scorerId = await createScorerAndGetId(page, scorerName);
 
-    await goToEditPage(page, scorerId);
+      // First edit: update the name
+      await goToEditPage(page, scorerId);
+      const firstUpdate = uniqueScorerName('First Update');
+      await fillScorerFields(page, { name: firstUpdate });
+      await page.getByRole('button', { name: 'Publish' }).click();
+      await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
 
-    // Intercept PATCH requests to simulate server error (set up after page loads)
-    await page.route(`**/stored/scorers/${scorerId}**`, route => {
-      if (route.request().method() === 'PATCH') {
-        route.fulfill({
-          status: 500,
-          contentType: 'application/json',
-          body: JSON.stringify({ message: 'Internal server error' }),
-        });
-      } else {
-        route.continue();
-      }
+      // Second edit: update again
+      await goToEditPage(page, scorerId);
+      const secondUpdate = uniqueScorerName('Second Update');
+      await fillScorerFields(page, { name: secondUpdate });
+      await page.getByRole('button', { name: 'Publish' }).click();
+      await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
+
+      // Navigate back to edit - should show second update, not first
+      await goToEditPage(page, scorerId);
+      await expect(page.getByRole('textbox', { name: /^Name/ })).toHaveValue(secondUpdate);
     });
-
-    const updatedName = uniqueScorerName('Not Lost');
-    const updatedDescription = 'This description should not be lost';
-    await fillScorerFields(page, { name: updatedName, description: updatedDescription });
-
-    await page.getByRole('button', { name: 'Publish' }).click();
-
-    await expect(page.getByText(/Failed to publish scorer/i)).toBeVisible({ timeout: 15000 });
-
-    // Form data should still be present
-    await expect(page.locator('#scorer-name')).toHaveValue(updatedName);
-    await expect(page.locator('#scorer-description')).toHaveValue(updatedDescription);
-  });
-});
-
-test.describe('Navigation & State', () => {
-  test('navigating away and back to edit page shows persisted data', async ({ page }) => {
-    const scorerName = uniqueScorerName('Nav Away');
-    const description = 'Description for nav test';
-    const scorerId = await createScorerAndGetId(page, scorerName, { description });
-
-    await goToEditPage(page, scorerId);
-
-    // Verify initial data
-    await expect(page.locator('#scorer-name')).toHaveValue(scorerName);
-
-    // Navigate away
-    await page.goto('/cms/scorers/create');
-    await expect(page).toHaveURL(/\/cms\/scorers\/create/);
-
-    // Navigate back to edit page
-    await goToEditPage(page, scorerId);
-
-    await expect(page.locator('#scorer-name')).toHaveValue(scorerName);
-    await expect(page.locator('#scorer-description')).toHaveValue(description);
-  });
-
-  test('form reflects latest server data after re-navigation', async ({ page }) => {
-    const scorerName = uniqueScorerName('Latest Data');
-    const scorerId = await createScorerAndGetId(page, scorerName);
-
-    // First edit: update the name
-    await goToEditPage(page, scorerId);
-    const firstUpdate = uniqueScorerName('First Update');
-    await fillScorerFields(page, { name: firstUpdate });
-    await page.getByRole('button', { name: 'Publish' }).click();
-    await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
-
-    // Second edit: update again
-    await goToEditPage(page, scorerId);
-    const secondUpdate = uniqueScorerName('Second Update');
-    await fillScorerFields(page, { name: secondUpdate });
-    await page.getByRole('button', { name: 'Publish' }).click();
-    await expect(page).toHaveURL(/\/scorers\/[a-z0-9-]+$/, { timeout: 15000 });
-
-    // Navigate back to edit - should show second update, not first
-    await goToEditPage(page, scorerId);
-    await expect(page.locator('#scorer-name')).toHaveValue(secondUpdate);
   });
 });

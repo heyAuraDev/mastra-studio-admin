@@ -8,7 +8,7 @@
 import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import type { MastraDBMessage, MastraMessageContentV2 } from '@mastra/core/agent';
 import { InMemoryMemory, InMemoryDB } from '@mastra/core/storage';
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 
 import { BufferingCoordinator } from '../buffering-coordinator';
 import { ObservationalMemory } from '../observational-memory';
@@ -295,13 +295,9 @@ describe('Long session: observation and reflection lifecycle', () => {
     storage = createInMemoryStorage();
     BufferingCoordinator.asyncBufferingOps.clear();
     BufferingCoordinator.lastBufferedBoundary.clear();
+    BufferingCoordinator.observationBoundaryOwners.clear();
     BufferingCoordinator.lastBufferedAtTime.clear();
     BufferingCoordinator.reflectionBufferCycleIds.clear();
-    vi.useFakeTimers({ toFake: ['Date'] });
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
   });
 
   it('should exercise full lifecycle across 35 turns with buffering, observation, and reflection', async () => {
@@ -384,7 +380,7 @@ describe('Long session: observation and reflection lifecycle', () => {
     let maxObservationTokens = 0;
     let observationTokensBeforeReflection = 0;
 
-    // ── Stream event tracking (mirrors mastracode harness state) ──
+    // ── Stream event tracking (mirrors mastracode controller state) ──
     let totalStatusParts = 0;
     const turnsWithBufferingStart = new Set<number>();
     const turnsWithActivation = new Set<number>();
@@ -427,7 +423,6 @@ describe('Long session: observation and reflection lifecycle', () => {
       );
 
       // ── Add user message ──
-      vi.setSystemTime(new Date(baseTime + timeOffset));
       const userMsgId = `user-${turnNum}`;
       const userText = generateFiller(spec.tokensPerMessage, `Turn ${turnNum} user question`);
       messageList.add(
@@ -462,7 +457,6 @@ describe('Long session: observation and reflection lifecycle', () => {
       // ── Tool steps (if any) ──
       for (let step = 1; step <= spec.toolSteps; step++) {
         // Add tool-call response from assistant
-        vi.setSystemTime(new Date(baseTime + timeOffset));
         const toolResultText = generateFiller(spec.tokensPerToolResult, `Turn ${turnNum} tool-${step} result`);
         const toolMsgId = `tool-${turnNum}-${step}`;
         messageList.add(
@@ -510,7 +504,6 @@ describe('Long session: observation and reflection lifecycle', () => {
       }
 
       // ── Add final assistant response ──
-      vi.setSystemTime(new Date(baseTime + timeOffset));
       const assistantMsgId = `assistant-${turnNum}`;
       const assistantText = generateFiller(spec.tokensPerMessage, `Turn ${turnNum} assistant response`);
       messageList.add(
@@ -701,7 +694,7 @@ describe('Long session: observation and reflection lifecycle', () => {
     // ── Stream event: observation start/end markers ──
     // Finish cleanup no longer forces a final observation pass, so observation
     // work may still happen during the lifecycle without emitting a terminal
-    // turn marker in this harness.
+    // turn marker in this controller.
     expect(tracker.observerCalls).toBeGreaterThanOrEqual(3);
     for (const [, pair] of observationPairsPerTurn) {
       expect(pair.ends).toBeGreaterThanOrEqual(pair.starts);

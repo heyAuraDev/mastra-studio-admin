@@ -3,10 +3,11 @@ import http from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
+import { escapeStudioHtmlValue } from '@mastra/deployer/build';
 import { config } from 'dotenv';
 import handler from 'serve-handler';
 import { logger } from '../../utils/logger';
-import { loadAndValidatePresets, escapeJsonForHtml } from '../../utils/validate-presets.js';
+import { loadAndValidatePresets } from '../../utils/validate-presets.js';
 
 interface StudioOptions {
   env?: string;
@@ -38,6 +39,11 @@ function normalizeBasePath(basePath: string): string {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+
+// frame-ancestors is not valid in a meta tag, so the document response sets it here.
+// The Studio shell also ships a matching frame-src meta policy.
+const STUDIO_DOCUMENT_CSP =
+  "frame-src 'self' blob: data: https:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'";
 
 export async function studio(
   options: StudioOptions = {
@@ -102,7 +108,11 @@ export const createServer = (builtStudioPath: string, options: StudioOptions, re
   const experimentalFeatures = process.env.EXPERIMENTAL_FEATURES === 'true' ? 'true' : 'false';
   const experimentalUI = process.env.MASTRA_EXPERIMENTAL_UI === 'true' ? 'true' : 'false';
   const templatesEnabled = process.env.MASTRA_TEMPLATES === 'true' ? 'true' : 'false';
-  const agentSignals = process.env.MASTRA_AGENT_SIGNALS === 'true' ? 'true' : 'false';
+  const agentSignals = process.env.MASTRA_AGENT_SIGNALS === 'false' ? 'false' : 'true';
+  const signalsUI = process.env.MASTRA_SIGNALS_UI === 'true' ? 'true' : 'false';
+  const organizationId = process.env.MASTRA_ORGANIZATION_ID || '';
+  const platformProjectId = process.env.MASTRA_PLATFORM_PROJECT_ID || '';
+  const platformObservabilityEndpoint = process.env.MASTRA_PLATFORM_OBSERVABILITY_ENDPOINT || '';
 
   let html = readFileSync(indexHtmlPath, 'utf8')
     .replaceAll('%%MASTRA_STUDIO_BASE_PATH%%', basePath)
@@ -114,10 +124,18 @@ export const createServer = (builtStudioPath: string, options: StudioOptions, re
     .replaceAll('%%MASTRA_TEMPLATES%%', templatesEnabled)
     .replaceAll('%%MASTRA_CLOUD_API_ENDPOINT%%', '')
     .replaceAll('%%MASTRA_HIDE_CLOUD_CTA%%', '')
-    .replaceAll('%%MASTRA_TELEMETRY_DISABLED%%', process.env.MASTRA_TELEMETRY_DISABLED ?? '')
-    .replaceAll('%%MASTRA_REQUEST_CONTEXT_PRESETS%%', escapeJsonForHtml(requestContextPresetsJson))
+    .replaceAll('%%MASTRA_TELEMETRY_DISABLED%%', () =>
+      escapeStudioHtmlValue(process.env.MASTRA_TELEMETRY_DISABLED ?? ''),
+    )
+    .replaceAll('%%MASTRA_REQUEST_CONTEXT_PRESETS%%', () => escapeStudioHtmlValue(requestContextPresetsJson))
     .replaceAll('%%MASTRA_EXPERIMENTAL_UI%%', experimentalUI)
-    .replaceAll('%%MASTRA_AGENT_SIGNALS%%', agentSignals);
+    .replaceAll('%%MASTRA_AGENT_SIGNALS%%', agentSignals)
+    .replaceAll('%%MASTRA_SIGNALS_UI%%', signalsUI)
+    .replaceAll('%%MASTRA_ORGANIZATION_ID%%', () => escapeStudioHtmlValue(organizationId))
+    .replaceAll('%%MASTRA_PLATFORM_PROJECT_ID%%', () => escapeStudioHtmlValue(platformProjectId))
+    .replaceAll('%%MASTRA_PLATFORM_OBSERVABILITY_ENDPOINT%%', () =>
+      escapeStudioHtmlValue(platformObservabilityEndpoint),
+    );
 
   // Pre-compress the HTML shell since it's served for every non-asset request
   const compressedHtml = gzipSync(Buffer.from(html));
@@ -138,8 +156,9 @@ export const createServer = (builtStudioPath: string, options: StudioOptions, re
     // Let static assets be served by serve-handler
     const isAssetsPath = /(^|\/)assets\//.test(pathWithoutBase);
     const isDistAssetsPath = /(^|\/)dist\/assets\//.test(pathWithoutBase);
-    const isMastraSvg = pathWithoutBase === '/mastra.svg' || pathWithoutBase.endsWith('/mastra.svg');
-    const isStaticAsset = isAssetsPath || isDistAssetsPath || isMastraSvg;
+    // Studio's favicon (`packages/playground/index.html`)
+    const isFavicon = pathWithoutBase.endsWith('/mastra-dark-tile.svg');
+    const isStaticAsset = isAssetsPath || isDistAssetsPath || isFavicon;
 
     const rawEncoding = req.headers['accept-encoding'] ?? '';
     const encodingValues = Array.isArray(rawEncoding) ? rawEncoding : [rawEncoding];
@@ -158,13 +177,18 @@ export const createServer = (builtStudioPath: string, options: StudioOptions, re
       if (supportsGzip) {
         res.writeHead(200, {
           'Content-Type': 'text/html',
+          'Content-Security-Policy': STUDIO_DOCUMENT_CSP,
           'Content-Encoding': 'gzip',
           'Content-Length': compressedHtml.length,
           Vary: 'Accept-Encoding',
         });
         return res.end(compressedHtml);
       }
-      res.writeHead(200, { 'Content-Type': 'text/html', Vary: 'Accept-Encoding' });
+      res.writeHead(200, {
+        'Content-Type': 'text/html',
+        'Content-Security-Policy': STUDIO_DOCUMENT_CSP,
+        Vary: 'Accept-Encoding',
+      });
       return res.end(html);
     }
 

@@ -1,131 +1,147 @@
-import type { UpdateModelParams } from '@mastra/client-js';
-import { cn } from '@mastra/playground-ui';
-import { TriangleAlert } from 'lucide-react';
-import { useState, useEffect } from 'react';
-import { useAgent } from '../hooks/use-agent';
-import { useUpdateAgentModel } from '../hooks/use-agents';
-import { LLMProviders, LLMModels, useLLMProviders, cleanProviderId, findProviderById } from '@/domains/llm';
+import { Badge } from '@mastra/playground-ui/components/Badge';
+import { Skeleton } from '@mastra/playground-ui/components/Skeleton';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { ModelPicker, cleanProviderId } from '@mastra/playground-ui/domains/llm';
+import type { ModelPickerProvider } from '@mastra/playground-ui/domains/llm';
+import { IconExclamationTriangle } from '@mastra/playground-ui/icons/central/IconExclamationTriangle';
+import { IconLock } from '@mastra/playground-ui/icons/central/IconLock';
+import { useLLMProviders } from '@mastra/react/hooks/llm';
+import { usePlaygroundModelOptional } from '../context/playground-model-context';
+import { useBuilderFilteredModels, useBuilderFilteredProviders, useBuilderModelPolicy } from '@/domains/agent-builder';
+import { useAgentBuilderAllowedModels } from '@/domains/agent-builder/hooks/use-agent-builder-allowed-models';
+import { findProviderById } from '@/domains/llm';
+import { useAllModels } from '@/domains/llm/hooks/use-filtered-models';
+import { useFilteredProviders } from '@/domains/llm/hooks/use-filtered-providers';
 
-// Triggers stay transparent; the wrapper owns the shared pill border/background.
-const COMPOSER_TRIGGER_CLASS = [
-  'w-auto min-w-0 px-3 gap-1',
-  'border-0 bg-transparent',
-  'hover:bg-surface5 active:bg-surface6',
-  'data-[popup-open]:bg-surface5',
-  'transition-colors duration-normal',
-].join(' ');
-
-export interface ComposerModelSwitcherProps {
-  agentId: string;
-}
-
-export const ComposerModelSwitcher = ({ agentId }: ComposerModelSwitcherProps) => {
-  const { data: agent } = useAgent(agentId);
-  const { mutateAsync: updateModel } = useUpdateAgentModel(agentId);
+export const ComposerModelSwitcher = () => {
+  const selection = usePlaygroundModelOptional();
   const { data: dataProviders, isLoading: providersLoading } = useLLMProviders();
+  const policy = useBuilderModelPolicy();
+  const allProviders = dataProviders?.providers || [];
+  const sortedProviders = useFilteredProviders(useBuilderFilteredProviders(allProviders, policy), '', false);
+  const allowedModels = useBuilderFilteredModels(useAllModels(allProviders), policy);
+  const pickerProviders: ModelPickerProvider[] = sortedProviders.map(provider => ({
+    id: provider.id,
+    name: provider.name,
+    connected: provider.connected,
+    models: allowedModels
+      .filter(model => model.provider === provider.id)
+      .map(model => ({ id: model.model, releaseDate: model.releaseDate })),
+  }));
 
-  const defaultProvider = agent?.provider || '';
-  const defaultModel = agent?.modelId || '';
-
-  const [selectedModel, setSelectedModel] = useState(defaultModel);
-  const [selectedProvider, setSelectedProvider] = useState(defaultProvider);
-  const [modelOpen, setModelOpen] = useState(false);
-
-  const providers = dataProviders?.providers || [];
-
-  // Update local state when agent data changes
-  useEffect(() => {
-    setSelectedModel(defaultModel);
-    setSelectedProvider(defaultProvider);
-  }, [defaultModel, defaultProvider]);
-
-  const currentModelProvider = cleanProviderId(selectedProvider);
-
-  // Resolve the full provider ID (handles gateway prefix, e.g., 'custom' -> 'acme/custom')
-  const resolvedProvider = findProviderById(providers, currentModelProvider);
-  const fullProviderId = resolvedProvider?.id || currentModelProvider;
-
-  // Auto-save when model changes
-  const handleModelSelect = async (modelId: string) => {
-    setSelectedModel(modelId);
-
-    if (modelId && fullProviderId) {
-      try {
-        await updateModel({
-          provider: fullProviderId as UpdateModelParams['provider'],
-          modelId,
-        });
-      } catch (error) {
-        console.error('Failed to update model:', error);
-      }
-    }
+  if (!selection) return null;
+  const resolveProviderId = (providerId: string) => {
+    const cleaned = cleanProviderId(providerId);
+    return findProviderById(allProviders, cleaned)?.id || cleaned;
   };
-
-  // Handle provider selection
-  const handleProviderSelect = (providerId: string) => {
-    const cleanedId = cleanProviderId(providerId);
-    setSelectedProvider(cleanedId);
-
-    // Only clear model selection and open model combobox when switching to a different provider
-    if (cleanedId !== currentModelProvider) {
-      setSelectedModel('');
-      setModelOpen(true);
-    }
-  };
-
+  // Reserve the picker footprint so the action row doesn't collapse then pop in.
   if (providersLoading) {
-    return null;
+    // Lighter than the default `bg-muted`: the composer surface is already light, so the
+    // skeleton would otherwise read as a dark pill instead of a placeholder.
+    return (
+      <Skeleton
+        className="h-control-sm w-32 rounded-full bg-fill-subtle before:via-fill"
+        data-testid="composer-model-switcher-skeleton"
+      />
+    );
   }
 
+  const { provider: selectedProvider, model: selectedModel, agentModel, resetModel, setModel } = selection;
+
+  // Admin locked the picker — surface a non-interactive chip instead.
+  if (policy.active && policy.pickerVisible === false) {
+    const lockedLabel = selectedProvider && selectedModel ? `${selectedProvider}/${selectedModel}` : 'Locked by admin';
+    return (
+      <Badge icon={<IconLock />} data-testid="composer-model-locked">
+        {lockedLabel}
+      </Badge>
+    );
+  }
+
+  // Resolve the full provider ID (handles gateway prefix, e.g., 'custom' -> 'acme/custom')
+  const fullProviderId = resolveProviderId(selectedProvider);
+
   return (
-    <div className="inline-flex items-stretch max-w-full">
-      <LLMProviders
-        value={currentModelProvider}
-        onValueChange={handleProviderSelect}
-        size="md"
-        className={cn(
-          COMPOSER_TRIGGER_CLASS,
-          'shrink-0',
-          'rounded-none! rounded-tl-full! rounded-bl-full!',
-          // Collapse provider to icon-only in narrow containers.
-          '@max-md:px-2 @max-md:[&>span>span]:hidden @max-md:[&>svg]:hidden',
-        )}
-      />
-      <div className="w-px self-stretch bg-border1" aria-hidden />
-      <LLMModels
-        llmId={currentModelProvider}
-        value={selectedModel}
-        onValueChange={handleModelSelect}
-        open={modelOpen}
-        onOpenChange={setModelOpen}
-        size="md"
-        className={cn(COMPOSER_TRIGGER_CLASS, 'rounded-none! rounded-tr-full! rounded-br-full!', 'max-w-[10rem]')}
-      />
-    </div>
+    <ModelPicker
+      providers={pickerProviders}
+      value={fullProviderId ? { provider: fullProviderId, model: selectedModel } : undefined}
+      onValueChange={({ provider, model }) => setModel(provider, model)}
+      defaultModel={agentModel && { provider: resolveProviderId(agentModel.provider), model: agentModel.model }}
+      reset={resetModel && { label: "Reset to the agent's model", onClick: resetModel }}
+      openOnSelectedProvider
+      triggerClassName="max-w-48"
+    />
   );
 };
 
-export const ComposerModelWarning = ({ agentId }: ComposerModelSwitcherProps) => {
-  const { data: agent } = useAgent(agentId);
+export const ComposerModelWarning = () => {
+  const selection = usePlaygroundModelOptional();
   const { data: dataProviders, isLoading: providersLoading } = useLLMProviders();
+  const policy = useBuilderModelPolicy();
+  const {
+    models: allowedModels,
+    isLoading: allowedModelsLoading,
+    isError: allowedModelsError,
+  } = useAgentBuilderAllowedModels();
 
-  if (providersLoading || !agent) return null;
+  if (providersLoading || !selection) return null;
 
   const providers = dataProviders?.providers || [];
-  const currentModelProvider = cleanProviderId(agent.provider || '');
+  const { provider, model, modelWarning } = selection;
+  const currentModelProvider = cleanProviderId(provider);
   const currentProvider = findProviderById(providers, currentModelProvider);
+  const selectedModel = model;
 
-  if (!currentProvider || currentProvider.connected) return null;
+  const stale =
+    Boolean(currentModelProvider && selectedModel) &&
+    policy.active &&
+    policy.allowed !== undefined &&
+    !allowedModelsLoading &&
+    !allowedModelsError &&
+    !allowedModels.some(m => cleanProviderId(m.provider) === currentModelProvider && m.model === selectedModel);
 
-  const envVar = Array.isArray(currentProvider.envVar) ? currentProvider.envVar.join(', ') : currentProvider.envVar;
+  const showProviderWarning = currentProvider && !currentProvider.connected;
+
+  if (!modelWarning && !stale && !showProviderWarning) return null;
+
+  const envVar =
+    currentProvider && Array.isArray(currentProvider.envVar)
+      ? currentProvider.envVar.join(', ')
+      : currentProvider?.envVar;
 
   return (
-    <div className="flex items-start gap-1 px-3 pb-1.5 text-accent6 text-xs min-w-0 max-w-full">
-      <TriangleAlert className="w-3 h-3 shrink-0 mt-0.5" />
-      <span className="min-w-0 break-words">
-        Set <code className="px-1 py-0.5 bg-accent6Dark rounded text-accent6 break-all">{envVar}</code> to use this
-        provider
-      </span>
+    <div className="flex flex-col gap-1 px-3 pb-1.5">
+      {(modelWarning || stale) && (
+        <div
+          className="flex max-w-full min-w-0 items-start gap-1 text-warning-foreground"
+          data-testid="composer-model-stale-warning"
+          role="alert"
+        >
+          <IconExclamationTriangle className="mt-0.5 size-icon-xs shrink-0" />
+          <Txt as="span" variant="caption" className="min-w-0 break-words">
+            {modelWarning || (
+              <>
+                <code className="rounded bg-warning-subtle px-1 py-0.5 break-all text-warning-subtle-foreground">
+                  {provider}/{selectedModel}
+                </code>{' '}
+                is no longer allowed by admin policy. Pick a different model.
+              </>
+            )}
+          </Txt>
+        </div>
+      )}
+      {showProviderWarning && (
+        <div className="flex max-w-full min-w-0 items-start gap-1 text-warning-foreground">
+          <IconExclamationTriangle className="mt-0.5 size-icon-xs shrink-0" />
+          <Txt as="span" variant="caption" className="min-w-0 break-words">
+            Set{' '}
+            <code className="rounded bg-warning-subtle px-1 py-0.5 break-all text-warning-subtle-foreground">
+              {envVar}
+            </code>{' '}
+            to use this provider
+          </Txt>
+        </div>
+      )}
     </div>
   );
 };

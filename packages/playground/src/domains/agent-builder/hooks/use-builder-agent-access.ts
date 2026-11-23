@@ -1,4 +1,4 @@
-import { useBuilderSettings } from './use-builder-settings';
+import { useBuilderSettings } from '@/domains/agent-builder/hooks/use-builder-settings';
 import { usePermissions } from '@/domains/auth/hooks/use-permissions';
 
 export type DenialReason = 'permission-denied' | 'not-configured' | 'error' | null;
@@ -63,7 +63,7 @@ export function useBuilderAgentAccess(): UseBuilderAgentAccessResult {
 
   return {
     isLoading: canFetchSettings && isLoading,
-    error: canFetchSettings ? (error as Error | null) : null,
+    error: canFetchSettings ? error : null,
     denialReason,
     isBuilderEnabled,
     hasAgentFeature,
@@ -73,6 +73,6 @@ export function useBuilderAgentAccess(): UseBuilderAgentAccessResult {
     canExecute,
     canManageSkills,
     canUseFavorites,
-    agentFeatures: builderSettings?.features?.agent as AgentFeatureFlags | undefined,
+    agentFeatures: builderSettings?.features?.agent,
   };
 }

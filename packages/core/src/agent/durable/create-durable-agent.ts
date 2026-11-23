@@ -26,6 +26,7 @@
 
 import type { MastraServerCache } from '../../cache/base';
 import type { PubSub } from '../../events/pubsub';
+import type { ShouldPersistSnapshotFn } from '../../workflows/types';
 import type { Agent } from '../agent';
 
 import { DurableAgent } from './durable-agent';
@@ -67,14 +68,56 @@ export interface CreateDurableAgentOptions<
 
   /** Maximum steps for agentic loop */
   maxSteps?: number;
+
+  /**
+   * Auto-cleanup timer for durable stream state (ms).
+   * Set to `0` to disable auto-cleanup. Defaults to `30_000` (30 seconds).
+   */
+  cleanupTimeoutMs?: number;
+
+  /**
+   * Overrides the snapshot-persistence policy for the agent's durable
+   * workflows. By default `pending | paused | suspended` snapshots are always
+   * persisted (required for human-in-the-loop `resume()`), and `running`
+   * checkpoints are persisted only when the Mastra instance sets
+   * `recovery: { durableAgents: 'auto' }`. See
+   * {@link DurableAgentConfig.shouldPersistSnapshot} for caveats.
+   */
+  shouldPersistSnapshot?: ShouldPersistSnapshotFn;
+
+  /**
+   * How the agent's new runs are stored (`1` or `2`). Defaults to `1`. See
+   * {@link DurableAgentConfig.storageVersion}.
+   *
+   * @experimental
+   */
+  storageVersion?: 1 | 2;
+
+  /**
+   * Per-topic opt-out of the replay cache.
+   *
+   * Return `false` to publish a topic straight through to the underlying
+   * PubSub without recording it in the cache. Subscribers of that topic then
+   * receive live events only and cannot resume from an offset. Use this to
+   * trade replay for minimum publish latency on hot topics when the cache is
+   * remote (e.g. cross-region Redis). Run-local topics are always excluded,
+   * regardless of this option.
+   */
+  shouldCache?: (topic: string) => boolean;
 }
 
 /**
  * Create a DurableAgent that wraps an existing Agent.
  *
- * This factory function is the recommended way to add durable execution
- * capabilities to an agent. It creates a DurableAgent instance with
- * resumable streams.
+ * This factory function is the recommended way to add checkpoint-backed durable
+ * execution to an agent. The `durable` option on `AgentConfig` only configures
+ * resumable streams and never wraps the agent.
+ *
+ * Wrapping does not change the wrapped Agent's direct runs, including runs already
+ * in flight. Without explicit stream settings, the wrapper shares the Agent's
+ * stream bus; pubsub, cache, cleanupTimeoutMs, and shouldCache overrides apply
+ * only to the wrapper's runs. Evented wrapper runs use Mastra's shared run log
+ * without changing the wrapped Agent's native stream routing.
  *
  * @param options - Configuration options
  * @returns A DurableAgent instance
@@ -93,13 +136,37 @@ export interface CreateDurableAgentOptions<
  *   agents: { myAgent: durableAgent },
  * });
  * ```
+ *
+ * @example
+ * ```typescript
+ * // Equivalent, using the durable config flag:
+ * const agent = new Agent({
+ *   id: 'my-agent',
+ *   instructions: 'You are helpful',
+ *   model: openai('gpt-4'),
+ *   durable: true,
+ * });
+ *
+ * const mastra = new Mastra({ agents: { myAgent: agent } });
+ * ```
  */
 export function createDurableAgent<
   TAgentId extends string = string,
   TTools extends Record<string, any> = Record<string, any>,
   TOutput = undefined,
 >(options: CreateDurableAgentOptions<TAgentId, TTools, TOutput>): DurableAgent<TAgentId, TTools, TOutput> {
-  const { agent, id, name, cache, pubsub, maxSteps } = options;
+  const {
+    agent,
+    id,
+    name,
+    cache,
+    pubsub,
+    maxSteps,
+    cleanupTimeoutMs,
+    shouldCache,
+    shouldPersistSnapshot,
+    storageVersion,
+  } = options;
 
   return new DurableAgent({
     agent,
@@ -108,6 +175,10 @@ export function createDurableAgent<
     cache,
     pubsub,
     maxSteps,
+    cleanupTimeoutMs,
+    shouldCache,
+    shouldPersistSnapshot,
+    storageVersion,
   } as DurableAgentConfig<TAgentId, TTools, TOutput>);
 }
 

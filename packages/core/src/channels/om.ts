@@ -115,6 +115,12 @@ export interface DataOmBufferingFailedPart {
     /** Error message */
     error: string;
 
+    /** Resolved failure policy for this cycle. Treat a missing value as `'abort'` (markers written before this field existed). */
+    failurePolicy?: 'abort' | 'continue';
+
+    /** Machine-readable failure classification when the observer/provider call failed. */
+    failureKind?: 'observer-model' | 'reflector-model';
+
     /** The OM record ID */
     recordId: string;
 
@@ -225,7 +231,7 @@ export function asOmChunk(chunk: AgentChunkType<any>): OmChunk | null {
 
 /**
  * Token formatter: `8200 → "8.2k"`, `12000 → "12k"`. Matches
- * `mastracode/src/tui/components/om-marker.ts` so OM lines render the same
+ * `mastracode/tui/src/tui/components/om-marker.ts` so OM lines render the same
  * way across surfaces.
  */
 export function formatTokens(tokens: number): string {

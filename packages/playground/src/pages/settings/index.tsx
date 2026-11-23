@@ -1,62 +1,21 @@
-import {
-  PageLayout,
-  SectionCard,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-  SettingsRow,
-  useTheme,
-} from '@mastra/playground-ui';
-import type { Theme } from '@mastra/playground-ui';
-import { StudioConfigForm } from '@/domains/configuration/components/studio-config-form';
-import { useStudioConfig } from '@/domains/configuration/context/studio-config-context';
-
-const THEME_OPTIONS: { value: Theme; label: string }[] = [
-  { value: 'dark', label: 'Dark' },
-  { value: 'light', label: 'Light' },
-  { value: 'system', label: 'System' },
-];
-
-const isTheme = (value: string): value is Theme => THEME_OPTIONS.some(option => option.value === value);
+import { PageLayout } from '@mastra/playground-ui/components/PageLayout';
+import { ThemeToggle } from '@mastra/playground-ui/components/ThemeToggle';
+import { SettingsContainer, SettingsGroup, SettingsRow, SettingsTitle } from '@mastra/playground-ui/new/settings';
+import { StudioConnectionSettings } from '@/domains/configuration/components/studio-connection-settings';
 
 export const StudioSettingsPage = () => {
-  const { baseUrl, headers, apiPrefix } = useStudioConfig();
-  const { theme, setTheme } = useTheme();
-
   return (
-    <PageLayout width="narrow">
-      <PageLayout.MainArea className="flex flex-col gap-5 mt-6">
-        <SectionCard title="Theme" description="Customize the appearance of the studio.">
-          <SettingsRow label="Theme mode" htmlFor="theme">
-            <Select
-              value={theme}
-              onValueChange={value => {
-                if (isTheme(value)) setTheme(value);
-              }}
-            >
-              <SelectTrigger id="theme" className="w-full sm:w-48">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {THEME_OPTIONS.map(option => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+    <PageLayout variant="settings" title="Settings">
+      <SettingsGroup>
+        <SettingsTitle info="Stored in this browser.">General</SettingsTitle>
+        <SettingsContainer>
+          <SettingsRow label="Theme" description="Color scheme for the interface.">
+            <ThemeToggle />
           </SettingsRow>
-        </SectionCard>
+        </SettingsContainer>
+      </SettingsGroup>
 
-        <SectionCard
-          title="Mastra Connection"
-          description="Configure the Mastra instance URL, API prefix, and request headers used by the studio."
-        >
-          <StudioConfigForm initialConfig={{ baseUrl, headers, apiPrefix }} />
-        </SectionCard>
-      </PageLayout.MainArea>
+      <StudioConnectionSettings />
     </PageLayout>
   );
 };

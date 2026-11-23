@@ -193,6 +193,7 @@ function createOM(storage: InMemoryMemory, opts?: { messageTokens?: number; buff
 beforeEach(() => {
   BufferingCoordinator.asyncBufferingOps.clear();
   BufferingCoordinator.lastBufferedBoundary.clear();
+  BufferingCoordinator.observationBoundaryOwners.clear();
   BufferingCoordinator.lastBufferedAtTime.clear();
   BufferingCoordinator.reflectionBufferCycleIds.clear();
 });
@@ -462,6 +463,46 @@ describe('AI SDK: buffer in one turn, activate + generateText in next', () => {
     }
   });
 
+  it('observes a later revision of a message saved under an id that was activated', async () => {
+    // Six messages, so the last one is the activated assistant message revised below.
+    const messages = createMessagesExceedingThreshold(6, threadId);
+    await storage.saveMessages({ messages });
+    expect((await om.buffer({ threadId })).buffered).toBe(true);
+    expect((await om.activate({ threadId })).activated).toBe(true);
+
+    // The host appends to an activated assistant message under the same id.
+    const last = messages.at(-1)!;
+    const revision: MastraDBMessage = {
+      ...last,
+      createdAt: new Date(Date.now() + 1000),
+      content: {
+        ...last.content,
+        parts: [...last.content.parts, { type: 'text', text: 'Later addition: '.padEnd(400, 'y') }],
+      },
+    };
+    await storage.saveMessages({ messages: [revision] });
+
+    const result = await om.observe({ threadId, messages: [revision], force: true });
+    expect(result.observed).toBe(true);
+  });
+
+  it('observes content appended to an observed message after a reflection', async () => {
+    // Six messages, so the last one is the assistant message that carries the observation markers.
+    const messages = createMessagesExceedingThreshold(6, threadId);
+    await storage.saveMessages({ messages });
+    expect((await om.observe({ threadId, messages, force: true })).observed).toBe(true);
+    const currentRecord = (await storage.getObservationalMemory(threadId, null))!;
+    await storage.createReflectionGeneration({ currentRecord, reflection: '- compressed', tokenCount: 2 });
+
+    // The host appends to the last observed message under the same id and timestamp.
+    const last = (await storage.listMessagesById({ messageIds: [messages.at(-1)!.id] })).messages[0]!;
+    last.content.parts.push({ type: 'text', text: 'Later addition: '.padEnd(400, 'y') });
+    await storage.saveMessages({ messages: [last] });
+
+    const result = await om.observe({ threadId, messages: [last], force: true });
+    expect(result.observed).toBe(true);
+  });
+
   it('writes observer-exchange repro captures for buffering', async () => {
     const reproDir = mkdtempSync('.tmp-om-repro-');
     const previousCapture = process.env.OM_REPRO_CAPTURE;
@@ -483,7 +524,7 @@ describe('AI SDK: buffer in one turn, activate + generateText in next', () => {
         readFileSync(join(threadCaptureDir, runDir!, 'observer-exchange.json'), 'utf8'),
       );
       expect(observerExchange.systemPrompt).toBeTruthy();
-      expect(observerExchange.observerMessages).toHaveLength(2);
+      expect(observerExchange.observerMessages).toHaveLength(1);
       expect(observerExchange.rawOutput).toContain('<observations>');
     } finally {
       if (previousCapture === undefined) {
@@ -624,6 +665,24 @@ describe('AI SDK: multi-turn buffer→activate lifecycle invariants', () => {
 
     const recordAfter = await om.getRecord(threadId);
     expect(recordAfter!.lastObservedAt).toEqual(lastObservedBefore);
+  });
+
+  it('can skip the minimum token gate for idle-triggered short turns', async () => {
+    const shortTurnOm = createOM(storage, { messageTokens: 2000, bufferTokens: 1000 });
+    const thresholdThreadId = `${threadId}-threshold-short`;
+    const idleThreadId = `${threadId}-idle-short`;
+
+    await storage.saveMessages({
+      messages: [{ ...createTestMessage('ok', 'user', `${thresholdThreadId}-msg`), threadId: thresholdThreadId }],
+    });
+    await storage.saveMessages({
+      messages: [{ ...createTestMessage('ok', 'user', `${idleThreadId}-msg`), threadId: idleThreadId }],
+    });
+
+    await expect(shortTurnOm.buffer({ threadId: thresholdThreadId })).resolves.toMatchObject({ buffered: false });
+    await expect(shortTurnOm.buffer({ threadId: idleThreadId, skipMinimumTokenCheck: true })).resolves.toMatchObject({
+      buffered: true,
+    });
   });
 
   it('activate promotes buffered observations without LLM call', async () => {

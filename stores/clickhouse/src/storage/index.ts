@@ -3,17 +3,31 @@ import { createClient } from '@clickhouse/client';
 import { MastraError, ErrorDomain, ErrorCategory } from '@mastra/core/error';
 import { createStorageErrorId, MastraCompositeStore } from '@mastra/core/storage';
 import type { TABLE_NAMES, StorageDomains, TABLE_SCHEMAS } from '@mastra/core/storage';
-import { BackgroundTasksStorageClickhouse } from './domains/background-tasks';
+import { addOnClusterToDDL, validateReplicationConfig } from './db/replication';
+import type { ClickhouseReplicationConfig } from './db/replication';
 import { MemoryStorageClickhouse } from './domains/memory';
 import { ObservabilityStorageClickhouse } from './domains/observability';
 import { ObservabilityStorageClickhouseVNext } from './domains/observability/v-next';
-export type { VNextObservabilityConfig, RetentionConfig } from './domains/observability/v-next';
+import type { RetentionConfig, VNextObservabilityOptions } from './domains/observability/v-next';
+export {
+  applyClickHouseRetention,
+  TABLE_DELETION_REQUESTS,
+  markDeletionRequestApplied,
+  recordDeletionRequest,
+} from './domains/observability/v-next';
+export type {
+  VNextObservabilityConfig,
+  VNextObservabilityOptions,
+  TraceQueryConfig,
+  RetentionConfig,
+  DeletionRequestRow,
+  RecordDeletionRequestArgs,
+} from './domains/observability/v-next';
 import { ScoresStorageClickhouse } from './domains/scores';
 import { WorkflowsStorageClickhouse } from './domains/workflows';
 
 // Export domain classes for direct use with MastraStorage composition
 export {
-  BackgroundTasksStorageClickhouse,
   MemoryStorageClickhouse,
   ObservabilityStorageClickhouse,
   ObservabilityStorageClickhouseVNext,
@@ -21,6 +35,7 @@ export {
   WorkflowsStorageClickhouse,
 };
 export type { ClickhouseDomainConfig } from './db';
+export type { ClickhouseReplicationConfig } from './db/replication';
 
 type IntervalUnit =
   | 'NANOSECOND'
@@ -96,6 +111,18 @@ type ClickhouseCredentialsConfig = Omit<ClickHouseClientConfigOptions, 'url' | '
 export type ClickhouseConfig = {
   id: string;
   ttl?: ClickhouseTtlConfig;
+  /** Per-signal retention periods for the vNext observability schema. */
+  retention?: RetentionConfig;
+  /**
+   * Opt into replicated MergeTree engines for Mastra-owned ClickHouse tables.
+   * Set `cluster` to also emit ON CLUSTER for table and materialized-view DDL.
+   */
+  replication?: ClickhouseReplicationConfig;
+  /**
+   * Maximum execution time for one advanced trace query. Default 15 seconds.
+   * @deprecated Use `ClickhouseStoreVNext` with `observability.traceQuery.timeoutMs` instead.
+   */
+  traceQueryTimeoutMs?: number;
   /**
    * When true, automatic initialization (table creation/migrations) is disabled.
    * This is useful for CI/CD pipelines where you want to:
@@ -143,6 +170,10 @@ export type ClickhouseConfig = {
   | ClickhouseCredentialsConfig
 );
 
+export type ClickhouseStoreVNextConfig = ClickhouseConfig & {
+  observability?: VNextObservabilityOptions;
+};
+
 /**
  * Type guard for pre-configured client config
  */
@@ -175,11 +206,13 @@ const isClientConfig = (config: ClickhouseConfig): config is ClickhouseConfig & 
 export class ClickhouseStore extends MastraCompositeStore {
   protected db: ClickHouseClient;
   protected ttl: ClickhouseConfig['ttl'] = {};
+  protected replication?: ClickhouseReplicationConfig;
 
   stores: StorageDomains;
 
   constructor(config: ClickhouseConfig) {
     super({ id: config.id, name: 'ClickhouseStore', disableInit: config.disableInit });
+    validateReplicationConfig(config.replication);
 
     // Handle pre-configured client vs creating new connection
     if (isClientConfig(config)) {
@@ -199,7 +232,16 @@ export class ClickhouseStore extends MastraCompositeStore {
       }
 
       // Extract Mastra-specific config, pass rest to ClickHouse client
-      const { id, ttl, disableInit, clickhouse_settings, ...clientOptions } = config;
+      const {
+        id,
+        ttl,
+        retention: _retention,
+        disableInit,
+        replication,
+        traceQueryTimeoutMs: _traceQueryTimeoutMs,
+        clickhouse_settings,
+        ...clientOptions
+      } = config;
 
       // Create client with all provided options
       this.db = createClient({
@@ -215,8 +257,9 @@ export class ClickhouseStore extends MastraCompositeStore {
     }
 
     this.ttl = config.ttl;
+    this.replication = config.replication;
 
-    const domainConfig = { client: this.db, ttl: this.ttl };
+    const domainConfig = { client: this.db, ttl: this.ttl, replication: config.replication };
     const workflows = new WorkflowsStorageClickhouse(domainConfig);
     const scores = new ScoresStorageClickhouse(domainConfig);
     const memory = new MemoryStorageClickhouse(domainConfig);
@@ -227,14 +270,13 @@ export class ClickhouseStore extends MastraCompositeStore {
       scores,
       memory,
       observability,
-      backgroundTasks: new BackgroundTasksStorageClickhouse(domainConfig),
     };
   }
 
   async optimizeTable({ tableName }: { tableName: TABLE_NAMES }): Promise<void> {
     try {
       await this.db.command({
-        query: `OPTIMIZE TABLE ${tableName} FINAL`,
+        query: addOnClusterToDDL(`OPTIMIZE TABLE ${tableName} FINAL`, this.replication),
       });
     } catch (error: any) {
       throw new MastraError(
@@ -252,7 +294,7 @@ export class ClickhouseStore extends MastraCompositeStore {
   async materializeTtl({ tableName }: { tableName: TABLE_NAMES }): Promise<void> {
     try {
       await this.db.command({
-        query: `ALTER TABLE ${tableName} MATERIALIZE TTL;`,
+        query: addOnClusterToDDL(`ALTER TABLE ${tableName} MATERIALIZE TTL`, this.replication) + ';',
       });
     } catch (error: any) {
       throw new MastraError(
@@ -297,8 +339,9 @@ export class ClickhouseStore extends MastraCompositeStore {
  * Use this in new projects to opt into the vNext observability schema without
  * needing to wire the composite manually.
  *
- * Accepts the same configuration as `ClickhouseStore`. The underlying ClickHouse
- * client is shared between every domain, including observability.
+ * Accepts the same configuration as `ClickhouseStore`, plus nested vNext
+ * observability options. The underlying ClickHouse client is shared between every
+ * domain, including observability.
  *
  * @example
  * ```typescript
@@ -316,8 +359,9 @@ export class ClickhouseStore extends MastraCompositeStore {
  * ```
  */
 export class ClickhouseStoreVNext extends ClickhouseStore {
-  constructor(config: ClickhouseConfig) {
-    super(config);
+  constructor(config: ClickhouseStoreVNextConfig) {
+    const { observability: observabilityConfig, ...storeConfig } = config;
+    super(storeConfig);
 
     // Identify as ClickhouseStoreVNext for callers that introspect `name`.
     // The logger created by MastraBase still reflects the parent name.
@@ -325,7 +369,13 @@ export class ClickhouseStoreVNext extends ClickhouseStore {
 
     // Replace the legacy observability domain set up by ClickhouseStore with the
     // vNext implementation. Both share the same underlying client.
-    const observability = new ObservabilityStorageClickhouseVNext({ client: this.db });
+    const observability = new ObservabilityStorageClickhouseVNext({
+      client: this.db,
+      replication: config.replication,
+      retention: observabilityConfig?.retention ?? config.retention,
+      traceQuery: observabilityConfig?.traceQuery,
+      traceQueryTimeoutMs: config.traceQueryTimeoutMs,
+    });
 
     this.stores = {
       ...this.stores,

@@ -1,8 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import type { ToolsInput } from '@mastra/core/agent';
-import type { RequestContext } from '@mastra/core/request-context';
-import { MastraVoice } from '@mastra/core/voice';
+import type { ToolsInput, RequestContext } from '@internal/voice';
+import { MastraVoice } from '@internal/voice';
 import type { Realtime, RealtimeServerEvents } from 'openai-realtime-api';
 import { WebSocket } from 'ws';
 import { isReadableStream, transformTools } from './utils';
@@ -38,7 +37,7 @@ const DEFAULT_URL = 'wss://api.openai.com/v1/realtime';
  * Default model for real-time voice interactions.
  * This model is optimized for low-latency responses while maintaining high quality output.
  */
-const DEFAULT_MODEL = 'gpt-4o-mini-realtime-preview-2024-12-17';
+const DEFAULT_MODEL = 'gpt-realtime-2.1-mini';
 
 // /**
 //  * Default Voice Activity Detection (VAD) configuration.
@@ -79,6 +78,8 @@ type RealtimeClientServerEventMap = {
   ['response.output_audio.done']: [{ response_id: string }];
   ['response.output_audio_transcript.delta']: [{ delta: string; response_id: string }];
   ['response.output_audio_transcript.done']: [{ response_id: string }];
+  ['response.output_text.delta']: [{ delta: string; response_id: string }];
+  ['response.output_text.done']: [{ response_id: string }];
 };
 
 /**
@@ -99,7 +100,7 @@ type RealtimeClientServerEventMap = {
  * ```typescript
  * const voice = new OpenAIRealtimeVoice({
  *   apiKey: process.env.OPENAI_API_KEY,
- *   model: 'gpt-4o-mini-realtime'
+ *   model: 'gpt-realtime-2.1-mini'
  * });
  *
  * await voice.open();
@@ -119,14 +120,17 @@ export class OpenAIRealtimeVoice extends MastraVoice {
   private tools?: TTools;
   private debug: boolean;
   private queue: unknown[] = [];
+  private sessionReady = false;
   private transcriber: Realtime.AudioTranscriptionModel;
   private requestContext?: RequestContext;
+  private connectionAbort?: AbortController;
+  private speakerStreams = new Map<string, StreamWithId>();
   /**
    * Creates a new instance of OpenAIRealtimeVoice.
    *
    * @param options - Configuration options for the voice instance
    * @param options.url - The base URL for the OpenAI Realtime API
-   * @param options.model - The model ID to use (defaults to GPT-4 Mini Realtime)
+   * @param options.model - The model ID to use (defaults to gpt-realtime-2.1-mini)
    * @param options.apiKey - OpenAI API key. Falls back to process.env.OPENAI_API_KEY
    * @param options.speaker - Voice ID to use (defaults to 'alloy')
    * @param options.debug - Enable debug mode
@@ -135,7 +139,7 @@ export class OpenAIRealtimeVoice extends MastraVoice {
    * ```typescript
    * const voice = new OpenAIRealtimeVoice({
    *   apiKey: 'your-api-key',
-   *   model: 'gpt-4o-mini-realtime',
+   *   model: 'gpt-realtime-2.1-mini',
    *   speaker: 'alloy'
    * });
    * ```
@@ -148,9 +152,20 @@ export class OpenAIRealtimeVoice extends MastraVoice {
       speaker?: Realtime.Voice;
       transcriber?: Realtime.AudioTranscriptionModel;
       debug?: boolean;
+      /** Maximum connection handshake duration in milliseconds. Defaults to 15,000. */
+      connectTimeoutMs?: number;
     } = {},
   ) {
     super();
+
+    if (
+      options.connectTimeoutMs !== undefined &&
+      (!Number.isFinite(options.connectTimeoutMs) ||
+        options.connectTimeoutMs <= 0 ||
+        options.connectTimeoutMs > 2_147_483_647)
+    ) {
+      throw new Error('connectTimeoutMs must be a positive finite number no greater than 2147483647');
+    }
 
     this.client = new EventEmitter();
     this.state = 'close';
@@ -188,6 +203,7 @@ export class OpenAIRealtimeVoice extends MastraVoice {
     if (!this.ws) return;
     this.ws.close();
     this.state = 'close';
+    this.closeSpeakerStreams();
   }
 
   /**
@@ -355,15 +371,69 @@ export class OpenAIRealtimeVoice extends MastraVoice {
     }
   }
 
-  waitForOpen() {
-    return new Promise(resolve => {
-      this.ws?.on('open', resolve);
-    });
+  waitForOpen(): Promise<void> {
+    return this.waitForHandshake('open');
   }
 
-  waitForSessionCreated() {
-    return new Promise(resolve => {
-      this.client.on('session.created', resolve);
+  waitForSessionCreated(): Promise<void> {
+    return this.waitForHandshake('session.created');
+  }
+
+  private waitForHandshake(event: 'open' | 'session.created'): Promise<void> {
+    const ws = this.ws;
+    const signal = this.connectionAbort?.signal;
+    return new Promise((resolve, reject) => {
+      if (!ws) {
+        reject(new Error('WebSocket not initialized'));
+        return;
+      }
+      if (signal?.aborted) {
+        reject(signal.reason);
+        return;
+      }
+      if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        reject(new Error('OpenAI realtime WebSocket is closed'));
+        return;
+      }
+      if (event === 'open' && ws.readyState === WebSocket.OPEN) {
+        resolve();
+        return;
+      }
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        ws.removeListener('open', onReady);
+        ws.removeListener('error', onError);
+        ws.removeListener('close', onClose);
+        this.client.removeListener('session.created', onReady);
+        this.client.removeListener('error', onProtocolError);
+        signal?.removeEventListener('abort', onAbort);
+      };
+      const onReady = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+      const onClose = (code: number, reason: Buffer) =>
+        onError(new Error(`OpenAI realtime WebSocket closed during handshake (${code}: ${reason.toString()})`));
+      const onProtocolError = (event: RealtimeServerEvents.EventMap['error']) =>
+        onError(new Error(event.error.message, { cause: event.error }));
+      const onAbort = () => onError(signal!.reason);
+      const timeoutMs = this.options.connectTimeoutMs ?? 15_000;
+      const timer = setTimeout(
+        () => onError(new Error(`OpenAI realtime connection timed out after ${timeoutMs}ms`)),
+        timeoutMs,
+      );
+
+      if (event === 'open') ws.once('open', onReady);
+      else this.client.once('session.created', onReady);
+      ws.once('error', onError);
+      ws.once('close', onClose);
+      this.client.once('error', onProtocolError);
+      signal?.addEventListener('abort', onAbort, { once: true });
     });
   }
 
@@ -387,28 +457,54 @@ export class OpenAIRealtimeVoice extends MastraVoice {
     this.ws = new WebSocket(url, undefined, {
       headers: {
         Authorization: 'Bearer ' + apiKey,
-        'OpenAI-Beta': 'realtime=v1',
       },
     });
 
+    const ws = this.ws;
+    this.state = 'close';
+    this.sessionReady = false;
+    this.client.removeAllListeners();
+    this.closeSpeakerStreams();
+    const controller = new AbortController();
+    this.connectionAbort = controller;
     this.setupEventListeners();
-    await Promise.all([this.waitForOpen(), this.waitForSessionCreated()]);
+    try {
+      await Promise.all([this.waitForOpen(), this.waitForSessionCreated()]);
+    } catch (error) {
+      controller.abort(error);
+      this.state = 'close';
+      this.ws = undefined;
+      ws.close();
+      throw error;
+    } finally {
+      this.connectionAbort = undefined;
+    }
 
+    this.sessionReady = true;
     const openaiTools = transformTools(this.tools);
     this.updateConfig({
+      type: 'realtime',
       instructions: this.instructions,
       tools: openaiTools.map(t => t.openaiTool),
-      input_audio_transcription: {
-        model: this.transcriber,
+      audio: {
+        input: {
+          transcription: {
+            model: this.transcriber,
+          },
+        },
+        output: {
+          voice: this.speaker,
+        },
       },
-      voice: this.speaker,
     });
     this.state = 'open';
   }
 
   disconnect() {
     this.state = 'close';
+    this.connectionAbort?.abort(new Error('OpenAI realtime connection disconnected during handshake'));
     this.ws?.close();
+    this.closeSpeakerStreams();
   }
 
   /**
@@ -481,9 +577,12 @@ export class OpenAIRealtimeVoice extends MastraVoice {
 
   /**
    * Registers an event listener for voice events.
-   * Available events: 'speaking', 'writing, 'error'
-   * Can listen to OpenAI Realtime events by prefixing with 'openAIRealtime:'
-   * Such as 'openAIRealtime:conversation.item.completed', 'openAIRealtime:conversation.updated', etc.
+   * Voice events include 'speaking', 'writing', and 'error'.
+   * Supported native input events use their unprefixed OpenAI names:
+   * 'input_audio_buffer.speech_started', 'input_audio_buffer.speech_stopped',
+   * and 'conversation.item.input_audio_transcription.completed'.
+   * These native events deliver the complete received payload, including transcription usage when present.
+   * Every server event is also emitted as 'openAIRealtime:<event.type>', and the socket emits 'open' and 'close'.
    *
    * @param event - Name of the event to listen for
    * @param callback - Function to call when the event occurs
@@ -550,17 +649,40 @@ export class OpenAIRealtimeVoice extends MastraVoice {
     }
   }
 
+  private closeSpeakerStreams(): void {
+    for (const stream of this.speakerStreams.values()) {
+      if (!stream.writableEnded) stream.end();
+    }
+    this.speakerStreams.clear();
+  }
+
   private setupEventListeners(): void {
-    const speakerStreams = new Map<string, StreamWithId>();
+    const speakerStreams = this.speakerStreams;
     const userTranscriptionDeltaItems = new Set<string>();
 
     if (!this.ws) {
       throw new Error('WebSocket not initialized');
     }
 
-    this.ws.on('message', message => {
+    const ws = this.ws;
+    ws.on('error', error => {
+      if (this.ws === ws) this.emit('error', error);
+    });
+    ws.on('open', () => {
+      if (this.ws === ws) this.emit('open');
+    });
+    ws.on('close', (code, reason) => {
+      if (this.ws !== ws) return;
+      this.state = 'close';
+      this.sessionReady = false;
+      this.closeSpeakerStreams();
+      this.emit('close', { code, reason: reason.toString() });
+    });
+    ws.on('message', message => {
+      if (this.ws !== ws) return;
       const data = JSON.parse(message.toString());
       this.client.emit(data.type, data);
+      this.emit(`openAIRealtime:${data.type}`, data);
 
       if (this.debug) {
         const { delta, ...fields } = data;
@@ -571,6 +693,7 @@ export class OpenAIRealtimeVoice extends MastraVoice {
     this.client.on('session.created', ev => {
       this.emit('session.created', ev);
 
+      this.sessionReady = true;
       const queue = this.queue.splice(0, this.queue.length);
       for (const ev of queue) {
         this.ws?.send(JSON.stringify(ev));
@@ -578,6 +701,12 @@ export class OpenAIRealtimeVoice extends MastraVoice {
     });
     this.client.on('session.updated', ev => {
       this.emit('session.updated', ev);
+    });
+    this.client.on('input_audio_buffer.speech_started', ev => {
+      this.emit('input_audio_buffer.speech_started', ev);
+    });
+    this.client.on('input_audio_buffer.speech_stopped', ev => {
+      this.emit('input_audio_buffer.speech_stopped', ev);
     });
     this.client.on('response.created', ev => {
       this.emit('response.created', ev);
@@ -594,6 +723,7 @@ export class OpenAIRealtimeVoice extends MastraVoice {
       this.emit('writing', { text: ev.delta, response_id: ev.item_id, role: 'user' });
     });
     this.client.on('conversation.item.input_audio_transcription.completed', ev => {
+      this.emit('conversation.item.input_audio_transcription.completed', ev);
       if (!userTranscriptionDeltaItems.has(ev.item_id) && ev.transcript) {
         this.emit('writing', { text: ev.transcript, response_id: ev.item_id, role: 'user' });
       }
@@ -619,6 +749,12 @@ export class OpenAIRealtimeVoice extends MastraVoice {
     const handleAudioTranscriptDone = (ev: { response_id: string }) => {
       this.emit('writing', { text: '\n', response_id: ev.response_id, role: 'assistant' });
     };
+    const handleTextDelta = (ev: { delta: string; response_id: string }) => {
+      this.emit('writing', { text: ev.delta, response_id: ev.response_id, role: 'assistant' });
+    };
+    const handleTextDone = (ev: { response_id: string }) => {
+      this.emit('writing', { text: '\n', response_id: ev.response_id, role: 'assistant' });
+    };
     this.client.on('response.audio.delta', handleAudioDelta);
     this.client.on('response.output_audio.delta', handleAudioDelta);
     this.client.on('response.audio.done', handleAudioDone);
@@ -627,16 +763,20 @@ export class OpenAIRealtimeVoice extends MastraVoice {
     this.client.on('response.output_audio_transcript.delta', handleAudioTranscriptDelta);
     this.client.on('response.audio_transcript.done', handleAudioTranscriptDone);
     this.client.on('response.output_audio_transcript.done', handleAudioTranscriptDone);
-    this.client.on('response.text.delta', ev => {
-      this.emit('writing', { text: ev.delta, response_id: ev.response_id, role: 'assistant' });
-    });
-    this.client.on('response.text.done', ev => {
-      this.emit('writing', { text: '\n', response_id: ev.response_id, role: 'assistant' });
-    });
+    this.client.on('response.text.delta', handleTextDelta);
+    this.client.on('response.output_text.delta', handleTextDelta);
+    this.client.on('response.text.done', handleTextDone);
+    this.client.on('response.output_text.done', handleTextDone);
     this.client.on('response.done', async ev => {
+      // Responses without audio (tool-call-only turns, text modality, or cancelled before any audio)
+      // never send output_audio.done, so end the stream here. Do it before running tools so a slow
+      // or failing tool cannot hold the stream open.
+      const stream = speakerStreams.get(ev.response.id);
+      if (stream && !stream.writableEnded) stream.end();
+      speakerStreams.delete(ev.response.id);
+
       await this.handleFunctionCalls(ev);
       this.emit('response.done', ev);
-      speakerStreams.delete(ev.response.id);
     });
     this.client.on('error', async ev => {
       this.emit('error', ev);
@@ -644,10 +784,15 @@ export class OpenAIRealtimeVoice extends MastraVoice {
   }
 
   private async handleFunctionCalls(ev: any) {
+    let handledFunctionCall = false;
     for (const output of ev.response?.output ?? []) {
-      if (output.type === 'function_call') {
+      if (output.type === 'function_call' && Object.hasOwn(this.tools ?? {}, output.name)) {
+        handledFunctionCall = true;
         await this.handleFunctionCall(output);
       }
+    }
+    if (handledFunctionCall) {
+      this.sendEvent('response.create', {});
     }
   }
 
@@ -687,7 +832,7 @@ export class OpenAIRealtimeVoice extends MastraVoice {
         item: {
           type: 'function_call_output',
           call_id: output.call_id,
-          output: JSON.stringify(result),
+          output: JSON.stringify(result ?? null),
         },
       });
     } catch (e) {
@@ -700,8 +845,6 @@ export class OpenAIRealtimeVoice extends MastraVoice {
           output: JSON.stringify({ error: err.message }),
         },
       });
-    } finally {
-      this.sendEvent('response.create', {});
     }
   }
 
@@ -719,14 +862,28 @@ export class OpenAIRealtimeVoice extends MastraVoice {
     return btoa(binary);
   }
 
-  private sendEvent(type: string, data: any) {
-    if (!this.ws || this.ws.readyState !== this.ws.OPEN) {
-      this.queue.push({ type: type, ...data });
+  /**
+   * Sends a raw client event to the OpenAI Realtime session.
+   * Events sent before the session is created are queued and flushed once it is.
+   *
+   * @param type - OpenAI Realtime client event type, such as 'conversation.item.create'
+   * @param data - Event payload merged alongside the type
+   *
+   * @example
+   * ```typescript
+   * voice.sendEvent('conversation.item.create', {
+   *   item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Hello' }] },
+   * });
+   * ```
+   */
+  sendEvent(type: string, data: Record<string, unknown> = {}) {
+    if (!this.sessionReady || !this.ws || this.ws.readyState !== this.ws.OPEN) {
+      this.queue.push({ ...data, type });
     } else {
       this.ws?.send(
         JSON.stringify({
-          type: type,
           ...data,
+          type,
         }),
       );
     }

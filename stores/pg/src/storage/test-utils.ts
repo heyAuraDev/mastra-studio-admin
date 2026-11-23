@@ -1,4 +1,6 @@
-import { createSampleThread } from '@internal/storage-test-utils';
+import { randomUUID } from 'node:crypto';
+import { createSampleMessageV2, createSampleThread } from '@internal/storage-test-utils';
+import { SPAN_SCHEMA, TABLE_SPANS } from '@mastra/core/storage';
 import type { MemoryStorage, StorageColumn, TABLE_NAMES } from '@mastra/core/storage';
 import { Pool } from 'pg';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -70,6 +72,150 @@ export function pgTests() {
         await store.init();
         // Recreate dbOps with new store connection
         dbOps = new PgDB({ client: store.db });
+      });
+    });
+
+    describe('Memory saveMessages batching', () => {
+      it('should save a message batch larger than one PostgreSQL bind-parameter chunk', async () => {
+        const memory = (await store.getStore('memory'))!;
+        const thread = createSampleThread({
+          id: `batch-thread-${Date.now()}`,
+          resourceId: `batch-resource-${Date.now()}`,
+        });
+        await memory.saveThread({ thread });
+
+        const messages = Array.from({ length: 8192 }, (_, index) =>
+          createSampleMessageV2({
+            threadId: thread.id,
+            resourceId: thread.resourceId,
+            content: { content: `Batch message ${index}` },
+            createdAt: new Date(Date.now() + index),
+          }),
+        );
+
+        const { messages: savedMessages } = await memory.saveMessages({ messages });
+        expect(savedMessages).toHaveLength(8192);
+
+        const row = await store.db.one<{ count: string }>(
+          'SELECT COUNT(*)::text AS count FROM mastra_messages WHERE thread_id = $1',
+          [thread.id],
+        );
+        expect(Number(row.count)).toBe(8192);
+      });
+    });
+
+    describe('batchInsert span conflict handling', () => {
+      beforeAll(async () => {
+        const existing = await store.db.oneOrNone<{ table: string | null }>(
+          `SELECT to_regclass('public.mastra_ai_spans') AS "table"`,
+        );
+        if (!existing?.table) {
+          await dbOps.createTable({ tableName: TABLE_SPANS, schema: SPAN_SCHEMA });
+        }
+      });
+
+      beforeEach(async () => {
+        await dbOps.clearTable({ tableName: TABLE_SPANS });
+      });
+
+      it('applies last-write-wins for duplicate (traceId, spanId) within one input batch', async () => {
+        const traceId = `dup-trace-${Date.now()}`;
+        const spanId = 'dup-span';
+        const startedAt = new Date('2024-01-01T00:00:00.000Z');
+
+        await dbOps.batchInsert({
+          tableName: TABLE_SPANS,
+          records: [
+            { traceId, spanId, name: 'first', spanType: 'agent_run', isEvent: false, startedAt },
+            { traceId, spanId, name: 'second', spanType: 'agent_run', isEvent: false, startedAt },
+            { traceId, spanId, name: 'third', spanType: 'agent_run', isEvent: false, startedAt },
+          ],
+        });
+
+        const rows = await store.db.manyOrNone<{ name: string }>(
+          'SELECT "name" FROM mastra_ai_spans WHERE "traceId" = $1 AND "spanId" = $2',
+          [traceId, spanId],
+        );
+
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.name).toBe('third');
+      });
+
+      it('persists a large span batch through chunked multi-row inserts', async () => {
+        const traceId = `chunk-trace-${Date.now()}`;
+        const startedAt = new Date('2024-01-01T00:00:00.000Z');
+        const records = Array.from({ length: 5000 }, (_, index) => ({
+          traceId,
+          spanId: `span-${index}`,
+          name: `span-${index}`,
+          spanType: 'tool_call',
+          isEvent: false,
+          startedAt,
+        }));
+
+        await dbOps.batchInsert({ tableName: TABLE_SPANS, records });
+
+        const row = await store.db.one<{ count: string }>(
+          'SELECT COUNT(*)::text AS count FROM mastra_ai_spans WHERE "traceId" = $1',
+          [traceId],
+        );
+        expect(Number(row.count)).toBe(5000);
+      });
+
+      it('upserts existing spans across separate batches (last write wins)', async () => {
+        const traceId = `cross-batch-trace-${Date.now()}`;
+        const spanId = 'cross-batch-span';
+        const startedAt = new Date('2024-01-01T00:00:00.000Z');
+
+        await dbOps.batchInsert({
+          tableName: TABLE_SPANS,
+          records: [{ traceId, spanId, name: 'initial', spanType: 'agent_run', isEvent: false, startedAt }],
+        });
+        await dbOps.batchInsert({
+          tableName: TABLE_SPANS,
+          records: [{ traceId, spanId, name: 'updated', spanType: 'agent_run', isEvent: false, startedAt }],
+        });
+
+        const rows = await store.db.manyOrNone<{ name: string }>(
+          'SELECT "name" FROM mastra_ai_spans WHERE "traceId" = $1 AND "spanId" = $2',
+          [traceId, spanId],
+        );
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.name).toBe('updated');
+      });
+    });
+
+    describe('Span outcome fields', () => {
+      it('returns how a span ended from every span read', async () => {
+        const observability = (await store.getStore('observability'))!;
+        const traceId = randomUUID().replaceAll('-', '');
+        const runId = randomUUID();
+        const ended = {
+          outcome: 'limit',
+          stopReason: 'timeout',
+          stopReasonContext: { limitMs: 3000 },
+          resumedFromSpanId: 'suspended-span',
+        };
+        await observability.createSpan({
+          span: {
+            traceId,
+            spanId: 'root',
+            parentSpanId: null,
+            runId,
+            name: 'agent run',
+            spanType: 'agent_run',
+            isEvent: false,
+            startedAt: new Date(),
+            endedAt: new Date(),
+            ...ended,
+          },
+        } as Parameters<typeof observability.createSpan>[0]);
+
+        expect((await observability.getSpan({ traceId, spanId: 'root' }))?.span).toMatchObject(ended);
+        expect((await observability.getRootSpan({ traceId }))?.span).toMatchObject(ended);
+        expect((await observability.getTrace({ traceId }))?.spans[0]).toMatchObject(ended);
+        const listed = await observability.listTraces({ filters: { runId }, pagination: { page: 0, perPage: 10 } });
+        expect(listed.spans).toMatchObject([{ traceId, ...ended }]);
       });
     });
 
@@ -397,9 +543,10 @@ export function pgTests() {
       });
 
       beforeEach(async () => {
-        testThreadId = `thread-${Date.now()}`;
-        testResourceId = `resource-${Date.now()}`;
-        testMessageId = `msg-${Date.now()}`;
+        // Date.now() alone collides when consecutive tests start in the same millisecond.
+        testThreadId = `thread-${randomUUID()}`;
+        testResourceId = `resource-${randomUUID()}`;
+        testMessageId = `msg-${randomUUID()}`;
       });
 
       it('should use createdAtZ over createdAt for messages when both exist', async () => {
@@ -700,11 +847,19 @@ export function pgTests() {
         expect(schema).toContain('PRIMARY KEY ("traceId", "spanId")');
       });
 
-      it('should reject invalid schema names', () => {
-        // Schema names with special characters should throw an error
-        expect(() => exportSchemas('my-schema')).toThrow('Invalid schema name');
-        expect(() => exportSchemas('123schema')).toThrow('Invalid schema name');
-        expect(() => exportSchemas('schema with spaces')).toThrow('Invalid schema name');
+      it('should reject schema names that could break out of quoting', () => {
+        expect(() => exportSchemas('bad"name')).toThrow('Invalid schema name');
+        expect(() => exportSchemas("it's")).toThrow('Invalid schema name');
+        expect(() => exportSchemas('a$b')).toThrow('Invalid schema name');
+        expect(() => exportSchemas('back\\slash')).toThrow('Invalid schema name');
+      });
+
+      it('should accept schema names that need quoting', () => {
+        const schema = exportSchemas('my-schema');
+
+        expect(schema).toContain('CREATE SCHEMA IF NOT EXISTS "my-schema"');
+        expect(schema).toContain('"my-schema"."mastra_threads"');
+        expect(schema).toContain('"my_schema_idx_om_lookup_key"');
       });
 
       it('should accept valid schema names with underscores', () => {
@@ -814,6 +969,28 @@ export function pgTests() {
         expect(schema).toContain(
           'CREATE INDEX IF NOT EXISTS "my_schema_idx_om_lookup_key" ON "my_schema"."mastra_observational_memory" ("lookupKey")',
         );
+      });
+
+      it('should apply the full exported schema as a single multi-statement query', async () => {
+        const pool = new Pool({ connectionString });
+
+        try {
+          await pool.query('DROP SCHEMA IF EXISTS export_apply CASCADE');
+          // Fails with a syntax error if any statement boundary is missing a semicolon
+          await pool.query(exportSchemas('export_apply'));
+
+          const result = await pool.query(
+            `SELECT EXISTS (
+              SELECT 1 FROM information_schema.tables
+              WHERE table_schema = 'export_apply'
+              AND table_name = 'mastra_favorites'
+            )`,
+          );
+          expect(result.rows[0]?.exists).toBe(true);
+        } finally {
+          await pool.query('DROP SCHEMA IF EXISTS export_apply CASCADE');
+          await pool.end();
+        }
       });
     });
 
@@ -1209,6 +1386,90 @@ export function pgTests() {
         expect(result.versions.length).toBe(1);
         expect(result.versions[0].id).toBe(versionId);
         expect(result.versions[0].filesystem).toBe('filesystem-as-scalar-string');
+      });
+    });
+
+    describe('ScorerDefinitionsPG tenancy', () => {
+      let tenancyStore: PostgresStore;
+
+      const baseSnapshot = {
+        name: 'Tenant Scorer',
+        type: 'llm-judge' as const,
+        model: { provider: 'openai', name: 'gpt-4' },
+        instructions: 'Evaluate accuracy',
+      };
+
+      beforeAll(async () => {
+        tenancyStore = new PostgresStore({ ...TEST_CONFIG, id: 'scorer-definitions-tenancy-test' });
+        await tenancyStore.init();
+      });
+
+      afterAll(async () => {
+        try {
+          await tenancyStore.close();
+        } catch {}
+      });
+
+      beforeEach(async () => {
+        await tenancyStore.db.none(`DELETE FROM mastra_scorer_definition_versions`);
+        await tenancyStore.db.none(`DELETE FROM mastra_scorer_definitions`);
+      });
+
+      it('persists organizationId/projectId on create and getById', async () => {
+        const store: any = await tenancyStore.getStore('scorerDefinitions');
+        const created = await store.create({
+          scorerDefinition: { id: 'tenant-1', organizationId: 'org-a', projectId: 'proj-1', ...baseSnapshot },
+        });
+        expect(created.organizationId).toBe('org-a');
+        expect(created.projectId).toBe('proj-1');
+
+        const fetched = await store.getById('tenant-1');
+        expect(fetched.organizationId).toBe('org-a');
+        expect(fetched.projectId).toBe('proj-1');
+      });
+
+      it('filters list by organizationId, projectId, and both together', async () => {
+        const store: any = await tenancyStore.getStore('scorerDefinitions');
+        await store.create({
+          scorerDefinition: { id: 'a1', organizationId: 'org-a', projectId: 'proj-1', ...baseSnapshot },
+        });
+        await store.create({
+          scorerDefinition: { id: 'a2', organizationId: 'org-a', projectId: 'proj-2', ...baseSnapshot },
+        });
+        await store.create({
+          scorerDefinition: { id: 'b1', organizationId: 'org-b', projectId: 'proj-1', ...baseSnapshot },
+        });
+
+        const byOrg = await store.list({ status: 'draft', organizationId: 'org-a' });
+        expect(byOrg.total).toBe(2);
+        expect(byOrg.scorerDefinitions.every((s: any) => s.organizationId === 'org-a')).toBe(true);
+
+        const byProject = await store.list({ status: 'draft', projectId: 'proj-1' });
+        expect(byProject.total).toBe(2);
+        expect(byProject.scorerDefinitions.every((s: any) => s.projectId === 'proj-1')).toBe(true);
+
+        const byBoth = await store.list({ status: 'draft', organizationId: 'org-a', projectId: 'proj-1' });
+        expect(byBoth.total).toBe(1);
+        expect(byBoth.scorerDefinitions[0].id).toBe('a1');
+
+        const noMatch = await store.list({ status: 'draft', organizationId: 'org-c' });
+        expect(noMatch.total).toBe(0);
+      });
+
+      it('propagates tenancy filters through listResolved', async () => {
+        const store: any = await tenancyStore.getStore('scorerDefinitions');
+        await store.create({
+          scorerDefinition: { id: 'a1', organizationId: 'org-a', projectId: 'proj-1', ...baseSnapshot },
+        });
+        await store.create({
+          scorerDefinition: { id: 'a2', organizationId: 'org-a', projectId: 'proj-2', ...baseSnapshot },
+        });
+
+        const resolved = await store.listResolved({ status: 'draft', organizationId: 'org-a', projectId: 'proj-2' });
+        expect(resolved.total).toBe(1);
+        expect(resolved.scorerDefinitions[0].id).toBe('a2');
+        expect(resolved.scorerDefinitions[0].organizationId).toBe('org-a');
+        expect(resolved.scorerDefinitions[0].name).toBe('Tenant Scorer');
       });
     });
   });

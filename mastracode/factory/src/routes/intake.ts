@@ -1,0 +1,545 @@
+import type { ApiRoute } from '@mastra/core/server';
+import { registerApiRoute } from '@mastra/core/server';
+import type { Context } from 'hono';
+import { z } from 'zod';
+
+import type { Intake, IntakeItem } from '../capabilities/intake.js';
+import type { AuditEmitter } from '../storage/domains/audit/domain.js';
+import { FactoryProjectNotFoundError, normalizeBindingLabels } from '../storage/domains/intake/base.js';
+import type { IntakeBindingConflict, IntakeConfig, IntakeStorage } from '../storage/domains/intake/base.js';
+import type { RouteDependencies } from './route.js';
+import { loose, Route } from './route.js';
+
+export interface IntakeIntegration {
+  id: string;
+  intake: Pick<Intake, 'listSources' | 'listItems' | 'bindingLabelFilters'>;
+}
+
+interface AggregatedIntakeItem extends Omit<IntakeItem, 'source'> {
+  integrationId: string;
+  externalSource: {
+    integrationId: string;
+    type: string;
+    externalId: string;
+    url?: string;
+  };
+}
+
+export interface IntakeRoutesDeps extends RouteDependencies {
+  audit: AuditEmitter;
+  /** Intake selection domain handle. */
+  intake: IntakeStorage;
+  /** Factory project domain handle, used to validate binding targets. */
+  projects?: { get(input: { orgId: string; id: string }): Promise<unknown | null> };
+  integrations?: IntakeIntegration[];
+  /** Sources newly selected by a config save, so their existing items can be brought in. */
+  onSourcesSelected?: (args: { orgId: string; integrationId: string; sourceIds: string[] }) => void;
+}
+
+/** One integration that failed while the rest of the aggregation succeeded. */
+export interface IntakeIntegrationFailure {
+  integrationId: string;
+  message: string;
+}
+
+type SettledIntegration<T> = { integrationId: string; value: T } | IntakeIntegrationFailure;
+
+const PROVIDER_READ_TIMEOUT_MS = 15_000;
+
+function syncedSourceIds(selection: { enabled: boolean; sourceIds: string[] | null } | undefined): string[] {
+  return selection?.enabled ? (selection.sourceIds ?? []) : [];
+}
+
+/** The Intake contract takes no abort signal, so a slow read is abandoned, not cancelled. */
+function withTimeout<T>(
+  integrationId: string,
+  read: () => Promise<T>,
+  timeoutMs: number = PROVIDER_READ_TIMEOUT_MS,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const budget = Math.max(0, timeoutMs);
+    const timer = setTimeout(
+      () => reject(new Error(`${integrationId} did not answer within ${Math.round(budget / 1000)}s`)),
+      budget,
+    );
+    read()
+      .then(resolve, reject)
+      .finally(() => clearTimeout(timer));
+  });
+}
+
+/**
+ * Read every integration concurrently and isolate the ones that throw or hang, so a single
+ * unreachable provider degrades to a per-source error instead of failing the listing.
+ */
+async function settleByIntegration<T>(
+  requests: Array<{ integrationId: string; read: () => Promise<T> }>,
+): Promise<{ pages: Array<{ integrationId: string; value: T }>; failures: IntakeIntegrationFailure[] }> {
+  const settled = await Promise.all(
+    requests.map(async ({ integrationId, read }): Promise<SettledIntegration<T>> => {
+      try {
+        return { integrationId, value: await withTimeout(integrationId, read) };
+      } catch (error) {
+        console.error(`[factory] intake integration ${integrationId} is unavailable:`, error);
+        return { integrationId, message: error instanceof Error ? error.message : String(error) };
+      }
+    }),
+  );
+  const pages: Array<{ integrationId: string; value: T }> = [];
+  const failures: IntakeIntegrationFailure[] = [];
+  for (const entry of settled) {
+    if ('value' in entry) pages.push(entry);
+    else failures.push(entry);
+  }
+  return { pages, failures };
+}
+
+const MAX_INTAKE_SOURCE_ID_LENGTH = 1024;
+
+const identifier = z.string().min(1).max(256);
+const sourceIdentifier = z.string().min(1).max(MAX_INTAKE_SOURCE_ID_LENGTH);
+
+/** Labels a shared binding takes; `[]` is rejected because "all issues" is spelled `null`. Jira labels never hold spaces. */
+const bindingLabelsSchema = z
+  .array(
+    z
+      .string()
+      .max(255)
+      .refine(label => !/\s/.test(label.trim()), 'labels cannot contain spaces'),
+  )
+  .max(50)
+  .transform(normalizeBindingLabels)
+  .refine(labels => labels.length > 0, 'labels must name at least one label; use null for all issues');
+
+const bindingBodySchema = z.object({
+  integrationId: identifier,
+  sourceId: sourceIdentifier,
+  /** `null` unbinds the source (integrations without label filters only). */
+  factoryProjectId: identifier.nullable(),
+  /** Label filter for integrations with `bindingLabelFilters`; `null` takes all issues, omitted keeps the current filter. */
+  labels: bindingLabelsSchema.nullable().optional(),
+});
+type ParsedBinding = z.output<typeof bindingBodySchema>;
+
+/** Validate a binding request body, rejecting unknown shapes. */
+export function parseIntakeBinding(body: unknown): ParsedBinding | null {
+  const parsed = bindingBodySchema.safeParse(body);
+  return parsed.success ? parsed.data : null;
+}
+
+const bindingDeleteQuerySchema = z.object({
+  integrationId: identifier,
+  sourceId: sourceIdentifier,
+  factoryProjectId: identifier,
+});
+
+function bindingConflictMessage(conflicts: readonly IntakeBindingConflict[]): string {
+  const labels = conflicts.flatMap(conflict => conflict.labels ?? []);
+  return labels.length > 0
+    ? `Already routed to another factory: ${labels.join(', ')}.`
+    : 'Another factory already takes all issues from this source.';
+}
+
+function sanitizeIdList(value: unknown): string[] | null | undefined {
+  if (value === null) return null;
+  if (!Array.isArray(value) || value.length > 200) return undefined;
+  const ids = value.filter(
+    (item): item is string => typeof item === 'string' && item.length > 0 && item.length <= MAX_INTAKE_SOURCE_ID_LENGTH,
+  );
+  return ids.length === value.length && new Set(ids).size === ids.length ? ids : undefined;
+}
+
+function sanitizeLinearRepositoryMap(value: unknown): Record<string, string> | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value);
+  if (entries.length > 200) return undefined;
+  const mapping: Record<string, string> = Object.create(null);
+  for (const [projectId, slug] of entries) {
+    if (
+      !projectId ||
+      projectId.length > MAX_INTAKE_SOURCE_ID_LENGTH ||
+      typeof slug !== 'string' ||
+      !slug.trim() ||
+      slug.length > 512
+    ) {
+      return undefined;
+    }
+    mapping[projectId] = slug;
+  }
+  return mapping;
+}
+
+/** Validate a request body into an intake config, rejecting unknown shapes. */
+export function parseIntakeConfig(body: unknown): IntakeConfig | null {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return null;
+  const entries = Object.entries(body);
+  if (entries.length > 50) return null;
+
+  // Null-prototype so an `__proto__` key lands as a real entry instead of silently
+  // reassigning the prototype and disappearing from the validation below.
+  const config: IntakeConfig = Object.create(null);
+  for (const [integrationId, value] of entries) {
+    if (
+      !integrationId ||
+      integrationId.length > 128 ||
+      typeof value !== 'object' ||
+      value === null ||
+      Array.isArray(value)
+    ) {
+      return null;
+    }
+    const selection = value as { enabled?: unknown; sourceIds?: unknown; repositoryByLinearProject?: unknown };
+    if (typeof selection.enabled !== 'boolean') return null;
+    const sourceIds = sanitizeIdList(selection.sourceIds ?? null);
+    if (sourceIds === undefined) return null;
+    const repositoryByLinearProject =
+      integrationId === 'linear' ? sanitizeLinearRepositoryMap(selection.repositoryByLinearProject) : undefined;
+    if (
+      integrationId === 'linear' &&
+      selection.repositoryByLinearProject !== undefined &&
+      repositoryByLinearProject === undefined
+    )
+      return null;
+    config[integrationId] = {
+      enabled: selection.enabled,
+      sourceIds,
+      ...(repositoryByLinearProject ? { repositoryByLinearProject } : {}),
+    };
+  }
+  return config;
+}
+
+function encodeCursor(cursors: Record<string, string>): string | null {
+  return Object.keys(cursors).length > 0 ? Buffer.from(JSON.stringify(cursors)).toString('base64url') : null;
+}
+
+function decodeCursor(value: string | undefined): Record<string, string> | null {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as unknown;
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+    const entries = Object.entries(parsed);
+    if (entries.some(([key, cursor]) => !key || typeof cursor !== 'string')) return null;
+    return Object.fromEntries(entries) as Record<string, string>;
+  } catch {
+    return null;
+  }
+}
+
+export class IntakeRoutes extends Route<IntakeRoutesDeps> {
+  async #resolveTenant(c: Context): Promise<{ orgId: string; userId: string } | { response: Response }> {
+    await this.deps.auth.ensureUser(c);
+    const tenant = this.deps.auth.tenant(c);
+    if (!tenant) return { response: c.json({ error: 'unauthorized' }, 401) };
+    if (!tenant.orgId) {
+      return {
+        response: c.json(
+          { error: 'organization_required', message: 'Intake configuration requires an organization.' },
+          403,
+        ),
+      };
+    }
+    return { orgId: tenant.orgId, userId: tenant.userId };
+  }
+
+  routes(): ApiRoute[] {
+    const { audit, intake, projects, integrations = [] } = this.deps;
+    const integrationIds = integrations.map(integration => integration.id);
+
+    return [
+      registerApiRoute('/web/intake/config', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async c => {
+          const tenant = await this.#resolveTenant(loose(c));
+          if ('response' in tenant) return tenant.response;
+          await intake.ensureReady();
+          const config = await intake.getConfig({ orgId: tenant.orgId, integrationIds });
+          return c.json({ config });
+        },
+      }),
+      registerApiRoute('/web/intake/config', {
+        method: 'PUT',
+        requiresAuth: false,
+        handler: async c => {
+          const tenant = await this.#resolveTenant(loose(c));
+          if ('response' in tenant) return tenant.response;
+
+          let body: unknown;
+          try {
+            body = await c.req.json();
+          } catch {
+            return c.json({ error: 'Invalid JSON body' }, 400);
+          }
+          const config = parseIntakeConfig(body);
+          if (!config) {
+            return c.json({ error: 'invalid_config' }, 400);
+          }
+
+          const registeredConfig: IntakeConfig = Object.create(null);
+          for (const [integrationId, selection] of Object.entries(config)) {
+            if (integrationIds.includes(integrationId)) {
+              registeredConfig[integrationId] = selection;
+              continue;
+            }
+            if (selection.enabled || selection.sourceIds?.length) {
+              return c.json({ error: 'invalid_config' }, 400);
+            }
+          }
+
+          await intake.ensureReady();
+          const before = await intake.getConfig({ orgId: tenant.orgId, integrationIds });
+          await intake.mergeConfig({ orgId: tenant.orgId, config: registeredConfig });
+          const after = await intake.getConfig({ orgId: tenant.orgId, integrationIds });
+          for (const integrationId of Object.keys(registeredConfig)) {
+            const synced = new Set(syncedSourceIds(before[integrationId]));
+            const added = syncedSourceIds(after[integrationId]).filter(sourceId => !synced.has(sourceId));
+            if (added.length > 0)
+              this.deps.onSourcesSelected?.({ orgId: tenant.orgId, integrationId, sourceIds: added });
+          }
+          await audit.emit({
+            context: loose(c),
+            input: {
+              action: 'factory.intake.config_updated',
+              targets: [{ type: 'intake_config', id: tenant.orgId }],
+              metadata: Object.fromEntries(
+                Object.entries(registeredConfig).map(([integrationId, selection]) => [
+                  integrationId,
+                  { enabled: selection.enabled, sources: selection.sourceIds?.length ?? null },
+                ]),
+              ),
+            },
+          });
+          return c.json({ config: await intake.getConfig({ orgId: tenant.orgId, integrationIds }) });
+        },
+      }),
+      registerApiRoute('/web/intake/bindings', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async c => {
+          const tenant = await this.#resolveTenant(loose(c));
+          if ('response' in tenant) return tenant.response;
+          await intake.ensureReady();
+          return c.json({ bindings: await intake.listBindings({ orgId: tenant.orgId }) });
+        },
+      }),
+      registerApiRoute('/web/intake/bindings', {
+        method: 'PUT',
+        requiresAuth: false,
+        handler: async c => {
+          const tenant = await this.#resolveTenant(loose(c));
+          if ('response' in tenant) return tenant.response;
+
+          let body: unknown;
+          try {
+            body = await c.req.json();
+          } catch {
+            return c.json({ error: 'Invalid JSON body' }, 400);
+          }
+          const binding = parseIntakeBinding(body);
+          if (!binding || !integrationIds.includes(binding.integrationId)) {
+            return c.json({ error: 'invalid_binding' }, 400);
+          }
+          const integration = integrations.find(candidate => candidate.id === binding.integrationId);
+          // Sources of label-filtering integrations feed several Factory projects at once.
+          const shared = integration?.intake.bindingLabelFilters === true;
+          if (!shared && binding.labels) {
+            return c.json(
+              { error: 'invalid_binding', message: `${binding.integrationId} bindings do not support label filters.` },
+              400,
+            );
+          }
+          if (shared && binding.factoryProjectId === null) {
+            return c.json(
+              {
+                error: 'use_delete',
+                message:
+                  "Remove one factory's binding with DELETE /web/intake/bindings?integrationId=…&sourceId=…&factoryProjectId=….",
+              },
+              400,
+            );
+          }
+          if (binding.factoryProjectId && projects) {
+            const project = await projects.get({ orgId: tenant.orgId, id: binding.factoryProjectId });
+            if (!project) return c.json({ error: 'factory_project_not_found' }, 404);
+          }
+
+          await intake.ensureReady();
+          let auditFactoryProjectId = binding.factoryProjectId;
+          let labels: string[] | null = null;
+          if (binding.factoryProjectId === null) {
+            const previousBinding = await intake.clearBinding({
+              orgId: tenant.orgId,
+              integrationId: binding.integrationId,
+              sourceId: binding.sourceId,
+            });
+            auditFactoryProjectId = previousBinding?.factoryProjectId ?? null;
+          } else {
+            const previousBinding = await intake.getBinding({
+              orgId: tenant.orgId,
+              integrationId: binding.integrationId,
+              sourceId: binding.sourceId,
+              ...(shared ? { factoryProjectId: binding.factoryProjectId } : {}),
+            });
+            const target = {
+              orgId: tenant.orgId,
+              userId: tenant.userId,
+              integrationId: binding.integrationId,
+              sourceId: binding.sourceId,
+              factoryProjectId: binding.factoryProjectId,
+            };
+            try {
+              if (shared) {
+                // Omitted labels keep the filter, so a save that doesn't name labels never widens what the binding takes.
+                labels = binding.labels === undefined ? (previousBinding?.labels ?? null) : binding.labels;
+                const { conflicts } = await intake.setSharedBinding({ ...target, labels });
+                if (conflicts.length > 0) {
+                  return c.json(
+                    { error: 'binding_conflict', message: bindingConflictMessage(conflicts), conflicts },
+                    409,
+                  );
+                }
+              } else {
+                await intake.setBinding(target);
+              }
+            } catch (error) {
+              if (error instanceof FactoryProjectNotFoundError) {
+                return c.json({ error: 'factory_project_not_found' }, 404);
+              }
+              throw error;
+            }
+          }
+          await audit.emit({
+            context: loose(c),
+            input: {
+              action: 'factory.intake.binding_updated',
+              ...(auditFactoryProjectId ? { factoryProjectId: auditFactoryProjectId } : {}),
+              targets: [{ type: 'intake_source', id: `${binding.integrationId}:${binding.sourceId}` }],
+              metadata: { factoryProjectId: binding.factoryProjectId, labels },
+            },
+          });
+          return c.json({ bindings: await intake.listBindings({ orgId: tenant.orgId }) });
+        },
+      }),
+      // Removes exactly one Factory project's binding, so a shared source keeps feeding the others.
+      // Identifiers travel in the query string because some clients and proxies drop DELETE bodies.
+      registerApiRoute('/web/intake/bindings', {
+        method: 'DELETE',
+        requiresAuth: false,
+        handler: async c => {
+          const tenant = await this.#resolveTenant(loose(c));
+          if ('response' in tenant) return tenant.response;
+
+          const parsed = bindingDeleteQuerySchema.safeParse({
+            integrationId: c.req.query('integrationId'),
+            sourceId: c.req.query('sourceId'),
+            factoryProjectId: c.req.query('factoryProjectId'),
+          });
+          if (!parsed.success || !integrationIds.includes(parsed.data.integrationId)) {
+            return c.json({ error: 'invalid_binding' }, 400);
+          }
+          const binding = parsed.data;
+
+          await intake.ensureReady();
+          const removed = await intake.clearBinding({ orgId: tenant.orgId, ...binding });
+          if (!removed) return c.json({ error: 'binding_not_found' }, 404);
+          await audit.emit({
+            context: loose(c),
+            input: {
+              action: 'factory.intake.binding_updated',
+              factoryProjectId: removed.factoryProjectId,
+              targets: [{ type: 'intake_source', id: `${binding.integrationId}:${binding.sourceId}` }],
+              metadata: { factoryProjectId: null, labels: null },
+            },
+          });
+          return c.json({ bindings: await intake.listBindings({ orgId: tenant.orgId }) });
+        },
+      }),
+      // Label routes are gone: a project's intake routes decide where its cards land.
+      ...(['GET', 'PUT'] as const).map(method =>
+        registerApiRoute('/web/intake/label-routes', {
+          method,
+          requiresAuth: false,
+          handler: async c => {
+            const tenant = await this.#resolveTenant(loose(c));
+            if ('response' in tenant) return tenant.response;
+            return c.json(
+              {
+                error: 'label_routes_removed',
+                message:
+                  "Label routes were removed. Add an intake route on the project instead: POST /web/factory/projects/:id/intake-routes with a condition on 'item.labels'.",
+              },
+              410,
+            );
+          },
+        }),
+      ),
+      registerApiRoute('/web/intake/sources', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async c => {
+          const tenant = await this.#resolveTenant(loose(c));
+          if ('response' in tenant) return tenant.response;
+          const requested = c.req.query('integrationId');
+          const { pages, failures } = await settleByIntegration(
+            (requested ? integrations.filter(integration => integration.id === requested) : integrations).map(
+              integration => ({
+                integrationId: integration.id,
+                read: () => integration.intake.listSources(tenant),
+              }),
+            ),
+          );
+          return c.json({
+            sources: pages.flatMap(({ integrationId, value }) => value.map(source => ({ integrationId, ...source }))),
+            failures,
+          });
+        },
+      }),
+      registerApiRoute('/web/intake/items', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async c => {
+          const tenant = await this.#resolveTenant(loose(c));
+          if ('response' in tenant) return tenant.response;
+          const cursors = decodeCursor(c.req.query('cursor'));
+          if (!cursors) return c.json({ error: 'invalid_cursor' }, 400);
+
+          await intake.ensureReady();
+          const config = await intake.getConfig({ orgId: tenant.orgId, integrationIds });
+          const { pages, failures } = await settleByIntegration(
+            integrations.flatMap(integration => {
+              const selection = config[integration.id];
+              if (!selection?.enabled || !selection.sourceIds?.length) return [];
+              const sourceIds = selection.sourceIds;
+              const cursor = cursors[integration.id];
+              return [
+                {
+                  integrationId: integration.id,
+                  read: () => integration.intake.listItems({ ...tenant, sourceIds, ...(cursor ? { cursor } : {}) }),
+                },
+              ];
+            }),
+          );
+
+          const items: AggregatedIntakeItem[] = [];
+          const nextCursors: Record<string, string> = {};
+          for (const { integrationId, value } of pages) {
+            items.push(
+              ...value.items.map(item => {
+                const { source, ...candidate } = item;
+                return { ...candidate, integrationId, externalSource: { integrationId, ...source } };
+              }),
+            );
+            if (value.nextCursor) nextCursors[integrationId] = value.nextCursor;
+          }
+          // Keep the cursor an unavailable integration came in with, so the next page resumes there instead of replaying it.
+          for (const { integrationId } of failures) {
+            const cursor = cursors[integrationId];
+            if (cursor) nextCursors[integrationId] = cursor;
+          }
+          return c.json({ items, nextCursor: encodeCursor(nextCursors), failures });
+        },
+      }),
+    ];
+  }
+}

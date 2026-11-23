@@ -1,21 +1,16 @@
 import type { StoredSkillResponse } from '@mastra/client-js';
-import {
-  Button,
-  EmptyState,
-  Entity,
-  EntityContent,
-  EntityName,
-  EntityDescription,
-  ScrollArea,
-  Searchbar,
-  Switch,
-} from '@mastra/playground-ui';
-import { Plus, Drill } from 'lucide-react';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { EmptyState } from '@mastra/playground-ui/components/EmptyState';
+import { Entity, EntityContent, EntityName, EntityDescription } from '@mastra/playground-ui/components/Entity';
+import { ScrollArea } from '@mastra/playground-ui/components/ScrollArea';
+import { SearchInput } from '@mastra/playground-ui/components/SearchInput';
+import { Switch } from '@mastra/playground-ui/components/Switch';
+import { IconPlusMedium } from '@mastra/playground-ui/icons/central/IconPlusMedium';
+import { useStoredSkills } from '@mastra/react/hooks/agents';
+
 import { useState } from 'react';
 import { useWatch } from 'react-hook-form';
-
 import { useAgentEditFormContext } from '../../context/agent-edit-form-context';
-import { useStoredSkills } from '../../hooks/use-stored-skills';
 import { SkillEditDialog } from './skill-edit-dialog';
 import { SectionHeader } from '@/domains/cms';
 
@@ -67,7 +62,7 @@ export function SkillsPage() {
 
   return (
     <ScrollArea className="h-full">
-      <div className="flex flex-col gap-6">
+      <div className="flex flex-col gap-4">
         <div className="flex items-center justify-between">
           <SectionHeader
             title="Skills"
@@ -75,19 +70,18 @@ export function SkillsPage() {
           />
 
           {!readOnly && (
-            <Button variant="outline" size="sm" onClick={() => setDialogOpen(true)}>
-              <Plus className="size-3" />
+            <Button size="sm" onClick={() => setDialogOpen(true)} icon={<IconPlusMedium />}>
               Add a skill
             </Button>
           )}
         </div>
 
-        <Searchbar onSearch={setSearch} label="Search skills" placeholder="Search skills" />
+        <SearchInput label="Search skills" placeholder="Search skills" value={search} onValueChange={setSearch} />
 
         {filteredSkills.length > 0 && (
           <div className="flex flex-col gap-2">
             {filteredSkills.map(skill => (
-              <Entity key={skill.id} className="bg-surface2">
+              <Entity key={skill.id} className="bg-background">
                 <EntityContent>
                   <EntityName>{skill.name}</EntityName>
                   <EntityDescription>{skill.description || 'No description'}</EntityDescription>
@@ -105,15 +99,13 @@ export function SkillsPage() {
         )}
 
         {!isLoading && storedSkills.length === 0 && (
-          <div className="py-12">
+          <div className="py-8">
             <EmptyState
-              iconSlot={<Drill height={40} width={40} />}
               titleSlot="No skills available"
               descriptionSlot="Create a skill to give your agent specialized knowledge."
               actionSlot={
                 !readOnly ? (
-                  <Button onClick={() => setDialogOpen(true)}>
-                    <Plus />
+                  <Button onClick={() => setDialogOpen(true)} icon={<IconPlusMedium />}>
                     Add a skill
                   </Button>
                 ) : undefined
@@ -123,12 +115,7 @@ export function SkillsPage() {
         )}
       </div>
 
-      <SkillEditDialog
-        isOpen={dialogOpen}
-        onClose={() => setDialogOpen(false)}
-        onSkillCreated={handleSkillCreated}
-        readOnly={readOnly}
-      />
+      <SkillEditDialog isOpen={dialogOpen} onClose={() => setDialogOpen(false)} onSkillCreated={handleSkillCreated} />
     </ScrollArea>
   );
 }

@@ -8,30 +8,27 @@
  */
 export const RUN_REGISTRY_SYMBOL = Symbol('run_registry');
 
-/**
- * Generate the pubsub topic name for agent streaming events
- * @param runId - The unique run identifier
- * @returns The topic name for subscribing/publishing agent stream events
- */
-export const AGENT_STREAM_TOPIC = (runId: string): string => `agent.stream.${runId}`;
+export {
+  AGENT_STREAM_TOPIC,
+  AGENT_CONTROL_TOPIC,
+  AgentControlEventTypes,
+  AgentStreamEventTypes,
+} from '../streams/constants';
 
-/**
- * Event type constants for agent stream events
- */
-export const AgentStreamEventTypes = {
-  /** Chunk of streaming data (text, tool call, etc.) */
-  CHUNK: 'chunk',
-  /** Start of a new step in the agentic loop */
-  STEP_START: 'step-start',
-  /** End of a step in the agentic loop */
-  STEP_FINISH: 'step-finish',
-  /** Agent execution completed successfully */
-  FINISH: 'finish',
-  /** Error occurred during execution */
-  ERROR: 'error',
-  /** Workflow suspended (e.g., for tool approval) */
-  SUSPENDED: 'suspended',
-} as const;
+export const DURABLE_STOP_WHEN_ERROR_ID = 'DURABLE_AGENT_STOP_WHEN_FAILED';
+
+const REJECT_STREAM_ERROR = Symbol('mastra.durable.rejectStreamError');
+
+type RejectStreamError = Error & { [REJECT_STREAM_ERROR]?: true };
+
+export function markErrorForStreamRejection(error: Error): Error {
+  (error as RejectStreamError)[REJECT_STREAM_ERROR] = true;
+  return error;
+}
+
+export function shouldRejectStream(error: Error): boolean {
+  return (error as RejectStreamError)[REJECT_STREAM_ERROR] === true;
+}
 
 /**
  * Default values for durable agent execution
@@ -41,10 +38,9 @@ export const DurableAgentDefaults = {
   MAX_STEPS: 5,
   /**
    * Default tool call concurrency.
-   * NOTE: Currently unused — durable workflows run tool calls sequentially
-   * (concurrency: 1) because tool approval and suspension require sequential
-   * execution. The serialized toolCallConcurrency option is preserved in
-   * workflow input for future use when dynamic foreach concurrency is supported.
+   * Applied by `resolveDurableToolCallConcurrency` when a run doesn't
+   * configure `toolCallConcurrency`. Approval / suspend-capable tool sets
+   * always run sequentially (concurrency: 1) regardless of this value.
    */
   TOOL_CALL_CONCURRENCY: 10,
 } as const;
@@ -65,4 +61,18 @@ export const DurableStepIds = {
   AGENTIC_LOOP: 'durable-agentic-loop',
   /** Scorer execution step */
   SCORER_EXECUTION: 'durable-scorer-execution',
+  /** isTaskComplete evaluation step */
+  IS_TASK_COMPLETE: 'durable-is-task-complete',
 } as const;
+
+export const RECOVER_ALREADY_IN_PROGRESS_ERROR_ID = 'DURABLE_AGENT_RECOVER_ALREADY_IN_PROGRESS';
+
+export const RECOVER_SNAPSHOT_NOT_FOUND_ERROR_ID = 'DURABLE_AGENT_RECOVER_SNAPSHOT_NOT_FOUND';
+
+export const RECOVER_CHECKPOINT_NOT_AVAILABLE_ERROR_ID = 'DURABLE_AGENT_RECOVER_CHECKPOINT_NOT_AVAILABLE';
+
+export const RECOVER_RUN_SUSPENDED_ERROR_ID = 'DURABLE_AGENT_RECOVER_RUN_SUSPENDED';
+
+export const RECOVER_RUN_NOT_ACTIVE_ERROR_ID = 'DURABLE_AGENT_RECOVER_RUN_NOT_ACTIVE';
+
+export const RECOVER_SHUTDOWN_ERROR_ID = 'DURABLE_AGENT_RECOVER_SHUTDOWN';

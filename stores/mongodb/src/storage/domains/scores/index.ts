@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto';
-
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import type { ListScoresResponse, SaveScorePayload, ScoreRowData, ScoringSource } from '@mastra/core/evals';
 import { saveScorePayloadSchema } from '@mastra/core/evals';
@@ -12,9 +10,17 @@ import {
   safelyParseJSON,
   transformScoreRow as coreTransformScoreRow,
 } from '@mastra/core/storage';
-import type { StoragePagination } from '@mastra/core/storage';
+import type {
+  PruneOptions,
+  PruneResult,
+  RetentionTablesDescriptor,
+  ScoreTenancyFilters,
+  StoragePagination,
+  TableRetentionPolicy,
+} from '@mastra/core/storage';
 import type { MongoDBConnector } from '../../connectors/MongoDBConnector';
 import { resolveMongoDBConfig } from '../../db';
+import { resolveTargets, runPrune } from '../../retention';
 import type { MongoDBDomainConfig, MongoDBIndexConfig } from '../../types';
 
 /**
@@ -27,6 +33,16 @@ function transformScoreRow(row: Record<string, any>): ScoreRowData {
   });
 }
 
+/** Adds multi-tenant scope fields to a MongoDB query object. */
+function applyTenancyFilters(query: Record<string, any>, filters?: ScoreTenancyFilters): void {
+  if (filters?.organizationId !== undefined) {
+    query.organizationId = filters.organizationId;
+  }
+  if (filters?.projectId !== undefined) {
+    query.projectId = filters.projectId;
+  }
+}
+
 export class ScoresStorageMongoDB extends ScoresStorage {
   #connector: MongoDBConnector;
   #skipDefaultIndexes?: boolean;
@@ -34,6 +50,11 @@ export class ScoresStorageMongoDB extends ScoresStorage {
 
   /** Collections managed by this domain */
   static readonly MANAGED_COLLECTIONS = [TABLE_SCORERS] as const;
+
+  /** Anchor is the score row's creation time, stored as a BSON date. */
+  static override readonly retentionTables: RetentionTablesDescriptor = {
+    scorers: { table: TABLE_SCORERS, column: 'createdAt', indexed: true },
+  };
 
   constructor(config: MongoDBDomainConfig) {
     super();
@@ -47,6 +68,16 @@ export class ScoresStorageMongoDB extends ScoresStorage {
 
   private async getCollection(name: string) {
     return this.#connector.getCollection(name);
+  }
+
+  /** Delete scorer results older than the `scorers` policy's `maxAge`, batched. */
+  async prune(policies: Record<string, TableRetentionPolicy>, options?: PruneOptions): Promise<PruneResult[]> {
+    const targets = resolveTargets({
+      policies,
+      descriptor: ScoresStorageMongoDB.retentionTables,
+      order: ['scorers'],
+    });
+    return runPrune({ connector: this.#connector, domain: 'scores', targets, options, logger: this.logger });
   }
 
   /**
@@ -154,7 +185,10 @@ export class ScoresStorageMongoDB extends ScoresStorage {
     }
     try {
       const now = new Date();
-      const scoreId = randomUUID();
+      // Caller-supplied ids give scores a stable identity: retried writes for
+      // the same id replace the previous document (latest wins).
+      const suppliedId = validatedScore.id;
+      const scoreId = suppliedId ?? globalThis.crypto.randomUUID();
 
       const scorer =
         typeof validatedScore.scorer === 'string' ? safelyParseJSON(validatedScore.scorer) : validatedScore.scorer;
@@ -194,7 +228,11 @@ export class ScoresStorageMongoDB extends ScoresStorage {
       };
 
       const collection = await this.getCollection(TABLE_SCORERS);
-      await collection.insertOne(dataToSave);
+      if (suppliedId) {
+        await collection.replaceOne({ id: scoreId }, dataToSave, { upsert: true });
+      } else {
+        await collection.insertOne(dataToSave);
+      }
 
       return { score: dataToSave as ScoreRowData };
     } catch (error) {
@@ -216,12 +254,14 @@ export class ScoresStorageMongoDB extends ScoresStorage {
     entityId,
     entityType,
     source,
+    filters,
   }: {
     scorerId: string;
     pagination: StoragePagination;
     entityId?: string;
     entityType?: string;
     source?: ScoringSource;
+    filters?: ScoreTenancyFilters;
   }): Promise<ListScoresResponse> {
     try {
       const { page, perPage: perPageInput } = pagination;
@@ -241,6 +281,8 @@ export class ScoresStorageMongoDB extends ScoresStorage {
       if (source) {
         query.source = source;
       }
+
+      applyTenancyFilters(query, filters);
 
       const collection = await this.getCollection(TABLE_SCORERS);
       const total = await collection.countDocuments(query);
@@ -294,17 +336,22 @@ export class ScoresStorageMongoDB extends ScoresStorage {
   async listScoresByRunId({
     runId,
     pagination,
+    filters,
   }: {
     runId: string;
     pagination: StoragePagination;
+    filters?: ScoreTenancyFilters;
   }): Promise<ListScoresResponse> {
     try {
       const { page, perPage: perPageInput } = pagination;
       const perPage = normalizePerPage(perPageInput, 100);
       const { offset: start, perPage: perPageForResponse } = calculatePagination(page, perPageInput, perPage);
 
+      const query: any = { runId };
+      applyTenancyFilters(query, filters);
+
       const collection = await this.getCollection(TABLE_SCORERS);
-      const total = await collection.countDocuments({ runId });
+      const total = await collection.countDocuments(query);
 
       if (total === 0) {
         return {
@@ -321,7 +368,7 @@ export class ScoresStorageMongoDB extends ScoresStorage {
       const end = perPageInput === false ? total : start + perPage;
 
       // Build query - omit limit() when perPage is false to fetch all results
-      let cursor = collection.find({ runId }).sort({ createdAt: -1 }).skip(start);
+      let cursor = collection.find(query).sort({ createdAt: -1 }).skip(start);
 
       if (perPageInput !== false) {
         cursor = cursor.limit(perPage);
@@ -351,23 +398,27 @@ export class ScoresStorageMongoDB extends ScoresStorage {
       );
     }
   }
-
   async listScoresByEntityId({
     entityId,
     entityType,
     pagination,
+    filters,
   }: {
     pagination: StoragePagination;
     entityId: string;
     entityType: string;
+    filters?: ScoreTenancyFilters;
   }): Promise<ListScoresResponse> {
     try {
       const { page, perPage: perPageInput } = pagination;
       const perPage = normalizePerPage(perPageInput, 100);
       const { offset: start, perPage: perPageForResponse } = calculatePagination(page, perPageInput, perPage);
 
+      const query: any = { entityId, entityType };
+      applyTenancyFilters(query, filters);
+
       const collection = await this.getCollection(TABLE_SCORERS);
-      const total = await collection.countDocuments({ entityId, entityType });
+      const total = await collection.countDocuments(query);
 
       if (total === 0) {
         return {
@@ -384,7 +435,7 @@ export class ScoresStorageMongoDB extends ScoresStorage {
       const end = perPageInput === false ? total : start + perPage;
 
       // Build query - omit limit() when perPage is false to fetch all results
-      let cursor = collection.find({ entityId, entityType }).sort({ createdAt: -1 }).skip(start);
+      let cursor = collection.find(query).sort({ createdAt: -1 }).skip(start);
 
       if (perPageInput !== false) {
         cursor = cursor.limit(perPage);
@@ -419,17 +470,20 @@ export class ScoresStorageMongoDB extends ScoresStorage {
     traceId,
     spanId,
     pagination,
+    filters,
   }: {
     traceId: string;
     spanId: string;
     pagination: StoragePagination;
+    filters?: ScoreTenancyFilters;
   }): Promise<ListScoresResponse> {
     try {
       const { page, perPage: perPageInput } = pagination;
       const perPage = normalizePerPage(perPageInput, 100);
       const { offset: start, perPage: perPageForResponse } = calculatePagination(page, perPageInput, perPage);
 
-      const query = { traceId, spanId };
+      const query: any = { traceId, spanId };
+      applyTenancyFilters(query, filters);
       const collection = await this.getCollection(TABLE_SCORERS);
       const total = await collection.countDocuments(query);
 

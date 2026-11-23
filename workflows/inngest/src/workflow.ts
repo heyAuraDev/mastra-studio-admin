@@ -1,10 +1,13 @@
-import { randomUUID } from 'node:crypto';
-import { emitErrorEvent } from '@mastra/core/agent/durable';
+import { DURABLE_STOP_WHEN_ERROR_ID, emitErrorEvent } from '@mastra/core/agent/durable';
 import { RequestContext } from '@mastra/core/di';
+import { getErrorFromUnknown } from '@mastra/core/error';
+import { PubSub } from '@mastra/core/events';
+import type { Event, EventCallback, SubscribeOptions } from '@mastra/core/events';
 import type { Mastra } from '@mastra/core/mastra';
-import { SpanType, EntityType } from '@mastra/core/observability';
-import type { WorkflowRuns } from '@mastra/core/storage';
-import { Workflow } from '@mastra/core/workflows';
+import * as coreObservability from '@mastra/core/observability';
+import { SpanType, EntityType, getOrCreateSpan } from '@mastra/core/observability';
+import type { RunFence, WorkflowRuns } from '@mastra/core/storage';
+import { Workflow, getEntryWorkflow, isSingleStepEntry } from '@mastra/core/workflows';
 import type {
   Step,
   StepResult,
@@ -17,7 +20,14 @@ import type {
 } from '@mastra/core/workflows';
 import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
+import { RESUME_CLAIM_RUN_LEASE_MS } from './durable-event-payload';
 import { InngestExecutionEngine } from './execution-engine';
+import {
+  compactNestedWorkflowResult,
+  NESTED_WORKFLOW_OUTPUT_MODE,
+  resolveNestedWorkflowOutputMode,
+} from './nested-workflow-output';
+import { workflowResumeTracingContext, workflowTermination } from './observability-compat';
 import { InngestPubSub } from './pubsub';
 import { InngestRun } from './run';
 import type {
@@ -27,30 +37,155 @@ import type {
   InngestWorkflowConfig,
 } from './types';
 
+function durableAgentWorkflowError(error: unknown): { error: Error; delivery?: 'reject' } {
+  const serialized = error as {
+    code?: unknown;
+    id?: unknown;
+    name?: unknown;
+    message?: unknown;
+    stepId?: unknown;
+    details?: { name?: unknown; message?: unknown };
+    cause?: { name?: unknown; message?: unknown };
+  };
+  const isMarkedStopWhenError =
+    serialized?.code === DURABLE_STOP_WHEN_ERROR_ID || serialized?.id === DURABLE_STOP_WHEN_ERROR_ID;
+  // Inngest's serve transport serializes predicate failures as StepErrors and drops
+  // the MastraError id/details. Keep this prefix in sync with the memoized step id
+  // in create-inngest-agentic-workflow.ts; any failure in that step is classified
+  // as a stopWhen failure.
+  const isStopWhenStepError = typeof serialized?.stepId === 'string' && serialized.stepId.startsWith('stop-when-');
+  if (isMarkedStopWhenError || isStopWhenStepError) {
+    const normalized = new Error(
+      typeof serialized.details?.message === 'string'
+        ? serialized.details.message
+        : typeof serialized.cause?.message === 'string'
+          ? serialized.cause.message
+          : typeof serialized.message === 'string'
+            ? serialized.message
+            : 'Workflow execution failed',
+    );
+    normalized.name =
+      typeof serialized.details?.name === 'string'
+        ? serialized.details.name
+        : typeof serialized.cause?.name === 'string'
+          ? serialized.cause.name
+          : typeof serialized.name === 'string'
+            ? serialized.name
+            : 'Error';
+    return { error: normalized, delivery: 'reject' };
+  }
+  return { error: getErrorFromUnknown(error, { fallbackMessage: 'Workflow execution failed' }) };
+}
+
+/**
+ * Resolves the nested `InngestWorkflow` wrapped by a graph entry, if any.
+ * Handles both plain single-step entries and `loop` / `foreach` entries whose
+ * body is a `SingleStepEntry` wrapper (so `{ type: 'step', step: workflow }`
+ * bodies are unwrapped correctly).
+ */
+function getNestedInngestWorkflow(entry: StepFlowEntry): InngestWorkflow | null {
+  let nested: unknown = null;
+  if (entry.type === 'loop' || entry.type === 'foreach') {
+    nested = getEntryWorkflow(entry.step);
+  } else if (isSingleStepEntry(entry)) {
+    nested = getEntryWorkflow(entry);
+  }
+  return nested instanceof InngestWorkflow ? nested : null;
+}
+
+class WorkflowEventPolicyPubSub extends PubSub {
+  constructor(
+    private readonly pubsub: PubSub,
+    private readonly emitWorkflowEvents: boolean,
+  ) {
+    super();
+  }
+
+  publish(topic: string, event: Omit<Event, 'id' | 'createdAt'>, options?: { localOnly?: boolean }): Promise<void> {
+    if (!this.emitWorkflowEvents && topic.startsWith('workflow.events.v2.')) return Promise.resolve();
+    return this.pubsub.publish(topic, event, options);
+  }
+
+  subscribe(topic: string, cb: EventCallback, options?: SubscribeOptions): Promise<void> {
+    return this.pubsub.subscribe(topic, cb, options);
+  }
+
+  unsubscribe(topic: string, cb: EventCallback): Promise<void> {
+    return this.pubsub.unsubscribe(topic, cb);
+  }
+
+  flush(): Promise<void> {
+    return this.pubsub.flush();
+  }
+
+  clearTopic(topic: string): Promise<void> {
+    return this.pubsub.clearTopic(topic);
+  }
+
+  get supportedModes() {
+    return this.pubsub.supportedModes;
+  }
+
+  get supportsNativeBatching(): boolean {
+    return this.pubsub.supportsNativeBatching;
+  }
+
+  get supportsOffsets(): boolean {
+    return this.pubsub.supportsOffsets;
+  }
+
+  override __replaysTopic(topic: string): boolean {
+    return this.pubsub.__replaysTopic(topic);
+  }
+
+  getHistory(topic: string, offset?: number): Promise<Event[]> {
+    return this.pubsub.getHistory(topic, offset);
+  }
+
+  subscribeWithReplay(topic: string, cb: EventCallback): Promise<void> {
+    return this.pubsub.subscribeWithReplay(topic, cb);
+  }
+
+  subscribeFromOffset(topic: string, offset: number, cb: EventCallback): Promise<void> {
+    return this.pubsub.subscribeFromOffset(topic, offset, cb);
+  }
+}
+
 export class InngestWorkflow<
   TEngineType = InngestEngineType,
-  TSteps extends Step<string, any, any, any, any, any, TEngineType>[] = Step<
+  TSteps extends Step<string, any, any, any, any, any, TEngineType, any>[] = Step<
     string,
     unknown,
     unknown,
     unknown,
     unknown,
     unknown,
-    TEngineType
+    TEngineType,
+    unknown
   >[],
   TWorkflowId extends string = string,
   TState = unknown,
   TInput = unknown,
   TOutput = unknown,
   TPrevSchema = TInput,
-> extends Workflow<TEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema> {
+  TRequestContext extends Record<string, any> | unknown = unknown,
+> extends Workflow<TEngineType, TSteps, TWorkflowId, TState, TInput, TOutput, TPrevSchema, TRequestContext> {
   #mastra: Mastra;
   public inngest: Inngest;
 
   private function: ReturnType<Inngest['createFunction']> | undefined;
   private cronFunction: ReturnType<Inngest['createFunction']> | undefined;
   private readonly flowControlConfig?: InngestFlowControlConfig;
+  private readonly functionRetries: NonNullable<InngestFlowControlConfig['retries']>;
   private readonly cronConfig?: InngestFlowCronConfig<TInput, TState>;
+  /**
+   * Optional override that lets a host (e.g. `createInngestAgent`) route topics
+   * while retaining the workflow-local `InngestPubSub` as the default.
+   */
+  #pubsubFactory?: (defaultPubsub: PubSub) => PubSub;
+  #emitWorkflowEvents = true;
+  /** Functions a host (e.g. the durable agent loop) serves alongside this workflow's own. */
+  #hostFunctions: ReturnType<Inngest['createFunction']>[] = [];
 
   constructor(
     params: InngestWorkflowConfig<
@@ -58,14 +193,25 @@ export class InngestWorkflow<
       TState,
       TInput,
       TOutput,
-      TSteps & Step<string, any, any, any, any, any, InngestEngineType>[]
+      TSteps & Step<string, any, any, any, any, any, InngestEngineType, any>[],
+      TRequestContext
     >,
     inngest: Inngest,
   ) {
-    const { concurrency, rateLimit, throttle, debounce, priority, cron, inputData, initialState, ...workflowParams } =
-      params;
+    const {
+      concurrency,
+      rateLimit,
+      throttle,
+      debounce,
+      priority,
+      retries,
+      cron,
+      inputData,
+      initialState,
+      ...workflowParams
+    } = params;
 
-    super(workflowParams as WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps>);
+    super(workflowParams as WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps, TRequestContext>);
 
     this.engineType = 'inngest';
 
@@ -74,6 +220,7 @@ export class InngestWorkflow<
     );
 
     this.flowControlConfig = flowControlEntries.length > 0 ? Object.fromEntries(flowControlEntries) : undefined;
+    this.functionRetries = retries ?? 0;
 
     this.#mastra = params.mastra!;
     this.inngest = inngest;
@@ -103,16 +250,84 @@ export class InngestWorkflow<
     return workflowsStore.listWorkflowRuns({ workflowName: this.id, ...(args ?? {}) }) as unknown as WorkflowRuns;
   }
 
+  /**
+   * Override the PubSub used inside the durable workflow function. The factory
+   * receives the workflow's own default `InngestPubSub`, allowing hosts to route
+   * selected topics elsewhere while preserving workflow-local channels.
+   *
+   * The factory is propagated to every nested `InngestWorkflow` in the step
+   * graph. Nested workflows resolve their own default pubsub at runtime and pass
+   * it through the same factory.
+   */
+  __setPubsubFactory(factory: (defaultPubsub: PubSub) => PubSub) {
+    this.#pubsubFactory = factory;
+    const updateNested = (step: StepFlowEntry) => {
+      const nested = getNestedInngestWorkflow(step);
+      if (nested) {
+        nested.__setPubsubFactory(factory);
+      } else if (step.type === 'parallel' || step.type === 'conditional') {
+        for (const subStep of step.steps) {
+          updateNested(subStep);
+        }
+      }
+    };
+    for (const step of this.executionGraph.steps) {
+      updateNested(step);
+    }
+  }
+
+  override commit() {
+    const committed = super.commit();
+    if (this.#pubsubFactory) {
+      this.__setPubsubFactory(this.#pubsubFactory);
+    }
+    this.__setEmitWorkflowEvents(this.#emitWorkflowEvents);
+    return committed;
+  }
+
+  __addHostFunctions(functions: ReturnType<Inngest['createFunction']>[]) {
+    this.#hostFunctions.push(...functions);
+  }
+
+  __setEmitWorkflowEvents(enabled: boolean) {
+    this.#emitWorkflowEvents = enabled;
+    const updateNested = (step: StepFlowEntry) => {
+      const nested = getNestedInngestWorkflow(step);
+      if (nested) {
+        nested.__setEmitWorkflowEvents(enabled);
+      } else if (step.type === 'parallel' || step.type === 'conditional') {
+        for (const subStep of step.steps) {
+          updateNested(subStep);
+        }
+      }
+    };
+    for (const step of this.executionGraph.steps) {
+      updateNested(step);
+    }
+  }
+
+  /**
+   * Test-only accessor for the configured pubsub factory. Lets tests verify that
+   * a host (e.g. `createInngestAgent`) wired the workflow to its agent pubsub
+   * without having to drive a real Inngest invocation.
+   */
+  __getPubsubFactory(): ((defaultPubsub: PubSub) => PubSub) | undefined {
+    return this.#pubsubFactory;
+  }
+
+  /** @internal Exposed for focused wiring tests. */
+  __getEmitWorkflowEvents(): boolean {
+    return this.#emitWorkflowEvents;
+  }
+
   __registerMastra(mastra: Mastra) {
     super.__registerMastra(mastra);
     this.#mastra = mastra;
     this.executionEngine.__registerMastra(mastra);
     const updateNested = (step: StepFlowEntry) => {
-      if (
-        (step.type === 'step' || step.type === 'loop' || step.type === 'foreach') &&
-        step.step instanceof InngestWorkflow
-      ) {
-        step.step.__registerMastra(mastra);
+      const nested = getNestedInngestWorkflow(step);
+      if (nested) {
+        nested.__registerMastra(mastra);
       } else if (step.type === 'parallel' || step.type === 'conditional') {
         for (const subStep of step.steps) {
           updateNested(subStep);
@@ -130,12 +345,14 @@ export class InngestWorkflow<
   async createRun(options?: {
     runId?: string;
     resourceId?: string;
-  }): Promise<Run<TEngineType, TSteps, TState, TInput, TOutput>> {
-    const runIdToUse = options?.runId || randomUUID();
+    disableScorers?: boolean;
+    pubsub?: PubSub;
+  }): Promise<Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>> {
+    const runIdToUse = options?.runId || globalThis.crypto.randomUUID();
 
     // Return a new Run instance with object parameters
     const existingInMemoryRun = this.runs.get(runIdToUse);
-    const newRun = new InngestRun<TEngineType, TSteps, TState, TInput, TOutput>(
+    const newRun = new InngestRun<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>(
       {
         workflowId: this.id,
         runId: runIdToUse,
@@ -152,7 +369,7 @@ export class InngestWorkflow<
       },
       this.inngest,
     );
-    const run = (existingInMemoryRun ?? newRun) as Run<TEngineType, TSteps, TState, TInput, TOutput>;
+    const run = (existingInMemoryRun ?? newRun) as Run<TEngineType, TSteps, TState, TInput, TOutput, TRequestContext>;
 
     this.runs.set(runIdToUse, run);
 
@@ -195,6 +412,33 @@ export class InngestWorkflow<
     return run;
   }
 
+  /**
+   * Records a run Inngest gave up on as failed. Only a row still marked live is
+   * rewritten: a run that failed in its own code already wrote a richer terminal
+   * snapshot in finalize, and a suspended row stays resumable.
+   */
+  async #markRunFailed(runId: string, error: unknown) {
+    const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
+    if (!workflowsStore) return;
+    const run = await workflowsStore.getWorkflowRunById({ runId, workflowName: this.id });
+    const snapshot = typeof run?.snapshot === 'string' ? undefined : run?.snapshot;
+    if (!snapshot || !['running', 'pending', 'waiting'].includes(snapshot.status)) return;
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: this.id,
+      runId,
+      resourceId: run?.resourceId,
+      expectedStatus: ['running', 'pending', 'waiting'],
+      snapshot: {
+        ...snapshot,
+        status: 'failed',
+        activePaths: [],
+        activeStepsPath: {},
+        error: getErrorFromUnknown(error, { fallbackMessage: 'Inngest run failed' }),
+        timestamp: Date.now(),
+      },
+    });
+  }
+
   //createCronFunction is only called if cronConfig.cron is defined.
   private createCronFunction() {
     if (this.cronFunction) {
@@ -203,7 +447,10 @@ export class InngestWorkflow<
     this.cronFunction = this.inngest.createFunction(
       {
         id: `workflow.${this.id}.cron`,
-        retries: 0,
+        retries: this.functionRetries,
+        // Not scoped by `match` like the event-triggered function above: a cron
+        // trigger carries no event data to match a runId against, and the run
+        // is created inside the function, so the canceller has no id to name.
         cancelOn: [{ event: `cancel.workflow.${this.id}` }],
         triggers: { cron: this.cronConfig?.cron ?? '' },
         ...this.flowControlConfig,
@@ -221,25 +468,55 @@ export class InngestWorkflow<
     return this.cronFunction;
   }
 
+  /**
+   * Gets the durable Inngest function that executes this workflow.
+   *
+   * @returns The memoized Inngest function for this workflow.
+   */
   getFunction(): ReturnType<Inngest['createFunction']> {
     if (this.function) {
       return this.function;
     }
 
-    // Always set function-level retries to 0, since retries are handled at the step level via executeStepWithRetry
-    // which uses either step.retries or retryConfig.attempts (step.retries takes precedence).
-    // step.retries is not accessible at function level, so we handle retries manually in executeStepWithRetry.
-    // This is why we set retries to 0 here.
+    // Step-code errors are retried at the step level via executeStepWithRetry (step.retries or
+    // retryConfig.attempts) and fail their step.run() as NonRetriableError, so function-level retries
+    // never re-run failed step code. Function-level retries cover failed SDK requests (process restart,
+    // OOM, 5xx/timeout) and transient errors in other durable operations such as spans and event
+    // publishing; they default to 0 and are configurable via `retries`.
     this.function = this.inngest.createFunction(
       {
         id: `workflow.${this.id}`,
-        retries: 0,
-        cancelOn: [{ event: `cancel.workflow.${this.id}` }],
+        retries: this.functionRetries,
+        // `match` scopes the cancellation to the run the cancel event names.
+        // Without it Inngest cancels every in-flight run of this function, and
+        // since all durable agents share one function, cancelling a single run
+        // tore down every other run in the deployment — only the targeted run's
+        // snapshot was marked canceled, so the rest simply vanished.
+        // Every event that triggers this function carries `data.runId`, and
+        // `Run.cancel()` sends the same field.
+        cancelOn: [{ event: `cancel.workflow.${this.id}`, match: 'data.runId' }],
+        // Inngest calls this once it gives up on a run. The handler's finalize step is
+        // what records a terminal snapshot, so a run that dies before reaching it
+        // (worker crash, retries exhausted on a failed request) would otherwise stay
+        // `running` in storage forever.
+        // A resumed InngestAgent segment carries a resume claim; the resume-claim release function
+        // ends those under the claim, so a stale segment cannot fail a run a later resume took over.
+        onFailure: async ({ event, error }) => {
+          const original = event.data?.event?.data;
+          if (typeof original?.runId !== 'string' || original.resume?.claim) return;
+          await this.#markRunFailed(original.runId, error);
+        },
         triggers: { event: `workflow.${this.id}` },
         // Spread flow control configuration
         ...this.flowControlConfig,
       },
-      async ({ event, step, attempt }) => {
+      /**
+       * Executes a workflow invocation from its Inngest trigger event.
+       *
+       * @param context - The Inngest event, durable step tools, and current attempt.
+       * @returns The workflow result and run identifier returned to Inngest.
+       */
+      async ({ event, step, attempt, runId: inngestRunId }) => {
         let {
           inputData,
           initialState,
@@ -251,18 +528,68 @@ export class InngestWorkflow<
           timeTravel,
           perStep,
           tracingOptions,
+          parentSampled,
+          actor,
+          parentStream,
+          nestedWorkflowOutputMode: requestedNestedWorkflowOutputMode,
         } = event.data;
+        const nestedWorkflowOutputMode = resolveNestedWorkflowOutputMode(requestedNestedWorkflowOutputMode);
+        const shouldCompactNestedWorkflowOutput = nestedWorkflowOutputMode === NESTED_WORKFLOW_OUTPUT_MODE.COMPACT;
 
         if (!runId) {
+          // Reached when a trigger event arrives without a run id — an event sent
+          // directly rather than through `createRun()`, which always supplies one.
+          // The id generated here never reaches the trigger event that `cancelOn`
+          // matches against, so `cancel.workflow.${this.id}` cannot target this
+          // run. Warn rather than reject: an unnamed run is still a valid way to
+          // start a workflow, it just can't be cancelled by id afterwards.
           runId = await step.run(`workflow.${this.id}.runIdGen`, async () => {
-            return randomUUID();
+            return globalThis.crypto.randomUUID();
           });
+          this.logger.warn?.(
+            `Workflow "${this.id}" was triggered without a runId, so run "${runId}" cannot be cancelled by id. ` +
+              `Send \`data.runId\` on the trigger event (or start the run with createRun()) to make it cancellable.`,
+          );
+        }
+
+        // An InngestAgent resume runs under a claim on the run, held for the whole segment once it starts.
+        // A claim a later resume took over before this event ran leaves nothing to run. Checked once, in
+        // a step, because the segment releases the claim before its last invocation replays.
+        const resumeClaim: RunFence | undefined = resume?.claim;
+        if (resumeClaim) {
+          const held = await step.run(`workflow.${this.id}.resume-claim`, async () => {
+            const store = await this.#mastra?.getStorage()?.getStore('workflows');
+            const lease = await store?.renewRunOwnership({ ...resumeClaim, leaseMs: RESUME_CLAIM_RUN_LEASE_MS });
+            return lease?.renewed ?? true;
+          });
+          if (!held) return { result: undefined, runId };
+        }
+
+        if (resume && (initialState === undefined || resume.stepResults === undefined)) {
+          const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
+          const snapshot = await workflowsStore?.loadWorkflowSnapshot({
+            workflowName: this.id,
+            runId,
+          });
+
+          initialState ??= snapshot?.value;
+          if (resume.stepResults === undefined && snapshot?.context !== undefined) {
+            resume = { ...resume, stepResults: snapshot.context };
+          }
         }
 
         // Create InngestPubSub instance. Publishes go through `inngest.realtime.publish()`
         // (Inngest SDK v4 client API), which auto-includes the current runId from the
         // function's async context.
-        const pubsub = new InngestPubSub(this.inngest, this.id);
+        //
+        // The default is constructed with `this.id` so workflow-event channels stay
+        // workflow-local (InngestPubSub encodes the workflowId in `workflow:<id>:<runId>`).
+        // Hosts (e.g. `createInngestAgent`) can override via `__setPubsubFactory` to
+        // wrap this default - typically with a `CachingPubSub` so `observe()` can replay
+        // cached history - without disturbing per-workflow channel isolation.
+        const defaultPubsub = new InngestPubSub(this.inngest, this.id, this.logger);
+        const configuredPubsub: PubSub = this.#pubsubFactory?.(defaultPubsub) ?? defaultPubsub;
+        const pubsub = new WorkflowEventPolicyPubSub(configuredPubsub, this.#emitWorkflowEvents);
 
         // Create requestContext before execute so we can reuse it in finalize
         const requestContext: RequestContext = new RequestContext(Object.entries(event.data.requestContext ?? {}));
@@ -274,12 +601,23 @@ export class InngestWorkflow<
         // Create the workflow root span durably - exports SPAN_STARTED immediately on first execution
         // On replay, returns memoized ExportedSpan data without re-creating the span
         const workflowSpanData = await step.run(`workflow.${this.id}.span.start`, async () => {
-          const observability = mastra?.observability?.getSelectedInstance({ requestContext });
-          if (!observability) return undefined;
+          if (!mastra?.observability?.getSelectedInstance({ requestContext })) return undefined;
 
-          const span = observability.startSpan({
+          // A resume continues the suspended run's trace: same sampling decision, nested under its span.
+          const suspendedTracingContext = resume
+            ? (
+                await (
+                  await mastra.getStorage()?.getStore('workflows')
+                )?.loadWorkflowSnapshot({
+                  workflowName: this.id,
+                  runId,
+                })
+              )?.tracingContext
+            : undefined;
+          const span = getOrCreateSpan({
             type: SpanType.WORKFLOW_RUN,
-            name: `workflow run: '${this.id}'`,
+            outcome: null,
+            name: resume ? `workflow run: '${this.id}' (resumed)` : `workflow run: '${this.id}'`,
             entityType: EntityType.WORKFLOW_RUN,
             entityId: this.id,
             entityName: this.id,
@@ -287,16 +625,29 @@ export class InngestWorkflow<
             metadata: {
               resourceId,
               runId,
+              ...(resume ? { resumed: true, resumedFromSpanId: suspendedTracingContext?.spanId } : {}),
             },
             tracingPolicy,
             tracingOptions,
             requestContext,
+            resumeFrom: suspendedTracingContext,
+            // A nested run repeats the decision of the run that invoked it.
+            samplingDecision: parentSampled,
+            mastra,
           });
 
-          return span?.exportSpan();
+          return span?.snapshot?.() ?? span?.exportSpan();
         });
 
-        const engine = new InngestExecutionEngine(this.#mastra, step, attempt, this.options);
+        const engine = new InngestExecutionEngine(
+          this.#mastra,
+          step,
+          attempt,
+          this.options,
+          parentStream,
+          inngestRunId,
+          workflowSpanData,
+        );
 
         let result: WorkflowResult<TState, TInput, TOutput, TSteps>;
         try {
@@ -311,6 +662,7 @@ export class InngestWorkflow<
             pubsub,
             retryConfig: this.retryConfig,
             requestContext,
+            actor,
             resume,
             timeTravel,
             perStep,
@@ -323,6 +675,7 @@ export class InngestWorkflow<
               ? {
                   traceId: workflowSpanData.traceId,
                   workflowSpanId: workflowSpanData.id,
+                  sampled: workflowResumeTracingContext(workflowSpanData)?.sampled,
                 }
               : undefined,
             outputOptions,
@@ -335,6 +688,15 @@ export class InngestWorkflow<
                 });
               } catch (err) {
                 this.logger.debug?.('Failed to publish watch event:', err);
+              }
+              // Nested functions have workflow-local channels; send writer chunks
+              // directly to the outermost run without forwarding lifecycle events.
+              if (this.#emitWorkflowEvents && parentStream) {
+                try {
+                  await defaultPubsub.publishWorkflowWatchTo(parentStream.workflowId, parentStream.runId, chunk);
+                } catch (err) {
+                  this.logger.debug?.('Failed to publish parent watch event:', err);
+                }
               }
             },
           });
@@ -349,18 +711,30 @@ export class InngestWorkflow<
           } as WorkflowResult<TState, TInput, TOutput, TSteps>;
         }
 
+        const returnedResult = shouldCompactNestedWorkflowOutput ? compactNestedWorkflowResult(result) : result;
+
         // Final step to invoke lifecycle callbacks and end workflow span.
         // This step is memoized by step.run.
         let finalizeError: unknown;
         let finalizeErrored = false;
         try {
-          await step.run(`workflow.${this.id}.finalize`, async () => {
+          /**
+           * Finalizes workflow lifecycle reporting in a memoized Inngest step.
+           *
+           * @returns The workflow result, or only its status for compact nested invocations.
+           */
+          const finalizeWorkflow = async () => {
             // For durable agent workflows, emit error event on failure so the
-            // client's stream can receive the error and close properly.
-            if (result.status === 'failed' && inputData?.__workflowKind === 'durable-agent' && inputData?.runId) {
-              const error = result.error instanceof Error ? result.error : new Error(String(result.error));
+            // client's stream can receive the error and close properly. A resume
+            // event carries the resume payload as `inputData`, so read the agent
+            // input from the restored step results instead.
+            const durableAgentInput = [inputData, resume?.stepResults?.input].find(
+              input => input?.__workflowKind === 'durable-agent' && input.runId,
+            );
+            if (result.status === 'failed' && durableAgentInput) {
+              const { error, delivery } = durableAgentWorkflowError(result.error);
               try {
-                await emitErrorEvent(pubsub, inputData.runId, error);
+                await emitErrorEvent(pubsub, durableAgentInput.runId, error, undefined, delivery);
               } catch (e) {
                 this.logger.debug?.('Failed to emit error event:', e);
               }
@@ -392,12 +766,19 @@ export class InngestWorkflow<
                 const workflowSpan = observability.rebuildSpan(workflowSpanData);
 
                 if (result.status === 'failed') {
+                  const failure = getErrorFromUnknown(result.error, { fallbackMessage: 'Workflow execution failed' });
+                  const origin = coreObservability.getSpanErrorOrigin?.(result.error);
+                  if (origin) coreObservability.setSpanErrorOrigin?.(failure, origin);
                   workflowSpan.error({
-                    error: result.error instanceof Error ? result.error : new Error(String(result.error)),
+                    ...workflowTermination(result),
+                    error: failure,
                     attributes: { status: 'failed' },
                   });
+                  const recordedOrigin = coreObservability.getSpanErrorOrigin?.(failure);
+                  if (recordedOrigin) coreObservability.setSpanErrorOrigin?.(result.error, recordedOrigin);
                 } else {
                   workflowSpan.end({
+                    ...workflowTermination(result),
                     output: result.status === 'success' ? result.result : undefined,
                     attributes: { status: result.status },
                   });
@@ -427,27 +808,40 @@ export class InngestWorkflow<
                     })) ?? undefined;
                 }
 
+                const finalSnapshot: WorkflowRunState = {
+                  runId,
+                  status: result.status,
+                  value: result.state ?? initialState ?? {},
+                  context: toSnapshotContext(result.steps),
+                  // InngestAgent resumes only claim a suspension written here, which they tell apart
+                  // from the engine's earlier writes by this empty path.
+                  activePaths: [],
+                  activeStepsPath: {},
+                  serializedStepGraph: this.serializedStepGraph,
+                  suspendedPaths: existingSnapshot?.suspendedPaths ?? {},
+                  waitingPaths: {},
+                  resumeLabels: existingSnapshot?.resumeLabels ?? result.resumeLabels ?? {},
+                  result: result.status === 'success' ? toSnapshotResult(result.result) : undefined,
+                  error: result.status === 'failed' ? result.error : undefined,
+                  requestContext: requestContext.toJSON(),
+                  tracingContext: workflowResumeTracingContext(workflowSpanData),
+                  timestamp: Date.now(),
+                };
+
                 await workflowsStore.persistWorkflowSnapshot({
                   workflowName: this.id,
                   runId,
                   resourceId,
-                  snapshot: {
-                    runId,
-                    status: result.status,
-                    value: result.state ?? initialState ?? {},
-                    context: toSnapshotContext(result.steps),
-                    activePaths: [],
-                    activeStepsPath: {},
-                    serializedStepGraph: this.serializedStepGraph,
-                    suspendedPaths: existingSnapshot?.suspendedPaths ?? {},
-                    waitingPaths: {},
-                    resumeLabels: existingSnapshot?.resumeLabels ?? result.resumeLabels ?? {},
-                    result: result.status === 'success' ? toSnapshotResult(result.result) : undefined,
-                    error: result.status === 'failed' ? result.error : undefined,
-                    timestamp: Date.now(),
-                  },
+                  snapshot: this.options.pruneSnapshot
+                    ? this.options.pruneSnapshot({ snapshot: finalSnapshot, workflowStatus: result.status })
+                    : finalSnapshot,
                 });
               }
+            }
+
+            // The run is parked or finished again, so the next resume may claim it.
+            if (resumeClaim) {
+              await (await mastra?.getStorage()?.getStore('workflows'))?.releaseRunOwnership(resumeClaim);
             }
 
             // Publish workflow-finish event for realtime subscribers (best-effort)
@@ -471,12 +865,16 @@ export class InngestWorkflow<
             // Throw after span ended for failed workflows
             if (result.status === 'failed') {
               throw new NonRetriableError(`Workflow failed`, {
-                cause: result,
+                cause: {
+                  ...(shouldCompactNestedWorkflowOutput ? { ...returnedResult, runId } : result),
+                  __mastraSpanErrorOrigin: coreObservability.getSpanErrorOrigin?.(result.error),
+                },
               });
             }
 
-            return result;
-          });
+            return shouldCompactNestedWorkflowOutput ? { status: result.status } : result;
+          };
+          await step.run(`workflow.${this.id}.finalize`, finalizeWorkflow);
         } catch (error) {
           finalizeErrored = true;
           finalizeError = error;
@@ -496,7 +894,7 @@ export class InngestWorkflow<
           throw finalizeError;
         }
 
-        return { result, runId };
+        return { result: returnedResult, runId };
       },
     );
     return this.function;
@@ -504,12 +902,11 @@ export class InngestWorkflow<
 
   getNestedFunctions(steps: StepFlowEntry[]): ReturnType<Inngest['createFunction']>[] {
     return steps.flatMap(step => {
-      if (step.type === 'step' || step.type === 'loop' || step.type === 'foreach') {
-        if (step.step instanceof InngestWorkflow) {
-          return [step.step.getFunction(), ...step.step.getNestedFunctions(step.step.executionGraph.steps)];
-        }
-        return [];
-      } else if (step.type === 'parallel' || step.type === 'conditional') {
+      const nested = getNestedInngestWorkflow(step);
+      if (nested) {
+        return [nested.getFunction(), ...nested.getNestedFunctions(nested.executionGraph.steps)];
+      }
+      if (step.type === 'parallel' || step.type === 'conditional') {
         return this.getNestedFunctions(step.steps);
       }
 
@@ -522,6 +919,7 @@ export class InngestWorkflow<
       this.getFunction(),
       ...(this.cronConfig?.cron ? [this.createCronFunction()] : []),
       ...this.getNestedFunctions(this.executionGraph.steps),
+      ...this.#hostFunctions,
     ];
   }
 }

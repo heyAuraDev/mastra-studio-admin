@@ -19,6 +19,8 @@ export {
   OBSERVATIONAL_MEMORY_DEFAULTS,
   OBSERVATION_CONTINUATION_HINT,
   OBSERVATION_CONTEXT_PROMPT,
+  OBSERVATION_CONTEXT_PROMPT_THREAD,
+  getObservationContextPrompt,
   OBSERVATION_CONTEXT_INSTRUCTIONS,
 } from './constants';
 
@@ -31,16 +33,42 @@ export { getObservationsAsOf } from './observation-utils';
 
 // Types
 export { ModelByInputTokens, type ModelByInputTokensConfig } from './model-by-input-tokens';
+export { Extractor } from './extractor';
+export type {
+  ExtractorConfig,
+  ExtractorOnExtractedContext,
+  ExtractorRuntimeContext,
+  ExtractorSource,
+} from './extractor';
+export { WorkingMemoryExtractor } from './working-memory-extractor';
+
+// Standalone conversation summarization (reuses the Observer + extractor plumbing)
+export { summarizeConversation } from './summarize';
+export type { SummarizeConversationOptions, SummarizeConversationResult, SummarizeModel } from './summarize';
 
 export type {
   ObservationalMemoryConfig,
   ObservationDebugEvent,
   ObserveHooks,
+  ObserveLifecycleHooks,
+  ObserveTransformHooks,
+  ObserveHookContext,
   ObserveHookUsage,
+  ObserveTrigger,
   ObservationConfig,
   ReflectionConfig,
+  ContinuationHintsConfig,
   ObserverResult,
   ReflectorResult,
+  // Observation marker config
+  ObservationMarkerConfig,
+  // Observation data parts
+  DataOmObservationStartPart,
+  DataOmObservationEndPart,
+  DataOmObservationFailedPart,
+  DataOmStatusPart,
+  DataOmThreadUpdatePart,
+  DataOmObservationPart,
   // Buffering data parts
   DataOmBufferingStartPart,
   DataOmBufferingEndPart,
@@ -88,3 +116,4 @@ export {
   combineObservationGroupRanges,
   type ObservationGroup,
 } from './observation-groups';
+export { AUTO_MODEL_BY_PROVIDER, resolveAutoModelId, type ResolveAutoModelIdOptions } from './auto-model';

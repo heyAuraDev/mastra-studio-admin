@@ -1,12 +1,20 @@
 import type { WritableStream } from 'node:stream/web';
 import type { TextStreamPart } from '@internal/ai-sdk-v4';
 import type { z } from 'zod/v4';
+import type { ActorSignal } from '../auth/ee';
 import type { SerializedError } from '../error';
 import type { MastraScorers } from '../evals';
 import type { PubSub } from '../events/pubsub';
 import type { IMastraLogger } from '../logger';
 import type { Mastra } from '../mastra';
-import type { AnySpan, ObservabilityContext, TracingOptions, TracingPolicy, TracingProperties } from '../observability';
+import type {
+  AnySpan,
+  ObservabilityContext,
+  ResumeTracingContext,
+  TracingOptions,
+  TracingPolicy,
+  TracingProperties,
+} from '../observability';
 import type { RequestContext } from '../request-context';
 import type { InferPublicSchema, PublicSchema, StandardSchemaWithJSON, InferStandardSchemaOutput } from '../schema';
 import type { OutputSchema } from '../stream';
@@ -15,6 +23,7 @@ import type { ChunkType, WorkflowStreamEvent } from '../stream/types';
 import type { Tool, ToolExecutionContext } from '../tools';
 import type { DynamicArgument } from '../types';
 import type { ExecutionEngine } from './execution-engine';
+import type { Predicate } from './predicate';
 import type { WorkflowScheduleInput } from './scheduler/types';
 import type { ConditionFunction, ExecuteFunction, ExecuteFunctionParams, LoopConditionFunction, Step } from './step';
 
@@ -25,6 +34,7 @@ export type OutputWriter<TChunk = any> = (chunk: TChunk, options?: { messageId?:
  */
 export type WorkflowRunStartOptions = {
   outputWriter?: OutputWriter;
+  actor?: ActorSignal;
   tracingOptions?: TracingOptions;
   outputOptions?: {
     includeState?: boolean;
@@ -51,7 +61,9 @@ export type RestartExecutionParams = {
   stepResults: Record<string, StepResult<any, any, any, any>>;
   state?: Record<string, any>;
   stepExecutionPath?: string[];
+  isPreFirstStepRestart?: boolean;
   isParallelOrConditionalRestarted?: boolean;
+  isForeachRestarted?: boolean;
 };
 
 export type TimeTravelExecutionParams = {
@@ -103,6 +115,8 @@ export type StepFailure<P, R, S, T> = {
   metadata?: StepMetadata;
   /** Tripwire data when step failed due to processor rejection */
   tripwire?: StepTripwireInfo;
+  /** Step failure marked as non-retryable (MastraNonRetryableError). */
+  nonRetryable?: true;
 };
 
 export type StepSuspended<P, S, T> = {
@@ -147,13 +161,38 @@ export type StepPaused<P, R, S, T> = {
   metadata?: StepMetadata;
 };
 
+export type StepSkipped<P, R, S, T> = {
+  status: 'skipped';
+  payload: P;
+  resumePayload?: R;
+  suspendPayload?: S;
+  suspendOutput?: T;
+  startedAt: number;
+  endedAt: number;
+  metadata?: StepMetadata;
+};
+
+export type StepCanceled<P, R, S, T> = {
+  status: 'canceled';
+  payload?: P;
+  resumePayload?: R;
+  suspendPayload?: S;
+  suspendOutput?: T;
+  output?: T;
+  startedAt?: number;
+  endedAt?: number;
+  metadata?: StepMetadata;
+};
+
 export type StepResult<P, R, S, T> =
   | StepSuccess<P, R, S, T>
   | StepFailure<P, R, S, T>
   | StepSuspended<P, S, T>
   | StepRunning<P, R, S, T>
   | StepWaiting<P, R, S, T>
-  | StepPaused<P, R, S, T>;
+  | StepPaused<P, R, S, T>
+  | StepSkipped<P, R, S, T>
+  | StepCanceled<P, R, S, T>;
 
 /**
  * Serialized version of StepFailure where error is a SerializedError
@@ -173,7 +212,9 @@ export type SerializedStepResult<P, R, S, T> =
   | StepSuspended<P, S, T>
   | StepRunning<P, R, S, T>
   | StepWaiting<P, R, S, T>
-  | StepPaused<P, R, S, T>;
+  | StepPaused<P, R, S, T>
+  | StepSkipped<P, R, S, T>
+  | StepCanceled<P, R, S, T>;
 
 export type TimeTravelContext<P, R, S, T> = Record<
   string,
@@ -271,7 +312,8 @@ export type WorkflowRunStatus =
   | 'pending'
   | 'canceled'
   | 'bailed'
-  | 'paused';
+  | 'paused'
+  | 'skipped';
 
 export type WorkflowResumeLabel = {
   stepId: string;
@@ -295,11 +337,7 @@ export type WorkflowStateSingleStepResult = {
 
 export type WorkflowStateStepResult = WorkflowStateSingleStepResult | WorkflowStateSingleStepResult[];
 
-export type WorkflowStateTracingContext = {
-  traceId?: string;
-  spanId?: string;
-  parentSpanId?: string;
-};
+export type WorkflowStateTracingContext = ResumeTracingContext;
 
 /**
  * Unified workflow state that combines metadata with processed execution state.
@@ -361,6 +399,13 @@ export type WorkflowStateField =
   | 'requestContext'
   | 'tracingContext';
 
+export interface NestedWorkflowParent {
+  workflowId: string;
+  runId: string;
+  stepId: string;
+  foreachIndex?: number;
+}
+
 export interface WorkflowRunState {
   // Core state info
   runId: string;
@@ -377,6 +422,37 @@ export interface WorkflowRunState {
   resumeLabels: Record<string, WorkflowResumeLabel>;
   waitingPaths: Record<string, number[]>;
   timestamp: number;
+  /**
+   * Epoch ms when an agent resume claimed this suspended run (status `pending`). Lets a later
+   * resume recognize a claim abandoned by a process that died before starting the run.
+   * @internal
+   */
+  resumeClaimedAt?: number;
+  /**
+   * The `resumeClaimedAt` of an agent resume that started running while holding a run-ownership
+   * lease on its claim. Only such a `running` claim can be taken over once its lease lapses, so a
+   * resume started by a process that holds no lease is never taken over.
+   * @internal
+   */
+  resumeLeasedClaimAt?: number;
+  /**
+   * What the agent resume that claimed this run resumes it with, written in the same update as
+   * `resumeClaimedAt`. A later process replays it to finish a resume whose claimant died. Only
+   * describes the current claim while `claimedAt === resumeClaimedAt`.
+   * @internal
+   */
+  resumeClaimIntent?: {
+    claimedAt: number;
+    /** The suspended tool call the resume targets. Absent when the resume targeted none. */
+    toolCallId?: string;
+    /** The approval decision or `resumeSchema` data the resume passes to the suspended tool call. */
+    resumeData?: unknown;
+  };
+  /**
+   * @internal Snapshot stored only because evented step guards or storage v2 need it while the run
+   * runs; the workflow's `shouldPersistSnapshot` declined it.
+   */
+  guardedOnlySnapshot?: boolean;
   /** Tripwire data when status is 'tripwire' */
   tripwire?: StepTripwireInfo;
   stepExecutionPath?: string[];
@@ -386,20 +462,57 @@ export interface WorkflowRunState {
    * as children of the original suspended span.
    */
   tracingContext?: WorkflowStateTracingContext;
+  parentWorkflow?: NestedWorkflowParent;
 }
+
+/**
+ * Info object passed to the onStart callback before a workflow run begins.
+ */
+export interface WorkflowStartCallbackInfo {
+  /** The unique workflow run ID */
+  runId: string;
+  /** The workflow identifier */
+  workflowId: string;
+  /** Resource/user identifier for multi-tenant scenarios (optional) */
+  resourceId?: string;
+  /** Function to get the initial workflow input data */
+  getInitData: () => any;
+  /** The Mastra instance (if registered) */
+  mastra?: Mastra;
+  /** The request context */
+  requestContext: RequestContext;
+  /** The Mastra logger for structured logging */
+  logger: IMastraLogger;
+  /** The initial workflow state */
+  state: Record<string, any>;
+}
+
+/**
+ * How a run's result holds its step results, by the workflow's `storageVersion`. On `1` it's the
+ * record. On `2` it's an async loader, so returning the result reads none of the step results the
+ * run kept only in storage: `await result.steps()` reads them. A version the type doesn't know
+ * (`any`) keeps the record, and `1 | 2` is either, told apart with `typeof steps === 'function'`.
+ */
+// `[TStorageVersion] extends [1]` only holds for `any` here, which keeps the record. Written this way,
+// rather than as an `any` check, a result for `1` is still assignable to one for `1 | 2`.
+export type WorkflowStepResults<TStepResults, TStorageVersion extends 1 | 2 = 1> = TStorageVersion extends 2
+  ? [TStorageVersion] extends [1]
+    ? TStepResults
+    : () => Promise<TStepResults>
+  : TStepResults;
 
 /**
  * Result object passed to the onFinish callback when a workflow completes.
  */
-export interface WorkflowFinishCallbackResult {
+export interface WorkflowFinishCallbackResult<TStorageVersion extends 1 | 2 = 1> {
   /** The final status of the workflow */
   status: WorkflowRunStatus;
   /** The workflow result (only for successful workflows) */
   result?: any;
   /** Error details (only for failed workflows) */
   error?: SerializedError;
-  /** All step results */
-  steps: Record<string, StepResult<any, any, any, any>>;
+  /** All step results. On storage v2, an async loader that reads them. */
+  steps: WorkflowStepResults<Record<string, StepResult<any, any, any, any>>, TStorageVersion>;
   /** Tripwire info (only if failure was due to tripwire) */
   tripwire?: StepTripwireInfo;
   /** The unique workflow run ID */
@@ -424,13 +537,13 @@ export interface WorkflowFinishCallbackResult {
 /**
  * Error info object passed to the onError callback when a workflow fails.
  */
-export interface WorkflowErrorCallbackInfo {
+export interface WorkflowErrorCallbackInfo<TStorageVersion extends 1 | 2 = 1> {
   /** The failure status (either 'failed' or 'tripwire') */
   status: 'failed' | 'tripwire';
   /** Error details */
   error?: SerializedError;
-  /** All step results */
-  steps: Record<string, StepResult<any, any, any, any>>;
+  /** All step results. On storage v2, an async loader that reads them. */
+  steps: WorkflowStepResults<Record<string, StepResult<any, any, any, any>>, TStorageVersion>;
   /** Tripwire info (only if status is 'tripwire') */
   tripwire?: StepTripwireInfo;
   /** The unique workflow run ID */
@@ -452,33 +565,176 @@ export interface WorkflowErrorCallbackInfo {
   stepExecutionPath?: string[];
 }
 
-export interface WorkflowOptions {
+/**
+ * Predicate deciding whether a workflow run snapshot is persisted for a given
+ * status transition. Returning false skips the storage write entirely.
+ */
+export type ShouldPersistSnapshotFn = (params: {
+  stepResults: Record<string, StepResult<any, any, any, any>>;
+  workflowStatus: WorkflowRunStatus;
+}) => boolean;
+
+export interface WorkflowOptions<TStorageVersion extends 1 | 2 = 1> {
   tracingPolicy?: TracingPolicy;
   validateInputs?: boolean;
+  /**
+   * Whether workflow step lifecycle events are emitted. Defaults to true.
+   * Internal workflows may disable these events when no consumer observes them.
+   */
+  emitStepEvents?: boolean;
   /**
    * When true, nested runs created by execute() share the parent's pubsub
    * instance instead of creating an isolated one. Used by durable agent
    * workflows so inner step events reach the outer subscriber.
    */
   sharePubsub?: boolean;
-  shouldPersistSnapshot?: (params: {
-    stepResults: Record<string, StepResult<any, any, any, any>>;
-    workflowStatus: WorkflowRunStatus;
-  }) => boolean;
+  /**
+   * Whether `Mastra.restartAllActiveWorkflowRuns()` (boot-time generic
+   * recovery) automatically restarts this workflow's active runs. Defaults to
+   * true. Set to false for workflows whose recovery is owned elsewhere or
+   * whose side effects must not be re-driven by a blanket restart — durable
+   * agent workflows set this to false because their recovery is owned by the
+   * dedicated opt-in path (`recovery.durableAgents: 'auto'`).
+   */
+  autoRestartActiveRuns?: boolean;
+  shouldPersistSnapshot?: ShouldPersistSnapshotFn;
+  /**
+   * Evaluates `shouldPersistSnapshot` before entering the durable operation so a
+   * false verdict does not consume a durable step.
+   *
+   * @internal Only enable this for framework-owned predicates that depend solely
+   * on serialized workflow state and are guaranteed deterministic across replay.
+   */
+  evaluatePersistencePredicateBeforeDurableOperation?: boolean;
+
+  /**
+   * Acknowledges that `resume()` calls for this workflow cannot be de-duplicated
+   * via the persisted resume claim (for example because `shouldPersistSnapshot`
+   * excludes the `running` status), and suppresses the per-resume warning.
+   *
+   * Set by internal workflows that intentionally trade resume de-duplication
+   * for reduced snapshot writes and serialize their own resumes.
+   */
+  allowUnclaimedResumes?: boolean;
+
+  /**
+   * Writes the resume claim (`suspended -> running`) even when `shouldPersistSnapshot`
+   * excludes `running`, so a resumed run stops reading back as `suspended` while it runs.
+   *
+   * @internal Set by durable agent loops, whose suspended-run listing reads the stored status.
+   */
+  persistResumeClaim?: boolean;
+
+  /**
+   * Only this process cancels runs of this workflow (`run.cancel()` or an aborted signal), so
+   * the default engine does not read a stored `canceled` status before or between steps.
+   *
+   * @internal Set by workflows the framework creates for each agent call (stream preparation
+   * and combined processors). Their runs are never stored, so a status read can only miss.
+   */
+  localCancellationOnly?: boolean;
+
+  /**
+   * Identifies step errors raised because this execution lost, or could not
+   * confirm, ownership of the run — for example a durable agent run taken
+   * over by `recover()`. Another execution may be driving the run from its
+   * stored snapshot, so the evented engine fails such a run without any
+   * storage write: no step-result merge, no terminal `failed` update, and no
+   * snapshot cleanup.
+   *
+   * @internal Set by durable agent workflows.
+   */
+  isOwnershipLostError?: (error: unknown) => boolean;
+
+  /**
+   * Whether the serialized request context carried by a run event belongs to a
+   * different execution of the run than `requestContext` — for example one
+   * that lost the run to `recover()` but is still publishing. A caller waiting
+   * on the evented engine ignores such an execution's finish event and keeps
+   * waiting for its own.
+   *
+   * @internal Set by durable agent workflows.
+   */
+  isForeignExecution?: (eventRequestContext: unknown, requestContext: RequestContext) => boolean;
+
+  /**
+   * Call `onLost` if the execution `requestContext` claims loses the run before its caller receives a result,
+   * so a caller waiting on the evented engine stops waiting for a finish that will never be its own.
+   * Returns a function that stops watching.
+   *
+   * @internal Set by durable agent workflows.
+   */
+  watchExecutionLoss?: (requestContext: RequestContext, runId: string, onLost: (error: Error) => void) => () => void;
+
+  /**
+   * Transforms the run snapshot immediately before it is persisted.
+   * Called at every snapshot persist site (both engines). Must be a pure
+   * function returning JSON-safe data — the snapshot may cross a pubsub
+   * codec boundary. Defaults to identity (no change).
+   *
+   * Used internally by agent-loop workflows to strip data that is never
+   * read on resume (stale suspend payloads, duplicated message arrays).
+   */
+  pruneSnapshot?: (params: { snapshot: WorkflowRunState; workflowStatus: WorkflowRunStatus }) => WorkflowRunState;
+
+  /**
+   * How runs of this workflow are stored. `1` (default) rewrites one snapshot
+   * per run on every write. `2` stores a run header plus per-step entries, and
+   * each write sends only what changed.
+   *
+   * Version 2 requires the default or evented execution engine and a storage
+   * adapter that supports it (in-memory, `@mastra/pg`, `@mastra/libsql`), and
+   * can't be combined with `pruneSnapshot`. Steps read earlier results with
+   * `getStepResultAsync`; sync `getStepResult` throws. Runs keep the version
+   * they were created with: a run resumed after this option changes continues
+   * in its stored version. A nested workflow's run uses its parent run's
+   * version, so this option applies only when the workflow runs on its own.
+   *
+   * On version 2 a run's result holds its step results as an async loader,
+   * `await result.steps()`, so returning a result doesn't read them all back.
+   *
+   * @experimental
+   */
+  storageVersion?: TStorageVersion;
+
+  /**
+   * When `storageVersion` isn't set, a new top-level run takes version 2 if
+   * it runs on the default or evented engine and the store supports it,
+   * otherwise 1.
+   * Unlike an explicit `storageVersion: 2`, this never throws, and runs it
+   * stores as version 2 skip `pruneSnapshot`.
+   *
+   * @internal
+   */
+  autoStorageVersion?: boolean;
+
+  /**
+   * Called before a workflow run starts executing, and awaited.
+   * This callback is invoked server-side without requiring client-side .watch().
+   *
+   * Unlike `onFinish`/`onError`, errors thrown here are NOT swallowed: they reject
+   * the `start()`/`stream()` call and the run never executes, so the hook can act as
+   * a pre-flight gate (quota checks, entitlement checks). This mirrors how input
+   * schema validation failures behave: no step executes. The pending run record that
+   * `createRun()` already wrote is left as-is, so a gated run stays at `pending`.
+   *
+   * Fires only when a run first starts, not on resume, restart, or time travel.
+   */
+  onStart?: (info: WorkflowStartCallbackInfo) => Promise<void> | void;
 
   /**
    * Called when workflow execution completes (success, failed, suspended, or tripwire).
    * This callback is invoked server-side without requiring client-side .watch().
    * Errors thrown in this callback are caught and logged, not propagated.
    */
-  onFinish?: (result: WorkflowFinishCallbackResult) => Promise<void> | void;
+  onFinish?: (result: WorkflowFinishCallbackResult<TStorageVersion>) => Promise<void> | void;
 
   /**
    * Called only when workflow execution fails (failed or tripwire status).
    * This callback is invoked server-side without requiring client-side .watch().
    * Errors thrown in this callback are caught and logged, not propagated.
    */
-  onError?: (errorInfo: WorkflowErrorCallbackInfo) => Promise<void> | void;
+  onError?: (errorInfo: WorkflowErrorCallbackInfo<TStorageVersion>) => Promise<void> | void;
 }
 
 export type WorkflowInfo = {
@@ -486,47 +742,198 @@ export type WorkflowInfo = {
   allSteps: Record<string, SerializedStep>;
   name: string | undefined;
   description: string | undefined;
+  metadata?: Record<string, unknown> | undefined;
   stepGraph: SerializedStepFlowEntry[];
   inputSchema: string | undefined;
   outputSchema: string | undefined;
   stateSchema: string | undefined;
   requestContextSchema: string | undefined;
-  options?: WorkflowOptions;
+  options?: WorkflowOptions<any>;
   stepCount?: number;
   /** Whether this workflow is a processor workflow (auto-generated from agent processors) */
   isProcessorWorkflow?: boolean;
+  /**
+   * How this workflow got into the live registry. `'code'` for statically
+   * authored / `addWorkflow()`-added workflows, `'dynamic'` for anything
+   * hydrated or added via `addDynamicWorkflow()` (HTTP or SDK).
+   *
+   * Optional so external consumers of `WorkflowInfo` don't break; the server
+   * reads it from `workflow.origin`, which `rehydrateWorkflow` sets to
+   * `'dynamic'` at construction time (defaults to `'code'`).
+   */
+  origin?: 'code' | 'dynamic';
 };
 
 export type DefaultEngineType = {};
 
-export type StepFlowEntry<TEngineType = DefaultEngineType> =
+/**
+ * Object form of a `.map()` mapping config: a record of output keys to mapping
+ * sources (`value`, `fn`, `requestContextPath`, `step`+`path`, `initData`+`path`).
+ * Kept loose here because the precise per-key union lives in the `.map()` overload.
+ */
+export type MappingConfig = Record<string, any>;
+
+/**
+ * Optional identity and display metadata accepted by the control-flow builder
+ * methods (`.parallel()`, `.branch()`, `.dowhile()`, `.dountil()`, `.foreach()`,
+ * `.sleep()`, `.sleepUntil()`, `.map()`). Mirrors the `id` / `description` /
+ * `metadata` model that executable steps already have: `id` is a stable machine
+ * identity for addressing the entry across edits and serialization,
+ * `description` explains the intent of the control-flow operation, and
+ * `metadata` carries arbitrary JSON-serializable data (e.g. a display title
+ * for visual editors). None of these affect execution.
+ */
+export type StepFlowEntryOptions = {
+  id?: string;
+  description?: string;
+  metadata?: StepMetadata;
+};
+
+/**
+ * The "single step-like" graph entries: a plain user step plus the declarative
+ * variants that Mastra interprets at execution time (agent / tool / mapping).
+ *
+ * The live form carries runtime references (`agent`, `tool`, `mapConfig`,
+ * `options`) so the engine can materialize a runnable step on demand - mirroring
+ * how `loop` carries a live `condition`. These references are intentionally loose
+ * (`any`) because the public type-safety for these entries is enforced by the
+ * `Workflow` builder method overloads, not by this internal union.
+ */
+export type SerializableClassifierStepOptions = {
+  maxRetries?: number;
+  providerOptions?: Record<string, Record<string, unknown>>;
+  retries?: number;
+  metadata?: StepMetadata;
+};
+
+export type SingleStepEntry<TEngineType = DefaultEngineType> =
   | { type: 'step'; step: Step }
-  | { type: 'sleep'; id: string; duration?: number; fn?: ExecuteFunction<any, any, any, any, any, TEngineType> }
-  | { type: 'sleepUntil'; id: string; date?: Date; fn?: ExecuteFunction<any, any, any, any, any, TEngineType> }
+  | { type: 'agent'; id: string; agentId: string; agent?: any; options?: any }
+  | { type: 'tool'; id: string; toolId: string; tool?: any; options?: any }
+  | {
+      type: 'classifier';
+      id: string;
+      classifierId: string;
+      classifier?: any;
+      options?: SerializableClassifierStepOptions;
+    }
+  | {
+      type: 'mapping';
+      id: string;
+      description?: string;
+      metadata?: StepMetadata;
+      mapConfig: MappingConfig | ExecuteFunction<any, any, any, any, any, TEngineType>;
+    };
+
+/** The `{ type: 'step' }` variant of {@link SingleStepEntry}: a plain live step. */
+export type StepEntry = Extract<SingleStepEntry, { type: 'step' }>;
+/** The `{ type: 'agent' }` variant of {@link SingleStepEntry}. */
+export type AgentStepEntry = Extract<SingleStepEntry, { type: 'agent' }>;
+/** The `{ type: 'tool' }` variant of {@link SingleStepEntry}. */
+export type ToolStepEntry = Extract<SingleStepEntry, { type: 'tool' }>;
+/** The `{ type: 'classifier' }` variant of {@link SingleStepEntry}. */
+export type ClassifierStepEntry = Extract<SingleStepEntry, { type: 'classifier' }>;
+/** The `{ type: 'mapping' }` variant of {@link SingleStepEntry}. */
+export type MappingStepEntry<TEngineType = DefaultEngineType> = Extract<
+  SingleStepEntry<TEngineType>,
+  { type: 'mapping' }
+>;
+
+export type StepFlowEntry<TEngineType = DefaultEngineType> =
+  | SingleStepEntry<TEngineType>
+  | {
+      type: 'sleep';
+      id: string;
+      description?: string;
+      metadata?: StepMetadata;
+      duration?: number;
+      fn?: ExecuteFunction<any, any, any, any, any, TEngineType>;
+    }
+  | {
+      type: 'sleepUntil';
+      id: string;
+      description?: string;
+      metadata?: StepMetadata;
+      date?: Date;
+      fn?: ExecuteFunction<any, any, any, any, any, TEngineType>;
+    }
   | {
       type: 'parallel';
-      steps: { type: 'step'; step: Step }[];
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      steps: SingleStepEntry<TEngineType>[];
     }
   | {
       type: 'conditional';
-      steps: { type: 'step'; step: Step }[];
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      steps: SingleStepEntry<TEngineType>[];
       conditions: ConditionFunction<any, any, any, any, any, TEngineType>[];
       serializedConditions: { id: string; fn: string }[];
+      /**
+       * Declarative predicates for each condition, aligned by index. Present
+       * for entries built via the `.branch({ predicate })` overload; absent
+       * for `.branch(fn)` closures. When present the entry is storable and
+       * round-trips through `toStorableGraph` / `rehydrateWorkflow`.
+       */
+      predicates?: (Predicate | null)[];
     }
   | {
+      // `loop` supports two condition forms: a closure (`.dowhile(fn)`, not
+      // storable) and a declarative predicate (`.dowhile({ predicate })`,
+      // storable). The live step shape is aligned with `parallel` / `foreach`
+      // so the builder can accept an Agent / Tool directly.
       type: 'loop';
-      step: Step;
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      step: SingleStepEntry<TEngineType>;
       condition: LoopConditionFunction<any, any, any, any, any, TEngineType>;
       serializedCondition: { id: string; fn: string };
       loopType: 'dowhile' | 'dountil';
+      /**
+       * Declarative predicate for the loop condition. Present when built via
+       * `.dowhile({ predicate })` / `.dountil({ predicate })`; absent for
+       * closure loops. Enables storage round-trip.
+       */
+      predicate?: Predicate;
     }
   | {
       type: 'foreach';
-      step: Step;
-      opts: {
-        concurrency: number;
-      };
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      step: SingleStepEntry<TEngineType>;
+      opts: ForeachOptions;
     };
+
+/**
+ * Context passed to a foreach {@link ForeachConcurrencyResolver} when the
+ * foreach entry is about to execute.
+ */
+export interface ForeachConcurrencyContext {
+  /** The array the foreach iterates over (output of the previous step). */
+  inputData: unknown;
+  /** Returns the workflow run's init data (the workflow input). */
+  getInitData: () => unknown;
+}
+
+/**
+ * Resolves the foreach concurrency at execution time, per run.
+ *
+ * Use this instead of a static number when the effective concurrency depends
+ * on run input (e.g. per-run options). Workflow graphs are built once and
+ * shared across runs, so a resolver is the only safe way to vary concurrency
+ * per run — mutating a shared options object races between concurrent runs
+ * and does not survive durable-engine replays.
+ */
+export type ForeachConcurrencyResolver = (context: ForeachConcurrencyContext) => number;
+
+export interface ForeachOptions {
+  concurrency: number | ForeachConcurrencyResolver;
+}
 
 export type SerializedStep<TEngineType = DefaultEngineType> = Pick<
   Step<any, any, any, any, any, any, TEngineType>,
@@ -538,49 +945,146 @@ export type SerializedStep<TEngineType = DefaultEngineType> = Pick<
   canSuspend?: boolean;
 };
 
-export type SerializedStepFlowEntry =
+/**
+ * JSON-safe mirror of {@link SingleStepEntry}: declarative variants carry
+ * ids/strings only (no closures or live references).
+ */
+/**
+ * JSON-safe subset of {@link AgentStepOptions} / tool step options carried on
+ * a serialized declarative entry. Closure-valued fields (`onFinish`, function
+ * `scorers`) don't round-trip and are rejected at `toStorableGraph` time.
+ */
+export type SerializedStepOptions = {
+  retries?: number;
+  metadata?: StepMetadata;
+};
+
+export type SerializedSingleStepEntry =
+  | { type: 'step'; step: SerializedStep }
   | {
-      type: 'step';
-      step: SerializedStep;
+      type: 'agent';
+      id: string;
+      agentId: string;
+      description?: string;
+      /**
+       * The step's output shape. When `.agent()` is called with
+       * `structuredOutput.schema`, that schema becomes the step output; this
+       * field captures it as JSON Schema so rehydration can reconstruct the
+       * same `structuredOutput` wiring. Absent means the step produces the
+       * default `{ text: string }`.
+       */
+      outputSchema?: Record<string, any>;
+      options?: SerializedStepOptions;
     }
+  | {
+      type: 'tool';
+      id: string;
+      toolId: string;
+      description?: string;
+      // No outputSchema: a tool's output shape lives on the tool itself and is
+      // looked up from the live Mastra instance at rehydration time.
+      options?: SerializedStepOptions;
+    }
+  | {
+      type: 'classifier';
+      id: string;
+      classifierId: string;
+      options?: SerializableClassifierStepOptions;
+    }
+  | { type: 'mapping'; id: string; description?: string; metadata?: StepMetadata; mapConfig: string }
+  /**
+   * A nested workflow referenced by its registered id (code-defined or
+   * another dynamic workflow). The referenced workflow must resolve on the
+   * live Mastra registry at rehydration time; missing refs fail loudly.
+   *
+   * `serializedStepFlow` is the nested workflow's full graph, inlined for
+   * Studio/API consumers (same role `SerializedStep.serializedStepFlow`
+   * played when nested workflows were emitted as `type: 'step'` +
+   * `component: 'WORKFLOW'`). Stored JSON definitions may omit it and keep
+   * only the id reference.
+   */
+  | {
+      type: 'workflow';
+      id: string;
+      workflowId: string;
+      description?: string;
+      serializedStepFlow?: SerializedStepFlowEntry[];
+    };
+
+export type SerializedStepFlowEntry =
+  | SerializedSingleStepEntry
   | {
       type: 'sleep';
       id: string;
+      description?: string;
+      metadata?: StepMetadata;
       duration?: number;
       fn?: string;
     }
   | {
       type: 'sleepUntil';
       id: string;
+      description?: string;
+      metadata?: StepMetadata;
       date?: Date;
       fn?: string;
     }
   | {
       type: 'parallel';
-      steps: {
-        type: 'step';
-        step: SerializedStep;
-      }[];
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      steps: SerializedSingleStepEntry[];
     }
   | {
       type: 'conditional';
-      steps: {
-        type: 'step';
-        step: SerializedStep;
-      }[];
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      steps: SerializedSingleStepEntry[];
       serializedConditions: { id: string; fn: string }[];
+      /**
+       * Optional declarative predicate for each condition, aligned by index
+       * with `steps` / `serializedConditions`. When present, the entry is
+       * fully round-trippable through storage — the runtime rebuilds a live
+       * `ConditionFunction` by evaluating the predicate against the workflow
+       * context. When absent, the entry originated from a closure-based
+       * `.branch(fn)` call and cannot be stored (see `toStorableGraph`).
+       * Additive: never changes the shape of closure-based workflows.
+       */
+      predicates?: (Predicate | null)[];
     }
   | {
       type: 'loop';
-      step: SerializedStep;
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      step: SerializedSingleStepEntry;
       serializedCondition: { id: string; fn: string };
       loopType: 'dowhile' | 'dountil';
+      /**
+       * Optional declarative predicate for the loop condition. When present,
+       * the entry is fully round-trippable through storage. When absent, the
+       * loop uses a closure predicate and cannot be stored. Additive.
+       */
+      predicate?: Predicate;
     }
   | {
       type: 'foreach';
-      step: SerializedStep;
-      opts: {
-        concurrency: number;
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      step: SerializedSingleStepEntry;
+      /**
+       * Optional. When omitted, the engine defaults to `concurrency: 1`. Present
+       * when the foreach entry carries a static concurrency value or a
+       * serialized concurrency resolver function.
+       */
+      opts?: {
+        /** Static concurrency. Omitted when a resolver function is used. */
+        concurrency?: number;
+        /** Source of the concurrency resolver function, when one is used. */
+        fn?: string;
       };
     };
 
@@ -589,9 +1093,7 @@ export type StepWithComponent = Step<string, any, any, any, any, any> & {
   steps?: Record<string, StepWithComponent>;
 };
 
-type InferParsedPublicSchema<TSchema extends PublicSchema<any>> = TSchema extends { _output: infer Output }
-  ? Output
-  : InferPublicSchema<TSchema>;
+type InferParsedPublicSchema<TSchema extends PublicSchema<any>> = InferPublicSchema<TSchema>;
 
 /**
  * StepParams with schema-based inference for better type errors.
@@ -629,7 +1131,7 @@ export type StepParams<
     TResumeSchema extends PublicSchema<any> ? InferPublicSchema<TResumeSchema> : unknown,
     TSuspendSchema extends PublicSchema<any> ? InferPublicSchema<TSuspendSchema> : unknown,
     DefaultEngineType,
-    TRequestContextSchema extends PublicSchema<any> ? InferPublicSchema<TRequestContextSchema> : unknown
+    InferWorkflowRequestContext<TRequestContextSchema>
   >;
 };
 
@@ -675,7 +1177,29 @@ export type ToolStep<
   execute: (input: TSchemaIn, context?: TContext) => Promise<any>;
 };
 
-export type WorkflowResult<TState, TInput, TOutput, TSteps extends Step<string, any, any, any, any, any>[]> =
+/** A workflow's step results, typed by each step's schemas. */
+type TypedStepResults<TSteps extends Step<string, any, any, any, any, any>[]> = {
+  [K in keyof StepsRecord<TSteps>]: StepsRecord<TSteps>[K]['outputSchema'] extends undefined
+    ? StepResult<unknown, unknown, unknown, unknown>
+    : StepResult<
+        InferStandardSchemaOutput<StepsRecord<TSteps>[K]['inputSchema']>,
+        StepsRecord<TSteps>[K]['resumeSchema'] extends StandardSchemaWithJSON<any>
+          ? InferStandardSchemaOutput<StepsRecord<TSteps>[K]['resumeSchema']>
+          : unknown,
+        StepsRecord<TSteps>[K]['suspendSchema'] extends StandardSchemaWithJSON<any>
+          ? InferStandardSchemaOutput<StepsRecord<TSteps>[K]['suspendSchema']>
+          : unknown,
+        InferStandardSchemaOutput<StepsRecord<TSteps>[K]['outputSchema']>
+      >;
+};
+
+export type WorkflowResult<
+  TState,
+  TInput,
+  TOutput,
+  TSteps extends Step<string, any, any, any, any, any>[],
+  TStorageVersion extends 1 | 2 = 1,
+> =
   | ({
       status: 'success';
       state?: TState;
@@ -683,20 +1207,7 @@ export type WorkflowResult<TState, TInput, TOutput, TSteps extends Step<string, 
       resumeLabels?: Record<string, { stepId: string; forEachIndex?: number }>;
       result: TOutput;
       input: TInput;
-      steps: {
-        [K in keyof StepsRecord<TSteps>]: StepsRecord<TSteps>[K]['outputSchema'] extends undefined
-          ? StepResult<unknown, unknown, unknown, unknown>
-          : StepResult<
-              InferStandardSchemaOutput<StepsRecord<TSteps>[K]['inputSchema']>,
-              StepsRecord<TSteps>[K]['resumeSchema'] extends StandardSchemaWithJSON<any>
-                ? InferStandardSchemaOutput<StepsRecord<TSteps>[K]['resumeSchema']>
-                : unknown,
-              StepsRecord<TSteps>[K]['suspendSchema'] extends StandardSchemaWithJSON<any>
-                ? InferStandardSchemaOutput<StepsRecord<TSteps>[K]['suspendSchema']>
-                : unknown,
-              InferStandardSchemaOutput<StepsRecord<TSteps>[K]['outputSchema']>
-            >;
-      };
+      steps: WorkflowStepResults<TypedStepResults<TSteps>, TStorageVersion>;
     } & TracingProperties)
   | ({
       status: 'failed';
@@ -704,20 +1215,7 @@ export type WorkflowResult<TState, TInput, TOutput, TSteps extends Step<string, 
       state?: TState;
       stepExecutionPath?: string[];
       resumeLabels?: Record<string, { stepId: string; forEachIndex?: number }>;
-      steps: {
-        [K in keyof StepsRecord<TSteps>]: StepsRecord<TSteps>[K]['outputSchema'] extends undefined
-          ? StepResult<unknown, unknown, unknown, unknown>
-          : StepResult<
-              InferStandardSchemaOutput<StepsRecord<TSteps>[K]['inputSchema']>,
-              StepsRecord<TSteps>[K]['resumeSchema'] extends StandardSchemaWithJSON<any>
-                ? InferStandardSchemaOutput<StepsRecord<TSteps>[K]['resumeSchema']>
-                : unknown,
-              StepsRecord<TSteps>[K]['suspendSchema'] extends StandardSchemaWithJSON<any>
-                ? InferStandardSchemaOutput<StepsRecord<TSteps>[K]['suspendSchema']>
-                : unknown,
-              InferStandardSchemaOutput<StepsRecord<TSteps>[K]['outputSchema']>
-            >;
-      };
+      steps: WorkflowStepResults<TypedStepResults<TSteps>, TStorageVersion>;
       error: Error;
     } & TracingProperties)
   | ({
@@ -726,20 +1224,7 @@ export type WorkflowResult<TState, TInput, TOutput, TSteps extends Step<string, 
       state?: TState;
       stepExecutionPath?: string[];
       resumeLabels?: Record<string, { stepId: string; forEachIndex?: number }>;
-      steps: {
-        [K in keyof StepsRecord<TSteps>]: StepsRecord<TSteps>[K]['outputSchema'] extends undefined
-          ? StepResult<unknown, unknown, unknown, unknown>
-          : StepResult<
-              InferStandardSchemaOutput<StepsRecord<TSteps>[K]['inputSchema']>,
-              StepsRecord<TSteps>[K]['resumeSchema'] extends StandardSchemaWithJSON<any>
-                ? InferStandardSchemaOutput<StepsRecord<TSteps>[K]['resumeSchema']>
-                : unknown,
-              StepsRecord<TSteps>[K]['suspendSchema'] extends StandardSchemaWithJSON<any>
-                ? InferStandardSchemaOutput<StepsRecord<TSteps>[K]['suspendSchema']>
-                : unknown,
-              InferStandardSchemaOutput<StepsRecord<TSteps>[K]['outputSchema']>
-            >;
-      };
+      steps: WorkflowStepResults<TypedStepResults<TSteps>, TStorageVersion>;
       /** Tripwire data including reason, retry flag, metadata, and processor ID */
       tripwire: StepTripwireInfo;
     } & TracingProperties)
@@ -749,20 +1234,7 @@ export type WorkflowResult<TState, TInput, TOutput, TSteps extends Step<string, 
       state?: TState;
       stepExecutionPath?: string[];
       resumeLabels?: Record<string, { stepId: string; forEachIndex?: number }>;
-      steps: {
-        [K in keyof StepsRecord<TSteps>]: StepsRecord<TSteps>[K]['outputSchema'] extends undefined
-          ? StepResult<unknown, unknown, unknown, unknown>
-          : StepResult<
-              InferStandardSchemaOutput<StepsRecord<TSteps>[K]['inputSchema']>,
-              StepsRecord<TSteps>[K]['resumeSchema'] extends StandardSchemaWithJSON<any>
-                ? InferStandardSchemaOutput<StepsRecord<TSteps>[K]['resumeSchema']>
-                : unknown,
-              StepsRecord<TSteps>[K]['suspendSchema'] extends StandardSchemaWithJSON<any>
-                ? InferStandardSchemaOutput<StepsRecord<TSteps>[K]['suspendSchema']>
-                : unknown,
-              InferStandardSchemaOutput<StepsRecord<TSteps>[K]['outputSchema']>
-            >;
-      };
+      steps: WorkflowStepResults<TypedStepResults<TSteps>, TStorageVersion>;
       suspendPayload: any;
       suspended: [string[], ...string[][]];
     } & TracingProperties)
@@ -772,41 +1244,21 @@ export type WorkflowResult<TState, TInput, TOutput, TSteps extends Step<string, 
       stepExecutionPath?: string[];
       resumeLabels?: Record<string, { stepId: string; forEachIndex?: number }>;
       input: TInput;
-      steps: {
-        [K in keyof StepsRecord<TSteps>]: StepsRecord<TSteps>[K]['outputSchema'] extends undefined
-          ? StepResult<unknown, unknown, unknown, unknown>
-          : StepResult<
-              InferStandardSchemaOutput<StepsRecord<TSteps>[K]['inputSchema']>,
-              StepsRecord<TSteps>[K]['resumeSchema'] extends StandardSchemaWithJSON<any>
-                ? InferStandardSchemaOutput<StepsRecord<TSteps>[K]['resumeSchema']>
-                : unknown,
-              StepsRecord<TSteps>[K]['suspendSchema'] extends StandardSchemaWithJSON<any>
-                ? InferStandardSchemaOutput<StepsRecord<TSteps>[K]['suspendSchema']>
-                : unknown,
-              InferStandardSchemaOutput<StepsRecord<TSteps>[K]['outputSchema']>
-            >;
-      };
+      steps: WorkflowStepResults<TypedStepResults<TSteps>, TStorageVersion>;
     } & TracingProperties);
 
-export type WorkflowStreamResult<TState, TInput, TOutput, TSteps extends Step<string, any, any>[]> =
-  | WorkflowResult<TState, TInput, TOutput, TSteps>
+export type WorkflowStreamResult<
+  TState,
+  TInput,
+  TOutput,
+  TSteps extends Step<string, any, any>[],
+  TStorageVersion extends 1 | 2 = 1,
+> =
+  | WorkflowResult<TState, TInput, TOutput, TSteps, TStorageVersion>
   | {
       status: 'running' | 'waiting' | 'pending' | 'canceled';
       input: TInput;
-      steps: {
-        [K in keyof StepsRecord<TSteps>]: StepsRecord<TSteps>[K]['outputSchema'] extends undefined
-          ? StepResult<unknown, unknown, unknown, unknown>
-          : StepResult<
-              InferStandardSchemaOutput<StepsRecord<TSteps>[K]['inputSchema']>,
-              StepsRecord<TSteps>[K]['resumeSchema'] extends StandardSchemaWithJSON<any>
-                ? InferStandardSchemaOutput<StepsRecord<TSteps>[K]['resumeSchema']>
-                : unknown,
-              StepsRecord<TSteps>[K]['suspendSchema'] extends StandardSchemaWithJSON<any>
-                ? InferStandardSchemaOutput<StepsRecord<TSteps>[K]['suspendSchema']>
-                : unknown,
-              InferStandardSchemaOutput<StepsRecord<TSteps>[K]['outputSchema']>
-            >;
-      };
+      steps: WorkflowStepResults<TypedStepResults<TSteps>, TStorageVersion>;
     };
 
 export type WorkflowConfig<
@@ -816,10 +1268,12 @@ export type WorkflowConfig<
   TOutput,
   TSteps extends Step[],
   TRequestContext extends Record<string, any> | unknown = unknown,
+  TStorageVersion extends 1 | 2 = 1,
 > = {
   mastra?: Mastra;
   id: TWorkflowId;
   description?: string | undefined;
+  metadata?: Record<string, unknown> | undefined;
   inputSchema: PublicSchema<TInput>;
   outputSchema: PublicSchema<TOutput>;
   stateSchema?: PublicSchema<TState>;
@@ -835,13 +1289,14 @@ export type WorkflowConfig<
     attempts?: number;
     delay?: number;
   };
-  options?: WorkflowOptions;
+  options?: WorkflowOptions<TStorageVersion>;
   /** Type of workflow - 'processor' for processor workflows, 'default' otherwise */
   type?: WorkflowType;
   /**
-   * Optional cron schedule configuration. When set, the Mastra scheduler will
-   * publish a `workflow.start` event on the cron schedule.
-   * Only supported on the evented engine.
+   * Optional cron schedule configuration. When set, the Mastra scheduler
+   * starts a run on the cron schedule. Supported on the default and evented
+   * engines; other engines (Inngest, Temporal) ignore it and use their own
+   * scheduling.
    *
    * Accepts either a single schedule object or an array of schedule objects.
    * Array entries must each specify a unique stable `id`. The `inputData`,
@@ -850,6 +1305,71 @@ export type WorkflowConfig<
    * `requestContextSchema` respectively.
    */
   schedule?: WorkflowScheduleInput<NoInfer<TInput>, NoInfer<TState>, NoInfer<TRequestContext>>;
+};
+
+/**
+ * Infers the output type from a schema type that may be `undefined`.
+ * Returns `unknown` when no schema is provided.
+ */
+export type InferSchemaOutput<T> = T extends PublicSchema<any> ? InferPublicSchema<T> : unknown;
+
+/**
+ * Infers the request context type for workflows and steps.
+ *
+ * Workflows validate request context without decoding it, so step code sees the raw input values.
+ * Unlike `InferPublicSchema`, this does not resolve a Standard Schema's optional `~standard.types`
+ * to its transformed output, which would type raw values as decoded ones.
+ */
+export type InferWorkflowRequestContext<T> =
+  T extends PublicSchema<any>
+    ? T extends { _output: infer Output }
+      ? Output
+      : T extends { _type: infer Output }
+        ? Output
+        : T extends { '~standard': { types: { output: infer Output } } }
+          ? Output
+          : T extends PublicSchema<infer Output>
+            ? Output
+            : never
+    : unknown;
+
+/**
+ * Schema-typed variant of `WorkflowConfig` used by `createWorkflow` factories.
+ *
+ * Instead of inferring output types through the `PublicSchema<TOutput>` union
+ * (which forces TypeScript to distribute across 8+ union members and triggers
+ * TS2589 "Type instantiation is excessively deep"), this type infers the
+ * **schema type itself** (shallow inference) and defers output-type extraction
+ * to `InferSchemaOutput` / `InferPublicSchema` (which use `_output` / `_type`
+ * / `~standard` fast paths).
+ */
+export type CreateWorkflowParams<
+  TWorkflowId extends string = string,
+  TStateSchema extends PublicSchema<any> | undefined = undefined,
+  TInputSchema extends PublicSchema<any> = PublicSchema<any>,
+  TOutputSchema extends PublicSchema<any> = PublicSchema<any>,
+  TSteps extends Step[] = Step[],
+  TRequestContextSchema extends PublicSchema<any> | undefined = undefined,
+  TStorageVersion extends 1 | 2 = 1,
+> = {
+  mastra?: Mastra;
+  id: TWorkflowId;
+  description?: string | undefined;
+  metadata?: Record<string, unknown> | undefined;
+  inputSchema: TInputSchema;
+  outputSchema: TOutputSchema;
+  stateSchema?: TStateSchema;
+  requestContextSchema?: TRequestContextSchema;
+  executionEngine?: ExecutionEngine;
+  steps?: TSteps;
+  retryConfig?: { attempts?: number; delay?: number };
+  options?: WorkflowOptions<TStorageVersion>;
+  type?: WorkflowType;
+  schedule?: WorkflowScheduleInput<
+    NoInfer<InferSchemaOutput<TInputSchema>>,
+    NoInfer<InferSchemaOutput<TStateSchema>>,
+    NoInfer<InferWorkflowRequestContext<TRequestContextSchema>>
+  >;
 };
 
 /**
@@ -889,6 +1409,7 @@ export type SubsetOf<TStepState, TState> =
 export type ExecutionContext = {
   workflowId: string;
   runId: string;
+  parentWorkflow?: NestedWorkflowParent;
   executionPath: number[];
   stepExecutionPath?: string[];
   activeStepsPath: Record<string, number[]>;
@@ -915,6 +1436,8 @@ export type ExecutionContext = {
   tracingIds?: {
     traceId: string;
     workflowSpanId: string;
+    /** The run's sampling decision. Spans started from these ids repeat it instead of sampling again. */
+    sampled?: boolean;
   };
 };
 
@@ -925,6 +1448,16 @@ export type ExecutionContext = {
  */
 export type MutableContext = {
   state: Record<string, any>;
+  /**
+   * @internal Set when `state` is a nested run's state: the JSON state its changes are relative
+   * to. Applying it applies those changes to the state then, not `state` itself.
+   */
+  stateBase?: Record<string, unknown>;
+  /**
+   * @internal A storage v2 step's `setState` changes, applied on top of the state then. A key set
+   * to `undefined` is deleted.
+   */
+  stateDelta?: Record<string, unknown>;
   suspendedPaths: Record<string, number[]>;
   resumeLabels: Record<
     string,
@@ -943,7 +1476,8 @@ export type StepExecutionResult = {
   result: StepResult<any, any, any, any>;
   stepResults: Record<string, StepResult<any, any, any, any>>;
   mutableContext: MutableContext;
-  requestContext: Record<string, any>;
+  /** Serialized requestContext — only set by engines where `requiresDurableContextSerialization()` is true. */
+  requestContext?: Record<string, any>;
 };
 
 /**
@@ -954,7 +1488,8 @@ export type EntryExecutionResult = {
   result: StepResult<any, any, any, any>;
   stepResults: Record<string, StepResult<any, any, any, any>>;
   mutableContext: MutableContext;
-  requestContext: Record<string, any>;
+  /** Serialized requestContext — only set by engines where `requiresDurableContextSerialization()` is true. */
+  requestContext?: Record<string, any>;
 };
 
 // =============================================================================

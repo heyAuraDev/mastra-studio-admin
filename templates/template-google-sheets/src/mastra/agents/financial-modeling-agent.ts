@@ -4,9 +4,6 @@ import { Memory } from '@mastra/memory';
 import { Composio } from '@composio/core';
 import { MastraProvider } from '@composio/mastra';
 
-// High max steps value
-const MAX_STEPS = 1000;
-
 export const financialModelingAgent = new Agent({
   id: 'financial-modeling-agent',
   name: 'Financial Modeling Agent',
@@ -25,12 +22,12 @@ ${getFinancialModelingAgentPrompt(true)}
 
     return getFinancialModelingAgentPrompt(false);
   },
-  model: 'openai/gpt-5-mini',
+  model: 'openai/gpt-6.1-terra',
   memory: new Memory({
     embedder: fastembed,
     options: {
       observationalMemory: {
-        model: 'openai/gpt-5-mini',
+        model: 'openai/gpt-6.1-terra',
       },
     },
   }),
@@ -56,7 +53,6 @@ ${getFinancialModelingAgentPrompt(true)}
 
     return composioTools;
   },
-  defaultOptions: { maxSteps: MAX_STEPS },
 });
 
 const getFinancialModelingAgentPrompt = (needsAuth: boolean) => `

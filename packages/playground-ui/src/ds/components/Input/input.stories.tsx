@@ -1,7 +1,10 @@
 import type { Meta, StoryObj } from '@storybook/react-vite';
 import { Fragment } from 'react';
 import { Button } from '../Button/Button';
+import { Field, FieldError, FieldLabel } from '../Field';
+import { Txt } from '../Txt/Txt';
 import { Input } from './input';
+import { raisedSurfaceStyle } from '@/ds/primitives/raised-surface';
 
 const meta: Meta<typeof Input> = {
   title: 'Elements/Input',
@@ -12,7 +15,7 @@ const meta: Meta<typeof Input> = {
   argTypes: {
     variant: {
       control: { type: 'select' },
-      options: ['default', 'filled', 'unstyled'],
+      options: ['default', 'unstyled'],
     },
     size: {
       control: { type: 'select' },
@@ -33,16 +36,15 @@ type Story = StoryObj<typeof Input>;
 
 export const Default: Story = {
   args: {
-    placeholder: 'Enter text...',
+    placeholder: 'Enter text',
     variant: 'default',
   },
 };
 
 export const Variants: Story = {
   render: () => (
-    <div className="flex flex-col gap-3 w-64">
+    <div className="flex w-64 flex-col gap-3">
       <Input variant="default" placeholder="Default" />
-      {/* <Input variant="filled" placeholder="Filled" /> */}
       <Input variant="unstyled" placeholder="Unstyled" />
     </div>
   ),
@@ -50,41 +52,33 @@ export const Variants: Story = {
 
 export const Sizes: Story = {
   render: () => (
-    <div className="flex flex-col gap-3 w-64">
+    <div className="flex w-64 flex-col gap-3">
       <Input size="sm" placeholder="Small" />
       <Input size="md" placeholder="Medium" />
-      <Input size="default" placeholder="Default" />
       <Input size="lg" placeholder="Large" />
     </div>
   ),
 };
 
-// export const Filled: Story = {
-//   args: {
-//     placeholder: 'Filled variant',
-//     variant: 'filled',
-//   },
-// };
-
 // export const Unstyled: Story = {
-//   args: {
-//     placeholder: 'Unstyled variant',
-//     variant: 'unstyled',
-//   },
+// args: {
+// placeholder: 'Unstyled variant',
+// variant: 'unstyled',
+// },
 // };
 
 // export const Small: Story = {
-//   args: {
-//     placeholder: 'Small input',
-//     size: 'sm',
-//   },
+// args: {
+// placeholder: 'Small input',
+// size: 'sm',
+// },
 // };
 
 // export const Large: Story = {
-//   args: {
-//     placeholder: 'Large input',
-//     size: 'lg',
-//   },
+// args: {
+// placeholder: 'Large input',
+// size: 'lg',
+// },
 // };
 
 export const Disabled: Story = {
@@ -115,6 +109,28 @@ export const Password: Story = {
   },
 };
 
+// Password managers stay out of DS text fields unless the field asks for them: with no
+// `autoComplete`, a field renders `autocomplete="off"` plus each manager's ignore attribute.
+// A credential form opts in with a real autofill token.
+export const PasswordManagerAutofill: Story = {
+  render: () => (
+    <form className="flex w-72 flex-col gap-4" onSubmit={event => event.preventDefault()}>
+      <Field>
+        <FieldLabel>Name (opted out by default)</FieldLabel>
+        <Input placeholder="Dataset name" />
+      </Field>
+      <Field>
+        <FieldLabel>Email</FieldLabel>
+        <Input type="email" autoComplete="email" placeholder="you@example.com" />
+      </Field>
+      <Field>
+        <FieldLabel>Password</FieldLabel>
+        <Input type="password" autoComplete="current-password" placeholder="Enter password" />
+      </Field>
+    </form>
+  ),
+};
+
 export const Number: Story = {
   args: {
     type: 'number',
@@ -122,10 +138,33 @@ export const Number: Story = {
   },
 };
 
+export const Time: Story = {
+  render: () => (
+    <div className="grid w-80 grid-cols-[auto_1fr] items-center gap-x-4 gap-y-3">
+      <Txt variant="caption" tone="muted">
+        Empty
+      </Txt>
+      <Input type="time" aria-label="Empty time" />
+      <Txt variant="caption" tone="muted">
+        Filled
+      </Txt>
+      <Input type="time" aria-label="Filled time" defaultValue="12:00" />
+      <Txt variant="caption" tone="muted">
+        Small, w-24
+      </Txt>
+      <Input type="time" size="sm" aria-label="Narrow time" defaultValue="00:00" className="w-24" />
+      <Txt variant="caption" tone="muted">
+        Disabled
+      </Txt>
+      <Input type="time" aria-label="Disabled time" defaultValue="12:00" disabled />
+    </div>
+  ),
+};
+
 export const SizesWithButton: Story = {
   render: () => (
-    <div className="grid grid-cols-[200px_auto] gap-3 items-center">
-      {(['sm', 'md', 'default', 'lg'] as const).map(size => (
+    <div className="grid grid-cols-[200px_auto] items-center gap-3">
+      {(['sm', 'md', 'lg'] as const).map(size => (
         <Fragment key={size}>
           <Input size={size} placeholder={size} />
           <Button size={size} className="justify-self-start">
@@ -133,6 +172,51 @@ export const SizesWithButton: Story = {
           </Button>
         </Fragment>
       ))}
+    </div>
+  ),
+};
+
+export const Error: Story = {
+  args: {
+    placeholder: 'invalid@',
+    defaultValue: 'invalid@',
+  },
+  render: args => (
+    <Field invalid className="w-50">
+      <FieldLabel>Email</FieldLabel>
+      <Input {...args} />
+      <FieldError>Enter a complete email address.</FieldError>
+    </Field>
+  ),
+};
+
+export const OnDifferentSurfaces: Story = {
+  render: () => (
+    <div className="flex w-[calc(100vw-2rem)] max-w-96 flex-col gap-4">
+      <div className="rounded-lg border border-border bg-sidebar p-4">
+        <Txt variant="caption" tone="muted" className="mb-2">
+          Sidebar
+        </Txt>
+        <Input aria-label="Search agents on the sidebar" placeholder="Search agents" />
+      </div>
+      <div className="rounded-lg border border-border bg-background p-4">
+        <Txt variant="caption" tone="muted" className="mb-2">
+          Main canvas
+        </Txt>
+        <Input aria-label="Search agents on the main canvas" placeholder="Search agents" />
+      </div>
+      <div className={`${raisedSurfaceStyle} rounded-lg p-4`}>
+        <Txt variant="caption" tone="muted" className="mb-2">
+          Card
+        </Txt>
+        <Input aria-label="Search agents on a card" placeholder="Search agents" />
+      </div>
+      <div className="rounded-lg border border-border bg-popover p-4">
+        <Txt variant="caption" tone="muted" className="mb-2">
+          Popover
+        </Txt>
+        <Input aria-label="Search agents in a popover" placeholder="Search agents" />
+      </div>
     </div>
   ),
 };

@@ -1,7 +1,6 @@
 import { createClient } from '@libsql/client';
-import type { Client, InValue } from '@libsql/client';
-import { MastraBase } from '@mastra/core/base';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
+import type { IMastraLogger } from '@mastra/core/logger';
 import {
   createStorageErrorId,
   getSqlType,
@@ -9,8 +8,18 @@ import {
   TABLE_SPANS,
   TABLE_SCHEMAS,
 } from '@mastra/core/storage';
-import type { TABLE_NAMES, StorageColumn } from '@mastra/core/storage';
+import type {
+  KNOWLEDGE_TABLE_NAME,
+  TABLE_NAMES,
+  TABLE_MEMORY_RUN_FENCES,
+  TABLE_WORKFLOW_RUN_OWNERS,
+  TABLE_WORKFLOW_RUNS,
+  StorageColumn,
+} from '@mastra/core/storage';
 import { parseSqlIdentifier } from '@mastra/core/utils';
+import type { SqliteClient as Client, SqliteInValue as InValue } from './client';
+import { withRunFence } from './run-fencing';
+import type { RunFenceCheck } from './run-fencing';
 import {
   buildSelectColumns,
   createExecuteWriteOperationWithRetry,
@@ -18,11 +27,27 @@ import {
   prepareStatement,
   prepareUpdateStatement,
 } from './utils';
+import { withClientWriteLock } from './write-lock';
+
+/** Tables retention can prune: the core tables plus the run fencing and storage v2 run tables, which aren't in TABLE_NAMES. */
+export type PrunableTable =
+  | TABLE_NAMES
+  | typeof TABLE_WORKFLOW_RUN_OWNERS
+  | typeof TABLE_WORKFLOW_RUNS
+  | typeof TABLE_MEMORY_RUN_FENCES;
 
 /**
  * Base configuration options shared across LibSQL domain configurations
  */
 export type LibSQLDomainBaseConfig = {
+  /** @internal Identifies the physical backend and namespace for keyed Knowledge isolation. */
+  storageIsolationKey?: unknown;
+  /**
+   * The client is a Turso embedded replica (`syncUrl`): reads are served from the local
+   * replica, so a write that conflicts with another instance's change syncs before retrying.
+   * @internal Set by `LibSQLStore`.
+   */
+  embeddedReplica?: boolean;
   /**
    * Maximum number of retries for write operations if an SQLITE_BUSY error occurs.
    * @default 5
@@ -34,7 +59,23 @@ export type LibSQLDomainBaseConfig = {
    * @default 100
    */
   initialBackoffMs?: number;
+  /**
+   * SQLite `busy_timeout` (in milliseconds) applied to the underlying connection
+   * for local (`file:`/`:memory:`) databases. Lets a write wait for a lock to
+   * clear instead of failing immediately with `SQLITE_BUSY`. Requires
+   * `@libsql/client` >= 0.17.4 (see libsql-client-ts#288/#345). Ignored when an
+   * existing `client` is supplied.
+   * @default 5000
+   */
+  connectionTimeoutMs?: number;
 };
+
+/**
+ * Default SQLite `busy_timeout` (ms) for local LibSQL connections. Chosen to
+ * comfortably exceed the write-retry backoff window so contended writes block
+ * briefly rather than surfacing as `SQLITE_BUSY` errors.
+ */
+export const DEFAULT_CONNECTION_TIMEOUT_MS = 5000;
 
 /**
  * Configuration for LibSQL domains - accepts either credentials or an existing client
@@ -62,13 +103,53 @@ export function resolveClient(config: LibSQLDomainConfig): Client {
   if ('client' in config) {
     return config.client;
   }
+  const isLocal = config.url.startsWith('file:') || config.url.includes(':memory:');
+  const timeout = config.connectionTimeoutMs ?? DEFAULT_CONNECTION_TIMEOUT_MS;
   return createClient({
     url: config.url,
     ...(config.authToken ? { authToken: config.authToken } : {}),
+    // Only local sqlite3 connections honor `busy_timeout`; remote contention is
+    // resolved server-side, so passing it there is meaningless.
+    ...(isLocal ? { timeout } : {}),
   });
 }
 
-export class LibSQLDB extends MastraBase {
+/**
+ * Guard prune batch limits: a non-positive limit deletes nothing while callers'
+ * drain checks (`affected < limit`) never fire, which turns the prune loop into
+ * an infinite spin. Fail loudly instead.
+ */
+function assertPositiveLimit(limit: number): void {
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error(`prune limit must be a positive integer; received ${limit}`);
+  }
+}
+
+/**
+ * Parses JSON object/array text in the table's `jsonb` columns only. A `text` column, such as a
+ * span preview of `{}`, must read back as the stored string.
+ */
+function parseJsonColumns(tableName: TABLE_NAMES, row: Record<string, unknown>): Record<string, unknown> {
+  const schema = TABLE_SCHEMAS[tableName];
+  return Object.fromEntries(
+    Object.entries(row).map(([k, v]) => {
+      if (schema[k]?.type !== 'jsonb' || typeof v !== 'string' || !(v.startsWith('{') || v.startsWith('['))) {
+        return [k, v];
+      }
+      try {
+        return [k, JSON.parse(v)];
+      } catch {
+        return [k, v];
+      }
+    }),
+  );
+}
+
+/**
+ * Shared database layer for the LibSQL domains. It has no logger of its own: every log goes
+ * through the owning domain's logger via `getLogger`, so the logger Mastra sets applies here.
+ */
+export class LibSQLDB {
   private client: Client;
   maxRetries: number;
   initialBackoffMs: number;
@@ -77,29 +158,39 @@ export class LibSQLDB extends MastraBase {
   /** Cache of actual table columns: tableName -> Promise<Set<columnName>> (stores in-flight promise to coalesce concurrent calls) */
   private tableColumnsCache = new Map<string, Promise<Set<string>>>();
 
+  /** Returns the owning domain's current logger; see the constructor's `getLogger`. */
+  readonly #getLogger: () => IMastraLogger;
+
+  /**
+   * @param getLogger - Returns the logger of the domain that owns this layer. It is read on
+   * every log call, so a logger set on the domain later (by `new Mastra({ logger })` or
+   * `mastra.setLogger()`) also covers write retries and failures here (#29885).
+   */
   constructor({
     client,
     maxRetries,
     initialBackoffMs,
+    getLogger,
   }: {
     client: Client;
     maxRetries?: number;
     initialBackoffMs?: number;
+    getLogger: () => IMastraLogger;
   }) {
-    super({
-      component: 'STORAGE',
-      name: 'LIBSQL_DB_LAYER',
-    });
-
     this.client = client;
     this.maxRetries = maxRetries ?? 5;
     this.initialBackoffMs = initialBackoffMs ?? 100;
+    this.#getLogger = getLogger;
 
     this.executeWriteOperationWithRetry = createExecuteWriteOperationWithRetry({
-      logger: this.logger,
+      getLogger,
       maxRetries: this.maxRetries,
       initialBackoffMs: this.initialBackoffMs,
     });
+  }
+
+  get #logger(): IMastraLogger {
+    return this.#getLogger();
   }
 
   /**
@@ -175,18 +266,22 @@ export class LibSQLDB extends MastraBase {
   private async doInsert({
     tableName,
     record,
+    check,
   }: {
     tableName: TABLE_NAMES;
     record: Record<string, any>;
+    check?: RunFenceCheck;
   }): Promise<void> {
     // Filter out columns that don't exist in the actual database table
     const filteredRecord = await this.filterRecordToKnownColumns(tableName, record);
     if (Object.keys(filteredRecord).length === 0) return; // No known columns after filtering - skip insert
-    await this.client.execute(
-      prepareStatement({
-        tableName,
-        record: filteredRecord,
-      }),
+    await withRunFence(this.client, check, writer =>
+      writer.execute(
+        prepareStatement({
+          tableName,
+          record: filteredRecord,
+        }),
+      ),
     );
   }
 
@@ -196,9 +291,24 @@ export class LibSQLDB extends MastraBase {
    * @param args - The insert arguments
    * @param args.tableName - The name of the table to insert into
    * @param args.record - The record to insert (key-value pairs)
+   * @param args.check - The run fence the insert must carry, if any
    */
-  public insert(args: { tableName: TABLE_NAMES; record: Record<string, any> }): Promise<void> {
+  public insert(args: { tableName: TABLE_NAMES; record: Record<string, any>; check?: RunFenceCheck }): Promise<void> {
     return this.executeWriteOperationWithRetry(() => this.doInsert(args), `insert into table ${args.tableName}`);
+  }
+
+  /** Inserts a record without replacing an existing primary key. */
+  public insertOnly(args: { tableName: TABLE_NAMES; record: Record<string, any> }): Promise<void> {
+    return this.executeWriteOperationWithRetry(async () => {
+      const filteredRecord = await this.filterRecordToKnownColumns(args.tableName, args.record);
+      if (Object.keys(filteredRecord).length === 0) return;
+      const statement = prepareStatement({ tableName: args.tableName, record: filteredRecord });
+      if (!statement.sql.startsWith('INSERT OR REPLACE')) {
+        throw new Error(`Unexpected insert statement generated for table ${args.tableName}`);
+      }
+      statement.sql = statement.sql.replace('INSERT OR REPLACE', 'INSERT');
+      await withClientWriteLock(this.client, () => this.client.execute(statement));
+    }, `insert into table ${args.tableName}`);
   }
 
   /**
@@ -216,7 +326,9 @@ export class LibSQLDB extends MastraBase {
     // Filter out columns that don't exist in the actual database table
     const filteredData = await this.filterRecordToKnownColumns(tableName, data);
     if (Object.keys(filteredData).length === 0) return; // Nothing to update after filtering
-    await this.client.execute(prepareUpdateStatement({ tableName, updates: filteredData, keys }));
+    await withClientWriteLock(this.client, () =>
+      this.client.execute(prepareUpdateStatement({ tableName, updates: filteredData, keys })),
+    );
   }
 
   /**
@@ -248,7 +360,7 @@ export class LibSQLDB extends MastraBase {
     const nonEmptyRecords = filteredRecords.filter(r => Object.keys(r).length > 0);
     if (nonEmptyRecords.length === 0) return;
     const batchStatements = nonEmptyRecords.map(r => prepareStatement({ tableName, record: r }));
-    await this.client.batch(batchStatements, 'write');
+    await withClientWriteLock(this.client, () => this.client.batch(batchStatements, 'write'));
   }
 
   /**
@@ -312,7 +424,7 @@ export class LibSQLDB extends MastraBase {
       }),
     );
 
-    await this.client.batch(batchStatements, 'write');
+    await withClientWriteLock(this.client, () => this.client.batch(batchStatements, 'write'));
   }
 
   /**
@@ -350,6 +462,55 @@ export class LibSQLDB extends MastraBase {
   }
 
   /**
+   * Updates multiple records in one write batch, with the same retry behavior as
+   * {@link batchUpdate}. Returns, in input order, whether each update changed a row,
+   * so callers can put extra conditions in `keys` (for example `{ endedAt: null }`).
+   */
+  public async batchUpdateReportingChanges({
+    tableName,
+    updates,
+  }: {
+    tableName: TABLE_NAMES;
+    updates: Array<{
+      keys: Record<string, any>;
+      data: Record<string, any>;
+    }>;
+  }): Promise<boolean[]> {
+    return this.executeWriteOperationWithRetry(async () => {
+      const changed = updates.map(() => false);
+      const statements: ReturnType<typeof prepareUpdateStatement>[] = [];
+      const statementIndexes: number[] = [];
+      for (const [index, { keys, data }] of updates.entries()) {
+        // Filter out columns that don't exist in the actual database table
+        const filteredData = await this.filterRecordToKnownColumns(tableName, data);
+        if (Object.keys(filteredData).length === 0) continue;
+        statements.push(prepareUpdateStatement({ tableName, updates: filteredData, keys }));
+        statementIndexes.push(index);
+      }
+      if (statements.length === 0) return changed;
+
+      const results = await withClientWriteLock(this.client, () => this.client.batch(statements, 'write'));
+      results.forEach((result, i) => {
+        const index = statementIndexes[i];
+        if (index !== undefined) changed[index] = result.rowsAffected > 0;
+      });
+      return changed;
+    }, `batch update in table ${tableName}`).catch(error => {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('LIBSQL', 'BATCH_UPDATE_REPORTING_CHANGES', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: {
+            tableName,
+          },
+        },
+        error,
+      );
+    });
+  }
+
+  /**
    * Internal batch delete implementation without retry logic.
    * Each record can be deleted based on single or composite keys.
    */
@@ -369,7 +530,7 @@ export class LibSQLDB extends MastraBase {
       }),
     );
 
-    await this.client.batch(batchStatements, 'write');
+    await withClientWriteLock(this.client, () => this.client.batch(batchStatements, 'write'));
   }
 
   /**
@@ -410,7 +571,7 @@ export class LibSQLDB extends MastraBase {
    * Internal single-record delete implementation without retry logic.
    */
   private async doDelete({ tableName, keys }: { tableName: TABLE_NAMES; keys: Record<string, any> }): Promise<void> {
-    await this.client.execute(prepareDeleteStatement({ tableName, keys }));
+    await withClientWriteLock(this.client, () => this.client.execute(prepareDeleteStatement({ tableName, keys })));
   }
 
   /**
@@ -442,7 +603,7 @@ export class LibSQLDB extends MastraBase {
   /**
    * Selects a single record from the specified table by key(s).
    * Returns the most recently created record if multiple matches exist.
-   * Automatically parses JSON string values back to objects/arrays.
+   * Parses `jsonb` column values back to objects/arrays.
    *
    * @typeParam R - The expected return type of the record
    * @param args - The select arguments
@@ -468,21 +629,7 @@ export class LibSQLDB extends MastraBase {
       return null;
     }
 
-    const row = result.rows[0];
-    // Checks whether the string looks like a JSON object ({}) or array ([])
-    // If the string starts with { or [, it assumes it's JSON and parses it
-    // Otherwise, it just returns, preventing unintended number conversions
-    const parsed = Object.fromEntries(
-      Object.entries(row || {}).map(([k, v]) => {
-        try {
-          return [k, typeof v === 'string' ? (v.startsWith('{') || v.startsWith('[') ? JSON.parse(v) : v) : v];
-        } catch {
-          return [k, v];
-        }
-      }),
-    );
-
-    return parsed as R;
+    return parseJsonColumns(tableName, result.rows[0] ?? {}) as R;
   }
 
   /**
@@ -539,18 +686,7 @@ export class LibSQLDB extends MastraBase {
       args: [...(whereClause?.args ?? []), ...(args ?? [])],
     });
 
-    // Parse JSON columns (same as select())
-    return (result.rows ?? []).map(row => {
-      return Object.fromEntries(
-        Object.entries(row || {}).map(([k, v]) => {
-          try {
-            return [k, typeof v === 'string' ? (v.startsWith('{') || v.startsWith('[') ? JSON.parse(v) : v) : v];
-          } catch {
-            return [k, v];
-          }
-        }),
-      );
-    }) as R[];
+    return (result.rows ?? []).map(row => parseJsonColumns(tableName, row ?? {})) as R[];
   }
 
   /**
@@ -570,7 +706,7 @@ export class LibSQLDB extends MastraBase {
   }): Promise<number> {
     const parsedTableName = parseSqlIdentifier(tableName, 'table name');
 
-    const statement = `SELECT COUNT(*) as count FROM ${parsedTableName} ${whereClause ? `${whereClause.sql}` : ''}`;
+    const statement = `SELECT COUNT(*) as count FROM ${parsedTableName} ${whereClause ? whereClause.sql : ''}`;
 
     const result = await this.client.execute({
       sql: statement,
@@ -616,10 +752,12 @@ export class LibSQLDB extends MastraBase {
     tableName,
     schema,
     compositePrimaryKey,
+    executor = this.client,
   }: {
-    tableName: TABLE_NAMES;
+    tableName: TABLE_NAMES | KNOWLEDGE_TABLE_NAME;
     schema: Record<string, StorageColumn>;
     compositePrimaryKey?: string[];
+    executor?: Pick<Client, 'execute'>;
   }): Promise<void> {
     try {
       const parsedTableName = parseSqlIdentifier(tableName, 'table name');
@@ -663,8 +801,8 @@ export class LibSQLDB extends MastraBase {
 
       const sql = `CREATE TABLE IF NOT EXISTS ${parsedTableName} (\n  ${allDefinitions}\n)`;
 
-      await this.client.execute(sql);
-      this.logger.debug(`LibSQLDB: Created table ${tableName}`);
+      await executor.execute(sql);
+      this.#logger.debug(`LibSQLDB: Created table ${tableName}`);
 
       // Run migrations for Spans table to add any new columns
       if (tableName === TABLE_SPANS) {
@@ -708,7 +846,7 @@ export class LibSQLDB extends MastraBase {
           const alterSql = `ALTER TABLE "${TABLE_SPANS}" ADD COLUMN "${columnName}" ${sqlType}`;
           await this.client.execute(alterSql);
           addedColumns = true;
-          this.logger.debug(`LibSQLDB: Added column '${columnName}' to ${TABLE_SPANS}`);
+          this.#logger.debug(`LibSQLDB: Added column '${columnName}' to ${TABLE_SPANS}`);
         }
       }
       if (addedColumns) {
@@ -756,18 +894,33 @@ export class LibSQLDB extends MastraBase {
           await this.client.execute(
             `CREATE UNIQUE INDEX IF NOT EXISTS "mastra_ai_spans_spanid_traceid_idx" ON "${TABLE_SPANS}" ("spanId", "traceId")`,
           );
-          this.logger.debug(`LibSQLDB: Created unique index on (spanId, traceId) for ${TABLE_SPANS}`);
+          this.#logger.debug(`LibSQLDB: Created unique index on (spanId, traceId) for ${TABLE_SPANS}`);
         }
       }
 
-      this.logger.info(`LibSQLDB: Migration completed for ${TABLE_SPANS}`);
+      // Ensure read indexes for the built-in trace list/detail queries exist.
+      // These are created idempotently on every init (cheap metadata no-op once present)
+      // and outside the unique-index guard above so existing/migrated databases also gain
+      // them. Without these, the default trace-list query
+      // (WHERE parentSpanId IS NULL ORDER BY startedAt DESC) and the trace-detail query
+      // (WHERE traceId = ? ORDER BY startedAt ASC) full-scan the table and build a
+      // temporary B-tree for ordering.
+      await this.client.execute(
+        `CREATE INDEX IF NOT EXISTS "mastra_ai_spans_roots_started_at_idx" ON "${TABLE_SPANS}" ("startedAt" DESC) WHERE "parentSpanId" IS NULL`,
+      );
+      await this.client.execute(
+        `CREATE INDEX IF NOT EXISTS "mastra_ai_spans_trace_started_at_idx" ON "${TABLE_SPANS}" ("traceId", "startedAt")`,
+      );
+      this.#logger.debug(`LibSQLDB: Ensured trace read indexes for ${TABLE_SPANS}`);
+
+      this.#logger.info(`LibSQLDB: Migration completed for ${TABLE_SPANS}`);
     } catch (error) {
       // Rethrow MastraError (especially for migration required errors) - these must stop init
       if (error instanceof MastraError) {
         throw error;
       }
       // Log warning but don't fail for other errors - schema migrations should be best-effort
-      this.logger.warn(`LibSQLDB: Failed to migrate spans table ${TABLE_SPANS}:`, error);
+      this.#logger.warn(`LibSQLDB: Failed to migrate spans table ${TABLE_SPANS}:`, error);
     }
   }
 
@@ -812,7 +965,7 @@ export class LibSQLDB extends MastraBase {
       };
     } catch (error) {
       // If table doesn't exist or other error, assume no duplicates
-      this.logger.debug(`LibSQLDB: Could not check for duplicates: ${error}`);
+      this.#logger.debug(`LibSQLDB: Could not check for duplicates: ${error}`);
       return { hasDuplicates: false, duplicateCount: 0 };
     }
   }
@@ -844,14 +997,14 @@ export class LibSQLDB extends MastraBase {
     const duplicateInfo = await this.checkForDuplicateSpans();
 
     if (duplicateInfo.hasDuplicates) {
-      this.logger.info(
+      this.#logger.info(
         `Found ${duplicateInfo.duplicateCount} duplicate (traceId, spanId) combinations. Starting deduplication...`,
       );
 
       // Run deduplication
       await this.deduplicateSpans();
     } else {
-      this.logger.info(`No duplicate spans found.`);
+      this.#logger.info(`No duplicate spans found.`);
     }
 
     // Add unique index
@@ -923,11 +1076,11 @@ export class LibSQLDB extends MastraBase {
 
       const duplicateCount = Number(duplicateCheck.rows?.[0]?.duplicate_count ?? 0);
       if (duplicateCount === 0) {
-        this.logger.debug(`LibSQLDB: No duplicate spans found, skipping deduplication`);
+        this.#logger.debug(`LibSQLDB: No duplicate spans found, skipping deduplication`);
         return;
       }
 
-      this.logger.warn(`LibSQLDB: Found ${duplicateCount} duplicate (spanId, traceId) combinations, deduplicating...`);
+      this.#logger.warn(`LibSQLDB: Found ${duplicateCount} duplicate (spanId, traceId) combinations, deduplicating...`);
 
       // Delete duplicate spans, keeping the "best" record for each (spanId, traceId) pair.
       // Priority: completed spans > most recently updated > most recently created
@@ -961,10 +1114,10 @@ export class LibSQLDB extends MastraBase {
       `);
 
       const deletedCount = deleteResult.rowsAffected ?? 0;
-      this.logger.warn(`LibSQLDB: Deleted ${deletedCount} duplicate span records`);
+      this.#logger.warn(`LibSQLDB: Deleted ${deletedCount} duplicate span records`);
     } catch (error) {
       // Log but continue - deduplication should be best-effort
-      this.logger.warn(`LibSQLDB: Failed to deduplicate spans:`, error);
+      this.#logger.warn(`LibSQLDB: Failed to deduplicate spans:`, error);
     }
   }
 
@@ -1005,7 +1158,7 @@ export class LibSQLDB extends MastraBase {
     schema,
     ifNotExists,
   }: {
-    tableName: TABLE_NAMES;
+    tableName: TABLE_NAMES | KNOWLEDGE_TABLE_NAME;
     schema: Record<string, StorageColumn>;
     ifNotExists: string[];
   }): Promise<void> {
@@ -1027,10 +1180,15 @@ export class LibSQLDB extends MastraBase {
           // Nullable columns use DEFAULT NULL; non-nullable use the type's default.
           const defaultValue = columnDef.nullable ? 'DEFAULT NULL' : this.getDefaultValue(columnDef.type);
 
-          // SQLite doesn't support ADD COLUMN IF NOT EXISTS, but we checked above
+          // SQLite has no ADD COLUMN IF NOT EXISTS. Another connection can add the column
+          // between the check above and this ALTER, in which case the column exists.
           const alterSql = `ALTER TABLE ${parsedTableName} ADD COLUMN "${columnName}" ${sqlType} ${defaultValue}`;
-          await this.client.execute(alterSql);
-          this.logger.debug(`LibSQLDB: Added column ${columnName} to table ${tableName}`);
+          try {
+            await this.client.execute(alterSql);
+            this.#logger.debug(`LibSQLDB: Added column ${columnName} to table ${tableName}`);
+          } catch (error) {
+            if (!(error instanceof Error && /duplicate column name/i.test(error.message))) throw error;
+          }
         }
       }
     } catch (error) {
@@ -1059,7 +1217,7 @@ export class LibSQLDB extends MastraBase {
   async deleteData({ tableName }: { tableName: TABLE_NAMES }): Promise<void> {
     const parsedTableName = parseSqlIdentifier(tableName, 'table name');
     try {
-      await this.client.execute(`DELETE FROM ${parsedTableName}`);
+      await withClientWriteLock(this.client, () => this.client.execute(`DELETE FROM ${parsedTableName}`));
     } catch (e) {
       const mastraError = new MastraError(
         {
@@ -1072,8 +1230,133 @@ export class LibSQLDB extends MastraBase {
         },
         e,
       );
-      this.logger?.trackException?.(mastraError);
-      this.logger?.error?.(mastraError.toString());
+      this.#logger.trackException?.(mastraError);
+      this.#logger.error?.(mastraError.toString());
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Retention helpers (prune)
+  //
+  // Low-level SQL primitives the memory and observability domains build their
+  // `prune()` on, plus a plain user-invoked `VACUUM`. Keeping the SQL here
+  // reuses the existing write-lock + retry machinery and keeps identifier
+  // parsing in one place.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Delete up to `limit` of the oldest rows whose `column` timestamp is strictly
+   * before `cutoffMs`, in a single bounded statement. Returns the number of rows
+   * removed so the caller can decide whether more batches remain.
+   *
+   * Deletes by `rowid` so the range scan is bounded by LIMIT and the write set
+   * stays small — short locks, bounded WAL growth. Requires an index on
+   * `column` to be fast at scale (see ensureIndex).
+   */
+  async pruneBatch({
+    tableName,
+    column,
+    cutoff,
+    limit,
+  }: {
+    tableName: PrunableTable;
+    column: string;
+    /**
+     * Exclusive upper bound for the anchor column. Must match the column's
+     * stored type — the memory/observability timestamp anchors are stored as
+     * ISO-8601 strings, which sort lexicographically in chronological order, so
+     * the caller passes an ISO string cutoff.
+     */
+    cutoff: string | number;
+    limit: number;
+  }): Promise<number> {
+    assertPositiveLimit(limit);
+    const parsedTable = parseSqlIdentifier(tableName, 'table name');
+    const parsedColumn = parseSqlIdentifier(column, 'column name');
+    const sql = `DELETE FROM "${parsedTable}" WHERE rowid IN (SELECT rowid FROM "${parsedTable}" WHERE "${parsedColumn}" < ? LIMIT ?)`;
+    const result = await this.executeWriteOperationWithRetry(
+      () => withClientWriteLock(this.client, () => this.client.execute({ sql, args: [cutoff, limit] })),
+      `prune ${tableName}`,
+    );
+    return Number(result.rowsAffected ?? 0);
+  }
+
+  /**
+   * Delete up to `limit` aged parent rows *and* their child rows together, in a
+   * single transaction. Used for whole-unit (parent-driven) pruning where
+   * children must die with their parent (e.g. an aged experiment and its
+   * experiment_results) — deleting per unit means a bound or abort between
+   * batches never leaves a parent hollow (kept, but with its children gone) or
+   * children orphaned.
+   *
+   * Both deletes target the same parent set via an identical deterministic
+   * subquery (`ORDER BY rowid LIMIT ?`); the batch runs as one write
+   * transaction, so the set cannot change between the two statements.
+   */
+  async pruneUnitsBatch({
+    parentTable,
+    parentKey,
+    parentColumn,
+    childTable,
+    childForeignKey,
+    cutoff,
+    limit,
+  }: {
+    parentTable: TABLE_NAMES;
+    parentKey: string;
+    parentColumn: string;
+    childTable: TABLE_NAMES;
+    childForeignKey: string;
+    cutoff: string | number;
+    limit: number;
+  }): Promise<{ parents: number; children: number }> {
+    assertPositiveLimit(limit);
+    const parsedChild = parseSqlIdentifier(childTable, 'table name');
+    const parsedChildFk = parseSqlIdentifier(childForeignKey, 'column name');
+    const parsedParent = parseSqlIdentifier(parentTable, 'table name');
+    const parsedParentKey = parseSqlIdentifier(parentKey, 'column name');
+    const parsedParentColumn = parseSqlIdentifier(parentColumn, 'column name');
+    const agedParents =
+      `SELECT "${parsedParentKey}" FROM "${parsedParent}" ` +
+      `WHERE "${parsedParentColumn}" < ? ORDER BY rowid LIMIT ?`;
+    const results = await this.executeWriteOperationWithRetry(
+      () =>
+        withClientWriteLock(this.client, () =>
+          this.client.batch(
+            [
+              {
+                sql: `DELETE FROM "${parsedChild}" WHERE "${parsedChildFk}" IN (${agedParents})`,
+                args: [cutoff, limit],
+              },
+              {
+                sql: `DELETE FROM "${parsedParent}" WHERE "${parsedParentKey}" IN (${agedParents})`,
+                args: [cutoff, limit],
+              },
+            ],
+            'write',
+          ),
+        ),
+      `prune units ${parentTable}`,
+    );
+    return {
+      children: Number(results[0]?.rowsAffected ?? 0),
+      parents: Number(results[1]?.rowsAffected ?? 0),
+    };
+  }
+
+  /** Create an index if it does not already exist. */
+  async ensureIndex({
+    indexName,
+    tableName,
+    column,
+  }: {
+    indexName: string;
+    tableName: PrunableTable;
+    column: string;
+  }): Promise<void> {
+    const parsedTable = parseSqlIdentifier(tableName, 'table name');
+    const parsedColumn = parseSqlIdentifier(column, 'column name');
+    const parsedIndex = parseSqlIdentifier(indexName, 'index name');
+    await this.client.execute(`CREATE INDEX IF NOT EXISTS "${parsedIndex}" ON "${parsedTable}" ("${parsedColumn}")`);
   }
 }

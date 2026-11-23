@@ -8,7 +8,13 @@ import { MastraError, ErrorDomain, ErrorCategory } from '../../../error';
 import { getTransformedToolPayload, hasTransformedToolPayload } from '../../../tools/payload-transform';
 import { TypeDetector } from '../detection/TypeDetector';
 import { convertDataContentToBase64String } from '../prompt/data-content';
-import { categorizeFileData, createDataUri, imageContentToString } from '../prompt/image-utils';
+import type { ImageContent } from '../prompt/image-utils';
+import {
+  categorizeFileData,
+  createDataUri,
+  imageContentToString,
+  resolveFilePartMediaTypeAndData,
+} from '../prompt/image-utils';
 import type {
   MastraDBMessage,
   MastraMessageContentV2,
@@ -90,6 +96,23 @@ function getSignalType(message: MastraDBMessage): string | undefined {
   return message.type;
 }
 
+function getSignalTagName(message: MastraDBMessage): string | undefined {
+  const signal = message.content.metadata?.signal;
+  if (signal && typeof signal === 'object' && !Array.isArray(signal)) {
+    const tagName = (signal as Record<string, unknown>).tagName;
+    if (typeof tagName === 'string') return tagName;
+  }
+
+  const type = getSignalType(message);
+  if (type === 'user') return 'user';
+  if (type === 'reactive') return message.type;
+  return type;
+}
+
+function isUserSignalType(type: string | undefined): boolean {
+  return type === 'user' || type === 'user-message';
+}
+
 function toSignalDataPart(message: MastraDBMessage, contents: string): MastraMessagePart {
   const signal =
     message.content.metadata?.signal && typeof message.content.metadata.signal === 'object'
@@ -99,14 +122,23 @@ function toSignalDataPart(message: MastraDBMessage, contents: string): MastraMes
     signal.metadata && typeof signal.metadata === 'object' && !Array.isArray(signal.metadata)
       ? (signal.metadata as Record<string, unknown>)
       : {};
+  const attributes =
+    signal.attributes && typeof signal.attributes === 'object' && !Array.isArray(signal.attributes)
+      ? (signal.attributes as Record<string, unknown>)
+      : {};
 
+  const type = getSignalType(message) ?? 'signal';
+  const tagName = getSignalTagName(message) ?? type;
   return {
-    type: `data-${getSignalType(message) ?? 'signal'}`,
+    type: type === 'user' ? 'data-user-message' : 'data-signal',
     data: {
       id: typeof signal.id === 'string' ? signal.id : message.id,
-      type: getSignalType(message) ?? 'signal',
+      type,
+      tagName,
       contents: 'contents' in signal ? signal.contents : contents,
       createdAt: typeof signal.createdAt === 'string' ? signal.createdAt : message.createdAt.toISOString(),
+      ...(typeof signal.acceptedAt === 'string' ? { acceptedAt: signal.acceptedAt } : {}),
+      ...(Object.keys(attributes).length ? { attributes } : {}),
       ...(Object.keys(metadata).length ? { metadata } : {}),
     },
   } as MastraMessagePart;
@@ -155,24 +187,30 @@ export class AIV4Adapter {
     if (sourceParts.length) {
       for (const part of sourceParts) {
         if (part.type === `file`) {
-          // Normalize part.data to ensure it's a valid URL or data URI
+          // Stored file parts can arrive in either the v4 (`mimeType`/`data`) or v5
+          // (`mediaType`/`url`) shape; resolve both so a v5 part isn't read as `undefined`.
+          const { mediaType: fileMimeType, data: fileData } = resolveFilePartMediaTypeAndData(part);
+          // Normalize fileData to ensure it's a valid URL or data URI
           let normalizedUrl: string;
-          if (typeof part.data === 'string') {
-            const categorized = categorizeFileData(part.data, part.mimeType);
+          if (typeof fileData === 'string') {
+            const categorized = categorizeFileData(fileData, fileMimeType);
             if (categorized.type === 'raw') {
               // Raw base64 - convert to data URI
-              normalizedUrl = createDataUri(part.data, part.mimeType || 'application/octet-stream');
+              normalizedUrl = createDataUri(fileData, fileMimeType || 'application/octet-stream');
             } else {
-              // Already a URL or data URI
-              normalizedUrl = part.data;
+              // Already a URL, data URI, or provider file ID (e.g. OpenAI "file-...").
+              // Provider file IDs are not parseable URLs; attachmentsToParts handles
+              // them explicitly before constructing a URL.
+              normalizedUrl = fileData;
             }
           } else {
-            // It's a non-string (shouldn't happen in practice for file parts, but handle it)
-            normalizedUrl = part.data;
+            // Non-string payload (shouldn't happen for stored file parts, but handle it):
+            // coerce to a string so `normalizedUrl` stays typed `string`.
+            normalizedUrl = imageContentToString(fileData as ImageContent, fileMimeType);
           }
 
           experimentalAttachments.push({
-            contentType: part.mimeType,
+            contentType: fileMimeType ?? 'application/octet-stream',
             url: normalizedUrl,
           });
         } else if (
@@ -183,8 +221,17 @@ export class AIV4Adapter {
           continue;
         } else if (part.type === 'tool-invocation') {
           // Handle tool invocations with step number logic
+          const isDeniedApproval = part.toolInvocation.state === 'output-denied';
+          const isOutputError = part.toolInvocation.state === 'output-error';
           const toolInvocation = {
             ...part.toolInvocation,
+            // v4 has no denied or output-error state and AI SDK v4's convertToCoreMessages
+            // requires every completed tool invocation to carry a result. Downgrade both to
+            // normal results so the error or denial is sent back to the model.
+            // A downgraded output-error still has to read as a failure, so keep the isError
+            // marker on it — otherwise a failed terminal tool looks like it succeeded.
+            ...(isDeniedApproval || isOutputError ? { state: 'result' as const } : {}),
+            ...(isOutputError ? { isError: true } : {}),
             args: getDisplayTransform(
               part.providerMetadata,
               'input-available',
@@ -205,7 +252,11 @@ export class AIV4Adapter {
                     transformToolPayloads,
                   ),
                 }
-              : {}),
+              : isDeniedApproval
+                ? { result: part.toolInvocation.approval?.reason ?? 'Tool call was not approved by the user' }
+                : isOutputError
+                  ? { result: part.toolInvocation.errorText }
+                  : {}),
           };
 
           // Find the step number for this tool invocation
@@ -249,7 +300,7 @@ export class AIV4Adapter {
     }
 
     const signalType = m.role === 'signal' ? getSignalType(m) : undefined;
-    const isUserMessageSignal = signalType === 'user-message';
+    const isUserMessageSignal = isUserSignalType(signalType);
     const v4Parts = preserveExtendedParts(
       m.role === 'signal' && !isUserMessageSignal ? [toSignalDataPart(m, m.content.content || contentString)] : parts,
     );
@@ -494,7 +545,7 @@ export class AIV4Adapter {
             {
               const part: MastraDBMessage['content']['parts'][number] = {
                 type: 'reasoning',
-                reasoning: '',
+                reasoning: aiV4Part.text,
                 details: [{ type: 'text', text: aiV4Part.text, signature: aiV4Part.signature }],
               };
               if (aiV4Part.providerOptions) {
@@ -545,7 +596,13 @@ export class AIV4Adapter {
             } else if (typeof aiV4Part.data === 'string') {
               const categorized = categorizeFileData(aiV4Part.data, aiV4Part.mimeType);
 
-              if (categorized.type === 'url' || categorized.type === 'dataUri') {
+              if (
+                categorized.type === 'url' ||
+                categorized.type === 'dataUri' ||
+                // Provider file IDs (e.g. OpenAI "file-...") must be stored untouched,
+                // not base64-converted, so they can be forwarded as { file_id } later.
+                categorized.type === 'providerFileId'
+              ) {
                 const part: MastraDBMessage['content']['parts'][number] = {
                   type: 'file' as const,
                   data: aiV4Part.data,

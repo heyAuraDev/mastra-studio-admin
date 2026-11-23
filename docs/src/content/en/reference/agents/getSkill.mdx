@@ -1,0 +1,93 @@
+---
+title: "Reference: .getSkill() | Agents"
+description: "Retrieves a specific skill by name from the agent's configured skills (both agent-level and workspace skills)."
+packages:
+  - "@mastra/core"
+---
+
+# `.getSkill()`
+
+Retrieves a specific skill by name from the agent's configured skills (both agent-level and workspace skills).
+
+## Usage example
+
+```typescript title="src/routes/skills.ts"
+import { agent } from '../mastra/agents'
+
+const skill = await agent.getSkill('code-review')
+
+if (skill) {
+  console.log(skill.name) // "code-review"
+  console.log(skill.description) // "Use when reviewing code changes."
+  console.log(skill.instructions) // Full markdown instructions
+}
+```
+
+## Parameters
+
+<PropertiesTable
+  content={[
+  {
+    name: 'skillName',
+    type: 'string',
+    description: 'The name of the skill to retrieve.',
+  },
+  {
+    name: 'options',
+    type: 'object',
+    isOptional: true,
+    description: 'Options for skill resolution.',
+    properties: [
+      {
+        type: 'object',
+        parameters: [
+          {
+            name: 'requestContext',
+            type: 'RequestContext',
+            isOptional: true,
+            description: 'Request context passed to dynamic skill resolvers.',
+          },
+        ],
+      },
+    ],
+  },
+]}
+/>
+
+## Return value
+
+Returns `Promise<Skill | null>`.
+
+Returns the `Skill` object if found, or `null` if no skill with that name exists.
+
+```typescript
+interface Skill {
+  name: string
+  description: string
+  instructions: string
+  path: string
+  source:
+    | { type: 'external'; packagePath: string }
+    | { type: 'local'; projectPath: string }
+    | { type: 'managed'; mastraPath: string }
+  references: string[]
+  scripts: string[]
+  assets: string[]
+  license?: string
+  compatibility?: unknown
+  'user-invocable'?: boolean
+  metadata?: Record<string, unknown>
+}
+```
+
+`source` describes where Mastra discovered the skill. Skills from a path with a `node_modules` segment are `external`, skills from a path under `.mastra/skills` are `managed`, and all other skills, including those created with [`createSkill()`](/reference/agents/createSkill), are `local`.
+
+## Merging behavior
+
+When both agent-level skills and workspace skills are configured, `.getSkill()` searches the merged set. Agent-level skills take precedence on name conflicts.
+
+## Related
+
+- [Agent skills](/docs/skills)
+- [`.listSkills()` reference](/reference/agents/listSkills)
+- [`createSkill()` reference](/reference/agents/createSkill)

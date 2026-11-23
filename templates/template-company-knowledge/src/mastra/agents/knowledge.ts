@@ -1,0 +1,92 @@
+import { Agent } from '@mastra/core/agent';
+import { Memory } from '@mastra/memory';
+import { PIIDetector, UnicodeNormalizer } from '@mastra/core/processors';
+import type { ToolsResolverContext } from '@mastra/connect';
+import { searchKnowledge } from '../tools/knowledge-search';
+import { connectTools } from '../connect';
+import { webSearchTool } from '../tools/web-search';
+
+const agentModel = process.env.AGENT_MODEL?.trim() || 'mastra/openai/gpt-5.4';
+
+async function getConnectTools(context: ToolsResolverContext) {
+  if (!connectTools) return {};
+  try {
+    return await connectTools(context);
+  } catch (error) {
+    console.warn(
+      'Failed to load Linear/Notion tools from Mastra Connect. The agent will continue with indexed search and web search only.',
+      error,
+    );
+    return {};
+  }
+}
+
+export const knowledgeAgent = new Agent({
+  id: 'knowledge-agent',
+  name: 'Company Knowledge',
+  description:
+    'Answers questions about company knowledge using indexed Linear issues and Notion pages, with live Linear/Notion lookups and provider-native web search as fallbacks.',
+  instructions: `You are a company knowledge assistant. You help the team find information across Linear (issues, projects) and Notion (docs, wikis, databases) — both from a pre-indexed semantic search corpus and via live lookups.
+
+## Your tools
+
+**Indexed search (fastest, search here first):**
+- search-knowledge — semantic vector search over the pre-indexed Linear + Notion corpus. Returns scored snippets with source, title, URL. Use this for any factual question about the company.
+
+**Live Linear lookups (via Mastra Connect — tools prefixed with \`linear_\`):**
+Linear tools come from the Linear connection attached to this project. They cover searching issues, fetching issue details, listing projects, and more.
+Use these when indexed results are stale or missing, or the user references a specific Linear issue/project.
+
+**Live Notion lookups (via Mastra Connect — tools prefixed with \`notion_\`):**
+Notion tools come from the Notion connection attached to this project. They cover searching pages and databases, reading page content, creating pages, and more.
+Use these when indexed results are stale or the user asks about a specific Notion doc.
+
+**Public fallback:**
+- web_search — search the public web. Only use this for questions that aren't about internal company data (e.g. "what's the latest Node.js LTS version?").
+
+## Lookup strategy
+
+Follow this order strictly — it saves API calls and gives faster answers:
+
+1. **Start with search-knowledge.** If the top results (score > 0.75) answer the question, use them and stop.
+2. **If indexed results are weak (score < 0.7 or don't address the question):**
+   - For Linear questions → use linear_ tools.
+   - For Notion questions → use notion_ tools.
+3. **Combine sources.** If the answer spans both Linear and Notion, say so. "According to ENG-456 and the API Design doc in Notion..."
+4. **Web search is last resort.** Only for public/external information the company tools won't have.
+
+## Response format
+
+- Lead with the direct answer.
+- Cite every source inline: \`[ENG-123](url)\` for Linear issues, \`[Page Title](url)\` for Notion pages.
+- If indexed results are outdated (e.g. an issue was closed since indexing), note that and supplement with the live lookup.
+- If you can't find the answer anywhere, say so. Never invent issue identifiers, page IDs, or URLs.
+- For ambiguous questions, ask one clarifying question rather than guessing.`,
+  model: agentModel,
+  defaultOptions: {
+    maxSteps: 100,
+  },
+  memory: new Memory({
+    options: {
+      lastMessages: 20,
+    },
+  }),
+  // Guardrails: normalize unicode input, redact PII in responses (internal data may contain
+  // employee emails, phone numbers, etc. that shouldn't be surfaced to all users).
+  inputProcessors: [new UnicodeNormalizer({ stripControlChars: true, collapseWhitespace: true })],
+  outputProcessors: [
+    new PIIDetector({
+      model: 'mastra/openai/gpt-6-luna',
+      strategy: 'redact',
+      // Fail closed: a detection-model error must reject the content, not pass it through unredacted.
+      errorStrategy: 'strict',
+      redactionMethod: 'mask',
+      detectionTypes: ['email', 'phone', 'credit-card', 'ssn', 'api-key'],
+    }),
+  ],
+  tools: async ({ requestContext, mastra }) => ({
+    searchKnowledge,
+    ...(await getConnectTools({ requestContext, mastra })),
+    web_search: webSearchTool,
+  }),
+});

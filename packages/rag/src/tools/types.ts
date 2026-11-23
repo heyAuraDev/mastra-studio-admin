@@ -1,5 +1,6 @@
 import type { RequestContext } from '@mastra/core/request-context';
 import type { MastraUnion } from '@mastra/core/tools';
+import type { MastraUser } from '@mastra/core/types';
 import type { MastraVector, MastraEmbeddingModel, MastraEmbeddingOptions } from '@mastra/core/vector';
 
 import type { RerankConfig } from '../rerank';
@@ -13,6 +14,8 @@ export interface VectorStoreResolverContext {
   requestContext?: RequestContext;
   /** The Mastra instance for accessing registered resources */
   mastra?: MastraUnion;
+  /** The authenticated end user, when the request was authenticated */
+  user?: MastraUser;
 }
 
 /**
@@ -74,11 +77,34 @@ export interface ChromaConfig {
   whereDocument?: WhereDocument;
 }
 
+export interface MongoDBConfig {
+  /**
+   * Number of candidates the HNSW graph considers before selecting the top-K
+   * results. Higher values improve recall at the cost of query latency.
+   * Must be >= topK. Defaults to 20 * topK, capped at 10 000.
+   * This is efSearch in the HNSW paper.
+   * See: https://www.mongodb.com/docs/atlas/atlas-vector-search/vector-search-stage/
+   */
+  numCandidates?: number;
+}
+
+export interface TurbopufferConfig {
+  /**
+   * The consistency level for queries.
+   * - 'strong': Queries see all data written before the query started. Higher latency (default).
+   * - 'eventual': Lower latency, but recently written data may not be visible yet.
+   * See: https://turbopuffer.com/docs/query
+   */
+  consistency?: 'strong' | 'eventual';
+}
+
 // Union type for all database-specific configs
 export type DatabaseConfig = {
   pinecone?: PineconeConfig;
   pgvector?: PgVectorConfig;
   chroma?: ChromaConfig;
+  mongodb?: MongoDBConfig;
+  turbopuffer?: TurbopufferConfig;
   // Add other database configs as needed
   [key: string]: any; // Allow for future database extensions
 };

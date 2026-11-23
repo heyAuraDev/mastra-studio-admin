@@ -1,3 +1,5 @@
+import { assertActiveObservationsApplied } from '@internal/core/memory';
+import type { UpdateActiveObservationsResult, UpdateBufferedObservationsResult } from '@internal/core/memory';
 import { MessageList } from '@mastra/core/agent';
 import type { MastraMessageContentV2 } from '@mastra/core/agent';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
@@ -11,18 +13,48 @@ import {
   calculatePagination,
   createStorageErrorId,
   normalizePerPage,
+  resolveRunFence,
   safelyParseJSON,
+  storageMessageMatchesMetadataFilter,
+  TABLE_MEMORY_RUN_FENCES,
+  validateStorageMetadataFilter,
+  executeRetentionPrune,
+  resolveRetentionTargets,
+  retentionCutoffMs,
 } from '@mastra/core/storage';
 import type {
+  BufferedObservationChunk,
+  CreateObservationalMemoryInput,
+  CreateReflectionGenerationInput,
+  ObservationalMemoryHistoryOptions,
+  ObservationalMemoryRecord,
+  RunFence,
+  StorageListMessagesByResourceIdInput,
   StorageListMessagesInput,
   StorageListMessagesOutput,
   StorageListThreadsInput,
   StorageListThreadsOutput,
   StorageResourceType,
+  SwapBufferedReflectionToActiveInput,
+  SwapBufferedToActiveInput,
+  SwapBufferedToActiveResult,
+  UpdateActiveObservationsInput,
+  UpdateBufferedObservationsInput,
+  UpdateBufferedReflectionInput,
+  UpdateObservationalMemoryConfigInput,
+  PruneOptions,
+  PruneResult,
+  RetentionTablesDescriptor,
+  TableRetentionPolicy,
 } from '@mastra/core/storage';
 
+import type { ConvexAdminClient } from '../../client';
 import { ConvexDB, resolveConvexConfig } from '../../db';
 import type { ConvexDomainConfig } from '../../db';
+import { assertRunFence, raiseRunFence, retireRunFence, pruneRunClaims } from '../../run-fencing';
+import type { RunFenceCheck } from '../../run-fencing';
+import { TABLE_OBSERVATIONAL_MEMORY } from '../../types';
+import type { SerializedOMChunk, SerializedOMCurrentRecord } from '../../types';
 
 type StoredMessage = {
   id: string;
@@ -34,22 +66,221 @@ type StoredMessage = {
   resourceId: string | null;
 };
 
+type StoredMetadata = Record<string, unknown> | string | null | undefined;
+type StoredThread = Omit<StorageThreadType, 'createdAt' | 'updatedAt' | 'metadata'> & {
+  createdAt: string;
+  updatedAt: string;
+  metadata?: StoredMetadata;
+};
+type StoredResource = Omit<StorageResourceType, 'createdAt' | 'updatedAt' | 'metadata'> & {
+  createdAt: string;
+  updatedAt: string;
+  metadata?: StoredMetadata;
+};
+
+function parseStoredThread(row: StoredThread): StorageThreadType {
+  return {
+    ...row,
+    metadata: typeof row.metadata === 'string' ? safelyParseJSON(row.metadata) : row.metadata,
+    createdAt: new Date(row.createdAt),
+    updatedAt: new Date(row.updatedAt),
+  };
+}
+
+function parseStoredResource(record: StoredResource): StorageResourceType {
+  const metadata = typeof record.metadata === 'string' ? safelyParseJSON(record.metadata) : record.metadata;
+  return {
+    ...record,
+    metadata: metadata ?? {},
+    createdAt: new Date(record.createdAt),
+    updatedAt: new Date(record.updatedAt),
+  };
+}
+
+/**
+ * Stored (Convex document) shape of an observational memory record.
+ * Timestamps are ISO strings; config/metadata/bufferedObservationChunks are
+ * JSON strings. Mirrors mastraObservationalMemoryTable in schema.ts.
+ */
+type StoredOMRecord = {
+  id: string;
+  lookupKey: string;
+  scope: string;
+  resourceId: string;
+  threadId?: string | null;
+  activeObservations: string;
+  activeObservationsPendingUpdate?: string | null;
+  originType: string;
+  config: string;
+  generationCount: number;
+  lastObservedAt?: string | null;
+  lastReflectionAt?: string | null;
+  pendingMessageTokens: number;
+  totalTokensObserved: number;
+  observationTokenCount: number;
+  isObserving: boolean;
+  isReflecting: boolean;
+  observedMessageIds?: string[] | null;
+  observedTimezone?: string | null;
+  bufferedObservations?: string | null;
+  bufferedObservationTokens?: number | null;
+  bufferedMessageIds?: string[] | null;
+  bufferedReflection?: string | null;
+  bufferedReflectionTokens?: number | null;
+  bufferedReflectionInputTokens?: number | null;
+  reflectedObservationLineCount?: number | null;
+  bufferedObservationChunks?: string | null;
+  isBufferingObservation: boolean;
+  isBufferingReflection: boolean;
+  lastBufferedAtTokens: number;
+  lastBufferedAtTime?: string | null;
+  metadata?: string | null;
+  supersededBy?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+function toISO(value: Date | string): string {
+  return value instanceof Date ? value.toISOString() : value;
+}
+
+function serializeOMChunk(chunk: BufferedObservationChunk): SerializedOMChunk {
+  return {
+    ...chunk,
+    lastObservedAt: toISO(chunk.lastObservedAt),
+    createdAt: toISO(chunk.createdAt),
+  };
+}
+
+function parseOMChunk(chunk: SerializedOMChunk): BufferedObservationChunk {
+  return {
+    ...chunk,
+    lastObservedAt: new Date(chunk.lastObservedAt),
+    createdAt: new Date(chunk.createdAt),
+  };
+}
+
+function parseStoredOMChunks(value: string | null | undefined): BufferedObservationChunk[] | undefined {
+  if (!value) return undefined;
+  const parsed = safelyParseJSON(value);
+  if (!Array.isArray(parsed)) return undefined;
+  return parsed.map(chunk => parseOMChunk(chunk));
+}
+
+function parseStoredOMRecord(doc: StoredOMRecord): ObservationalMemoryRecord {
+  const config = safelyParseJSON(doc.config);
+  const metadata = doc.metadata ? safelyParseJSON(doc.metadata) : undefined;
+  return {
+    id: doc.id,
+    scope: doc.scope as ObservationalMemoryRecord['scope'],
+    threadId: doc.threadId || null,
+    resourceId: doc.resourceId,
+    createdAt: new Date(doc.createdAt),
+    updatedAt: new Date(doc.updatedAt),
+    lastObservedAt: doc.lastObservedAt ? new Date(doc.lastObservedAt) : undefined,
+    originType: (doc.originType || 'initial') as ObservationalMemoryRecord['originType'],
+    generationCount: Number(doc.generationCount || 0),
+    activeObservations: doc.activeObservations || '',
+    bufferedObservationChunks: parseStoredOMChunks(doc.bufferedObservationChunks),
+    // Deprecated fields (for backward compatibility)
+    bufferedObservations: doc.activeObservationsPendingUpdate || undefined,
+    bufferedObservationTokens: doc.bufferedObservationTokens ? Number(doc.bufferedObservationTokens) : undefined,
+    bufferedMessageIds: undefined, // Use bufferedObservationChunks instead
+    bufferedReflection: doc.bufferedReflection || undefined,
+    bufferedReflectionTokens: doc.bufferedReflectionTokens ? Number(doc.bufferedReflectionTokens) : undefined,
+    bufferedReflectionInputTokens: doc.bufferedReflectionInputTokens
+      ? Number(doc.bufferedReflectionInputTokens)
+      : undefined,
+    reflectedObservationLineCount: doc.reflectedObservationLineCount
+      ? Number(doc.reflectedObservationLineCount)
+      : undefined,
+    totalTokensObserved: Number(doc.totalTokensObserved || 0),
+    observationTokenCount: Number(doc.observationTokenCount || 0),
+    pendingMessageTokens: Number(doc.pendingMessageTokens || 0),
+    isReflecting: Boolean(doc.isReflecting),
+    isObserving: Boolean(doc.isObserving),
+    isBufferingObservation: Boolean(doc.isBufferingObservation),
+    isBufferingReflection: Boolean(doc.isBufferingReflection),
+    lastBufferedAtTokens: Number(doc.lastBufferedAtTokens || 0),
+    lastBufferedAtTime: doc.lastBufferedAtTime ? new Date(doc.lastBufferedAtTime) : null,
+    config: (config as Record<string, unknown>) ?? {},
+    metadata: (metadata as Record<string, unknown>) ?? undefined,
+    observedMessageIds: doc.observedMessageIds || undefined,
+    observedTimezone: doc.observedTimezone || undefined,
+    supersededBy: doc.supersededBy ?? null,
+  };
+}
+
 export class MemoryConvex extends MemoryStorage {
+  /**
+   * Tables `prune()` can clean up. Run fences anchor on `retiredAt` (epoch ms), which stays unset until the
+   * execution holding the fence settles, so a running execution's fence is
+   * never pruned.
+   */
+  static override readonly retentionTables: RetentionTablesDescriptor = {
+    runFences: { table: TABLE_MEMORY_RUN_FENCES, column: 'retiredAt', indexed: false, anchorType: 'epoch-ms' },
+  };
+
+  override readonly supportsPartialThreadUpdate = true;
+  readonly supportsObservationalMemory = true;
+  readonly supportsObservationalMemoryHistorySearch = true;
+
   #db: ConvexDB;
+  #client: ConvexAdminClient;
   constructor(config: ConvexDomainConfig) {
     super();
-    const client = resolveConvexConfig(config);
-    this.#db = new ConvexDB(client);
+    this.#client = resolveConvexConfig(config);
+    this.#db = new ConvexDB(this.#client);
+  }
+
+  override supportsRunFencing(): boolean {
+    return true;
+  }
+
+  override async raiseRunFence(fence: RunFence): Promise<boolean> {
+    return raiseRunFence(this.#client, fence);
+  }
+
+  override async retireRunFence(fence: RunFence): Promise<boolean> {
+    return retireRunFence(this.#client, fence);
+  }
+
+  #runFenceCheck(fence: RunFence | undefined, operation: string): RunFenceCheck | undefined {
+    const resolved = resolveRunFence(this, fence);
+    return resolved && { claims: TABLE_MEMORY_RUN_FENCES, fence: resolved, operation };
+  }
+
+  /** The store to write through: fenced when the write carries or inherits a fence. */
+  #dbFor(fence: RunFence | undefined, operation: string): ConvexDB {
+    return this.#db.fenced(this.#runFenceCheck(fence, operation));
   }
 
   async init(): Promise<void> {
     // No-op for Convex; schema is managed server-side.
   }
 
+  async prune(policies: Record<string, TableRetentionPolicy>, options?: PruneOptions): Promise<PruneResult[]> {
+    const targets = resolveRetentionTargets({
+      policies,
+      descriptor: MemoryConvex.retentionTables,
+      order: ['runFences'],
+    });
+    return executeRetentionPrune({
+      domain: 'memory',
+      targets,
+      options,
+      cutoffFor: (target, now) => retentionCutoffMs(target.policy, now),
+      deleteBatch: (_target, cutoff, limit) =>
+        pruneRunClaims(this.#client, TABLE_MEMORY_RUN_FENCES, 'retiredAt', Number(cutoff), limit),
+    });
+  }
+
   async dangerouslyClearAll(): Promise<void> {
     await this.#db.clearTable({ tableName: TABLE_THREADS });
     await this.#db.clearTable({ tableName: TABLE_MESSAGES });
     await this.#db.clearTable({ tableName: TABLE_RESOURCES });
+    await this.#db.clearTable({ tableName: TABLE_OBSERVATIONAL_MEMORY });
+    await this.#db.clearTable({ tableName: TABLE_MEMORY_RUN_FENCES });
   }
 
   async getThreadById({
@@ -59,25 +290,18 @@ export class MemoryConvex extends MemoryStorage {
     threadId: string;
     resourceId?: string;
   }): Promise<StorageThreadType | null> {
-    const row = await this.#db.load<
-      (Omit<StorageThreadType, 'createdAt' | 'updatedAt'> & { createdAt: string; updatedAt: string }) | null
-    >({
+    const row = await this.#db.load<StoredThread | null>({
       tableName: TABLE_THREADS,
       keys: { id: threadId },
     });
 
     if (!row || (resourceId !== undefined && row.resourceId !== resourceId)) return null;
 
-    return {
-      ...row,
-      metadata: typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata,
-      createdAt: new Date(row.createdAt),
-      updatedAt: new Date(row.updatedAt),
-    };
+    return parseStoredThread(row);
   }
 
-  async saveThread({ thread }: { thread: StorageThreadType }): Promise<StorageThreadType> {
-    await this.#db.insert({
+  async saveThread({ thread, fence }: { thread: StorageThreadType; fence?: RunFence }): Promise<StorageThreadType> {
+    await this.#dbFor(fence, 'saveThread').insert({
       tableName: TABLE_THREADS,
       record: {
         ...thread,
@@ -91,13 +315,21 @@ export class MemoryConvex extends MemoryStorage {
     id,
     title,
     metadata,
+    fence,
   }: {
     id: string;
-    title: string;
-    metadata: Record<string, unknown>;
+    title?: string;
+    metadata?: Record<string, unknown>;
+    fence?: RunFence;
   }): Promise<StorageThreadType> {
-    const existing = await this.getThreadById({ threadId: id });
-    if (!existing) {
+    const updated = await this.#dbFor(fence, 'updateThread').updateThread({
+      id,
+      title,
+      metadata,
+      updatedAt: new Date(),
+    });
+
+    if (!updated) {
       throw new MastraError({
         id: createStorageErrorId('CONVEX', 'UPDATE_THREAD', 'THREAD_NOT_FOUND'),
         domain: ErrorDomain.STORAGE,
@@ -106,18 +338,7 @@ export class MemoryConvex extends MemoryStorage {
       });
     }
 
-    const updated: StorageThreadType = {
-      ...existing,
-      title,
-      metadata: {
-        ...existing.metadata,
-        ...metadata,
-      },
-      updatedAt: new Date(),
-    };
-
-    await this.saveThread({ thread: updated });
-    return updated;
+    return parseStoredThread(updated);
   }
 
   async deleteThread({ threadId }: { threadId: string }): Promise<void> {
@@ -152,6 +373,20 @@ export class MemoryConvex extends MemoryStorage {
 
     const perPage = normalizePerPage(perPageInput, 100);
 
+    try {
+      this.validateMetadataKeys(filter?.metadata);
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('CONVEX', 'LIST_THREADS', 'INVALID_METADATA_KEY'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.USER,
+          details: { metadataKeys: filter?.metadata ? Object.keys(filter.metadata).join(', ') : '' },
+        },
+        error instanceof Error ? error : new Error('Invalid metadata key'),
+      );
+    }
+
     const { field, direction } = this.parseOrderBy(orderBy);
     const { offset, perPage: perPageForResponse } = calculatePagination(page, perPageInput, perPage);
 
@@ -162,21 +397,14 @@ export class MemoryConvex extends MemoryStorage {
       queryFilters.push({ field: 'resourceId', value: filter.resourceId });
     }
 
-    const rows = await this.#db.queryTable<
-      Omit<StorageThreadType, 'createdAt' | 'updatedAt'> & { createdAt: string; updatedAt: string }
-    >(TABLE_THREADS, queryFilters);
+    const rows = await this.#db.queryTable<StoredThread>(TABLE_THREADS, queryFilters);
 
-    let threads = rows.map(row => ({
-      ...row,
-      metadata: typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata,
-      createdAt: new Date(row.createdAt),
-      updatedAt: new Date(row.updatedAt),
-    }));
+    let threads = rows.map(row => parseStoredThread(row));
 
     // Apply metadata filters if provided (AND logic)
     if (filter?.metadata && Object.keys(filter.metadata).length > 0) {
       threads = threads.filter(thread => {
-        if (!thread.metadata) return false;
+        if (!thread.metadata || typeof thread.metadata !== 'object' || Array.isArray(thread.metadata)) return false;
         return Object.entries(filter.metadata!).every(([key, value]) => thread.metadata![key] === value);
       });
     }
@@ -203,6 +431,7 @@ export class MemoryConvex extends MemoryStorage {
 
   async listMessages(args: StorageListMessagesInput): Promise<StorageListMessagesOutput> {
     const { threadId, resourceId, include, filter, perPage: perPageInput, page = 0, orderBy } = args;
+    const metadataFilter = validateStorageMetadataFilter(filter?.metadata);
 
     // Normalize threadId to array
     const threadIds = Array.isArray(threadId) ? threadId : [threadId];
@@ -230,7 +459,7 @@ export class MemoryConvex extends MemoryStorage {
 
     // When perPage is 0, we only need included messages — skip full thread load
     if (perPage === 0 && include && include.length > 0) {
-      const messages = await this._getIncludedMessages(include);
+      const messages = await this._getIncludedMessages(include, undefined, resourceId);
       const list = new MessageList().add(messages, 'memory');
       return {
         messages: this._sortMessages(list.get.all.db(), field, direction),
@@ -254,6 +483,7 @@ export class MemoryConvex extends MemoryStorage {
 
     // Apply date range filter
     rows = filterByDateRange(rows, row => new Date(row.createdAt), filter?.dateRange);
+    rows = rows.filter(row => storageMessageMatchesMetadataFilter(row.content, metadataFilter));
 
     rows.sort((a, b) => {
       const aValue =
@@ -283,7 +513,7 @@ export class MemoryConvex extends MemoryStorage {
       // dateRange filters are active, the rows are a subset and would cause
       // addContextMessages() to compute neighbors from a truncated snapshot.
       const preloadedThreads = new Map<string, StoredMessage[]>();
-      if (!resourceId && !filter?.dateRange) {
+      if (!resourceId && !filter?.dateRange && !metadataFilter) {
         for (const tid of threadIds) {
           preloadedThreads.set(
             tid,
@@ -292,7 +522,7 @@ export class MemoryConvex extends MemoryStorage {
         }
       }
 
-      const includedMessages = await this._getIncludedMessages(include, preloadedThreads);
+      const includedMessages = await this._getIncludedMessages(include, preloadedThreads, resourceId);
       for (const msg of includedMessages) {
         if (!messageIds.has(msg.id)) {
           messages.push(msg);
@@ -303,8 +533,9 @@ export class MemoryConvex extends MemoryStorage {
 
     messages = this._sortMessages(messages, field, direction);
 
-    const hasMore =
-      include && include.length > 0
+    const hasMore = metadataFilter
+      ? perPageInput !== false && offset + perPage < totalThreadMessages
+      : include && include.length > 0
         ? new Set(messages.filter(m => m.threadId === threadId).map(m => m.id)).size < totalThreadMessages
         : perPageInput === false
           ? false
@@ -319,18 +550,87 @@ export class MemoryConvex extends MemoryStorage {
     };
   }
 
+  async listMessagesByResourceId(args: StorageListMessagesByResourceIdInput): Promise<StorageListMessagesOutput> {
+    const { resourceId, filter, perPage: perPageInput, page = 0, orderBy } = args;
+    const metadataFilter = validateStorageMetadataFilter(filter?.metadata);
+    const { field, direction } = this.parseOrderBy(orderBy, 'ASC');
+
+    // Normalize perPage for query (false → MAX_SAFE_INTEGER, 0 → 0, undefined → 40)
+    const perPage = normalizePerPage(perPageInput, 40);
+
+    if (page < 0) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('CONVEX', 'LIST_MESSAGES_BY_RESOURCE_ID', 'INVALID_PAGE'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.USER,
+          details: { page },
+        },
+        new Error('page must be >= 0'),
+      );
+    }
+
+    // Prevent unreasonably large page values that could cause performance issues
+    const maxOffset = Number.MAX_SAFE_INTEGER / 2;
+    if (page * perPage > maxOffset) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('CONVEX', 'LIST_MESSAGES_BY_RESOURCE_ID', 'INVALID_PAGE'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.USER,
+          details: { page, perPage },
+        },
+        new Error('page value too large'),
+      );
+    }
+
+    const { offset, perPage: perPageForResponse } = calculatePagination(page, perPageInput, perPage);
+
+    // Get all messages for the resource across all threads (hits the by_resource index)
+    let rows = await this.#db.queryTable<StoredMessage>(TABLE_MESSAGES, [{ field: 'resourceId', value: resourceId }]);
+
+    // Apply date range filter
+    rows = filterByDateRange(rows, row => new Date(row.createdAt), filter?.dateRange);
+    rows = rows.filter(row => storageMessageMatchesMetadataFilter(row.content, metadataFilter));
+
+    rows = this._sortStoredMessages(rows, field, direction);
+
+    const total = rows.length;
+    const paginatedRows = rows.slice(offset, offset + perPage);
+
+    const list = new MessageList().add(
+      paginatedRows.map(row => this.parseStoredMessage(row)),
+      'memory',
+    );
+
+    return {
+      messages: list.get.all.db(),
+      total,
+      page,
+      perPage: perPageForResponse,
+      hasMore: offset + paginatedRows.length < total,
+    };
+  }
+
   async listMessagesById({ messageIds }: { messageIds: string[] }): Promise<{ messages: MastraDBMessage[] }> {
     if (messageIds.length === 0) {
       return { messages: [] };
     }
-    const rows = await this.#db.queryTable<StoredMessage>(TABLE_MESSAGES, undefined);
-    const filtered = rows.filter(row => messageIds.includes(row.id)).map(row => this.parseStoredMessage(row));
+    const rows = await this.#db.loadMany<StoredMessage>(TABLE_MESSAGES, messageIds);
+    const filtered = rows.map(row => this.parseStoredMessage(row));
     const list = new MessageList().add(filtered, 'memory');
     return { messages: list.get.all.db() };
   }
 
-  async saveMessages({ messages }: { messages: MastraDBMessage[] }): Promise<{ messages: MastraDBMessage[] }> {
+  async saveMessages({
+    messages,
+    fence,
+  }: {
+    messages: MastraDBMessage[];
+    fence?: RunFence;
+  }): Promise<{ messages: MastraDBMessage[] }> {
     if (messages.length === 0) return { messages: [] };
+    const db = this.#dbFor(fence, 'saveMessages');
 
     const normalized = messages.map(message => {
       if (!message.threadId) {
@@ -351,7 +651,7 @@ export class MemoryConvex extends MemoryStorage {
       };
     });
 
-    await this.#db.batchInsert({
+    await db.batchInsert({
       tableName: TABLE_MESSAGES,
       records: normalized,
     });
@@ -360,19 +660,11 @@ export class MemoryConvex extends MemoryStorage {
     const threadIds = [...new Set(messages.map(m => m.threadId).filter(Boolean) as string[])];
     const now = new Date();
     for (const threadId of threadIds) {
-      const thread = await this.getThreadById({ threadId });
-      if (thread) {
-        await this.#db.insert({
-          tableName: TABLE_THREADS,
-          record: {
-            ...thread,
-            id: thread.id,
-            updatedAt: now.toISOString(),
-            createdAt: thread.createdAt instanceof Date ? thread.createdAt.toISOString() : thread.createdAt,
-            metadata: thread.metadata ?? {},
-          },
-        });
-      }
+      await db.patch({
+        tableName: TABLE_THREADS,
+        id: threadId,
+        record: { updatedAt: now.toISOString() },
+      });
     }
 
     const list = new MessageList().add(messages, 'memory');
@@ -381,20 +673,28 @@ export class MemoryConvex extends MemoryStorage {
 
   async updateMessages({
     messages,
+    fence,
   }: {
     messages: (Partial<Omit<MastraDBMessage, 'createdAt'>> & {
       id: string;
       content?: { metadata?: MastraMessageContentV2['metadata']; content?: MastraMessageContentV2['content'] };
     })[];
+    fence?: RunFence;
   }): Promise<MastraDBMessage[]> {
     if (messages.length === 0) return [];
+    const check = this.#runFenceCheck(fence, 'updateMessages');
+    const db = this.#db.fenced(check);
 
-    const existing = await this.#db.queryTable<StoredMessage>(TABLE_MESSAGES, undefined);
+    const existingRows = await this.#db.loadMany<StoredMessage>(
+      TABLE_MESSAGES,
+      messages.map(message => message.id),
+    );
+    const existing = new Map(existingRows.map(row => [row.id, row]));
     const updated: MastraDBMessage[] = [];
     const affectedThreadIds = new Set<string>();
 
     for (const update of messages) {
-      const current = existing.find(row => row.id === update.id);
+      const current = existing.get(update.id);
       if (!current) continue;
 
       // Track old thread for timestamp update
@@ -426,36 +726,33 @@ export class MemoryConvex extends MemoryStorage {
         current.content = JSON.stringify(mergedContent);
       }
 
-      await this.#db.insert({
+      await db.insert({
         tableName: TABLE_MESSAGES,
         record: current,
       });
       updated.push(this.parseStoredMessage(current));
     }
 
+    if (updated.length === 0) {
+      await assertRunFence(this.#client, check);
+      return updated;
+    }
+
     // Update thread updatedAt timestamps for all affected threads
     const now = new Date();
     for (const threadId of affectedThreadIds) {
-      const thread = await this.getThreadById({ threadId });
-      if (thread) {
-        await this.#db.insert({
-          tableName: TABLE_THREADS,
-          record: {
-            ...thread,
-            id: thread.id,
-            updatedAt: now.toISOString(),
-            createdAt: thread.createdAt instanceof Date ? thread.createdAt.toISOString() : thread.createdAt,
-            metadata: thread.metadata ?? {},
-          },
-        });
-      }
+      await db.patch({
+        tableName: TABLE_THREADS,
+        id: threadId,
+        record: { updatedAt: now.toISOString() },
+      });
     }
 
     return updated;
   }
 
-  async deleteMessages(messageIds: string[]): Promise<void> {
-    await this.#db.deleteMany(TABLE_MESSAGES, messageIds);
+  async deleteMessages(messageIds: string[], options?: { fence?: RunFence }): Promise<void> {
+    await this.#dbFor(options?.fence, 'deleteMessages').deleteMany(TABLE_MESSAGES, messageIds);
   }
 
   async saveResource({ resource }: { resource: StorageResourceType }): Promise<StorageResourceType> {
@@ -476,56 +773,55 @@ export class MemoryConvex extends MemoryStorage {
   }
 
   async getResourceById({ resourceId }: { resourceId: string }): Promise<StorageResourceType | null> {
-    const record = await this.#db.load<
-      (Omit<StorageResourceType, 'createdAt' | 'updatedAt'> & { createdAt: string; updatedAt: string }) | null
-    >({
+    const record = await this.#db.load<StoredResource | null>({
       tableName: TABLE_RESOURCES,
       keys: { id: resourceId },
     });
     if (!record) return null;
 
-    return {
-      ...record,
-      metadata: typeof record.metadata === 'string' ? safelyParseJSON(record.metadata) : record.metadata,
-      createdAt: new Date(record.createdAt),
-      updatedAt: new Date(record.updatedAt),
-    };
+    return parseStoredResource(record);
   }
 
   async updateResource({
     resourceId,
     workingMemory,
     metadata,
+    fence,
   }: {
     resourceId: string;
     workingMemory?: string;
     metadata?: Record<string, unknown>;
+    fence?: RunFence;
   }): Promise<StorageResourceType> {
-    const existing = await this.getResourceById({ resourceId });
     const now = new Date();
-    if (!existing) {
-      const created: StorageResourceType = {
-        id: resourceId,
-        workingMemory,
-        metadata: metadata ?? {},
-        createdAt: now,
-        updatedAt: now,
-      };
-      return this.saveResource({ resource: created });
-    }
-
-    const updated: StorageResourceType = {
-      ...existing,
-      workingMemory: workingMemory ?? existing.workingMemory,
-      metadata: {
-        ...existing.metadata,
-        ...metadata,
-      },
+    const updated = await this.#dbFor(fence, 'updateResource').updateResource({
+      resourceId,
+      workingMemory,
+      metadata,
+      createdAt: now,
       updatedAt: now,
-    };
+    });
 
-    await this.saveResource({ resource: updated });
-    return updated;
+    return parseStoredResource(updated);
+  }
+
+  private _sortStoredMessages(rows: StoredMessage[], field: string, direction: string): StoredMessage[] {
+    return rows.sort((a, b) => {
+      const aValue =
+        field === 'createdAt' || field === 'updatedAt'
+          ? new Date((a as Record<string, any>)[field]).getTime()
+          : (a as Record<string, any>)[field];
+      const bValue =
+        field === 'createdAt' || field === 'updatedAt'
+          ? new Date((b as Record<string, any>)[field]).getTime()
+          : (b as Record<string, any>)[field];
+      if (typeof aValue === 'number' && typeof bValue === 'number') {
+        return direction === 'ASC' ? aValue - bValue : bValue - aValue;
+      }
+      return direction === 'ASC'
+        ? String(aValue).localeCompare(String(bValue))
+        : String(bValue).localeCompare(String(aValue));
+    });
   }
 
   private _sortMessages(messages: MastraDBMessage[], field: string, direction: string): MastraDBMessage[] {
@@ -543,11 +839,22 @@ export class MemoryConvex extends MemoryStorage {
     });
   }
 
+  /**
+   * Fetches the messages named by `include` together with their surrounding context.
+   *
+   * @param include - Message ids to pin, each with an optional before/after window.
+   * @param preloadedThreads - Thread snapshots already loaded by the caller, reused instead of re-querying.
+   * @param resourceId - When set, restricts both the pinned messages and their context
+   * to that resource so an id from another resource returns nothing.
+   */
   private async _getIncludedMessages(
     include: NonNullable<StorageListMessagesInput['include']>,
     preloadedThreads?: Map<string, StoredMessage[]>,
+    resourceId?: string,
   ): Promise<MastraDBMessage[]> {
     if (include.length === 0) return [];
+
+    const resourceFilters = resourceId ? [{ field: 'resourceId', value: resourceId }] : [];
 
     const messages: MastraDBMessage[] = [];
     const messageIds = new Set<string>();
@@ -574,6 +881,7 @@ export class MemoryConvex extends MemoryStorage {
       if (!target) {
         const messageRows = await this.#db.queryTable<StoredMessage>(TABLE_MESSAGES, [
           { field: 'id', value: includeItem.id },
+          ...resourceFilters,
         ]);
         if (messageRows.length > 0) {
           target = messageRows[0];
@@ -582,6 +890,7 @@ export class MemoryConvex extends MemoryStorage {
           if (targetThreadId && !threadMessagesCache.has(targetThreadId)) {
             const otherThreadRows = await this.#db.queryTable<StoredMessage>(TABLE_MESSAGES, [
               { field: 'thread_id', value: targetThreadId },
+              ...resourceFilters,
             ]);
             threadMessagesCache.set(targetThreadId, otherThreadRows);
             for (const row of otherThreadRows) {
@@ -665,5 +974,363 @@ export class MemoryConvex extends MemoryStorage {
         }
       }
     }
+  }
+
+  // ============================================
+  // Observational Memory Methods
+  // ============================================
+
+  private getOMKey(threadId: string | null, resourceId: string): string {
+    return threadId ? `thread:${threadId}` : `resource:${resourceId}`;
+  }
+
+  private omRecordNotFound(operation: string, id: string): MastraError {
+    return new MastraError({
+      id: createStorageErrorId('CONVEX', operation, 'NOT_FOUND'),
+      text: `Observational memory record not found: ${id}`,
+      domain: ErrorDomain.STORAGE,
+      category: ErrorCategory.THIRD_PARTY,
+      details: { id },
+    });
+  }
+
+  async getObservationalMemory(threadId: string | null, resourceId: string): Promise<ObservationalMemoryRecord | null> {
+    const lookupKey = this.getOMKey(threadId, resourceId);
+    const doc = await this.#db.omGetLatest<StoredOMRecord>(lookupKey);
+    return doc ? parseStoredOMRecord(doc) : null;
+  }
+
+  async getObservationalMemoryHistory(
+    threadId: string | null,
+    resourceId: string,
+    limit: number = 10,
+    options?: ObservationalMemoryHistoryOptions,
+  ): Promise<ObservationalMemoryRecord[]> {
+    const lookupKey = this.getOMKey(threadId, resourceId);
+    const docs = await this.#db.omGetHistory<StoredOMRecord>({
+      lookupKey,
+      limit,
+      from: options?.from ? options.from.toISOString() : undefined,
+      to: options?.to ? options.to.toISOString() : undefined,
+      offset: options?.offset ?? undefined,
+      groupId: options?.groupId,
+      recordId: options?.recordId,
+      beforeGeneration: options?.beforeGeneration,
+      afterGeneration: options?.afterGeneration,
+      sortDirection: options?.sortDirection,
+    });
+    return docs.map(doc => parseStoredOMRecord(doc));
+  }
+
+  async initializeObservationalMemory(input: CreateObservationalMemoryInput): Promise<ObservationalMemoryRecord> {
+    const now = new Date();
+    const lookupKey = this.getOMKey(input.threadId, input.resourceId);
+    // Never reused: a write addressed to a cleared record must not land on its successor. The
+    // server inserts the record only when the key has no live record, else returns that one.
+    const id = crypto.randomUUID();
+
+    const record: ObservationalMemoryRecord = {
+      id,
+      scope: input.scope,
+      threadId: input.threadId,
+      resourceId: input.resourceId,
+      createdAt: now,
+      updatedAt: now,
+      // lastObservedAt starts undefined - all messages are "unobserved" initially
+      lastObservedAt: undefined,
+      originType: 'initial',
+      generationCount: 0,
+      activeObservations: '',
+      totalTokensObserved: 0,
+      observationTokenCount: 0,
+      pendingMessageTokens: 0,
+      isReflecting: false,
+      isObserving: false,
+      isBufferingObservation: false,
+      isBufferingReflection: false,
+      lastBufferedAtTokens: 0,
+      lastBufferedAtTime: null,
+      config: input.config,
+      observedTimezone: input.observedTimezone,
+      supersededBy: null,
+    };
+
+    const doc = await this.#db.omInitialize<StoredOMRecord>({
+      id,
+      lookupKey,
+      scope: input.scope,
+      resourceId: input.resourceId,
+      threadId: input.threadId || null,
+      activeObservations: '',
+      activeObservationsPendingUpdate: null,
+      originType: 'initial',
+      config: JSON.stringify(input.config ?? {}),
+      generationCount: 0,
+      lastObservedAt: null,
+      lastReflectionAt: null,
+      pendingMessageTokens: 0,
+      totalTokensObserved: 0,
+      observationTokenCount: 0,
+      isObserving: false,
+      isReflecting: false,
+      isBufferingObservation: false,
+      isBufferingReflection: false,
+      lastBufferedAtTokens: 0,
+      lastBufferedAtTime: null,
+      observedTimezone: input.observedTimezone || null,
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+    });
+
+    return doc ? parseStoredOMRecord(doc) : record;
+  }
+
+  async insertObservationalMemoryRecord(record: ObservationalMemoryRecord): Promise<void> {
+    const lookupKey = this.getOMKey(record.threadId, record.resourceId);
+    await this.#db.insert({
+      tableName: TABLE_OBSERVATIONAL_MEMORY,
+      record: {
+        id: record.id,
+        lookupKey,
+        scope: record.scope,
+        resourceId: record.resourceId,
+        threadId: record.threadId || null,
+        activeObservations: record.activeObservations || '',
+        activeObservationsPendingUpdate: null,
+        originType: record.originType || 'initial',
+        config: JSON.stringify(record.config ?? {}),
+        generationCount: record.generationCount || 0,
+        lastObservedAt: record.lastObservedAt ? toISO(record.lastObservedAt) : null,
+        lastReflectionAt: null,
+        pendingMessageTokens: record.pendingMessageTokens || 0,
+        totalTokensObserved: record.totalTokensObserved || 0,
+        observationTokenCount: record.observationTokenCount || 0,
+        observedMessageIds: record.observedMessageIds || null,
+        bufferedObservationChunks: JSON.stringify(
+          (Array.isArray(record.bufferedObservationChunks) ? record.bufferedObservationChunks : []).map(chunk =>
+            serializeOMChunk(chunk),
+          ),
+        ),
+        bufferedReflection: record.bufferedReflection || null,
+        bufferedReflectionTokens: record.bufferedReflectionTokens ?? null,
+        bufferedReflectionInputTokens: record.bufferedReflectionInputTokens ?? null,
+        reflectedObservationLineCount: record.reflectedObservationLineCount ?? null,
+        isObserving: record.isObserving || false,
+        isReflecting: record.isReflecting || false,
+        isBufferingObservation: record.isBufferingObservation || false,
+        isBufferingReflection: record.isBufferingReflection || false,
+        lastBufferedAtTokens: record.lastBufferedAtTokens || 0,
+        lastBufferedAtTime: record.lastBufferedAtTime ? toISO(record.lastBufferedAtTime) : null,
+        observedTimezone: record.observedTimezone || null,
+        metadata: record.metadata ? JSON.stringify(record.metadata) : null,
+        supersededBy: record.supersededBy ?? null,
+        createdAt: toISO(record.createdAt),
+        updatedAt: toISO(record.updatedAt),
+      },
+    });
+  }
+
+  async updateActiveObservations(input: UpdateActiveObservationsInput): Promise<void> {
+    assertActiveObservationsApplied(await this.commitActiveObservations(input), input.id);
+  }
+
+  async commitActiveObservations(input: UpdateActiveObservationsInput): Promise<UpdateActiveObservationsResult> {
+    // A server deployed before commit results existed returns nothing for a completed write.
+    const result = await this.#dbFor(undefined, 'commitActiveObservations').omUpdateActive<
+      UpdateActiveObservationsResult | undefined
+    >({
+      id: input.id,
+      observations: input.observations,
+      tokenCount: input.tokenCount,
+      lastObservedAt: toISO(input.lastObservedAt),
+      observedMessageIds: input.observedMessageIds ?? null,
+      updatedAt: new Date().toISOString(),
+      ...(input.expectedActiveObservations !== undefined
+        ? { expectedActiveObservations: input.expectedActiveObservations }
+        : {}),
+    });
+    return result ?? { applied: true };
+  }
+
+  async updateBufferedObservations(input: UpdateBufferedObservationsInput): Promise<void> {
+    await this.appendBufferedObservations(input);
+  }
+
+  async appendBufferedObservations(input: UpdateBufferedObservationsInput): Promise<UpdateBufferedObservationsResult> {
+    const chunk: SerializedOMChunk = {
+      id: `ombuf-${crypto.randomUUID()}`,
+      cycleId: input.chunk.cycleId,
+      observations: input.chunk.observations,
+      tokenCount: input.chunk.tokenCount,
+      messageIds: input.chunk.messageIds,
+      messageTokens: input.chunk.messageTokens,
+      lastObservedAt: toISO(input.chunk.lastObservedAt),
+      createdAt: new Date().toISOString(),
+      suggestedContinuation: input.chunk.suggestedContinuation,
+      currentTask: input.chunk.currentTask,
+      threadTitle: input.chunk.threadTitle,
+      extractedValues: input.chunk.extractedValues,
+      extractionFailures: input.chunk.extractionFailures,
+    };
+
+    const result = await this.#dbFor(undefined, 'appendBufferedObservations').omAppendBufferedChunk<
+      UpdateBufferedObservationsResult | undefined
+    >({
+      id: input.id,
+      chunk,
+      lastBufferedAtTime: input.lastBufferedAtTime ? toISO(input.lastBufferedAtTime) : undefined,
+      updatedAt: new Date().toISOString(),
+    });
+    return result ?? { persisted: true, recordId: input.id };
+  }
+
+  async swapBufferedToActive(input: SwapBufferedToActiveInput): Promise<SwapBufferedToActiveResult> {
+    return this.#dbFor(undefined, 'swapBufferedToActive').omSwapBuffered<SwapBufferedToActiveResult>({
+      id: input.id,
+      activationRatio: input.activationRatio,
+      messageTokensThreshold: input.messageTokensThreshold,
+      currentPendingTokens: input.currentPendingTokens,
+      forceMaxActivation: input.forceMaxActivation,
+      lastObservedAt: input.lastObservedAt ? toISO(input.lastObservedAt) : undefined,
+      bufferedChunks: Array.isArray(input.bufferedChunks)
+        ? input.bufferedChunks.map(chunk => serializeOMChunk(chunk))
+        : undefined,
+      now: new Date().toISOString(),
+    });
+  }
+
+  /** The caller's snapshot as the server's rollover ops expect it. */
+  #serializeCurrentRecord(currentRecord: ObservationalMemoryRecord): SerializedOMCurrentRecord {
+    return {
+      id: currentRecord.id,
+      lookupKey: this.getOMKey(currentRecord.threadId, currentRecord.resourceId),
+      scope: currentRecord.scope,
+      threadId: currentRecord.threadId || null,
+      resourceId: currentRecord.resourceId,
+      config: JSON.stringify(currentRecord.config ?? {}),
+      metadata: currentRecord.metadata ? JSON.stringify(currentRecord.metadata) : null,
+      observedTimezone: currentRecord.observedTimezone || null,
+      lastObservedAt: currentRecord.lastObservedAt ? toISO(currentRecord.lastObservedAt) : null,
+      totalTokensObserved: currentRecord.totalTokensObserved,
+      generationCount: currentRecord.generationCount,
+      activeObservations: currentRecord.activeObservations ?? '',
+      observationTokenCount: currentRecord.observationTokenCount ?? 0,
+    };
+  }
+
+  async createReflectionGeneration(input: CreateReflectionGenerationInput): Promise<ObservationalMemoryRecord> {
+    // The server builds the next generation from the stored record and retires it in one mutation.
+    const doc = await this.#dbFor(undefined, 'createReflectionGeneration').omCreateReflectionGeneration<StoredOMRecord>(
+      {
+        currentRecord: this.#serializeCurrentRecord(input.currentRecord),
+        newId: input.newRecordId ?? crypto.randomUUID(),
+        reflection: input.reflection,
+        tokenCount: input.tokenCount,
+        now: new Date().toISOString(),
+      },
+    );
+    // No stored record: nothing was created.
+    return doc ? parseStoredOMRecord(doc) : input.currentRecord;
+  }
+
+  async updateBufferedReflection(input: UpdateBufferedReflectionInput): Promise<void> {
+    await this.#dbFor(undefined, 'updateBufferedReflection').omUpdateBufferedReflection({
+      id: input.id,
+      reflection: input.reflection,
+      tokenCount: input.tokenCount,
+      inputTokenCount: input.inputTokenCount,
+      reflectedObservationLineCount: input.reflectedObservationLineCount,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  async swapBufferedReflectionToActive(input: SwapBufferedReflectionToActiveInput): Promise<ObservationalMemoryRecord> {
+    const doc = await this.#dbFor(undefined, 'swapBufferedReflectionToActive').omSwapBufferedReflection<StoredOMRecord>(
+      {
+        currentRecord: this.#serializeCurrentRecord(input.currentRecord),
+        newId: input.newRecordId ?? crypto.randomUUID(),
+        tokenCount: input.tokenCount,
+        now: new Date().toISOString(),
+      },
+    );
+    // No stored record: nothing was created.
+    return doc ? parseStoredOMRecord(doc) : input.currentRecord;
+  }
+
+  async setReflectingFlag(id: string, isReflecting: boolean): Promise<void> {
+    const found = await this.#db.patch({
+      tableName: TABLE_OBSERVATIONAL_MEMORY,
+      id,
+      record: { isReflecting, updatedAt: new Date() },
+    });
+    if (!found) {
+      throw this.omRecordNotFound('SET_REFLECTING_FLAG', id);
+    }
+  }
+
+  async setObservingFlag(id: string, isObserving: boolean): Promise<void> {
+    const found = await this.#db.patch({
+      tableName: TABLE_OBSERVATIONAL_MEMORY,
+      id,
+      record: { isObserving, updatedAt: new Date() },
+    });
+    if (!found) {
+      throw this.omRecordNotFound('SET_OBSERVING_FLAG', id);
+    }
+  }
+
+  async setBufferingObservationFlag(id: string, isBuffering: boolean, lastBufferedAtTokens?: number): Promise<void> {
+    // The server redirects a retired id to the head.
+    await this.#db.omSetBufferingObservationFlag({
+      id,
+      isBuffering,
+      ...(lastBufferedAtTokens !== undefined ? { lastBufferedAtTokens } : {}),
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  async setBufferingReflectionFlag(id: string, isBuffering: boolean): Promise<void> {
+    const found = await this.#db.patch({
+      tableName: TABLE_OBSERVATIONAL_MEMORY,
+      id,
+      record: { isBufferingReflection: isBuffering, updatedAt: new Date() },
+    });
+    if (!found) {
+      throw this.omRecordNotFound('SET_BUFFERING_REFLECTION_FLAG', id);
+    }
+  }
+
+  async setPendingMessageTokens(id: string, tokenCount: number): Promise<void> {
+    if (typeof tokenCount !== 'number' || !Number.isFinite(tokenCount) || tokenCount < 0) {
+      throw new MastraError({
+        id: createStorageErrorId('CONVEX', 'SET_PENDING_MESSAGE_TOKENS', 'INVALID_INPUT'),
+        text: `Invalid tokenCount: must be a finite non-negative number, got ${tokenCount}`,
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.USER,
+        details: { id, tokenCount },
+      });
+    }
+
+    // The server redirects a retired id to the head.
+    await this.#db.omSetPendingMessageTokens({ id, tokenCount, updatedAt: new Date().toISOString() });
+  }
+
+  async clearObservationalMemory(threadId: string | null, resourceId: string): Promise<void> {
+    const lookupKey = this.getOMKey(threadId, resourceId);
+    const docs = await this.#db.queryTable<StoredOMRecord>(TABLE_OBSERVATIONAL_MEMORY, [
+      { field: 'lookupKey', value: lookupKey },
+    ]);
+    await this.#db.deleteMany(
+      TABLE_OBSERVATIONAL_MEMORY,
+      docs.map(doc => doc.id),
+    );
+  }
+
+  async updateObservationalMemoryConfig(input: UpdateObservationalMemoryConfigInput): Promise<void> {
+    await this.#db.omUpdateConfig({
+      id: input.id,
+      config: JSON.stringify(input.config ?? {}),
+      updatedAt: new Date().toISOString(),
+    });
   }
 }

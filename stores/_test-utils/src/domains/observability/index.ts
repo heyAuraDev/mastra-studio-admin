@@ -1,11 +1,27 @@
 import { MastraStorage, TraceStatus } from '@mastra/core/storage';
 import type { ObservabilityStorage, SpanRecord, TraceSpan } from '@mastra/core/storage';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { createSpan, createChildSpan, SpanType, EntityType, DEFAULT_BASE_DATE } from './data';
+import { createSpan, createChildSpan, createFeedbackRecord, SpanType, EntityType, DEFAULT_BASE_DATE } from './data';
 
-export function createObservabilityTests({ storage }: { storage: MastraStorage }) {
+export function createObservabilityTests({
+  storage,
+  capabilities = {},
+}: {
+  storage: MastraStorage;
+  capabilities?: { scopedTraceDeletion?: boolean };
+}) {
   // Skip tests if storage doesn't have observability domain
   const describeObservability = storage.stores?.observability ? describe : describe.skip;
+
+  // Adapters on the `insert-only` or `event-sourced` tracing strategies cannot
+  // satisfy updateSpan / batchUpdateSpans by contract — spans are persisted as
+  // immutable rows and a change is a new row, not an edit. Skip those describe
+  // blocks so the rest of the suite still runs.
+  const strategy = storage.stores?.observability?.runtimeTracingStrategy;
+  const describeUpdate = strategy === 'insert-only' || strategy === 'event-sourced' ? describe.skip : describe;
+  // batchUpdateUnendedSpans is optional; run its contract only for adapters that implement it.
+  const describeUnendedUpdate =
+    typeof storage.stores?.observability?.batchUpdateUnendedSpans === 'function' ? describeUpdate : describe.skip;
 
   let observabilityStorage: ObservabilityStorage;
 
@@ -417,7 +433,7 @@ export function createObservabilityTests({ storage }: { storage: MastraStorage }
       });
     });
 
-    describe('updateSpan', () => {
+    describeUpdate('updateSpan', () => {
       it('should update span fields', async () => {
         const span = createSpan({ traceId: 'trace-1', spanId: 'span-1' });
         await observabilityStorage.createSpan({ span });
@@ -475,7 +491,7 @@ export function createObservabilityTests({ storage }: { storage: MastraStorage }
       });
     });
 
-    describe('batchUpdateSpans', () => {
+    describeUpdate('batchUpdateSpans', () => {
       it('should update multiple spans in batch', async () => {
         await observabilityStorage.batchCreateSpans({
           records: [
@@ -520,6 +536,53 @@ export function createObservabilityTests({ storage }: { storage: MastraStorage }
       });
     });
 
+    // Issue #27479: a recovering process ends spans another process started, without
+    // reading them first. Only rows that exist and haven't ended may change.
+    describeUnendedUpdate('batchUpdateUnendedSpans', () => {
+      it('ends a running span and reports it as updated', async () => {
+        await observabilityStorage.batchCreateSpans({
+          records: [createSpan({ traceId: 'trace-1', spanId: 'span-1', endedAt: null })],
+        });
+        const endedAt = new Date(DEFAULT_BASE_DATE.getTime() + 5000);
+
+        const result = await observabilityStorage.batchUpdateUnendedSpans!({
+          records: [{ traceId: 'trace-1', spanId: 'span-1', updates: { endedAt, output: { status: 'interrupted' } } }],
+        });
+
+        expect(result.updated).toEqual([{ traceId: 'trace-1', spanId: 'span-1' }]);
+        const stored = await observabilityStorage.getSpan({ traceId: 'trace-1', spanId: 'span-1' });
+        expect(stored?.span.endedAt?.getTime()).toBe(endedAt.getTime());
+        expect(stored?.span.output).toEqual({ status: 'interrupted' });
+      });
+
+      it('leaves ended spans unchanged and skips spans that were never stored', async () => {
+        const originalEnd = new Date(DEFAULT_BASE_DATE.getTime() + 1000);
+        await observabilityStorage.batchCreateSpans({
+          records: [
+            createSpan({ traceId: 'trace-1', spanId: 'ended', endedAt: originalEnd, output: 'original' }),
+            createSpan({ traceId: 'trace-1', spanId: 'running', endedAt: null }),
+          ],
+        });
+        const endedAt = new Date(DEFAULT_BASE_DATE.getTime() + 5000);
+
+        const result = await observabilityStorage.batchUpdateUnendedSpans!({
+          records: [
+            { traceId: 'trace-1', spanId: 'ended', updates: { endedAt, output: 'second end' } },
+            { traceId: 'trace-1', spanId: 'missing', updates: { endedAt, output: 'second end' } },
+            { traceId: 'trace-1', spanId: 'running', updates: { endedAt, output: 'done' } },
+          ],
+        });
+
+        expect(result.updated).toEqual([{ traceId: 'trace-1', spanId: 'running' }]);
+        const ended = await observabilityStorage.getSpan({ traceId: 'trace-1', spanId: 'ended' });
+        expect(ended?.span.output).toBe('original');
+        expect(ended?.span.endedAt?.getTime()).toBe(originalEnd.getTime());
+        expect(await observabilityStorage.getSpan({ traceId: 'trace-1', spanId: 'missing' })).toBeNull();
+        const running = await observabilityStorage.getSpan({ traceId: 'trace-1', spanId: 'running' });
+        expect(running?.span.output).toBe('done');
+      });
+    });
+
     describe('batchDeleteTraces', () => {
       it('should delete traces and all their spans', async () => {
         await observabilityStorage.batchCreateSpans({
@@ -540,6 +603,19 @@ export function createObservabilityTests({ storage }: { storage: MastraStorage }
 
       it('should handle deleting non-existent traces gracefully', async () => {
         await expect(observabilityStorage.batchDeleteTraces({ traceIds: ['non-existent'] })).resolves.not.toThrow();
+      });
+
+      // Adapters without tenant columns must reject scoped deletes instead of
+      // silently performing an unscoped (cross-tenant-hazard) delete.
+      const itScoped = capabilities.scopedTraceDeletion ? it.skip : it;
+      itScoped('should reject tenant-scoped deletion when scope is not supported', async () => {
+        await expect(
+          observabilityStorage.batchDeleteTraces({ traceIds: ['trace-1'], organizationId: 'org-1' }),
+        ).rejects.toThrow(/tenant-scoped trace deletion/);
+
+        await expect(
+          observabilityStorage.batchDeleteTraces({ traceIds: ['trace-1'], resourceId: 'res-1' }),
+        ).rejects.toThrow(/tenant-scoped trace deletion/);
       });
     });
 
@@ -1305,8 +1381,46 @@ export function createObservabilityTests({ storage }: { storage: MastraStorage }
         });
       });
     });
+
+    describe('batchCreateFeedback', () => {
+      // Some legacy observability adapters do not implement the feedback
+      // surface yet. Detect at runtime via a tiny insert and skip the whole
+      // suite when the method throws "not implemented". Any OTHER error is
+      // re-thrown so real regressions surface — silencing them here would
+      // hide actual bugs behind a green test.
+      let feedbackSupported = false;
+      beforeAll(async () => {
+        try {
+          await observabilityStorage.batchCreateFeedback({ feedbacks: [] });
+          feedbackSupported = true;
+        } catch (error) {
+          const id = (error as { id?: string } | undefined)?.id;
+          const msg = (error as { message?: string } | undefined)?.message ?? '';
+          const isNotImplemented =
+            (typeof id === 'string' && id.includes('NOT_IMPLEMENTED')) || /not implemented/i.test(msg);
+          if (!isNotImplemented) throw error;
+          feedbackSupported = false;
+        }
+      });
+
+      it('stores userId (app user) and feedbackUserId (evaluator) as distinct fields', async () => {
+        if (!feedbackSupported) return;
+
+        const feedback = createFeedbackRecord({
+          feedbackId: `feedback-distinct-users-${Date.now()}`,
+          userId: 'app-user-123',
+          feedbackUserId: 'evaluator-456',
+        });
+        await observabilityStorage.batchCreateFeedback({ feedbacks: [feedback] });
+
+        const result = await observabilityStorage.listFeedback({});
+        expect(result.feedback).toHaveLength(1);
+        expect(result.feedback[0]!.userId).toBe('app-user-123');
+        expect(result.feedback[0]!.feedbackUserId).toBe('evaluator-456');
+      });
+    });
   });
 }
 
 // Re-export data helpers for use in tests
-export { createSpan, createRootSpan, createChildSpan, DEFAULT_BASE_DATE } from './data';
+export { createSpan, createRootSpan, createChildSpan, createFeedbackRecord, DEFAULT_BASE_DATE } from './data';

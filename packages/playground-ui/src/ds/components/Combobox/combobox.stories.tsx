@@ -1,6 +1,14 @@
 import type { Meta, StoryObj } from '@storybook/react-vite';
-import { Fragment } from 'react';
+import { Fragment, useState } from 'react';
+import { Field, FieldError, FieldLabel } from '../Field';
 import { Combobox } from './combobox';
+import { IconBranch } from '@/ds/icons/central/IconBranch';
+import { IconChart6 } from '@/ds/icons/central/IconChart6';
+import { IconChecklist } from '@/ds/icons/central/IconChecklist';
+import { IconElectrocardiogram } from '@/ds/icons/central/IconElectrocardiogram';
+import { IconGauge } from '@/ds/icons/central/IconGauge';
+import { IconScript } from '@/ds/icons/central/IconScript';
+import { IconServer1 } from '@/ds/icons/central/IconServer1';
 
 const meta: Meta<typeof Combobox> = {
   title: 'Composite/Combobox',
@@ -16,11 +24,24 @@ const meta: Meta<typeof Combobox> = {
       control: { type: 'select' },
       options: ['default', 'ghost'],
     },
+    showChevron: {
+      control: { type: 'boolean' },
+    },
+    iconOnlyValue: {
+      control: { type: 'boolean' },
+    },
+    popupWidth: {
+      control: { type: 'select' },
+      options: [undefined, 'sm', 'md', 'lg', 'xl'],
+    },
   },
 };
 
 export default meta;
 type Story = StoryObj<typeof Combobox>;
+
+const iconClassName = 'h-4 w-4 shrink-0 text-muted-foreground';
+const badgeClassName = 'rounded-full border border-border px-2 py-0.5 text-meta text-muted-foreground';
 
 const frameworkOptions = [
   { label: 'React', value: 'react' },
@@ -40,19 +61,86 @@ const modelOptions = [
   { label: 'Claude 3 Haiku', value: 'claude-3-haiku' },
 ];
 
+const capabilityOptions = [
+  {
+    label: 'Logs',
+    value: 'logs',
+    description: 'Inspect application output',
+    start: <IconScript className={iconClassName} />,
+    end: <span className={badgeClassName}>Live</span>,
+  },
+  {
+    label: 'Traces',
+    value: 'traces',
+    description: 'Follow request spans',
+    start: <IconBranch className={iconClassName} />,
+    end: <span className={badgeClassName}>8 services</span>,
+  },
+  {
+    label: 'Metrics',
+    value: 'metrics',
+    description: 'Monitor service health',
+    start: <IconGauge className={iconClassName} />,
+    end: <span className={badgeClassName}>42 charts</span>,
+  },
+  {
+    label: 'Datasets',
+    value: 'datasets',
+    description: 'Review evaluation data',
+    start: <IconServer1 className={iconClassName} />,
+    end: <span className={badgeClassName}>12 sets</span>,
+  },
+  {
+    label: 'Workflows',
+    value: 'workflows',
+    description: 'Run multi-step processes',
+    start: <IconChecklist className={iconClassName} />,
+    end: <span className={badgeClassName}>6 active</span>,
+  },
+  {
+    label: 'Scorers',
+    value: 'scorers',
+    description: 'Evaluate generated output',
+    start: <IconChart6 className={iconClassName} />,
+    end: <span className={badgeClassName}>Quality</span>,
+  },
+  {
+    label: 'Signals',
+    value: 'signals',
+    description: 'Watch runtime activity',
+    start: <IconElectrocardiogram className={iconClassName} />,
+    end: <span className={badgeClassName}>Beta</span>,
+  },
+];
+
 export const Default: Story = {
   args: {
     options: frameworkOptions,
-    placeholder: 'Select a framework...',
+    placeholder: 'Select a framework',
     className: 'w-[200px]',
   },
+};
+
+export const WithError: Story = {
+  args: {
+    options: frameworkOptions,
+    placeholder: 'Select a framework',
+    className: 'w-[200px]',
+  },
+  render: args => (
+    <Field invalid className="w-50">
+      <FieldLabel>Framework</FieldLabel>
+      <Combobox {...args} />
+      <FieldError>Choose a framework.</FieldError>
+    </Field>
+  ),
 };
 
 export const WithValue: Story = {
   args: {
     options: frameworkOptions,
     value: 'react',
-    placeholder: 'Select a framework...',
+    placeholder: 'Select a framework',
     className: 'w-[200px]',
   },
 };
@@ -60,16 +148,34 @@ export const WithValue: Story = {
 export const ModelSelector: Story = {
   args: {
     options: modelOptions,
-    placeholder: 'Select a model...',
-    searchPlaceholder: 'Search models...',
+    placeholder: 'Select a model',
+    searchPlaceholder: 'Search models',
     className: 'w-[220px]',
+  },
+};
+
+/** `popupWidth` gives a compact trigger a wider, fixed popup; labels past it wrap and clamp at two lines. */
+export const PopupWidth: Story = {
+  args: {
+    options: [
+      'moonshotai/kimi-k2',
+      'moonshotai/kimi-k2-0905',
+      'moonshotai/kimi-k2-thinking',
+      'moonshotai/kimi-k3.1-pro',
+      'cognitivecomputations/dolphin-mistral-24b-venice-edition',
+    ].map(id => ({ label: id, value: id })),
+    placeholder: 'Select model',
+    searchPlaceholder: 'Search models',
+    variant: 'ghost',
+    popupWidth: 'lg',
+    className: 'w-auto max-w-40',
   },
 };
 
 export const Disabled: Story = {
   args: {
     options: frameworkOptions,
-    placeholder: 'Select a framework...',
+    placeholder: 'Select a framework',
     disabled: true,
     className: 'w-[200px]',
   },
@@ -78,30 +184,54 @@ export const Disabled: Story = {
 export const CustomEmptyText: Story = {
   args: {
     options: [],
-    placeholder: 'Select an option...',
+    placeholder: 'Select an option',
     emptyText: 'No options available',
     className: 'w-[200px]',
   },
 };
 
 export const ManyOptions: Story = {
+  parameters: {
+    docs: {
+      description: {
+        story:
+          'Long lists scroll inside `ScrollArea`: an overlay scrollbar, fades at the clipped edges, and scroll padding that keeps the keyboard-highlighted row clear of the fade.',
+      },
+    },
+  },
+  args: {
+    options: Array.from({ length: 40 }, (_, index) => ({ label: `Option ${index + 1}`, value: `${index + 1}` })),
+    placeholder: 'Select an option',
+    className: 'w-[200px]',
+  },
+};
+
+export const IconOnlyValue: Story = {
   args: {
     options: [
-      { label: 'Option 1', value: '1' },
-      { label: 'Option 2', value: '2' },
-      { label: 'Option 3', value: '3' },
-      { label: 'Option 4', value: '4' },
-      { label: 'Option 5', value: '5' },
-      { label: 'Option 6', value: '6' },
-      { label: 'Option 7', value: '7' },
-      { label: 'Option 8', value: '8' },
-      { label: 'Option 9', value: '9' },
-      { label: 'Option 10', value: '10' },
-      { label: 'Option 11', value: '11' },
-      { label: 'Option 12', value: '12' },
+      {
+        label: 'Database',
+        value: 'database',
+        start: <IconServer1 className={iconClassName} />,
+        displayLabel: <span className="sr-only">Database</span>,
+      },
+      {
+        label: 'Metrics',
+        value: 'metrics',
+        start: <IconGauge className={iconClassName} />,
+        displayLabel: <span className="sr-only">Metrics</span>,
+      },
+      {
+        label: 'Branches',
+        value: 'branches',
+        start: <IconBranch className={iconClassName} />,
+        displayLabel: <span className="sr-only">Branches</span>,
+      },
     ],
-    placeholder: 'Select an option...',
-    className: 'w-[200px]',
+    value: 'database',
+    'aria-label': 'Source',
+    showChevron: false,
+    iconOnlyValue: true,
   },
 };
 
@@ -110,7 +240,7 @@ export const Variants: Story = {
     <div className="flex flex-col gap-3">
       {(['default', 'ghost'] as const).map(variant => (
         <Fragment key={variant}>
-          <Combobox variant={variant} options={frameworkOptions} placeholder={variant} className="w-[200px]" />
+          <Combobox variant={variant} options={frameworkOptions} placeholder={variant} className="w-50" />
         </Fragment>
       ))}
     </div>
@@ -126,7 +256,7 @@ export const WithDescriptions: Story = {
       { label: 'Claude 3 Opus', value: 'claude-3-opus', description: "Anthropic's most powerful" },
     ],
     value: 'gpt-4-turbo',
-    placeholder: 'Select a model...',
+    placeholder: 'Select a model',
     className: 'w-[280px]',
   },
 };
@@ -134,11 +264,65 @@ export const WithDescriptions: Story = {
 export const Sizes: Story = {
   render: () => (
     <div className="flex flex-col gap-3">
-      {(['default', 'md', 'sm'] as const).map(size => (
+      {(['sm', 'md', 'lg'] as const).map(size => (
         <Fragment key={size}>
-          <Combobox size={size} options={frameworkOptions} placeholder={size} className="w-[200px]" />
+          <Combobox size={size} options={frameworkOptions} placeholder={size} className="w-50" />
         </Fragment>
       ))}
+    </div>
+  ),
+};
+
+export const Multiple: Story = {
+  render: function MultipleStory() {
+    const [value, setValue] = useState<string[]>(['logs', 'traces', 'metrics']);
+    const selectedCapabilities = capabilityOptions.filter(option => value.includes(option.value));
+
+    return (
+      <div className="flex w-90 flex-col gap-3">
+        <Combobox
+          multiple
+          options={capabilityOptions}
+          value={value}
+          onValueChange={setValue}
+          placeholder="Select capabilities"
+          searchPlaceholder="Search capabilities"
+          emptyText="No capabilities found."
+          className="w-full"
+        />
+        <div className="flex flex-wrap gap-1.5">
+          {selectedCapabilities.map(option => (
+            <span
+              key={option.value}
+              className="rounded-full border border-border bg-card px-2.5 py-1 text-meta text-muted-foreground"
+            >
+              {option.label}
+            </span>
+          ))}
+        </div>
+      </div>
+    );
+  },
+};
+
+/** Selected, described and multi items side by side, to compare against the menu components. */
+export const KitchenSink: Story = {
+  render: () => (
+    <div className="flex w-56 flex-col gap-4">
+      <Combobox
+        placeholder="Single"
+        value="react"
+        options={[
+          { label: 'Plain item', value: 'plain' },
+          { label: 'React', value: 'react' },
+          {
+            label: 'With description',
+            value: 'described',
+            description: 'A second line under the label',
+          },
+        ]}
+      />
+      <Combobox multiple placeholder="Multiple" value={['react', 'vue']} options={frameworkOptions} />
     </div>
   ),
 };

@@ -1,7 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import { z } from 'zod/v4';
 
+import { resolveBackgroundConfig } from '../background-tasks/resolve-config';
 import { RequestContext } from '../request-context';
+import { makeCoreTool } from '../utils';
 import { createTool, Tool } from './tool';
 
 const mockFindUser = vi.fn().mockImplementation(async nameS => {
@@ -73,6 +75,61 @@ describe('createTool', () => {
       },
     );
     expect(user).toStrictEqual({ message: 'User not found' });
+  });
+});
+
+describe('createTool in a workflow', () => {
+  it('reads workflow getters that use their own object', async () => {
+    class WorkflowContext {
+      #state = { count: 1 };
+      runId = 'run-1';
+      workflowId = 'wf';
+      suspend = async () => {};
+      constructor() {
+        // An own accessor, as Mastra's workflow contexts define `state`.
+        Object.defineProperty(this, 'state', {
+          enumerable: true,
+          get() {
+            return this.#state;
+          },
+        });
+      }
+    }
+    const workflow = new WorkflowContext();
+    const tool = createTool({
+      id: 'read-state',
+      description: 'Reads workflow state',
+      inputSchema: z.object({}),
+      execute: async (_input, context) => ({ state: context.workflow?.state, runId: context.workflow?.runId }),
+    });
+
+    const output = await tool.execute?.({}, { workflow } as any);
+
+    expect(output).toStrictEqual({ state: { count: 1 }, runId: 'run-1' });
+  });
+
+  it('hands a flat workflow context its updateState', async () => {
+    const updateState = vi.fn(async (_update: Record<string, unknown>) => {});
+    const tool = createTool({
+      id: 'update-state',
+      description: 'Updates workflow state',
+      inputSchema: z.object({}),
+      execute: async (_input, context) => {
+        await context.workflow?.updateState({ count: 2 });
+        return {};
+      },
+    });
+
+    await tool.execute?.({}, {
+      workflowId: 'wf',
+      runId: 'run-1',
+      state: { count: 1 },
+      setState: vi.fn(),
+      updateState,
+      suspend: async () => {},
+    } as any);
+
+    expect(updateState).toHaveBeenCalledWith({ count: 2 });
   });
 });
 
@@ -164,6 +221,88 @@ describe('createTool with providerOptions', () => {
         cacheControl: { type: 'ephemeral' },
       },
     });
+  });
+});
+
+describe('createTool with background', () => {
+  it('should preserve background config when creating a tool', () => {
+    const backgroundTool = createTool({
+      id: 'background-tool',
+      description: 'A tool that runs in the background',
+      inputSchema: z.object({
+        input: z.string(),
+      }),
+      background: { enabled: true, timeoutMs: 60_000 },
+      execute: async ({ input }) => {
+        return { output: input };
+      },
+    });
+
+    expect(backgroundTool.background).toEqual({ enabled: true, timeoutMs: 60_000 });
+  });
+
+  it('should be undefined when background is not provided', () => {
+    const toolWithoutBackground = createTool({
+      id: 'no-background-tool',
+      description: 'A tool without background config',
+      inputSchema: z.object({
+        input: z.string(),
+      }),
+      execute: async ({ input }) => {
+        return { output: input };
+      },
+    });
+
+    expect(toolWithoutBackground.background).toBeUndefined();
+  });
+
+  it('should preserve background config through Tool class constructor', () => {
+    const tool = new Tool({
+      id: 'direct-background-tool',
+      description: 'Tool created directly with constructor',
+      inputSchema: z.object({ value: z.string() }),
+      background: { enabled: true },
+      execute: async ({ value }) => ({ result: value }),
+    });
+
+    expect(tool.background).toEqual({ enabled: true });
+  });
+
+  // Regression for #18451: storing `background` on the Tool isn't enough on its
+  // own — the value has to survive conversion to a CoreTool (where the agentic
+  // loop reads it as `backgroundConfig`) and be consumed by the dispatch
+  // resolver. This guards the whole writer -> reader path against field-name
+  // drift between `Tool.background` and `CoreTool.backgroundConfig`.
+  it('flows tool-level background config through to the dispatch resolver', () => {
+    const tool = createTool({
+      id: 'bg-dispatch-tool',
+      description: 'A tool eligible for background execution',
+      inputSchema: z.object({ topic: z.string() }),
+      background: { enabled: true, timeoutMs: 60_000 },
+      execute: async ({ topic }) => ({ summary: topic }),
+    });
+
+    // Mirror the agent's bridge: it reads `tool.background` into
+    // `options.backgroundConfig` when building the CoreTool.
+    const coreTool = makeCoreTool(
+      tool,
+      { name: 'bg-dispatch-tool', requestContext: new RequestContext(), backgroundConfig: tool.background },
+      undefined,
+      undefined,
+      true,
+    );
+
+    // The dispatch path (tool-call-step) reads `backgroundConfig` off the CoreTool.
+    expect((coreTool as any).backgroundConfig).toEqual({ enabled: true, timeoutMs: 60_000 });
+
+    // And the resolver actually selects background execution from that config.
+    const resolved = resolveBackgroundConfig({
+      llmBgOverrides: {},
+      toolName: 'bg-dispatch-tool',
+      toolConfig: (coreTool as any).backgroundConfig,
+    });
+    expect(resolved.runInBackground).toBe(true);
+    expect(resolved.timeoutMs).toBe(60_000);
   });
 });
 
@@ -280,5 +419,43 @@ describe('AgentToolExecutionContext', () => {
 
     expect(capturedContext.agent).toBeDefined();
     expect(capturedContext.agent.agentId).toBe('');
+  });
+
+  it('should expose the background task adoption bridge in context.background', async () => {
+    let capturedContext: any;
+    const backgroundTask = {
+      taskId: 'task-123',
+      disposition: 'deferred' as const,
+      adopt: vi.fn(),
+    };
+
+    const tool = createTool({
+      id: 'background-adoption-test',
+      description: 'Test tool for background operation adoption',
+      inputSchema: z.object({ message: z.string() }),
+      execute: async (_input, context) => {
+        capturedContext = context;
+        return { success: true };
+      },
+    });
+
+    await tool.execute(
+      { message: 'hello' },
+      {
+        requestContext: new RequestContext(),
+        agentId: 'test-agent',
+        toolCallId: 'call-background',
+        messages: [],
+        suspend: async () => {},
+        isBackgroundTask: true,
+        background: backgroundTask,
+      },
+    );
+
+    expect(capturedContext.agent).toMatchObject({
+      agentId: 'test-agent',
+      toolCallId: 'call-background',
+    });
+    expect(capturedContext.background).toBe(backgroundTask);
   });
 });

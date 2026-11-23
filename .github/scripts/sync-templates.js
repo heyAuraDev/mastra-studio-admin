@@ -1,8 +1,8 @@
 import { Octokit } from '@octokit/rest';
-import fs from 'fs';
+import fs from 'node:fs';
 import * as fsExtra from 'fs-extra/esm';
-import path from 'path';
-import { execSync } from 'child_process';
+import path from 'node:path';
+import { execSync } from 'node:child_process';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -158,7 +158,7 @@ async function pushToRepo(repoName) {
           cwd: tempDir,
         },
       );
-    } catch (error) {
+    } catch {
       console.log(`No main branch found in local, creating new main branch`);
       execSync(
         `
@@ -200,7 +200,7 @@ async function pushToRepo(repoName) {
     `,
         { stdio: 'inherit', cwd: tempDir },
       );
-    } catch (error) {
+    } catch {
       console.log(`No changes to push to beta branch, skipping`);
     }
 

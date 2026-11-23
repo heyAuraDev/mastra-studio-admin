@@ -9,6 +9,7 @@ import { useMemo } from 'react';
  * disambiguate the active row (and receive the new row's `spanId` on prev/next). In traces
  * mode `featuredSpanId` should be null/undefined; only the `traceId` is used.
  */
+// oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Preserve explicit type arguments and callers' row types, including additional fields.
 export function useTraceListNavigation<T extends { traceId: string; spanId?: string | null }>(
   traces: T[],
   featuredTraceId: string | undefined,
@@ -35,11 +36,20 @@ export function useTraceListNavigation<T extends { traceId: string; spanId?: str
   const passSpanId = featuredSpanId != null;
   const navigateTo = (row: T) => onTraceChange(row.traceId, passSpanId ? (row.spanId ?? undefined) : undefined);
 
-  const handlePreviousTrace = featuredTraceIdx > 0 ? () => navigateTo(traces[featuredTraceIdx - 1]) : undefined;
+  const handlePreviousTrace =
+    featuredTraceIdx > 0
+      ? () => {
+          const row = traces[featuredTraceIdx - 1];
+          if (row) navigateTo(row);
+        }
+      : undefined;
 
   const handleNextTrace =
     featuredTraceIdx >= 0 && featuredTraceIdx < traces.length - 1
-      ? () => navigateTo(traces[featuredTraceIdx + 1])
+      ? () => {
+          const row = traces[featuredTraceIdx + 1];
+          if (row) navigateTo(row);
+        }
       : undefined;
 
   return { featuredTraceIdx, handlePreviousTrace, handleNextTrace };

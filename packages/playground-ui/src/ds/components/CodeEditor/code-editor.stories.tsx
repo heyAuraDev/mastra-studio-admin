@@ -27,6 +27,13 @@ const meta: Meta<typeof CodeEditor> = {
     highlightVariables: {
       control: { type: 'boolean' },
     },
+    lineWrapping: {
+      control: { type: 'boolean' },
+    },
+    variant: {
+      control: { type: 'select' },
+      options: ['default', 'embedded', 'inline'],
+    },
   },
 };
 
@@ -90,11 +97,66 @@ export const ArrayData: Story = {
   },
 };
 
+export const FocusedDefault: Story = {
+  args: {
+    data: [
+      { id: 1, name: 'Agent 1', status: 'active' },
+      { id: 2, name: 'Agent 2', status: 'inactive' },
+      { id: 3, name: 'Agent 3', status: 'active' },
+    ],
+    className: 'w-150',
+  },
+  play: async ({ canvasElement }) => {
+    canvasElement.querySelector<HTMLElement>('[role="textbox"]')?.focus();
+  },
+};
+
+export const FocusedEmbedded: Story = {
+  args: {
+    value: `Use the agent instructions below.
+
+- Keep answers concise
+- Ask before taking destructive actions
+- Prefer tool-backed evidence over assumptions`,
+    variant: 'embedded',
+    language: 'markdown',
+    lineNumbers: false,
+    showCopyButton: false,
+    className: 'min-h-24 w-150',
+  },
+  play: async ({ canvasElement }) => {
+    canvasElement.querySelector<HTMLElement>('[role="textbox"]')?.focus();
+  },
+};
+
+export const FocusedEmbeddedInBlock: Story = {
+  args: {
+    value: `Use the agent instructions below.
+
+- Keep answers concise
+- Ask before taking destructive actions
+- Prefer tool-backed evidence over assumptions`,
+    variant: 'embedded',
+    language: 'markdown',
+    lineNumbers: false,
+    showCopyButton: false,
+    className: 'min-h-24',
+  },
+  render: args => (
+    <div className="w-150 rounded-md border border-border bg-card p-3 transition-colors focus-within:border-border-focus">
+      <CodeEditor {...args} />
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    canvasElement.querySelector<HTMLElement>('[role="textbox"]')?.focus();
+  },
+};
+
 export const WithoutCopyButton: Story = {
   args: {
     data: { message: 'Hello, World!' },
     showCopyButton: false,
-    className: 'w-dropdown-max-height',
+    className: 'w-75',
   },
 };
 
@@ -119,6 +181,56 @@ export const LargeContent: Story = {
       },
     },
     className: 'w-[600px] max-h-[400px] overflow-auto',
+  },
+};
+
+export const LargeJson: Story = {
+  args: {
+    data: {
+      runId: 'run_01J8Z3',
+      status: 'success',
+      input: {
+        customer: { id: 'cus_42', name: 'Ada Lovelace', email: 'ada@example.com', tier: 'enterprise' },
+        query: 'Summarize last quarter invoices',
+      },
+      steps: [
+        {
+          id: 'fetch-invoices',
+          status: 'success',
+          output: {
+            invoices: [
+              { id: 'inv_1', amount: 1200, currency: 'USD', lines: [{ sku: 'seat', qty: 10 }] },
+              { id: 'inv_2', amount: 860, currency: 'USD', lines: [{ sku: 'seat', qty: 7 }] },
+            ],
+          },
+        },
+        {
+          id: 'summarize',
+          status: 'success',
+          output: {
+            summary: 'Two invoices totalling 2060 USD.',
+            usage: { inputTokens: 1432, outputTokens: 96, totalTokens: 1528 },
+          },
+        },
+      ],
+      metadata: {
+        model: { provider: 'openai', id: 'gpt-4o-mini' },
+        timings: { startedAt: '2026-10-22T09:00:00Z', finishedAt: '2026-10-22T09:00:03Z', durationMs: 3120 },
+        tags: ['billing', 'summary'],
+      },
+    },
+    className: 'w-[600px] h-[400px]',
+  },
+};
+
+export const WithoutLineWrapping: Story = {
+  args: {
+    data: {
+      output:
+        'https://example.com/search?q=this-is-a-very-long-url-with-structured-query-parameters-that-should-stay-on-one-line-for-inspection&filter=recent&sort=created_at_desc',
+    },
+    lineWrapping: false,
+    className: 'w-[400px] overflow-x-auto',
   },
 };
 
@@ -237,5 +349,25 @@ Type {{ to see autocomplete suggestions for available variables.`,
           'Demonstrates the variable autocomplete feature. Type `{{` to trigger the autocomplete popup showing available variables derived from the schema.',
       },
     },
+  },
+};
+
+export const Prose: Story = {
+  args: {
+    value: 'You are a helpful assistant.\n\nExplain your decisions clearly and ask for missing context when needed.',
+    language: 'markdown',
+    font: 'body',
+    lineNumbers: false,
+    showCopyButton: false,
+    'aria-label': 'Instructions',
+    className: 'w-80 max-w-full',
+  },
+};
+
+export const Inline: Story = {
+  args: {
+    ...Prose.args,
+    variant: 'inline',
+    'aria-label': 'Skill instructions',
   },
 };

@@ -1,5 +1,8 @@
+import {
+  buildStreamErrorMessage,
+  isMaxStepsFinishChunk,
+} from '@mastra/playground-ui/domains/agents/chat/stream-error-message';
 import { describe, expect, it } from 'vitest';
-import { buildStreamErrorMessage, isMaxStepsFinishChunk } from '../stream-error-message';
 
 describe('stream error messages', () => {
   it('only treats terminal tool-call finish chunks as maxSteps exhaustion', () => {
@@ -42,12 +45,14 @@ describe('stream error messages', () => {
       buildStreamErrorMessage({
         runId: 'run-1',
         payload: { error: new Error('Readable failure') },
-      }).parts,
+      }).content.parts,
     ).toEqual([{ type: 'text', text: 'Readable failure' }]);
   });
 
   it('falls back safely for missing and unserializable error payloads', () => {
-    expect(buildStreamErrorMessage({ runId: 'run-1' }).parts).toEqual([{ type: 'text', text: 'Unknown error' }]);
+    expect(buildStreamErrorMessage({ runId: 'run-1' }).content.parts).toEqual([
+      { type: 'text', text: 'Unknown error' },
+    ]);
 
     const circularError: Record<string, unknown> = { reason: 'circular' };
     circularError.self = circularError;
@@ -56,7 +61,7 @@ describe('stream error messages', () => {
       buildStreamErrorMessage({
         runId: 'run-1',
         payload: { error: circularError },
-      }).parts,
+      }).content.parts,
     ).toEqual([{ type: 'text', text: '[object Object]' }]);
 
     const hostileError: Record<string, unknown> = {
@@ -70,7 +75,7 @@ describe('stream error messages', () => {
       buildStreamErrorMessage({
         runId: 'run-1',
         payload: { error: hostileError },
-      }).parts,
+      }).content.parts,
     ).toEqual([{ type: 'text', text: 'Unknown error' }]);
   });
 });

@@ -1,10 +1,9 @@
 import { Radio as RadioPrimitive } from '@base-ui/react/radio';
 import { RadioGroup as RadioGroupPrimitive } from '@base-ui/react/radio-group';
-import { Circle } from 'lucide-react';
 import * as React from 'react';
 
-import { formElementFocus } from '@/ds/primitives/form-element';
-import { transitions } from '@/ds/primitives/transitions';
+import { keepOwnAccessibleName } from '@/ds/components/Field/field-control-aria';
+import { selectionControlStyle } from '@/ds/primitives/selection-control';
 import { cn } from '@/lib/utils';
 
 type RadioGroupProps = Omit<RadioGroupPrimitive.Props, 'className'> & {
@@ -12,7 +11,15 @@ type RadioGroupProps = Omit<RadioGroupPrimitive.Props, 'className'> & {
 };
 
 const RadioGroup = React.forwardRef<HTMLDivElement, RadioGroupProps>(({ className, ...props }, ref) => {
-  return <RadioGroupPrimitive ref={ref} className={cn('grid gap-2', className)} {...props} />;
+  return (
+    <RadioGroupPrimitive
+      ref={ref}
+      data-slot="radio-group"
+      className={cn('grid gap-2', className)}
+      {...props}
+      {...keepOwnAccessibleName(props)}
+    />
+  );
 });
 RadioGroup.displayName = 'RadioGroup';
 
@@ -24,31 +31,22 @@ const RadioGroupItem = React.forwardRef<HTMLSpanElement, RadioGroupItemProps>(({
   return (
     <RadioPrimitive.Root
       ref={ref}
-      className={cn(
-        // Base UI's Radio.Root renders a `<span>` (inline) — unlike Radix's
-        // `<button>`. `flex` + `shrink-0` make the sizing/centering classes
-        // take effect and keep the control square inside flex rows.
-        'flex shrink-0 items-center justify-center',
-        'aspect-square h-4 w-4 rounded-full border border-neutral3 text-neutral6',
-        'shadow-sm',
-        transitions.all,
-        'hover:border-neutral5 hover:shadow-md',
-        formElementFocus,
-        // Base UI's Radio.Root is a `<span>`, so `:disabled` never matches — target `data-disabled`.
-        'data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50 data-[disabled]:hover:border-neutral3 data-[disabled]:hover:shadow-sm',
-        // Base UI exposes `data-checked`/`data-unchecked` instead of Radix's `data-state`.
-        'data-[checked]:border-accent1 data-[checked]:shadow-glow-accent1',
-        className,
-      )}
+      data-slot="radio-group-item"
+      className={cn('rounded-full', selectionControlStyle, className)}
+      render={<span {...keepOwnAccessibleName(props)} />}
       {...props}
     >
       <RadioPrimitive.Indicator
+        keepMounted
         className={cn(
-          'flex items-center justify-center',
-          'data-[checked]:animate-in data-[checked]:zoom-in-50 data-[checked]:duration-150',
+          'flex items-center justify-center text-current',
+          'scale-50 opacity-0 transition-[opacity,scale] duration-200 ease-out-custom',
+          'data-[checked]:scale-100 data-[checked]:opacity-100',
+          'data-[starting-style]:scale-50 data-[starting-style]:opacity-0',
+          'data-[ending-style]:scale-50 data-[ending-style]:opacity-0',
         )}
       >
-        <Circle className="h-2 w-2 fill-accent1 text-accent1" />
+        <span className="size-1.5 rounded-full bg-current" />
       </RadioPrimitive.Indicator>
     </RadioPrimitive.Root>
   );

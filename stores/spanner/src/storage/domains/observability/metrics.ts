@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { Spanner } from '@google-cloud/spanner';
 import type { Database, Transaction } from '@google-cloud/spanner';
 import type { ExecuteSqlRequest, TimestampBounds } from '@google-cloud/spanner/build/src/transaction';
@@ -604,13 +603,10 @@ function buildWhereClause(
       conditions.push('1 = 0');
       return;
     }
-    const placeholders: string[] = [];
-    for (const v of values) {
-      const param = `f${i++}`;
-      placeholders.push(`@${param}`);
-      params[param] = v;
-    }
-    conditions.push(`${quoteIdent(col, 'column name')} IN (${placeholders.join(', ')})`);
+    // One ARRAY parameter keeps long ID lists under Spanner's 950-parameters-per-query limit.
+    const param = `f${i++}`;
+    params[param] = [...values];
+    conditions.push(`${quoteIdent(col, 'column name')} IN UNNEST(@${param})`);
   };
 
   // Timestamp range
@@ -619,6 +615,8 @@ function buildWhereClause(
     | undefined;
   if (ts?.start) bindScalar('timestamp', ts.start, ts.startExclusive ? '>' : '>=');
   if (ts?.end) bindScalar('timestamp', ts.end, ts.endExclusive ? '<' : '<=');
+  if (Array.isArray(filters.traceIds)) bindIn('traceId', filters.traceIds);
+  if (Array.isArray(filters.experimentIds)) bindIn('experimentId', filters.experimentIds);
 
   // Scalar filters mapped 1:1 to columns
   const scalarKeys = [
@@ -761,7 +759,7 @@ export async function batchCreateMetrics(database: Database, args: BatchCreateMe
   // the JSON.stringify up-front sidesteps that fork.
   const encodeJson = (v: unknown): string | null => (v == null ? null : JSON.stringify(v));
   const rows = args.metrics.map(m => ({
-    metricId: m.metricId ?? randomUUID(),
+    metricId: m.metricId ?? globalThis.crypto.randomUUID(),
     timestamp: m.timestamp instanceof Date ? m.timestamp : new Date(m.timestamp as unknown as string | number),
     name: m.name,
     value: Spanner.float(Number(m.value)),
@@ -810,7 +808,9 @@ export async function batchCreateMetrics(database: Database, args: BatchCreateMe
           tx.insert(TABLE_AI_METRICS, rows);
           await tx.commit();
         } catch (err) {
-          await tx.rollback().catch(() => {});
+          await tx.rollback().catch(rollbackErr => {
+            throw new AggregateError([err, rollbackErr], 'Transaction and rollback both failed');
+          });
           throw err;
         }
       });
@@ -836,10 +836,14 @@ async function runWithAbortRetry<T>(fn: () => Promise<T>): Promise<T> {
       return await fn();
     } catch (error: unknown) {
       attempt++;
+      let checkError = error;
+      if (checkError instanceof AggregateError && checkError.errors.length > 0) {
+        checkError = checkError.errors[0];
+      }
       const aborted =
-        !!error &&
-        ((error as { code?: number }).code === 10 ||
-          /ABORTED/i.test(String((error as { message?: unknown })?.message ?? '')));
+        !!checkError &&
+        ((checkError as { code?: number }).code === 10 ||
+          /ABORTED/i.test(String((checkError as { message?: unknown })?.message ?? '')));
       if (!aborted || attempt >= maxAttempts) throw error;
       await new Promise(resolve => setTimeout(resolve, delay + Math.random() * delay));
       delay *= 2;
@@ -1491,7 +1495,9 @@ export async function clearMetrics(database: Database): Promise<void> {
       });
       await tx.commit();
     } catch (err) {
-      await tx.rollback().catch(() => {});
+      await tx.rollback().catch(rollbackErr => {
+        throw new AggregateError([err, rollbackErr], 'Transaction and rollback both failed');
+      });
       throw err;
     }
   });

@@ -1,24 +1,15 @@
-import { parsePartialJson, processDataStream } from '@ai-sdk/ui-utils';
-import type {
-  JSONValue,
-  ReasoningUIPart,
-  TextUIPart,
-  ToolInvocation,
-  ToolInvocationUIPart,
-  UIMessage,
-  UseChatOptions,
-} from '@ai-sdk/ui-utils';
 import { v4 as uuid } from '@lukeed/uuid';
-import type { AgentExecutionOptionsBase, SerializableStructuredOutputOptions } from '@mastra/core/agent';
-import type { MessageListInput } from '@mastra/core/agent/message-list';
+import type { SerializableStructuredOutputOptions, ToolsInput } from '@mastra/core/agent';
+import type { AIV5Type, MessageListInput } from '@mastra/core/agent/message-list';
 import { getErrorFromUnknown } from '@mastra/core/error';
 import type { GenerateReturn, CoreMessage } from '@mastra/core/llm';
-import type { RequestContext } from '@mastra/core/request-context';
-import type { FullOutput, MastraModelOutput } from '@mastra/core/stream';
+import { RequestContext } from '@mastra/core/request-context';
+import type { ChunkType, FullOutput, MastraModelOutput } from '@mastra/core/stream';
 import type { Tool, ToolObserve } from '@mastra/core/tools';
 import { standardSchemaToJSONSchema, toStandardSchema } from '@mastra/schema-compat/schema';
 import type { JSONSchema7 } from 'json-schema';
 import { createObservabilityCollector } from '../observability/collector';
+import type { Body, PathParams, RouteResponse } from '../route-types.generated.js';
 import type {
   ZodSchema,
   GenerateLegacyParams,
@@ -40,26 +31,71 @@ import type {
   AgentVersionResponse,
   ListAgentVersionsParams,
   ListAgentVersionsResponse,
+  SendAgentMessageParams,
   SendAgentSignalParams,
+  QueueAgentMessageParams,
+  QueueAgentSignalParams,
   SubscribeAgentThreadParams,
+  AbortAgentThreadParams,
+  CancelQueuedAgentMessagesParams,
+  CancelQueuedAgentMessagesResponse,
+  ListAgentSuspendedRunsParams,
+  ListAgentSuspendedRunsResponse,
+  GetAgentPlanResponse,
+  ProcessAgentThreadStreamOptions,
   CreateCodeAgentVersionParams,
   ActivateAgentVersionResponse,
   CompareVersionsResponse,
   DeleteAgentVersionResponse,
   RestoreAgentVersionResponse,
+  PartProviderMetadata,
+  MaybeProviderMetadata,
+  ToolInvocationUIPartWithMeta,
+  ClientToolsResolver,
 } from '../types';
 
-import { parseClientRequestContext, requestContextQueryString, toQueryParams } from '../utils';
+import {
+  isTerminalReconnectError,
+  mergeAbortSignals,
+  parseClientRequestContext,
+  requestContextQueryString,
+  toQueryParams,
+} from '../utils';
+import type {
+  JSONValue,
+  ReasoningUIPart,
+  TextUIPart,
+  ToolInvocation,
+  UIMessage,
+  UseChatOptions,
+} from '../utils/ai-sdk-v4';
+import { parsePartialJson, processDataStream } from '../utils/ai-sdk-v4';
+import { getClientToolModelOutput } from '../utils/client-tool-model-output';
 import { processClientTools } from '../utils/process-client-tools';
 import { processMastraNetworkStream, processMastraStream } from '../utils/process-mastra-stream';
+import { createSseEventSplitter } from '../utils/sse-event-splitter';
 import { zodToJsonSchema } from '../utils/zod-to-json-schema';
 import { BaseResource } from './base';
+
+type AgentId = PathParams<'GET /agents/:agentId'>['agentId'];
+type ToolId = PathParams<'GET /agents/:agentId/tools/:toolId'>['toolId'];
+type ToolCallGenerateResponse = RouteResponse<'POST /agents/:agentId/approve-tool-call-generate'> &
+  FullOutput<undefined>;
 
 type ResumeStreamParams<OUTPUT extends {}> = StreamParamsBaseWithoutMessages<OUTPUT> & {
   messages?: MessageListInput;
   runId: string;
   toolCallId?: string;
   structuredOutput?: StructuredOutputOptions<OUTPUT>;
+};
+
+type RecoverParams = {
+  runId: string;
+  requestContext?: Record<string, unknown>;
+  versions?: {
+    agents?: Record<string, { versionId: string } | { status: 'draft' | 'published' }>;
+    defaultStatus?: 'draft' | 'published';
+  };
 };
 
 type ToolCallRespondFn<OUTPUT> = (
@@ -74,6 +110,51 @@ type ClientToolObservabilityContext = { traceparent: string; tracestate?: string
 type ClientToolObservabilityEnvelope = {
   parentContext: ClientToolObservabilityContext;
   payload?: Record<string, unknown>;
+};
+
+type SignalRuntimeOptions = StreamParamsBaseWithoutMessages<any>;
+type SignalRuntimeOptionsEntry = {
+  streamOptions: SignalRuntimeOptions;
+  timeout: ReturnType<typeof setTimeout>;
+};
+
+const SIGNAL_RUNTIME_OPTIONS_TTL_MS = 5 * 60 * 1000;
+const signalRuntimeOptionsByRunId = new Map<string, SignalRuntimeOptionsEntry>();
+
+/**
+ * Client tools a resume request can execute, keyed by run. The stream that stayed open from
+ * before the suspension must not run those tools again, but it must run any resumed client tool
+ * the resume request cannot execute (a server-side approve sends no client tools). Held until the
+ * last stream of the run closes, which is after the resume request returns.
+ */
+const resumingClientToolNamesByRunKey = new Map<string, Map<string, number>>();
+const openStreamCountByRunKey = new Map<string, number>();
+const latestSignalRuntimeOptionsByThread = new Map<string, SignalRuntimeOptionsEntry>();
+
+const createSignalRuntimeOptionsEntry = (
+  store: Map<string, SignalRuntimeOptionsEntry>,
+  key: string,
+  streamOptions: SignalRuntimeOptions,
+): SignalRuntimeOptionsEntry => {
+  const timeout = setTimeout(() => store.delete(key), SIGNAL_RUNTIME_OPTIONS_TTL_MS);
+  (timeout as { unref?: () => void }).unref?.();
+  return { streamOptions, timeout };
+};
+
+const setSignalRuntimeOptionsEntry = (
+  store: Map<string, SignalRuntimeOptionsEntry>,
+  key: string,
+  streamOptions: SignalRuntimeOptions,
+): void => {
+  const existing = store.get(key);
+  if (existing) clearTimeout(existing.timeout);
+  store.set(key, createSignalRuntimeOptionsEntry(store, key, streamOptions));
+};
+
+const deleteSignalRuntimeOptionsEntry = (store: Map<string, SignalRuntimeOptionsEntry>, key: string): void => {
+  const existing = store.get(key);
+  if (existing) clearTimeout(existing.timeout);
+  store.delete(key);
 };
 
 const noopClientToolObserve: ToolObserve = {
@@ -147,6 +228,7 @@ async function executeToolCallAndRespond<OUTPUT>({
   threadId,
   requestContext,
   respondFn,
+  abortSignal,
 }: {
   params: StreamParams<OUTPUT>;
   response: Awaited<ReturnType<MastraModelOutput<OUTPUT>['getFullOutput']>>;
@@ -155,6 +237,7 @@ async function executeToolCallAndRespond<OUTPUT>({
   threadId?: string;
   requestContext?: RequestContext<any>;
   respondFn: ToolCallRespondFn<OUTPUT>;
+  abortSignal?: AbortSignal;
 }) {
   if (response.finishReason === 'tool-calls') {
     const toolCalls = (
@@ -175,7 +258,13 @@ async function executeToolCallAndRespond<OUTPUT>({
       return response;
     }
 
+    // Run every client tool the model called, then send all results back in one turn.
+    const toolResults: Record<string, unknown>[] = [];
     for (const toolCall of toolCalls) {
+      // Don't start more client tools once the caller has cancelled.
+      if (abortSignal?.aborted) {
+        throw abortSignal.reason ?? new DOMException('This operation was aborted', 'AbortError');
+      }
       const clientTool = params.clientTools?.[toolCall.payload.toolName] as Tool;
 
       if (clientTool && clientTool.execute) {
@@ -198,6 +287,8 @@ async function executeToolCallAndRespond<OUTPUT>({
           },
         });
 
+        const modelOutput = await getClientToolModelOutput(clientTool, result);
+
         // Build the tool-result content block. If we have observability
         // data (carrier + buffered spans/logs), attach it directly on
         // the result so it travels with the specific tool call it
@@ -207,37 +298,45 @@ async function executeToolCallAndRespond<OUTPUT>({
           toolCallId: toolCall.payload.toolCallId,
           toolName: toolCall.payload.toolName,
           result,
+          // Carry the client-side toModelOutput result so the server uses it
+          // when building the model prompt, while result keeps the raw value.
+          ...(modelOutput != null ? { providerOptions: { mastra: { modelOutput } } } : {}),
         };
 
         if (observability) {
           toolResultContent.__mastraObservability = observability;
         }
 
-        // Build updated messages from the response, adding the tool result
-        // When threadId is present, server has memory - don't re-include original messages to avoid storage duplicates
-        // When no threadId (stateless), include full conversation history for context
-        const newMessages = [
-          ...(response.response.messages || []),
-          {
-            role: 'tool',
-            content: [toolResultContent],
-          },
-        ];
-
-        const updatedMessages = threadId
-          ? newMessages
-          : [...(Array.isArray(params.messages) ? params.messages : []), ...newMessages];
-
-        const respondOptions: StreamParamsBaseWithoutMessages<OUTPUT> & {
-          structuredOutput?: StructuredOutputOptions<OUTPUT>;
-        } = {
-          ...params,
-        };
-
-        delete (respondOptions as { messages?: MessageListInput }).messages;
-
-        return respondFn(updatedMessages as MessageListInput, respondOptions);
+        toolResults.push(toolResultContent);
       }
+    }
+
+    if (toolResults.length > 0) {
+      // Build updated messages from the response, adding the tool results
+      // When threadId is present, server has memory - don't re-include original messages to avoid storage duplicates
+      // When no threadId (stateless), include full conversation history for context
+      const newMessages = [
+        ...(response.response.messages || []),
+        {
+          role: 'tool',
+          content: toolResults,
+        },
+      ];
+
+      const updatedMessages = threadId
+        ? newMessages
+        : [...(Array.isArray(params.messages) ? params.messages : []), ...newMessages];
+
+      const respondOptions: StreamParamsBaseWithoutMessages<OUTPUT> & {
+        structuredOutput?: StructuredOutputOptions<OUTPUT>;
+      } = {
+        ...params,
+        clientTools: params.clientToolsResolver?.() ?? params.clientTools,
+      };
+
+      delete (respondOptions as { messages?: MessageListInput }).messages;
+
+      return respondFn(updatedMessages as MessageListInput, respondOptions);
     }
   }
 
@@ -248,7 +347,7 @@ async function executeToolCallAndRespond<OUTPUT>({
 export class AgentVoice extends BaseResource {
   constructor(
     options: ClientOptions,
-    private agentId: string,
+    private agentId: AgentId,
     private version?: AgentVersionIdentifier,
   ) {
     super(options);
@@ -291,7 +390,7 @@ export class AgentVoice extends BaseResource {
    * @param options - Optional provider-specific options
    * @returns Promise containing the transcribed text
    */
-  listen(audio: Blob, options?: Record<string, any>): Promise<{ text: string }> {
+  listen(audio: Blob, options?: Record<string, any>): Promise<RouteResponse<'POST /agents/:agentId/voice/listen'>> {
     const formData = new FormData();
     formData.append('audio', audio);
 
@@ -313,7 +412,7 @@ export class AgentVoice extends BaseResource {
    */
   getSpeakers(
     requestContext?: RequestContext | Record<string, any>,
-  ): Promise<Array<{ voiceId: string; [key: string]: any }>> {
+  ): Promise<RouteResponse<'GET /agents/:agentId/voice/speakers'>> {
     return this.request(`/agents/${this.agentId}/voice/speakers${this.getQueryString(requestContext)}`);
   }
 
@@ -323,7 +422,9 @@ export class AgentVoice extends BaseResource {
    * @param requestContext - Optional request context to pass as query parameter
    * @returns Promise containing a check if the agent has listening capabilities
    */
-  getListener(requestContext?: RequestContext | Record<string, any>): Promise<{ enabled: boolean }> {
+  getListener(
+    requestContext?: RequestContext | Record<string, any>,
+  ): Promise<RouteResponse<'GET /agents/:agentId/voice/listener'> & { enabled: boolean }> {
     return this.request(`/agents/${this.agentId}/voice/listener${this.getQueryString(requestContext)}`);
   }
 }
@@ -333,8 +434,9 @@ export class Agent extends BaseResource {
 
   constructor(
     options: ClientOptions,
-    private agentId: string,
+    private agentId: AgentId,
     private version?: AgentVersionIdentifier,
+    private routeOverrides?: { stream?: string },
   ) {
     super(options);
     this.voice = new AgentVoice(options, this.agentId, this.version);
@@ -353,6 +455,191 @@ export class Agent extends BaseResource {
     return queryString ? `${delimiter}${queryString}` : '';
   }
 
+  private getSignalRuntimeRunKey(runId: string): string {
+    return `${this.options.baseUrl}|${this.apiPrefix}|${this.agentId}|${runId}`;
+  }
+
+  /**
+   * Records that `runId` is being resumed by a request that can execute these client tools, so the
+   * stream that is still open from before the suspension skips them. Released when the last stream
+   * of the run closes, which is after this request returns.
+   */
+  private holdResumingClientTools(
+    runId: string,
+    clientTools: ToolsInput | undefined,
+  ): (options?: { force?: boolean }) => void {
+    const names = Object.entries(clientTools ?? {})
+      .filter(([, tool]) => typeof (tool as { execute?: unknown }).execute === 'function')
+      .map(([name]) => name);
+    if (names.length === 0) return () => {};
+
+    const key = this.getSignalRuntimeRunKey(runId);
+    const held = resumingClientToolNamesByRunKey.get(key) ?? new Map<string, number>();
+    for (const name of names) held.set(name, (held.get(name) ?? 0) + 1);
+    resumingClientToolNamesByRunKey.set(key, held);
+
+    // A generate resume opens no stream, so nothing else would drop this hold. A stream resume
+    // leaves it: the open first stream still needs it after this request returns, and drops it
+    // when that stream closes.
+    let released = false;
+    // force drops the hold even while a stream is tracking the run. A rejected resume request
+    // never resumes the run, so the open stream must not treat a later retry as already covered.
+    return ({ force = false }: { force?: boolean } = {}) => {
+      if (released || (!force && openStreamCountByRunKey.has(key))) return;
+      released = true;
+      const current = resumingClientToolNamesByRunKey.get(key);
+      if (!current) return;
+      for (const name of names) {
+        const count = (current.get(name) ?? 1) - 1;
+        if (count > 0) current.set(name, count);
+        else current.delete(name);
+      }
+      if (current.size === 0) resumingClientToolNamesByRunKey.delete(key);
+    };
+  }
+
+  /** Drops the held tool names when the last stream of the run closes. */
+  private trackOpenStream(runId: string): () => void {
+    const key = this.getSignalRuntimeRunKey(runId);
+    openStreamCountByRunKey.set(key, (openStreamCountByRunKey.get(key) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (openStreamCountByRunKey.get(key) ?? 1) - 1;
+      if (remaining > 0) {
+        openStreamCountByRunKey.set(key, remaining);
+        return;
+      }
+      openStreamCountByRunKey.delete(key);
+      resumingClientToolNamesByRunKey.delete(key);
+    };
+  }
+
+  private getSignalRuntimeThreadKey({
+    resourceId,
+    threadId,
+  }: {
+    resourceId?: string;
+    threadId?: string;
+  }): string | undefined {
+    if (!threadId) return undefined;
+    return `${this.options.baseUrl}|${this.apiPrefix}|${this.agentId}|${resourceId ?? ''}|${threadId}`;
+  }
+
+  private setSignalRuntimeOptions({
+    runId,
+    resourceId,
+    threadId,
+    streamOptions,
+  }: {
+    runId?: string;
+    resourceId?: string;
+    threadId?: string;
+    streamOptions: SignalRuntimeOptions;
+  }): void {
+    const threadKey = this.getSignalRuntimeThreadKey({ resourceId, threadId });
+    if (runId) {
+      setSignalRuntimeOptionsEntry(signalRuntimeOptionsByRunId, this.getSignalRuntimeRunKey(runId), streamOptions);
+      if (threadKey) deleteSignalRuntimeOptionsEntry(latestSignalRuntimeOptionsByThread, threadKey);
+      return;
+    }
+
+    if (threadKey) {
+      setSignalRuntimeOptionsEntry(latestSignalRuntimeOptionsByThread, threadKey, streamOptions);
+    }
+  }
+
+  private getSignalRuntimeOptions({
+    runId,
+    resourceId,
+    threadId,
+  }: {
+    runId?: string;
+    resourceId?: string;
+    threadId?: string;
+  }): SignalRuntimeOptions | undefined {
+    if (runId) {
+      const runOptions = signalRuntimeOptionsByRunId.get(this.getSignalRuntimeRunKey(runId));
+      if (runOptions) return runOptions.streamOptions;
+    }
+
+    const threadKey = this.getSignalRuntimeThreadKey({ resourceId, threadId });
+    return threadKey ? latestSignalRuntimeOptionsByThread.get(threadKey)?.streamOptions : undefined;
+  }
+
+  private deleteSignalRuntimeOptions(runId?: string): void {
+    if (!runId) return;
+    deleteSignalRuntimeOptionsEntry(signalRuntimeOptionsByRunId, this.getSignalRuntimeRunKey(runId));
+  }
+
+  private deleteLatestSignalRuntimeOptions({ resourceId, threadId }: { resourceId?: string; threadId?: string }): void {
+    const threadKey = this.getSignalRuntimeThreadKey({ resourceId, threadId });
+    if (threadKey) deleteSignalRuntimeOptionsEntry(latestSignalRuntimeOptionsByThread, threadKey);
+  }
+
+  private prepareSignalRouteBody<
+    Params extends { resourceId?: string; threadId?: string; ifIdle?: { streamOptions?: unknown } },
+  >(params: Params): { body: Params; streamOptions?: SignalRuntimeOptions } {
+    const streamOptions = params.ifIdle?.streamOptions as SignalRuntimeOptions | undefined;
+    if (!streamOptions) return { body: params };
+
+    this.setSignalRuntimeOptions({
+      resourceId: params.resourceId,
+      threadId: params.threadId,
+      streamOptions,
+    });
+
+    return {
+      body: {
+        ...params,
+        ifIdle: {
+          ...params.ifIdle,
+          streamOptions: {
+            ...streamOptions,
+            requestContext: parseClientRequestContext(streamOptions.requestContext),
+            clientTools: processClientTools(streamOptions.clientToolsResolver?.() ?? streamOptions.clientTools),
+            // Functions can't ride along to the server; the live resolver stays
+            // in the local signal runtime options for continuation rounds.
+            clientToolsResolver: undefined,
+          },
+        },
+      } as Params,
+      streamOptions,
+    };
+  }
+
+  private async requestSignalRoute<
+    Params extends { resourceId?: string; threadId?: string; ifIdle?: { streamOptions?: unknown } },
+    Response extends { runId: string },
+  >(path: string, params: Params): Promise<Response> {
+    const { body, streamOptions } = this.prepareSignalRouteBody(params);
+
+    let response: Response;
+    try {
+      response = await this.request<Response>(path, {
+        method: 'POST',
+        body,
+      });
+    } catch (error) {
+      if (streamOptions) {
+        this.deleteLatestSignalRuntimeOptions({ resourceId: params.resourceId, threadId: params.threadId });
+      }
+      throw error;
+    }
+
+    if (streamOptions) {
+      this.setSignalRuntimeOptions({
+        runId: response.runId,
+        resourceId: params.resourceId,
+        threadId: params.threadId,
+        streamOptions,
+      });
+    }
+
+    return response;
+  }
+
   /**
    * Retrieves details about the agent
    * @param requestContext - Optional request context to pass as query parameter
@@ -360,6 +647,16 @@ export class Agent extends BaseResource {
    */
   details(requestContext?: RequestContext | Record<string, any>): Promise<GetAgentResponse> {
     return this.request(`/agents/${this.agentId}${this.getQueryString(requestContext)}`);
+  }
+
+  /**
+   * Reads a markdown plan submitted by this agent through the core submit_plan tool.
+   * The server only serves paths under `.mastracode/plans/` and only when the
+   * agent exposes that capability.
+   */
+  readPlan(path: string, requestContext?: RequestContext | Record<string, any>): Promise<GetAgentPlanResponse> {
+    const contextQuery = this.getQueryString(requestContext, '&');
+    return this.request(`/agents/${this.agentId}/plans/file?path=${encodeURIComponent(path)}${contextQuery}`);
   }
 
   /**
@@ -384,6 +681,11 @@ export class Agent extends BaseResource {
    * depending on the toolset's scope).
    *
    * @param threadId - Optional thread ID for thread-scoped browser sessions
+   *
+   * @remarks This is a browser-stream adapter compatibility endpoint, not a
+   * `SERVER_ROUTES` route. Its historical deployer implementation returns
+   * `{ success: true }`; no generated contract exists while the adapter owns it.
+   * The public `boolean` result remains broad for backwards compatibility.
    */
   closeBrowser(threadId?: string): Promise<{ success: boolean }> {
     return this.request(`/agents/${this.agentId}/browser/close`, {
@@ -392,64 +694,415 @@ export class Agent extends BaseResource {
     });
   }
 
-  enhanceInstructions(instructions: string, comment: string): Promise<{ explanation: string; new_prompt: string }> {
+  enhanceInstructions(
+    instructions: string,
+    comment: string,
+  ): Promise<RouteResponse<'POST /agents/:agentId/instructions/enhance'>> {
     return this.request(`/agents/${this.agentId}/instructions/enhance`, {
       method: 'POST',
       body: { instructions, comment },
     });
   }
 
-  /**
-   * @experimental Agent signals are experimental and may change in a future release.
-   */
-  sendSignal(params: SendAgentSignalParams): Promise<{ accepted: true; runId: string }> {
-    return this.request(`/agents/${this.agentId}/signals`, {
-      method: 'POST',
-      body: params,
-    });
+  sendMessage(params: SendAgentMessageParams): Promise<RouteResponse<'POST /agents/:agentId/send-message'>> {
+    return this.requestSignalRoute(`/agents/${this.agentId}/send-message`, params);
   }
 
-  /**
-   * @experimental Agent signals are experimental and may change in a future release.
-   */
-  async subscribeToThread(params: SubscribeAgentThreadParams): Promise<
+  queueMessage(params: QueueAgentMessageParams): Promise<RouteResponse<'POST /agents/:agentId/queue-message'>> {
+    return this.requestSignalRoute(`/agents/${this.agentId}/queue-message`, params);
+  }
+
+  sendSignal(params: SendAgentSignalParams): Promise<RouteResponse<'POST /agents/:agentId/signals'>> {
+    return this.requestSignalRoute(`/agents/${this.agentId}/signals`, params);
+  }
+
+  queueSignal(params: QueueAgentSignalParams): Promise<RouteResponse<'POST /agents/:agentId/queue-signal'>> {
+    return this.requestSignalRoute(`/agents/${this.agentId}/queue-signal`, params);
+  }
+
+  async subscribeToThread<WITH_RUN_STATUS extends boolean = false>(
+    params: SubscribeAgentThreadParams & { withRunStatus?: WITH_RUN_STATUS },
+  ): Promise<
     Response & {
-      processDataStream: ({
-        onChunk,
-      }: {
-        onChunk: Parameters<typeof processMastraStream>[0]['onChunk'];
-      }) => Promise<void>;
+      processDataStream: (options: ProcessAgentThreadStreamOptions<WITH_RUN_STATUS>) => Promise<void>;
+      abort: (options?: Pick<AbortAgentThreadParams, 'clearPendingSignals'>) => Promise<boolean>;
+      unsubscribe: () => void;
     }
   > {
-    const streamResponse = (await this.request(`/agents/${this.agentId}/threads/subscribe`, {
-      method: 'POST',
-      body: params,
-      stream: true,
-    })) as Response & {
-      processDataStream: ({
-        onChunk,
-      }: {
-        onChunk: Parameters<typeof processMastraStream>[0]['onChunk'];
-      }) => Promise<void>;
+    const { resourceId, threadId, withInitialHistory, withRunStatus } = params;
+    const requestSubscription = () =>
+      this.request(`/agents/${this.agentId}/threads/subscribe`, {
+        method: 'POST',
+        body: {
+          resourceId,
+          threadId,
+          ...(withInitialHistory ? { withInitialHistory } : {}),
+          ...(withRunStatus ? { withRunStatus } : {}),
+        },
+        stream: true,
+      }) as Promise<Response>;
+
+    const streamResponse = (await requestSubscription()) as Response & {
+      processDataStream: (options: ProcessAgentThreadStreamOptions<WITH_RUN_STATUS>) => Promise<void>;
+      abort: (options?: Pick<AbortAgentThreadParams, 'clearPendingSignals'>) => Promise<boolean>;
+      unsubscribe: () => void;
     };
 
     if (!streamResponse.body) {
       throw new Error('No response body');
     }
 
+    const agent = this;
+    streamResponse.abort = async options => (await agent.abortThread({ resourceId, threadId, ...options })).aborted;
+
+    let unsubscribed = false;
+    let processAbortController: AbortController | undefined;
+    let processStarted = false;
+
+    streamResponse.unsubscribe = () => {
+      if (unsubscribed) return;
+      unsubscribed = true;
+      processAbortController?.abort();
+      if (!processStarted) {
+        void streamResponse.body?.cancel().catch(() => {});
+      }
+    };
+
     streamResponse.processDataStream = async ({
       onChunk,
-    }: {
-      onChunk: Parameters<typeof processMastraStream>[0]['onChunk'];
-    }) => {
-      await processMastraStream({
-        stream: streamResponse.body as ReadableStream<Uint8Array>,
-        onChunk,
-        signal: this.options.abortSignal,
-      });
+      reconnect,
+    }: ProcessAgentThreadStreamOptions<WITH_RUN_STATUS>) => {
+      if (unsubscribed) return;
+      processStarted = true;
+      processAbortController = new AbortController();
+      const abortProcessStream = () => processAbortController?.abort();
+      const isClosed = () =>
+        unsubscribed || processAbortController?.signal.aborted || this.options.abortSignal?.aborted;
+
+      if (this.options.abortSignal?.aborted) {
+        abortProcessStream();
+      } else {
+        this.options.abortSignal?.addEventListener('abort', abortProcessStream, { once: true });
+      }
+
+      try {
+        const pendingToolCallsByRunId = new Map<
+          string,
+          Array<{
+            toolCallId: string;
+            toolName: string;
+            args?: unknown;
+            observability?: ClientToolObservabilityContext;
+          }>
+        >();
+
+        const handleSubscribedChunk = async (chunk: ChunkType) => {
+          if (chunk.type === 'tool-call') {
+            const payload = (
+              chunk as {
+                payload?: {
+                  toolCallId?: string;
+                  toolName?: string;
+                  args?: unknown;
+                  observability?: ClientToolObservabilityContext;
+                };
+              }
+            ).payload;
+            const toolCallId = payload?.toolCallId;
+            const toolName = payload?.toolName;
+            const runId = (chunk as { runId?: string }).runId;
+            if (!toolCallId || !toolName || !runId) return;
+
+            const pendingToolCalls = pendingToolCallsByRunId.get(runId) ?? [];
+            pendingToolCalls.push({ toolCallId, toolName, args: payload.args, observability: payload.observability });
+            pendingToolCallsByRunId.set(runId, pendingToolCalls);
+            return;
+          }
+
+          if (chunk.type !== 'finish') return;
+
+          const runId = (chunk as { runId?: string }).runId;
+          const finishPayload = chunk as {
+            payload?: {
+              stepResult?: { reason?: string };
+              messages?: { nonUser?: CoreMessage[] };
+            };
+          };
+          if (!runId) return;
+          if (finishPayload.payload?.stepResult?.reason !== 'tool-calls') {
+            agent.deleteSignalRuntimeOptions(runId);
+            return;
+          }
+
+          const pendingToolCalls = pendingToolCallsByRunId.get(runId);
+          pendingToolCallsByRunId.delete(runId);
+          if (!pendingToolCalls?.length) {
+            agent.deleteSignalRuntimeOptions(runId);
+            return;
+          }
+
+          const activeRuntimeOptions = agent.getSignalRuntimeOptions({ runId, resourceId, threadId });
+          if (!activeRuntimeOptions) {
+            agent.deleteSignalRuntimeOptions(runId);
+            return;
+          }
+
+          const activeClientTools = activeRuntimeOptions.clientToolsResolver?.() ?? activeRuntimeOptions.clientTools;
+          if (!activeClientTools) {
+            agent.deleteSignalRuntimeOptions(runId);
+            return;
+          }
+
+          const activeRequestContext = activeRuntimeOptions.requestContext;
+          const processedClientTools = processClientTools(activeClientTools);
+          const processedRequestContext = parseClientRequestContext(activeRequestContext);
+
+          const toolResultMessages: AIV5Type.ModelMessage[] = [];
+          for (const toolCall of pendingToolCalls) {
+            const clientTool = activeClientTools[toolCall.toolName] as Tool | undefined;
+            if (!clientTool || typeof clientTool.execute !== 'function') continue;
+
+            let result: unknown;
+            let modelOutput: unknown;
+            let observability: ClientToolObservabilityEnvelope | undefined;
+            try {
+              const execution = await executeClientToolWithObservability({
+                clientTool,
+                args: toolCall.args,
+                toolName: toolCall.toolName,
+                parentContext: toolCall.observability,
+                executeContext: {
+                  requestContext: activeRequestContext as RequestContext,
+                  tracingContext: { currentSpan: undefined },
+                  agent: {
+                    agentId: agent.agentId,
+                    messages: finishPayload.payload?.messages?.nonUser ?? [],
+                    toolCallId: toolCall.toolCallId,
+                    suspend: async () => {},
+                    threadId,
+                    resourceId,
+                  },
+                },
+              });
+              result = execution.result;
+              observability = execution.observability;
+              try {
+                modelOutput = await getClientToolModelOutput(clientTool, result);
+              } catch {
+                // A failing toModelOutput shouldn't discard a successful tool
+                // execution; continue with the raw result only.
+                modelOutput = undefined;
+              }
+            } catch (error) {
+              result = { error: String(error) };
+              modelOutput = undefined;
+            }
+
+            const toolResultContent = {
+              type: 'tool-result',
+              toolCallId: toolCall.toolCallId,
+              toolName: toolCall.toolName,
+              args: toolCall.args,
+              result,
+              ...(observability ? { __mastraObservability: observability } : {}),
+            } satisfies Extract<CoreMessage, { role: 'tool' }>['content'][number] & {
+              args?: unknown;
+              __mastraObservability?: ClientToolObservabilityEnvelope;
+            };
+
+            await onChunk({
+              type: 'tool-result',
+              runId,
+              payload: toolResultContent,
+            } as never);
+
+            const continuationToolCall = {
+              type: 'tool-call',
+              toolCallId: toolCall.toolCallId,
+              toolName: toolCall.toolName,
+              input: toolCall.args,
+            } satisfies AIV5Type.ToolCallPart;
+            const continuationToolResult = {
+              type: 'tool-result',
+              toolCallId: toolCall.toolCallId,
+              toolName: toolCall.toolName,
+              output: { type: 'json', value: result as JSONValue },
+              // Carry the client-side toModelOutput result so the server uses it
+              // when building the model prompt, while output keeps the raw result.
+              ...(modelOutput != null
+                ? { providerOptions: { mastra: { modelOutput: modelOutput as JSONValue } } }
+                : {}),
+              ...(observability ? { __mastraObservability: observability } : {}),
+            } satisfies AIV5Type.ToolResultPart & { __mastraObservability?: ClientToolObservabilityEnvelope };
+
+            toolResultMessages.push({
+              role: 'assistant',
+              content: [continuationToolCall, continuationToolResult],
+            });
+          }
+
+          if (toolResultMessages.length === 0) {
+            agent.deleteSignalRuntimeOptions(runId);
+            return;
+          }
+
+          const continuationStreamOptions = {
+            ...activeRuntimeOptions,
+            requestContext: processedRequestContext,
+            memory: threadId ? { thread: threadId, resource: resourceId } : undefined,
+            clientTools: processedClientTools,
+          } as StreamParamsBaseWithoutMessages<any>;
+
+          agent.setSignalRuntimeOptions({
+            resourceId,
+            threadId,
+            streamOptions: continuationStreamOptions,
+          });
+
+          const continuationMessages = (
+            threadId ? toolResultMessages : [...(finishPayload.payload?.messages?.nonUser ?? []), ...toolResultMessages]
+          ) as MessageListInput;
+
+          try {
+            await agent.sendToolApproval({
+              resourceId: resourceId || agent.agentId,
+              threadId,
+              toolCallId: pendingToolCalls[0]!.toolCallId,
+              approved: true,
+              requestContext: processedRequestContext,
+              messages: continuationMessages,
+              streamOptions: continuationStreamOptions,
+            });
+          } catch (error) {
+            agent.deleteLatestSignalRuntimeOptions({ resourceId, threadId });
+            console.error('Error running client-tool continuation:', error);
+          } finally {
+            agent.deleteSignalRuntimeOptions(runId);
+          }
+        };
+
+        const reconnectOptions =
+          reconnect === true
+            ? { maxRetries: Infinity, delayMs: 1000 }
+            : reconnect
+              ? { maxRetries: reconnect.maxRetries ?? Infinity, delayMs: reconnect.delayMs ?? 1000 }
+              : null;
+        let response: Response = streamResponse;
+        let attempts = 0;
+
+        // Sentinel used to distinguish errors thrown by the caller's `onChunk`
+        // callback from transport errors. Callback errors should not trigger a
+        // reconnect — we'd otherwise mask user bugs by resubscribing forever.
+        // The sentinel never escapes this method: we unwrap and rethrow the
+        // original error so consumers see exactly what they threw.
+        const onChunkErrorSentinel = Symbol('onChunkErrorSentinel');
+        const guardedOnChunk = async (chunk: ChunkType) => {
+          try {
+            await onChunk(chunk);
+            await handleSubscribedChunk(chunk);
+          } catch (cause) {
+            throw { [onChunkErrorSentinel]: true, cause };
+          }
+        };
+
+        while (true) {
+          if (!response.body) {
+            throw new Error('No response body');
+          }
+
+          try {
+            await processMastraStream({
+              stream: response.body as ReadableStream<Uint8Array>,
+              onChunk: guardedOnChunk,
+              signal: processAbortController.signal,
+            });
+          } catch (error) {
+            if (typeof error === 'object' && error !== null && (error as any)[onChunkErrorSentinel]) {
+              throw (error as { cause: unknown }).cause;
+            }
+            if (!reconnectOptions || isClosed() || attempts >= reconnectOptions.maxRetries) {
+              if (isClosed()) return;
+              throw error;
+            }
+          }
+
+          if (!reconnectOptions || isClosed() || attempts >= reconnectOptions.maxRetries) {
+            return;
+          }
+
+          while (attempts < reconnectOptions.maxRetries) {
+            attempts++;
+
+            if (isClosed()) {
+              return;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, reconnectOptions.delayMs));
+
+            if (isClosed()) {
+              return;
+            }
+
+            try {
+              response = await requestSubscription();
+              break;
+            } catch (error) {
+              if (isClosed()) return;
+              // Auth denials and other client errors won't resolve by resubscribing;
+              // 408/429 stay retryable.
+              if (isTerminalReconnectError(error) || attempts >= reconnectOptions.maxRetries) {
+                throw error;
+              }
+            }
+          }
+        }
+      } finally {
+        this.options.abortSignal?.removeEventListener('abort', abortProcessStream);
+        if (processAbortController?.signal.aborted) {
+          unsubscribed = true;
+        }
+        processAbortController = undefined;
+      }
     };
 
     return streamResponse;
+  }
+
+  /** Stops execution of a run, including runs without a memory thread. */
+  async abortRun(
+    runId: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<RouteResponse<'POST /agents/:agentId/runs/:runId/abort'>> {
+    return this.request<RouteResponse<'POST /agents/:agentId/runs/:runId/abort'>>(
+      `/agents/${this.agentId}/runs/${encodeURIComponent(runId)}/abort`,
+      { method: 'POST', signal: options?.signal },
+    );
+  }
+
+  async abortThread(
+    params: AbortAgentThreadParams,
+    options?: { signal?: AbortSignal },
+  ): Promise<RouteResponse<'POST /agents/:agentId/threads/abort'>> {
+    const { resourceId, threadId, clearPendingSignals, expectedRunId } = params;
+    return this.request<RouteResponse<'POST /agents/:agentId/threads/abort'>>(`/agents/${this.agentId}/threads/abort`, {
+      method: 'POST',
+      signal: options?.signal,
+      body: {
+        resourceId,
+        threadId,
+        ...(clearPendingSignals === undefined ? {} : { clearPendingSignals }),
+        ...(expectedRunId === undefined ? {} : { expectedRunId }),
+      },
+    });
+  }
+
+  /** Cancels pending thread signals and propagates requested IDs through shared PubSub. */
+  cancelQueuedMessages(params: CancelQueuedAgentMessagesParams): Promise<CancelQueuedAgentMessagesResponse> {
+    const { resourceId, threadId, signalIds } = params;
+    return this.request<CancelQueuedAgentMessagesResponse>(`/agents/${this.agentId}/threads/signals/cancel`, {
+      method: 'POST',
+      body: { resourceId, threadId, signalIds },
+    });
   }
 
   /**
@@ -612,23 +1265,26 @@ export class Agent extends BaseResource {
   async generateLegacy(
     params: GenerateLegacyParams<undefined> & { output?: never; experimental_output?: never },
   ): Promise<GenerateReturn<any, undefined, undefined>>;
-  // Use `any` in overload return types to avoid "Type instantiation is excessively deep" errors
   async generateLegacy<Output extends JSONSchema7 | ZodSchema>(
     params: GenerateLegacyParams<Output> & { output: Output; experimental_output?: never },
-  ): Promise<GenerateReturn<any, any, any>>;
+  ): Promise<GenerateReturn<any, Output, undefined>>;
   async generateLegacy<StructuredOutput extends JSONSchema7 | ZodSchema>(
     params: GenerateLegacyParams<StructuredOutput> & { output?: never; experimental_output: StructuredOutput },
-  ): Promise<GenerateReturn<any, any, any>>;
+  ): Promise<GenerateReturn<any, undefined, StructuredOutput>>;
   async generateLegacy<
     Output extends JSONSchema7 | ZodSchema | undefined = undefined,
     _StructuredOutput extends JSONSchema7 | ZodSchema | undefined = undefined,
   >(params: GenerateLegacyParams<Output>): Promise<GenerateReturn<any, any, any>> {
+    // `abortSignal` is forwarded to fetch and must never be serialized into the request body
+    const { abortSignal: perCallSignal, ...bodyParams } = params;
+    // Continuation guards must honor the client-wide signal too, not just the per-call one.
+    const abortSignal = mergeAbortSignals(this.options.abortSignal, perCallSignal);
     const processedParams = {
-      ...params,
+      ...bodyParams,
       output: params.output ? zodToJsonSchema(params.output) : undefined,
       experimental_output: params.experimental_output ? zodToJsonSchema(params.experimental_output) : undefined,
       requestContext: parseClientRequestContext(params.requestContext),
-      clientTools: processClientTools(params.clientTools),
+      clientTools: processClientTools(params.clientToolsResolver?.() ?? params.clientTools),
     };
 
     const { resourceId, threadId, requestContext } = processedParams as GenerateLegacyParams;
@@ -636,9 +1292,13 @@ export class Agent extends BaseResource {
     const response: GenerateReturn<any, any, any> = await this.request(`/agents/${this.agentId}/generate-legacy`, {
       method: 'POST',
       body: processedParams,
+      signal: abortSignal,
     });
 
     if (response.finishReason === 'tool-calls') {
+      if (abortSignal?.aborted) {
+        throw abortSignal.reason ?? new DOMException('This operation was aborted', 'AbortError');
+      }
       const toolCalls = (
         response as unknown as {
           toolCalls: { toolName: string; args: any; toolCallId: string }[];
@@ -650,8 +1310,13 @@ export class Agent extends BaseResource {
         return response;
       }
 
+      const toolResults: Record<string, unknown>[] = [];
       for (const toolCall of toolCalls) {
-        const clientTool = params.clientTools?.[toolCall.toolName] as Tool;
+        // Don't start more client tools once the caller has cancelled.
+        if (abortSignal?.aborted) {
+          throw abortSignal.reason ?? new DOMException('This operation was aborted', 'AbortError');
+        }
+        const clientTool = processedParams.clientTools?.[toolCall.toolName] as Tool;
 
         if (clientTool && clientTool.execute) {
           const { result, observability } = await executeClientToolWithObservability({
@@ -673,30 +1338,29 @@ export class Agent extends BaseResource {
             },
           });
 
-          // Build updated messages from the response, adding the tool result
-          // Do NOT re-include the original user message to avoid storage duplicates
-          const updatedMessages = [
-            ...(response.response as unknown as { messages: CoreMessage[] }).messages,
-            {
-              role: 'tool',
-              content: [
-                {
-                  type: 'tool-result',
-                  toolCallId: toolCall.toolCallId,
-                  toolName: toolCall.toolName,
-                  result,
-                  ...(observability ? { __mastraObservability: observability } : {}),
-                },
-              ],
-            },
-          ];
-          // Recursive call to generateLegacy with updated messages
-          // Using type assertion to handle the complex overload types
-          return (this.generateLegacy as any)({
-            ...params,
-            messages: updatedMessages,
+          toolResults.push({
+            type: 'tool-result',
+            toolCallId: toolCall.toolCallId,
+            toolName: toolCall.toolName,
+            result,
+            ...(observability ? { __mastraObservability: observability } : {}),
           });
         }
+      }
+
+      if (toolResults.length > 0) {
+        // Build updated messages from the response, adding the tool results
+        // Do NOT re-include the original user message to avoid storage duplicates
+        const updatedMessages = [
+          ...(response.response as unknown as { messages: CoreMessage[] }).messages,
+          { role: 'tool', content: toolResults },
+        ];
+        // Recursive call to generateLegacy with updated messages
+        // Using type assertion to handle the complex overload types
+        return (this.generateLegacy as any)({
+          ...params,
+          messages: updatedMessages,
+        });
       }
     }
 
@@ -721,10 +1385,15 @@ export class Agent extends BaseResource {
       ...options,
       messages: messages,
     } as StreamParams<OUTPUT>;
+    const resolvedClientTools = params.clientToolsResolver?.() ?? params.clientTools;
+    // `abortSignal` is forwarded to fetch and must never be serialized into the request body
+    // Continuation guards must honor the client-wide signal too, not just the per-call one.
+    const abortSignal = mergeAbortSignals(this.options.abortSignal, params.abortSignal);
     const processedParams = {
       ...params,
+      abortSignal: undefined,
       requestContext: parseClientRequestContext(params.requestContext),
-      clientTools: processClientTools(params.clientTools),
+      clientTools: processClientTools(resolvedClientTools),
       structuredOutput: params.structuredOutput
         ? {
             ...params.structuredOutput,
@@ -743,18 +1412,26 @@ export class Agent extends BaseResource {
       {
         method: 'POST',
         body: processedParams,
+        signal: abortSignal,
       },
     );
 
     if (response.finishReason === 'tool-calls') {
+      if (abortSignal?.aborted) {
+        throw abortSignal.reason ?? new DOMException('This operation was aborted', 'AbortError');
+      }
+      // params still carries abortSignal, so the continuation request inherits it
       return executeToolCallAndRespond<OUTPUT>({
         response,
-        params,
+        // Dispatch from the resolved tools so resolver-only calls execute; the
+        // continuation re-invokes the resolver per round via params.clientToolsResolver.
+        params: { ...params, clientTools: resolvedClientTools },
         agentId: this.agentId,
         resourceId,
         threadId,
         requestContext: requestContext as RequestContext<any>,
         respondFn: this.generate.bind(this) as ToolCallRespondFn<OUTPUT>,
+        abortSignal,
       }) as unknown as Awaited<ReturnType<MastraModelOutput<OUTPUT>['getFullOutput']>>;
     }
 
@@ -772,7 +1449,11 @@ export class Agent extends BaseResource {
     stream: ReadableStream<Uint8Array>;
     update: (options: { message: UIMessage; data: JSONValue[] | undefined; replaceLastMessage: boolean }) => void;
     onToolCall?: UseChatOptions['onToolCall'];
-    onFinish?: (options: { message: UIMessage | undefined; finishReason: string; usage: string }) => void;
+    onFinish?: (options: {
+      message: UIMessage | undefined;
+      finishReason: string;
+      usage: string;
+    }) => void | Promise<void>;
     generateId?: () => string;
     getCurrentDate?: () => Date;
     lastMessage: UIMessage | undefined;
@@ -800,18 +1481,35 @@ export class Agent extends BaseResource {
     let currentReasoningPart: ReasoningUIPart | undefined = undefined;
     let currentReasoningTextDetail: { type: 'text'; text: string; signature?: string } | undefined = undefined;
 
-    function updateToolInvocationPart(toolCallId: string, invocation: ToolInvocation) {
+    // `providerMetadata` has to land on the part itself, not inside `toolInvocation`: the
+    // server's MessageList adapters read `part.providerMetadata` when rebuilding the prompt,
+    // so metadata nested in the invocation (e.g. Gemini's `vertex.thoughtSignature`) is lost
+    // on the next turn of a client-tool continuation.
+    function updateToolInvocationPart(
+      toolCallId: string,
+      invocation: ToolInvocation,
+      partProviderMetadata?: PartProviderMetadata,
+    ) {
       const part = message.parts.find(
         part => part.type === 'tool-invocation' && part.toolInvocation.toolCallId === toolCallId,
-      ) as ToolInvocationUIPart | undefined;
+      ) as ToolInvocationUIPartWithMeta | undefined;
 
       if (part != null) {
         part.toolInvocation = invocation;
+        if (partProviderMetadata !== undefined) {
+          // Merge per namespace so a later chunk adding `mastra.*` doesn't drop `vertex.*`
+          // set by the original tool call.
+          part.providerMetadata = { ...(part.providerMetadata ?? {}), ...partProviderMetadata };
+        }
       } else {
-        message.parts.push({
+        const newPart: ToolInvocationUIPartWithMeta = {
           type: 'tool-invocation',
           toolInvocation: invocation,
-        });
+        };
+        if (partProviderMetadata !== undefined) {
+          newPart.providerMetadata = partProviderMetadata;
+        }
+        message.parts.push(newPart);
       }
     }
 
@@ -1003,13 +1701,16 @@ export class Agent extends BaseResource {
         execUpdate();
       },
       async onToolCallPart(value) {
+        const partialToolCall = partialToolCalls[value.toolCallId];
+        const streamedArgs = partialToolCall?.text ? parsePartialJson(partialToolCall.text).value : undefined;
+        const toolCall = streamedArgs === undefined ? value : { ...value, args: streamedArgs };
         const invocation = {
           state: 'call',
           step,
-          ...value,
+          ...toolCall,
         } as const;
 
-        if (partialToolCalls[value.toolCallId] != null) {
+        if (partialToolCall != null) {
           // change the partial tool call to a full tool call
           message.toolInvocations![partialToolCalls[value.toolCallId]!.index] = invocation;
         } else {
@@ -1020,7 +1721,7 @@ export class Agent extends BaseResource {
           message.toolInvocations.push(invocation);
         }
 
-        updateToolInvocationPart(value.toolCallId, invocation);
+        updateToolInvocationPart(value.toolCallId, invocation, (value as MaybeProviderMetadata).providerMetadata);
 
         execUpdate();
 
@@ -1028,19 +1729,19 @@ export class Agent extends BaseResource {
         // In the future we should make this non-blocking, which
         // requires additional state management for error handling etc.
         if (onToolCall) {
-          const result = await onToolCall({ toolCall: value });
+          const result = await onToolCall({ toolCall });
           if (result != null) {
             const invocation = {
               state: 'result',
               step,
-              ...value,
+              ...toolCall,
               result,
             } as const;
 
             // store the result in the tool invocation
             message.toolInvocations![message.toolInvocations!.length - 1] = invocation;
 
-            updateToolInvocationPart(value.toolCallId, invocation);
+            updateToolInvocationPart(value.toolCallId, invocation, (value as MaybeProviderMetadata).providerMetadata);
 
             execUpdate();
           }
@@ -1050,7 +1751,8 @@ export class Agent extends BaseResource {
         const toolInvocations = message.toolInvocations;
 
         if (toolInvocations == null) {
-          throw new Error('tool_result must be preceded by a tool_call');
+          // The matching tool-call may have been emitted in an earlier stream (e.g. before a resume).
+          return;
         }
 
         // find if there is any tool invocation with the same toolCallId
@@ -1058,7 +1760,7 @@ export class Agent extends BaseResource {
         const toolInvocationIndex = toolInvocations.findIndex(invocation => invocation.toolCallId === value.toolCallId);
 
         if (toolInvocationIndex === -1) {
-          throw new Error('tool_result must be preceded by a tool_call with the same toolCallId');
+          return;
         }
 
         const invocation = {
@@ -1069,7 +1771,11 @@ export class Agent extends BaseResource {
 
         toolInvocations[toolInvocationIndex] = invocation as ToolInvocation;
 
-        updateToolInvocationPart(value.toolCallId, invocation as ToolInvocation);
+        updateToolInvocationPart(
+          value.toolCallId,
+          invocation as ToolInvocation,
+          (value as MaybeProviderMetadata).providerMetadata,
+        );
 
         execUpdate();
       },
@@ -1116,7 +1822,7 @@ export class Agent extends BaseResource {
       },
     });
 
-    onFinish?.({ message, finishReason, usage });
+    await onFinish?.({ message, finishReason, usage });
   }
 
   /**
@@ -1136,14 +1842,34 @@ export class Agent extends BaseResource {
       output: params.output ? zodToJsonSchema(params.output) : undefined,
       experimental_output: params.experimental_output ? zodToJsonSchema(params.experimental_output) : undefined,
       requestContext: parseClientRequestContext(params.requestContext),
-      clientTools: processClientTools(params.clientTools),
+      clientTools: processClientTools(params.clientToolsResolver?.() ?? params.clientTools),
     };
 
     // Create a readable stream that will handle the response processing
-    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+    const { readable: innerReadable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+
+    // Wrap the readable so cancelling it aborts the underlying request and any
+    // client-tool continuations, instead of only detaching the consumer.
+    const abortController = new AbortController();
+    const signal = mergeAbortSignals(abortController.signal, params.abortSignal, this.options.abortSignal);
+    const innerReader = innerReadable.getReader();
+    const readable = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const { done, value } = await innerReader.read();
+        if (done) {
+          controller.close();
+        } else {
+          controller.enqueue(value);
+        }
+      },
+      cancel(reason) {
+        abortController.abort(reason);
+        return innerReader.cancel(reason).catch(() => {});
+      },
+    });
 
     // Start processing the response in the background
-    const response = await this.processStreamResponseLegacy(processedParams, writable);
+    const response = await this.processStreamResponseLegacy(processedParams, writable, signal);
 
     // Create a new response with the readable stream
     const streamResponse = new Response(readable, {
@@ -1177,7 +1903,11 @@ export class Agent extends BaseResource {
     stream: ReadableStream<Uint8Array>;
     update: (options: { message: UIMessage; data: JSONValue[] | undefined; replaceLastMessage: boolean }) => void;
     onToolCall?: UseChatOptions['onToolCall'];
-    onFinish?: (options: { message: UIMessage | undefined; finishReason: string; usage: string }) => void;
+    onFinish?: (options: {
+      message: UIMessage | undefined;
+      finishReason: string;
+      usage: string;
+    }) => void | Promise<void>;
     onStreamChunk?: (chunk: any) => void;
     generateId?: () => string;
     getCurrentDate?: () => Date;
@@ -1206,18 +1936,35 @@ export class Agent extends BaseResource {
     let currentReasoningPart: ReasoningUIPart | undefined = undefined;
     let currentReasoningTextDetail: { type: 'text'; text: string; signature?: string } | undefined = undefined;
 
-    function updateToolInvocationPart(toolCallId: string, invocation: ToolInvocation) {
+    // `providerMetadata` has to land on the part itself, not inside `toolInvocation`: the
+    // server's MessageList adapters read `part.providerMetadata` when rebuilding the prompt,
+    // so metadata nested in the invocation (e.g. Gemini's `vertex.thoughtSignature`) is lost
+    // on the next turn of a client-tool continuation.
+    function updateToolInvocationPart(
+      toolCallId: string,
+      invocation: ToolInvocation,
+      partProviderMetadata?: PartProviderMetadata,
+    ) {
       const part = message.parts.find(
         part => part.type === 'tool-invocation' && part.toolInvocation.toolCallId === toolCallId,
-      ) as ToolInvocationUIPart | undefined;
+      ) as ToolInvocationUIPartWithMeta | undefined;
 
       if (part != null) {
         part.toolInvocation = invocation;
+        if (partProviderMetadata !== undefined) {
+          // Merge per namespace so a later chunk adding `mastra.*` doesn't drop `vertex.*`
+          // set by the original tool call.
+          part.providerMetadata = { ...(part.providerMetadata ?? {}), ...partProviderMetadata };
+        }
       } else {
-        message.parts.push({
+        const newPart: ToolInvocationUIPartWithMeta = {
           type: 'tool-invocation',
           toolInvocation: invocation,
-        });
+        };
+        if (partProviderMetadata !== undefined) {
+          newPart.providerMetadata = partProviderMetadata;
+        }
+        message.parts.push(newPart);
       }
     }
 
@@ -1367,13 +2114,16 @@ export class Agent extends BaseResource {
           }
 
           case 'tool-call': {
+            const partialToolCall = partialToolCalls[chunk.payload.toolCallId];
+            const streamedArgs = partialToolCall?.text ? parsePartialJson(partialToolCall.text).value : undefined;
+            const toolCall = streamedArgs === undefined ? chunk.payload : { ...chunk.payload, args: streamedArgs };
             const invocation = {
               state: 'call',
               step,
-              ...chunk.payload,
+              ...toolCall,
             } as const;
 
-            if (partialToolCalls[chunk.payload.toolCallId] != null) {
+            if (partialToolCall != null) {
               // change the partial tool call to a full tool call
               message.toolInvocations![partialToolCalls[chunk.payload.toolCallId]!.index] =
                 invocation as ToolInvocation;
@@ -1385,7 +2135,11 @@ export class Agent extends BaseResource {
               message.toolInvocations.push(invocation as ToolInvocation);
             }
 
-            updateToolInvocationPart(chunk.payload.toolCallId, invocation as ToolInvocation);
+            updateToolInvocationPart(
+              chunk.payload.toolCallId,
+              invocation as ToolInvocation,
+              (chunk.payload as MaybeProviderMetadata).providerMetadata,
+            );
 
             execUpdate();
 
@@ -1393,19 +2147,23 @@ export class Agent extends BaseResource {
             // In the future we should make this non-blocking, which
             // requires additional state management for error handling etc.
             if (onToolCall) {
-              const result = await onToolCall({ toolCall: chunk.payload as any });
+              const result = await onToolCall({ toolCall: toolCall as any });
               if (result != null) {
                 const invocation = {
                   state: 'result',
                   step,
-                  ...chunk.payload,
+                  ...toolCall,
                   result,
                 } as const;
 
                 // store the result in the tool invocation
                 message.toolInvocations![message.toolInvocations!.length - 1] = invocation as ToolInvocation;
 
-                updateToolInvocationPart(chunk.payload.toolCallId, invocation as ToolInvocation);
+                updateToolInvocationPart(
+                  chunk.payload.toolCallId,
+                  invocation as ToolInvocation,
+                  (chunk.payload as MaybeProviderMetadata).providerMetadata,
+                );
 
                 execUpdate();
               }
@@ -1473,7 +2231,8 @@ export class Agent extends BaseResource {
             const toolInvocations = message.toolInvocations;
 
             if (toolInvocations == null) {
-              throw new Error('tool_result must be preceded by a tool_call');
+              // The matching tool-call may have been emitted in an earlier stream (e.g. before a resume).
+              break;
             }
 
             // find if there is any tool invocation with the same toolCallId
@@ -1483,7 +2242,7 @@ export class Agent extends BaseResource {
             );
 
             if (toolInvocationIndex === -1) {
-              throw new Error('tool_result must be preceded by a tool_call with the same toolCallId');
+              break;
             }
 
             const invocation = {
@@ -1494,7 +2253,11 @@ export class Agent extends BaseResource {
 
             toolInvocations[toolInvocationIndex] = invocation as ToolInvocation;
 
-            updateToolInvocationPart(chunk.payload.toolCallId, invocation as ToolInvocation);
+            updateToolInvocationPart(
+              chunk.payload.toolCallId,
+              invocation as ToolInvocation,
+              (chunk.payload as MaybeProviderMetadata).providerMetadata,
+            );
 
             execUpdate();
             break;
@@ -1537,79 +2300,234 @@ export class Agent extends BaseResource {
       },
     });
 
-    onFinish?.({ message, finishReason, usage });
+    await onFinish?.({ message, finishReason, usage });
+  }
+
+  /**
+   * Creates the consumer-facing stream for the streaming methods. Cancelling the
+   * returned stream or the client-wide signal detaches the HTTP observer and
+   * stops any client-tool continuations. Per-call execution cancellation is
+   * handled separately by processStreamResponse.
+   */
+  private createCancellableStream() {
+    const abortController = new AbortController();
+    let readableController: ReadableStreamDefaultController<Uint8Array>;
+    const readable = new ReadableStream<Uint8Array>({
+      start(controller) {
+        readableController = controller;
+      },
+      cancel(reason) {
+        abortController.abort(reason);
+      },
+    });
+    return {
+      readable,
+      controller: readableController!,
+      signal: mergeAbortSignals(abortController.signal, this.options.abortSignal)!,
+    };
   }
 
   async processStreamResponse(
     processedParams: any,
     controller: ReadableStreamDefaultController<Uint8Array>,
     route: string = 'stream',
+    signal?: AbortSignal,
   ) {
+    // Know the execution ID before the first chunk, including for early cancellation.
+    const suppliedRunId = processedParams.runId;
+    processedParams = { ...processedParams, runId: processedParams.runId ?? uuid() };
+    const callerSignal: AbortSignal | undefined = processedParams.abortSignal;
+    callerSignal?.throwIfAborted();
+    const transportAbort = new AbortController();
+    const cancellationAbort = new AbortController();
+    const detachSignal = signal;
+    signal = mergeAbortSignals(detachSignal, transportAbort.signal);
+    let cancellationTimer: ReturnType<typeof setTimeout> | undefined;
+    const stopCancellation = () => cancellationAbort.abort();
+    const cancelExecution = () => {
+      cancellationTimer = setTimeout(
+        () => cancellationAbort.abort(new Error('Agent run cancellation was not acknowledged')),
+        10_000,
+      );
+      void (async () => {
+        try {
+          while (true) {
+            cancellationAbort.signal.throwIfAborted();
+            const result = await this.abortRun(processedParams.runId, { signal: cancellationAbort.signal });
+            if (result.aborted) return;
+            await new Promise<void>((resolve, reject) => {
+              const onAbort = () => {
+                clearTimeout(timer);
+                reject(cancellationAbort.signal.reason);
+              };
+              const timer = setTimeout(() => {
+                cancellationAbort.signal.removeEventListener('abort', onAbort);
+                resolve();
+              }, 100);
+              cancellationAbort.signal.addEventListener('abort', onAbort, { once: true });
+              if (cancellationAbort.signal.aborted) onAbort();
+            });
+          }
+        } catch (error) {
+          if (
+            !cancellationAbort.signal.aborted &&
+            !(error instanceof Error && 'status' in error && (error.status === 404 || error.status === 501))
+          ) {
+            try {
+              controller.error(error);
+            } catch {
+              /* Already detached. */
+            }
+          }
+        } finally {
+          clearTimeout(cancellationTimer);
+          transportAbort.abort(callerSignal?.reason);
+        }
+      })();
+    };
+    const cleanupCancellation = () => {
+      callerSignal?.removeEventListener('abort', cancelExecution);
+      detachSignal?.removeEventListener('abort', stopCancellation);
+      clearTimeout(cancellationTimer);
+      stopCancellation();
+    };
+    detachSignal?.addEventListener('abort', stopCancellation, { once: true });
+    if (detachSignal?.aborted) stopCancellation();
+    callerSignal?.addEventListener('abort', cancelExecution, { once: true });
+    if (callerSignal?.aborted) cancelExecution();
+
     // Extract threadId from memory config if present (matching generate() behavior)
     const { memory } = processedParams ?? {};
     const { resource, thread } = memory ?? {};
     const threadId = processedParams.threadId ?? (typeof thread === 'string' ? thread : thread?.id);
     const resourceId = processedParams.resourceId ?? resource;
 
-    let requestBody = processedParams;
+    // `abortSignal` is consumed locally and must never be serialized into the request body
+    const { abortSignal: _abortSignal, ...serializableParams } = processedParams;
+    let requestBody = serializableParams;
     if (route === 'resume-stream') {
-      const { messages: _messages, ...resumeStreamBody } = processedParams;
+      const { messages: _messages, ...resumeStreamBody } = serializableParams;
       requestBody = resumeStreamBody;
     }
 
-    const response: Response = await this.request(`/agents/${this.agentId}/${route}`, {
+    const requestPath =
+      route === 'stream' && this.routeOverrides?.stream
+        ? this.routeOverrides.stream
+        : `/agents/${this.agentId}/${route}`;
+    const response = await this.request<Response>(requestPath, {
       method: 'POST',
       body: requestBody,
       stream: true,
+      signal,
+    }).catch(error => {
+      cleanupCancellation();
+      throw error;
     });
 
     if (!response.body) {
+      cleanupCancellation();
       throw new Error('No response body');
     }
 
+    const isAborted = () => Boolean(signal?.aborted || callerSignal?.aborted);
+    const isAbortError = (error: unknown) => isAborted() || (error as Error)?.name === 'AbortError';
+    const safeClose = () => {
+      try {
+        controller.close();
+      } catch {
+        // Already closed or cancelled
+      }
+    };
+    const safeEnqueue = (chunk: Uint8Array) => {
+      if (isAborted()) return;
+      controller.enqueue(chunk);
+    };
+
     try {
-      let toolCalls: ToolInvocation[] = [];
       let messages: UIMessage[] = [];
-      let streamRunId: string | undefined = processedParams.runId;
+      let streamRunId: string | undefined = suppliedRunId;
+      // The full model-message history the server reported on its last finish chunk. A resumed
+      // run restores the conversation from its snapshot, so this is the only place a stateless
+      // client can recover it for a client-tool continuation.
+      let finishedHistory: unknown[] | undefined;
+      // A durable run keeps this stream open across a suspension, so it also carries the
+      // resumed continuation. Its client tools are run by the request that resumed the run
+      // (approve/decline/resume), so this stream must not run them again.
+      let suspended = false;
+      const resumedToolCallIds = new Set<string>();
+      const releaseOpenStream = streamRunId ? this.trackOpenStream(streamRunId) : () => {};
 
       // Use tee() to split the stream into two branches
       const [streamForController, streamForProcessing] = response.body.tee();
+      const decoder = new TextDecoder();
+      const splitEvents = createSseEventSplitter();
 
-      // Pipe one branch directly to the controller
+      const enqueueReadableText = (text: string, isFinal = false) => {
+        const lines = splitEvents(text, isFinal);
+        for (const line of lines) {
+          if (!line.startsWith('data: ') || !line.includes('"type":"finish"')) continue;
+          try {
+            const all = JSON.parse(line.slice(6))?.payload?.messages?.all;
+            if (Array.isArray(all)) finishedHistory = all;
+          } catch {
+            // Not a JSON chunk
+          }
+        }
+
+        const readableLines = lines
+          .filter(line => line.trim() !== '[DONE]' && line.trim() !== 'data: [DONE]')
+          .join('\n\n');
+        if (readableLines) {
+          safeEnqueue(new TextEncoder().encode(`${readableLines}\n\n`));
+        }
+      };
+
+      // Pipe one branch directly to the controller. Aborting the signal cancels this
+      // branch; the tee source is released once both branches are cancelled/errored.
       const pipePromise = streamForController
         .pipeTo(
           new WritableStream<Uint8Array>({
             async write(chunk) {
               // Filter out terminal markers so the client stream doesn't end before recursion
               try {
-                const text = new TextDecoder().decode(chunk);
-                const lines = text.split('\n\n');
-                const readableLines = lines
-                  .filter(line => line.trim() !== '[DONE]' && line.trim() !== 'data: [DONE]')
-                  .join('\n\n');
-                if (readableLines) {
-                  const encoded = new TextEncoder().encode(readableLines);
-                  controller.enqueue(encoded);
-                }
+                enqueueReadableText(decoder.decode(chunk, { stream: true }));
               } catch (error) {
                 console.error('Error enqueueing to controller:', error);
-                controller.enqueue(chunk);
+                safeEnqueue(chunk);
               }
             },
+            close() {
+              enqueueReadableText(decoder.decode(), true);
+            },
           }),
+          { signal },
         )
         .catch(error => {
-          console.error('Error piping to controller:', error);
-          try {
-            controller.close();
-          } catch {
-            // Already closed
+          if (!isAbortError(error)) {
+            console.error('Error piping to controller:', error);
           }
+          safeClose();
         });
 
-      // Process the other branch for chat response handling
+      // Surface the abort to a consumer that is still reading (e.g. when a caller-provided
+      // abortSignal fires rather than the stream itself being cancelled).
+      const onAbort = () => {
+        try {
+          controller.error(signal?.reason);
+        } catch {
+          // Stream already cancelled/closed by the consumer
+        }
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+
+      // Process the other branch for chat response handling. Routing it through an
+      // abortable pipe lets the abort signal cancel this branch too, releasing the
+      // underlying response body once both tee branches are cancelled.
+      const processingStream = signal
+        ? streamForProcessing.pipeThrough(new TransformStream<Uint8Array, Uint8Array>(), { signal })
+        : streamForProcessing;
       this.processChatResponse_vNext({
-        stream: streamForProcessing as unknown as ReadableStream<Uint8Array>,
+        stream: processingStream as unknown as ReadableStream<Uint8Array>,
         update: ({ message }) => {
           const existingIndex = messages.findIndex(m => m.id === message.id);
 
@@ -1620,64 +2538,98 @@ export class Agent extends BaseResource {
           }
         },
         onFinish: async ({ finishReason, message }) => {
+          // The consumer cancelled: skip client-tool execution and any continuation request.
+          if (isAborted()) {
+            return;
+          }
+
           if (finishReason === 'tool-calls') {
-            const toolCall = [...(message?.parts ?? [])]
-              .reverse()
-              .find(part => part.type === 'tool-invocation')?.toolInvocation;
-            if (toolCall) {
+            const toolInvocationsById = new Map<string, ToolInvocation>();
+
+            for (const part of message?.parts ?? []) {
+              if (part.type !== 'tool-invocation' || !part.toolInvocation?.toolCallId) {
+                continue;
+              }
+
               const toolInvocationWithMetadata = message?.toolInvocations?.find(
-                invocation => invocation.toolCallId === toolCall.toolCallId,
+                invocation => invocation.toolCallId === part.toolInvocation.toolCallId,
               );
-              toolCalls.push({
+
+              toolInvocationsById.set(part.toolInvocation.toolCallId, {
                 ...toolInvocationWithMetadata,
-                ...toolCall,
-                ...(!getClientToolObservabilityContext(toolCall) && toolInvocationWithMetadata
+                ...part.toolInvocation,
+                ...(!getClientToolObservabilityContext(part.toolInvocation) && toolInvocationWithMetadata
                   ? { observability: getClientToolObservabilityContext(toolInvocationWithMetadata) }
                   : {}),
               });
             }
 
-            let shouldExecuteClientTool = false;
-            // Handle tool calls if needed
-            for (const toolCall of toolCalls) {
-              const clientTool = processedParams.clientTools?.[toolCall.toolName] as Tool;
-              if (clientTool && clientTool.execute) {
-                shouldExecuteClientTool = true;
+            for (const toolInvocation of message?.toolInvocations ?? []) {
+              if (!toolInvocation.toolCallId) {
+                continue;
+              }
 
-                // Synthesize a Mastra-shaped terminal chunk so React's toUIMessage
-                // reducer flips the matching `dynamic-tool` part from
-                // `input-available` to `output-available` / `output-error`.
-                // Without this, the React-side `dynamic-tool` part is stuck in
-                // `input-available` forever because the server stream never emits
-                // a terminal chunk for client-executed tools.
+              toolInvocationsById.set(toolInvocation.toolCallId, {
+                ...toolInvocationsById.get(toolInvocation.toolCallId),
+                ...toolInvocation,
+              });
+            }
+
+            const executableToolCalls = [...toolInvocationsById.values()].filter(toolCall => {
+              // A resumed call is skipped only when the request that resumed the run can execute
+              // that tool. A server-side approve sends no client tools, so the call must run here.
+              if (resumedToolCallIds.has(toolCall.toolCallId)) {
+                const held = streamRunId
+                  ? resumingClientToolNamesByRunKey.get(this.getSignalRuntimeRunKey(streamRunId))
+                  : undefined;
+                if (held?.has(toolCall.toolName)) return false;
+              }
+              const clientTool = processedParams.clientTools?.[toolCall.toolName] as Tool;
+              return Boolean(clientTool?.execute);
+            });
+
+            if (executableToolCalls.length > 0) {
+              const syntheticChunks: Array<
+                | {
+                    type: 'tool-result';
+                    runId: string;
+                    from: 'AGENT';
+                    payload: {
+                      toolCallId: string;
+                      toolName: string;
+                      args: unknown;
+                      result: unknown;
+                      isError: boolean;
+                      providerExecuted: false;
+                    };
+                  }
+                | {
+                    type: 'tool-error';
+                    runId: string;
+                    from: 'AGENT';
+                    payload: {
+                      toolCallId: string;
+                      toolName: string;
+                      error: unknown;
+                      args?: unknown;
+                      providerExecuted: false;
+                    };
+                  }
+              > = [];
+              const toolResultContents: Array<Record<string, unknown>> = [];
+
+              for (const toolCall of executableToolCalls) {
+                // Re-check between tools so an abort mid-batch stops the remaining executions.
+                if (isAborted()) {
+                  return;
+                }
+                const clientTool = processedParams.clientTools?.[toolCall.toolName] as Tool;
+
                 const runId: string = streamRunId ?? toolCall.toolCallId;
                 let result: unknown;
+                let modelOutput: unknown;
                 let observability: ClientToolObservabilityEnvelope | undefined;
-                let synthetic:
-                  | {
-                      type: 'tool-result';
-                      runId: string;
-                      from: 'AGENT';
-                      payload: {
-                        toolCallId: string;
-                        toolName: string;
-                        result: unknown;
-                        isError: boolean;
-                        providerExecuted: false;
-                      };
-                    }
-                  | {
-                      type: 'tool-error';
-                      runId: string;
-                      from: 'AGENT';
-                      payload: {
-                        toolCallId: string;
-                        toolName: string;
-                        error: unknown;
-                        args?: unknown;
-                        providerExecuted: false;
-                      };
-                    };
+                let synthetic: (typeof syntheticChunks)[number];
 
                 try {
                   ({ result, observability } = await executeClientToolWithObservability({
@@ -1699,6 +2651,8 @@ export class Agent extends BaseResource {
                     },
                   }));
 
+                  modelOutput = await getClientToolModelOutput(clientTool, result);
+
                   synthetic = {
                     type: 'tool-result',
                     runId,
@@ -1706,6 +2660,7 @@ export class Agent extends BaseResource {
                     payload: {
                       toolCallId: toolCall.toolCallId,
                       toolName: toolCall.toolName,
+                      args: toolCall.args,
                       result,
                       isError: false,
                       providerExecuted: false,
@@ -1731,15 +2686,34 @@ export class Agent extends BaseResource {
                   result = { error: error instanceof Error ? error.message : String(error) };
                 }
 
-                // Wait for the server-side stream pipe to finish before
-                // enqueueing the synthetic chunk so the React reducer observes
-                // the server `finish` chunk first, then our terminal tool chunk.
-                try {
-                  await pipePromise;
-                } catch {
-                  // pipePromise already has its own .catch; ignore here.
-                }
+                syntheticChunks.push(synthetic);
+                toolResultContents.push({
+                  type: 'tool-result' as const,
+                  toolCallId: toolCall.toolCallId,
+                  toolName: toolCall.toolName,
+                  input: toolCall.args,
+                  output: { type: 'json', value: result as JSONValue },
+                  ...(modelOutput != null
+                    ? { providerOptions: { mastra: { modelOutput: modelOutput as JSONValue } } }
+                    : {}),
+                  ...(observability ? { __mastraObservability: observability } : {}),
+                });
+              }
 
+              // Wait for the server-side stream pipe to finish before
+              // enqueueing synthetic chunks so the React reducer observes
+              // the server `finish` chunk first, then terminal tool chunks.
+              try {
+                await pipePromise;
+              } catch {
+                // pipePromise already has its own .catch; ignore here.
+              }
+
+              if (isAborted()) {
+                return;
+              }
+
+              for (const synthetic of syntheticChunks) {
                 try {
                   const errorForSerialization = synthetic.type === 'tool-error' ? synthetic.payload.error : undefined;
                   const serializedError =
@@ -1755,111 +2729,115 @@ export class Agent extends BaseResource {
                       ? { ...synthetic, payload: { ...synthetic.payload, error: serializedError } }
                       : synthetic;
                   const sseLine = `data: ${JSON.stringify(payloadForWire)}\n\n`;
-                  controller.enqueue(new TextEncoder().encode(sseLine));
+                  safeEnqueue(new TextEncoder().encode(sseLine));
                 } catch (enqueueErr) {
                   console.error('Failed to enqueue synthetic tool-result chunk:', enqueueErr);
                 }
+              }
 
-                const lastMessageRaw = messages[messages.length - 1];
-                const lastMessage: UIMessage | undefined =
-                  lastMessageRaw != null ? JSON.parse(JSON.stringify(lastMessageRaw)) : undefined;
+              const toolResultMessage = {
+                role: 'tool' as const,
+                content: toolResultContents,
+              };
 
-                const toolInvocationPart = lastMessage?.parts?.find(
-                  part => part.type === 'tool-invocation' && part.toolInvocation?.toolCallId === toolCall.toolCallId,
-                ) as ToolInvocationUIPart | undefined;
+              const isOneShotResume =
+                route === 'resume-stream' || route === 'approve-tool-call' || route === 'decline-tool-call';
+              const updatedMessages = threadId
+                ? [toolResultMessage]
+                : isOneShotResume && finishedHistory
+                  ? [...finishedHistory, toolResultMessage]
+                  : [
+                      ...(Array.isArray(processedParams.messages) ? processedParams.messages : []),
+                      ...messages,
+                      toolResultMessage,
+                    ];
 
-                if (toolInvocationPart) {
-                  toolInvocationPart.toolInvocation = {
-                    ...toolInvocationPart.toolInvocation,
-                    state: 'result',
-                    result,
-                    ...(observability ? { __mastraObservability: observability } : {}),
-                  };
-                }
+              // Recursively call stream with updated messages
+              // This will wait for the recursive stream to complete before continuing.
+              // Resume routes (including approve/decline) are one-shot (they consume server-side resumeData),
+              // so client-tool continuations must fall back to the corresponding
+              // non-resume stream endpoint. Other routes (e.g. stream-until-idle)
+              // are idempotent continuations and stay on the same endpoint.
+              const recursionRoute =
+                route === 'resume-stream' || route === 'approve-tool-call' || route === 'decline-tool-call'
+                  ? 'stream'
+                  : route === 'resume-stream-until-idle'
+                    ? 'stream-until-idle'
+                    : route;
+              if (isAborted()) {
+                return;
+              }
 
-                const toolInvocation = lastMessage?.toolInvocations?.find(
-                  toolInvocation => toolInvocation.toolCallId === toolCall.toolCallId,
-                ) as ToolInvocation | undefined;
-
-                if (toolInvocation) {
-                  toolInvocation.state = 'result';
-                  // @ts-expect-error - result property exists when state is 'result'
-                  toolInvocation.result = result;
-                  if (observability) {
-                    (
-                      toolInvocation as unknown as { __mastraObservability?: ClientToolObservabilityEnvelope }
-                    ).__mastraObservability = observability;
-                  }
-                }
-
-                // Build updated messages for the recursive call
-                // When threadId is present, server has memory - don't re-include original messages to avoid storage duplicates
-                // When no threadId (stateless), include full conversation history for context
-                const newMessages =
-                  lastMessage != null ? [...messages.filter(m => m.id !== lastMessage.id), lastMessage] : [...messages];
-
-                const updatedMessages = threadId
-                  ? newMessages
-                  : [...(Array.isArray(processedParams.messages) ? processedParams.messages : []), ...newMessages];
-
-                // Recursively call stream with updated messages
-                // This will wait for the recursive stream to complete before continuing.
-                // Resume routes are one-shot (they consume server-side resumeData),
-                // so client-tool continuations must fall back to the corresponding
-                // non-resume stream endpoint. Other routes (e.g. stream-until-idle)
-                // are idempotent continuations and stay on the same endpoint.
-                const recursionRoute =
-                  route === 'resume-stream'
-                    ? 'stream'
-                    : route === 'resume-stream-until-idle'
-                      ? 'stream-until-idle'
-                      : route;
-                try {
-                  await this.processStreamResponse(
-                    {
-                      ...processedParams,
-                      messages: updatedMessages,
-                    },
-                    controller,
-                    recursionRoute,
-                  );
-                } catch (error) {
+              try {
+                await this.processStreamResponse(
+                  {
+                    ...processedParams,
+                    messages: updatedMessages,
+                    clientTools: processClientTools(
+                      processedParams.clientToolsResolver?.() ?? processedParams.clientTools,
+                    ),
+                  },
+                  controller,
+                  recursionRoute,
+                  signal,
+                );
+              } catch (error) {
+                if (!isAbortError(error)) {
                   console.error('Error processing recursive stream response:', error);
                 }
               }
-            }
-
-            // Close the controller after all processing is complete
-            // Wait for current pipe to finish before closing
-            if (!shouldExecuteClientTool) {
+            } else {
+              // Close the controller after all processing is complete
+              // Wait for current pipe to finish before closing
               await pipePromise;
-              controller.close();
+              safeClose();
             }
-            // If client tool was executed, the recursive call will handle closing the stream
           } else {
             // No tool calls - wait for pipe to complete then close the stream
             await pipePromise;
-            controller.close();
+            safeClose();
           }
         },
         onStreamChunk: chunk => {
           if (!streamRunId && typeof chunk.runId === 'string') {
             streamRunId = chunk.runId;
           }
+          if (chunk.type === 'tool-call-approval' || chunk.type === 'tool-call-suspended') {
+            suspended = true;
+          } else if (suspended && chunk.type === 'tool-call' && typeof chunk.payload?.toolCallId === 'string') {
+            const toolName = chunk.payload.toolName;
+            const held = streamRunId
+              ? resumingClientToolNamesByRunKey.get(this.getSignalRuntimeRunKey(streamRunId))
+              : undefined;
+            if (typeof toolName === 'string' && held?.has(toolName)) {
+              resumedToolCallIds.add(chunk.payload.toolCallId);
+            }
+          }
         },
         lastMessage: undefined,
-      }).catch(async error => {
-        console.error('Error processing stream response:', error);
-        // On error, wait for pipe to complete then close the controller
-        try {
-          await pipePromise;
-          controller.close();
-        } catch {
-          // Already closed
-        }
-      });
+      })
+        .catch(async error => {
+          if (!isAbortError(error)) {
+            console.error('Error processing stream response:', error);
+          }
+          // On error, wait for pipe to complete then close the controller
+          try {
+            await pipePromise;
+          } catch {
+            // pipePromise already has its own .catch; ignore here.
+          }
+          safeClose();
+        })
+        .finally(() => {
+          cleanupCancellation();
+          signal?.removeEventListener('abort', onAbort);
+          releaseOpenStream();
+        });
     } catch (error) {
-      console.error('Error processing stream response:', error);
+      cleanupCancellation();
+      if (!isAbortError(error)) {
+        console.error('Error processing stream response:', error);
+      }
     }
 
     return response;
@@ -1927,6 +2905,7 @@ export class Agent extends BaseResource {
 
   async approveNetworkToolCall(params: {
     runId: string;
+    model?: string;
     requestContext?: RequestContext | Record<string, any>;
   }): Promise<
     Response & {
@@ -1976,6 +2955,9 @@ export class Agent extends BaseResource {
 
   async declineNetworkToolCall(params: {
     runId: string;
+    model?: string;
+    /** Optional explanation surfaced in place of the default decline message. */
+    reason?: string;
     requestContext?: RequestContext | Record<string, any>;
   }): Promise<
     Response & {
@@ -2065,8 +3047,8 @@ export class Agent extends BaseResource {
   >;
   async stream<OUTPUT>(
     messagesOrParams: MessageListInput,
-    options?: AgentExecutionOptionsBase<any> & {
-      structuredOutput?: StreamParamsBaseWithoutMessages<any>;
+    options?: StreamParamsBaseWithoutMessages<any> & {
+      structuredOutput?: StructuredOutputOptions<any>;
     },
   ): Promise<
     Response & {
@@ -2093,21 +3075,16 @@ export class Agent extends BaseResource {
     const processedParams: StreamParams<OUTPUT> = {
       ...params,
       requestContext: parseClientRequestContext(params.requestContext),
-      clientTools: processClientTools(params.clientTools),
+      clientTools: processClientTools(params.clientToolsResolver?.() ?? params.clientTools),
       structuredOutput,
     };
 
     // Create a manually controlled readable stream
-    let readableController: ReadableStreamDefaultController<Uint8Array>;
-    const readable = new ReadableStream<Uint8Array>({
-      start(controller) {
-        readableController = controller;
-      },
-    });
+    const { readable, controller: readableController, signal } = this.createCancellableStream();
 
     // Start processing the response in the background
     // This returns immediately with response metadata and continues streaming in background
-    const response = await this.processStreamResponse(processedParams, readableController!);
+    const response = await this.processStreamResponse(processedParams, readableController, 'stream', signal);
 
     // Create a new response with the readable stream
     const streamResponse = new Response(readable, {
@@ -2137,6 +3114,9 @@ export class Agent extends BaseResource {
     return streamResponse;
   }
 
+  /**
+   * @deprecated Use `stream(messages, { untilIdle: true })` instead.
+   */
   async streamUntilIdle<OUTPUT extends {}>(
     messages: MessageListInput,
     streamOptions: StreamParamsBaseWithoutMessages<OUTPUT> & {
@@ -2183,8 +3163,8 @@ export class Agent extends BaseResource {
   >;
   async streamUntilIdle<OUTPUT>(
     messagesOrParams: MessageListInput,
-    options?: AgentExecutionOptionsBase<any> & {
-      structuredOutput?: StreamParamsBaseWithoutMessages<any>;
+    options?: StreamParamsBaseWithoutMessages<any> & {
+      structuredOutput?: StructuredOutputOptions<any>;
       maxIdleMs?: number;
     },
   ): Promise<
@@ -2212,21 +3192,16 @@ export class Agent extends BaseResource {
     const processedParams: StreamParams<OUTPUT> = {
       ...params,
       requestContext: parseClientRequestContext(params.requestContext),
-      clientTools: processClientTools(params.clientTools),
+      clientTools: processClientTools(params.clientToolsResolver?.() ?? params.clientTools),
       structuredOutput,
     };
 
     // Create a manually controlled readable stream
-    let readableController: ReadableStreamDefaultController<Uint8Array>;
-    const readable = new ReadableStream<Uint8Array>({
-      start(controller) {
-        readableController = controller;
-      },
-    });
+    const { readable, controller: readableController, signal } = this.createCancellableStream();
 
     // Start processing the response in the background
     // This returns immediately with response metadata and continues streaming in background
-    const response = await this.processStreamResponse(processedParams, readableController!, 'stream-until-idle');
+    const response = await this.processStreamResponse(processedParams, readableController, 'stream-until-idle', signal);
 
     // Create a new response with the readable stream
     const streamResponse = new Response(readable, {
@@ -2254,12 +3229,48 @@ export class Agent extends BaseResource {
     };
 
     return streamResponse;
+  }
+
+  /**
+   * Lists suspended runs for this agent from storage — runs waiting on a
+   * tool-call approval or on a tool that suspended. Backed by storage, so it
+   * works after a server restart and across server instances. Pass the
+   * returned runId to approveToolCall(), declineToolCall(), or resumeStream().
+   * @param params - Optional filters (threadId, resourceId, fromDate, toDate) and pagination (perPage, page)
+   * @param requestContext - Optional request context
+   * @returns Promise containing the matching runs and the total count before pagination
+   */
+  async listSuspendedRuns(
+    params?: ListAgentSuspendedRunsParams,
+    requestContext?: RequestContext | Record<string, any>,
+  ): Promise<ListAgentSuspendedRunsResponse> {
+    const searchParams = new URLSearchParams(requestContextQueryString(requestContext).slice(1));
+    if (params?.threadId) searchParams.set('threadId', params.threadId);
+    if (params?.resourceId) searchParams.set('resourceId', params.resourceId);
+    if (params?.fromDate) searchParams.set('fromDate', params.fromDate.toISOString());
+    if (params?.toDate) searchParams.set('toDate', params.toDate.toISOString());
+    if (params?.perPage !== undefined) searchParams.set('perPage', String(params.perPage));
+    if (params?.page !== undefined) searchParams.set('page', String(params.page));
+
+    const query = searchParams.size ? `?${searchParams}` : '';
+    return this.request<ListAgentSuspendedRunsResponse>(`/agents/${this.agentId}/suspended-runs${query}`);
   }
 
   async approveToolCall(params: {
     runId: string;
     toolCallId: string;
+    model?: string;
+    /** Aborts the underlying request and any client-tool continuations. */
+    abortSignal?: AbortSignal;
     requestContext?: RequestContext | Record<string, any>;
+    /** Client tools the model may call after the approval decision. */
+    clientTools?: ToolsInput;
+    clientToolsResolver?: ClientToolsResolver;
+    /**
+     * Memory thread/resource of the suspended run. Client-tool continuations go to `/stream`,
+     * so pass the same memory as the original call to keep them on the thread.
+     */
+    memory?: StreamParamsBaseWithoutMessages['memory'];
   }): Promise<
     Response & {
       processDataStream: ({
@@ -2270,18 +3281,27 @@ export class Agent extends BaseResource {
     }
   > {
     const { requestContext, ...rest } = params;
-    const processedParams = { ...rest, requestContext: parseClientRequestContext(requestContext) };
+    const executableClientTools = params.clientToolsResolver?.() ?? params.clientTools;
+    const releaseHold = this.holdResumingClientTools(rest.runId, executableClientTools);
+    const processedParams = {
+      ...rest,
+      requestContext: parseClientRequestContext(requestContext),
+      clientTools: processClientTools(executableClientTools),
+    };
 
     // Create a manually controlled readable stream
-    let readableController: ReadableStreamDefaultController<Uint8Array>;
-    const readable = new ReadableStream<Uint8Array>({
-      start(controller) {
-        readableController = controller;
-      },
-    });
+    const { readable, controller: readableController, signal } = this.createCancellableStream();
 
-    // Start processing the response in the background
-    const response = await this.processStreamResponse(processedParams, readableController!, 'approve-tool-call');
+    // A rejected request never resumes the run, so drop the hold even if the original stream is open.
+    const response = await this.processStreamResponse(
+      processedParams,
+      readableController,
+      'approve-tool-call',
+      signal,
+    ).catch(error => {
+      releaseHold({ force: true });
+      throw error;
+    });
 
     // Create a new response with the readable stream
     const streamResponse = new Response(readable, {
@@ -2311,10 +3331,40 @@ export class Agent extends BaseResource {
     return streamResponse;
   }
 
+  async sendToolApproval(
+    params: Omit<Body<'POST /agents/:agentId/send-tool-approval'>, 'requestContext' | 'messages' | 'streamOptions'> & {
+      requestContext?: RequestContext | Record<string, any>;
+      messages?: MessageListInput;
+      streamOptions?: StreamParamsBaseWithoutMessages<any>;
+    },
+  ): Promise<RouteResponse<'POST /agents/:agentId/send-tool-approval'>> {
+    const { requestContext, ...rest } = params;
+    return this.request<RouteResponse<'POST /agents/:agentId/send-tool-approval'>>(
+      `/agents/${this.agentId}/send-tool-approval`,
+      {
+        method: 'POST',
+        body: { ...rest, requestContext: parseClientRequestContext(requestContext) },
+      },
+    );
+  }
+
   async declineToolCall(params: {
     runId: string;
     toolCallId: string;
+    model?: string;
+    /** Aborts the underlying request and any client-tool continuations. */
+    abortSignal?: AbortSignal;
+    /** Optional explanation surfaced to the model in place of the default decline message. */
+    reason?: string;
     requestContext?: RequestContext | Record<string, any>;
+    /** Client tools the model may call after the approval decision. */
+    clientTools?: ToolsInput;
+    clientToolsResolver?: ClientToolsResolver;
+    /**
+     * Memory thread/resource of the suspended run. Client-tool continuations go to `/stream`,
+     * so pass the same memory as the original call to keep them on the thread.
+     */
+    memory?: StreamParamsBaseWithoutMessages['memory'];
   }): Promise<
     Response & {
       processDataStream: ({
@@ -2325,18 +3375,27 @@ export class Agent extends BaseResource {
     }
   > {
     const { requestContext, ...rest } = params;
-    const processedParams = { ...rest, requestContext: parseClientRequestContext(requestContext) };
+    const executableClientTools = params.clientToolsResolver?.() ?? params.clientTools;
+    const releaseHold = this.holdResumingClientTools(rest.runId, executableClientTools);
+    const processedParams = {
+      ...rest,
+      requestContext: parseClientRequestContext(requestContext),
+      clientTools: processClientTools(executableClientTools),
+    };
 
     // Create a manually controlled readable stream
-    let readableController: ReadableStreamDefaultController<Uint8Array>;
-    const readable = new ReadableStream<Uint8Array>({
-      start(controller) {
-        readableController = controller;
-      },
-    });
+    const { readable, controller: readableController, signal } = this.createCancellableStream();
 
-    // Start processing the response in the background
-    const response = await this.processStreamResponse(processedParams, readableController!, 'decline-tool-call');
+    // A rejected request never resumes the run, so drop the hold even if the original stream is open.
+    const response = await this.processStreamResponse(
+      processedParams,
+      readableController,
+      'decline-tool-call',
+      signal,
+    ).catch(error => {
+      releaseHold({ force: true });
+      throw error;
+    });
 
     // Create a new response with the readable stream
     const streamResponse = new Response(readable, {
@@ -2371,20 +3430,27 @@ export class Agent extends BaseResource {
    * Use this to resume receiving events after a disconnection.
    *
    * @param params.runId - The run ID to observe
-   * @param params.offset - Optional position to resume from (0-based). If omitted, replays all events.
+   * @param params.offset - Run-log position to resume from. Chunks from `observe()`, and from `stream()` on
+   *   durable and evented agents, carry an `index`; pass the `index + 1` of the last chunk that has one. Chunks without an `index`
+   *   (`abort` and structured-output `object` chunks) are skipped when choosing the offset. If omitted,
+   *   replays the chunks still cached for the run, or only live chunks if the server's transport can't replay.
    * @returns Promise containing a streaming Response
    *
    * @example
    * ```typescript
-   * // Reconnect to a stream from a specific position
-   * const response = await client.agents('my-agent').observe({
-   *   runId: 'run-123',
-   *   offset: 42, // Resume from event 42
-   * });
+   * const agent = client.getAgent('my-agent');
+   * let offset = 0;
+   * const trackOffset = async (chunk: { index?: number }) => {
+   *   if (chunk.index === undefined) return;
+   *   offset = chunk.index + 1;
+   * };
    *
-   * await response.processDataStream({
-   *   onChunk: (chunk) => console.log('Received:', chunk),
-   * });
+   * const stream = await agent.stream(messages, { runId: 'run-123' });
+   * await stream.processDataStream({ onChunk: trackOffset });
+   *
+   * // After a dropped connection, resume where the last indexed chunk left off
+   * const response = await agent.observe({ runId: 'run-123', offset });
+   * await response.processDataStream({ onChunk: trackOffset });
    * ```
    */
   async observe(params: { runId: string; offset?: number }): Promise<
@@ -2448,11 +3514,13 @@ export class Agent extends BaseResource {
       }) => Promise<void>;
     }
   > {
+    const executableClientTools = options.clientToolsResolver?.() ?? options.clientTools;
+    const releaseHold = this.holdResumingClientTools(options.runId, executableClientTools);
     const processedParams = {
       ...options,
       resumeData,
       requestContext: parseClientRequestContext(options.requestContext),
-      clientTools: processClientTools(options.clientTools),
+      clientTools: processClientTools(executableClientTools),
       structuredOutput: options.structuredOutput
         ? {
             ...options.structuredOutput,
@@ -2461,14 +3529,17 @@ export class Agent extends BaseResource {
         : undefined,
     };
 
-    let readableController: ReadableStreamDefaultController<Uint8Array>;
-    const readable = new ReadableStream<Uint8Array>({
-      start(controller) {
-        readableController = controller;
-      },
-    });
+    const { readable, controller: readableController, signal } = this.createCancellableStream();
 
-    const response = await this.processStreamResponse(processedParams, readableController!, 'resume-stream');
+    const response = await this.processStreamResponse(
+      processedParams,
+      readableController,
+      'resume-stream',
+      signal,
+    ).catch(error => {
+      releaseHold({ force: true });
+      throw error;
+    });
 
     const streamResponse = new Response(readable, {
       status: response.status,
@@ -2497,6 +3568,66 @@ export class Agent extends BaseResource {
   }
 
   /**
+   * Re-drives an orphaned RUNNING durable-agent run after a process restart.
+   *
+   * Only supported when the target agent is a durable agent (createDurableAgent).
+   * The server rebuilds the runtime state from the persisted snapshot, replays
+   * past chunks, and continues the loop to completion.
+   *
+   * Responds with 409 when the run is not orphaned: another execution still
+   * owns it (retry once its lease lapses), it is already being recovered, or it
+   * is suspended (use `resumeStream` instead). To follow a live run, use `observe`.
+   */
+  async recover(params: RecoverParams): Promise<
+    Response & {
+      processDataStream: ({
+        onChunk,
+      }: {
+        onChunk: Parameters<typeof processMastraStream>[0]['onChunk'];
+      }) => Promise<void>;
+    }
+  > {
+    const body = {
+      runId: params.runId,
+      requestContext: parseClientRequestContext(params.requestContext),
+      versions: params.versions,
+    };
+
+    const response: Response = await this.request(`/agents/${this.agentId}/recover`, {
+      method: 'POST',
+      body,
+      stream: true,
+    });
+
+    if (!response.body) {
+      throw new Error('No response body');
+    }
+
+    const streamResponse = response as Response & {
+      processDataStream: ({
+        onChunk,
+      }: {
+        onChunk: Parameters<typeof processMastraStream>[0]['onChunk'];
+      }) => Promise<void>;
+    };
+
+    streamResponse.processDataStream = async ({
+      onChunk,
+    }: {
+      onChunk: Parameters<typeof processMastraStream>[0]['onChunk'];
+    }) => {
+      await processMastraStream({
+        stream: streamResponse.body as ReadableStream<Uint8Array>,
+        onChunk,
+      });
+    };
+
+    return streamResponse;
+  }
+
+  /**
+   * @deprecated Use `resumeStream(resumeData, { untilIdle: true, ... })` instead.
+   *
    * Resumes a suspended agent stream until idle with custom resume data.
    * Used to continue execution after a suspension point (e.g., workflow suspend within an agent).
    */
@@ -2514,11 +3645,13 @@ export class Agent extends BaseResource {
       }) => Promise<void>;
     }
   > {
+    const executableClientTools = options.clientToolsResolver?.() ?? options.clientTools;
+    const releaseHold = this.holdResumingClientTools(options.runId, executableClientTools);
     const processedParams = {
       ...options,
       resumeData,
       requestContext: parseClientRequestContext(options.requestContext),
-      clientTools: processClientTools(options.clientTools),
+      clientTools: processClientTools(executableClientTools),
       structuredOutput: options.structuredOutput
         ? {
             ...options.structuredOutput,
@@ -2527,14 +3660,17 @@ export class Agent extends BaseResource {
         : undefined,
     };
 
-    let readableController: ReadableStreamDefaultController<Uint8Array>;
-    const readable = new ReadableStream<Uint8Array>({
-      start(controller) {
-        readableController = controller;
-      },
-    });
+    const { readable, controller: readableController, signal } = this.createCancellableStream();
 
-    const response = await this.processStreamResponse(processedParams, readableController!, 'resume-stream-until-idle');
+    const response = await this.processStreamResponse(
+      processedParams,
+      readableController,
+      'resume-stream-until-idle',
+      signal,
+    ).catch(error => {
+      releaseHold({ force: true });
+      throw error;
+    });
 
     const streamResponse = new Response(readable, {
       status: response.status,
@@ -2566,50 +3702,177 @@ export class Agent extends BaseResource {
    * Approves a pending tool call and returns the complete response (non-streaming).
    * Used when `requireToolApproval` is enabled with generate() to allow the agent to proceed.
    */
-  async approveToolCallGenerate(params: {
-    runId: string;
-    toolCallId: string;
-    requestContext?: RequestContext | Record<string, any>;
-  }): Promise<any> {
-    const { requestContext, ...rest } = params;
-    return this.request(`/agents/${this.agentId}/approve-tool-call-generate`, {
-      method: 'POST',
-      body: { ...rest, requestContext: parseClientRequestContext(requestContext) },
-    });
+  async approveToolCallGenerate(
+    params: Omit<Body<'POST /agents/:agentId/approve-tool-call-generate'>, 'requestContext' | 'clientTools'> & {
+      requestContext?: RequestContext | Record<string, any>;
+      /** Client tools the model may call after the approval decision. */
+      clientTools?: ToolsInput;
+      clientToolsResolver?: ClientToolsResolver;
+      /**
+       * Memory of the original call. When the model calls a client tool after the decision, the
+       * continuation is saved to this thread instead of running stateless.
+       */
+      memory?: StreamParamsBaseWithoutMessages['memory'];
+    },
+  ): Promise<ToolCallGenerateResponse> {
+    const { requestContext, clientTools, clientToolsResolver, memory, ...rest } = params;
+    // The open first stream receives the resumed call while this request is in flight. Hold before
+    // the request so that stream skips tools this request can execute. A generate resume opens no
+    // stream of its own, so release the hold here unless a stream is still tracking the run.
+    const executableClientTools = clientToolsResolver?.() ?? clientTools;
+    const releaseHold = this.holdResumingClientTools(rest.runId, executableClientTools);
+    let response: ToolCallGenerateResponse;
+    try {
+      response = await this.request(`/agents/${this.agentId}/approve-tool-call-generate`, {
+        method: 'POST',
+        body: {
+          ...rest,
+          requestContext: parseClientRequestContext(requestContext),
+          clientTools: processClientTools(executableClientTools),
+        },
+      });
+    } catch (error) {
+      // The server rejected the resume, so it never happened. Drop the hold even if a stream is open.
+      releaseHold({ force: true });
+      throw error;
+    }
+    try {
+      return await this.continueResumedGenerate(response, {
+        requestContext,
+        clientTools: executableClientTools,
+        clientToolsResolver,
+        memory,
+      });
+    } finally {
+      // The resume was accepted. Leave the hold while a stream is still tracking the run.
+      releaseHold();
+    }
   }
 
   /**
    * Declines a pending tool call and returns the complete response (non-streaming).
    * Used when `requireToolApproval` is enabled with generate() to prevent tool execution.
    */
-  async declineToolCallGenerate(params: {
-    runId: string;
-    toolCallId: string;
-    requestContext?: RequestContext | Record<string, any>;
-  }): Promise<any> {
-    const { requestContext, ...rest } = params;
-    return this.request(`/agents/${this.agentId}/decline-tool-call-generate`, {
-      method: 'POST',
-      body: { ...rest, requestContext: parseClientRequestContext(requestContext) },
+  async declineToolCallGenerate(
+    params: Omit<Body<'POST /agents/:agentId/decline-tool-call-generate'>, 'requestContext' | 'clientTools'> & {
+      requestContext?: RequestContext | Record<string, any>;
+      /** Client tools the model may call after the approval decision. */
+      clientTools?: ToolsInput;
+      clientToolsResolver?: ClientToolsResolver;
+      /**
+       * Memory of the original call. When the model calls a client tool after the decision, the
+       * continuation is saved to this thread instead of running stateless.
+       */
+      memory?: StreamParamsBaseWithoutMessages['memory'];
+    },
+  ): Promise<ToolCallGenerateResponse> {
+    const { requestContext, clientTools, clientToolsResolver, memory, ...rest } = params;
+    // The open first stream receives the resumed call while this request is in flight. Hold before
+    // the request so that stream skips tools this request can execute. A generate resume opens no
+    // stream of its own, so release the hold here unless a stream is still tracking the run.
+    const executableClientTools = clientToolsResolver?.() ?? clientTools;
+    const releaseHold = this.holdResumingClientTools(rest.runId, executableClientTools);
+    let response: ToolCallGenerateResponse;
+    try {
+      response = await this.request(`/agents/${this.agentId}/decline-tool-call-generate`, {
+        method: 'POST',
+        body: {
+          ...rest,
+          requestContext: parseClientRequestContext(requestContext),
+          clientTools: processClientTools(executableClientTools),
+        },
+      });
+    } catch (error) {
+      // The server rejected the resume, so it never happened. Drop the hold even if a stream is open.
+      releaseHold({ force: true });
+      throw error;
+    }
+    try {
+      return await this.continueResumedGenerate(response, {
+        requestContext,
+        clientTools: executableClientTools,
+        clientToolsResolver,
+        memory,
+      });
+    } finally {
+      // The resume was accepted. Leave the hold while a stream is still tracking the run.
+      releaseHold();
+    }
+  }
+
+  /**
+   * Runs executable client tools the model called after an approval decision and continues on
+   * /generate, like generate() does. With memory the continuation sends only the new messages to the
+   * thread. Without memory it re-sends the conversation up to the last user turn, because the resume
+   * routes keep the earlier history server-side and drop it once the run finishes.
+   */
+  private async continueResumedGenerate(
+    response: ToolCallGenerateResponse,
+    {
+      requestContext,
+      clientTools,
+      clientToolsResolver,
+      memory,
+    }: {
+      requestContext?: RequestContext | Record<string, any>;
+      clientTools?: ToolsInput;
+      clientToolsResolver?: ClientToolsResolver;
+      memory?: StreamParamsBaseWithoutMessages['memory'];
+    },
+  ): Promise<ToolCallGenerateResponse> {
+    if (response.finishReason !== 'tool-calls') return response;
+    const context =
+      requestContext === undefined || requestContext instanceof RequestContext
+        ? requestContext
+        : new RequestContext<unknown>(Object.entries(requestContext));
+    const threadId = typeof memory?.thread === 'string' ? memory.thread : memory?.thread?.id;
+    const history = response.messages ?? [];
+    // response.messages is the whole run; the turns after the last user message are also in
+    // response.response.messages, which executeToolCallAndRespond appends.
+    const priorTurns = history.slice(0, history.findLastIndex(message => message.role === 'user') + 1);
+    return executeToolCallAndRespond<undefined>({
+      response,
+      params: {
+        messages: threadId ? [] : priorTurns,
+        clientTools: clientToolsResolver?.() ?? clientTools,
+        clientToolsResolver,
+        requestContext: context,
+        memory,
+      },
+      agentId: this.agentId,
+      resourceId: memory?.resource,
+      threadId,
+      requestContext: context,
+      respondFn: (messages, options) => this.generate(messages, options),
     });
   }
 
   /**
    * Processes the stream response and handles tool calls
    */
-  private async processStreamResponseLegacy(processedParams: any, writable: WritableStream<Uint8Array>) {
+  private async processStreamResponseLegacy(
+    processedParams: any,
+    writable: WritableStream<Uint8Array>,
+    signal?: AbortSignal,
+  ) {
     // Extract threadId from memory config if present (matching generate() behavior)
     const { memory } = processedParams ?? {};
     const { resource, thread } = memory ?? {};
     const threadId = processedParams.threadId ?? (typeof thread === 'string' ? thread : thread?.id);
     const resourceId = processedParams.resourceId ?? resource;
 
+    // The signal is not serializable; keep it out of the request body.
+    const { abortSignal: _abortSignal, ...bodyParams } = processedParams ?? {};
+    const isAborted = () => signal?.aborted === true;
+    const isAbortError = (error: unknown) => isAborted() || (error as Error)?.name === 'AbortError';
+
     const response: Response & {
       processDataStream: (options?: Omit<Parameters<typeof processDataStream>[0], 'stream'>) => Promise<void>;
-    } = await this.request(`/agents/${this.agentId}/stream-legacy`, {
+    } = await this.request(this.routeOverrides?.stream ?? `/agents/${this.agentId}/stream-legacy`, {
       method: 'POST',
-      body: processedParams,
+      body: bodyParams,
       stream: true,
+      signal,
     });
 
     if (!response.body) {
@@ -2623,18 +3886,25 @@ export class Agent extends BaseResource {
       // Use tee() to split the stream into two branches
       const [streamForWritable, streamForProcessing] = response.body.tee();
 
-      // Pipe one branch to the writable stream
+      // Pipe one branch to the writable stream. Passing the signal lets an abort
+      // cancel this tee branch so the underlying response body is released.
       streamForWritable
         .pipeTo(writable, {
           preventClose: true,
+          signal,
         })
         .catch(error => {
-          console.error('Error piping to writable stream:', error);
+          if (!isAbortError(error)) {
+            console.error('Error piping to writable stream:', error);
+          }
         });
 
       // Process the other branch for chat response handling
+      const processingStream = signal
+        ? streamForProcessing.pipeThrough(new TransformStream<Uint8Array, Uint8Array>(), { signal })
+        : streamForProcessing;
       this.processChatResponse({
-        stream: streamForProcessing as unknown as ReadableStream<Uint8Array>,
+        stream: processingStream as unknown as ReadableStream<Uint8Array>,
         update: ({ message }) => {
           const existingIndex = messages.findIndex(m => m.id === message.id);
 
@@ -2645,6 +3915,10 @@ export class Agent extends BaseResource {
           }
         },
         onFinish: async ({ finishReason, message }) => {
+          // Consumer cancelled: skip client-tool side effects and continuations.
+          if (isAborted()) {
+            return;
+          }
           if (finishReason === 'tool-calls') {
             const toolCall = [...(message?.parts ?? [])]
               .reverse()
@@ -2685,34 +3959,8 @@ export class Agent extends BaseResource {
                   },
                 });
 
-                const lastMessage: UIMessage = JSON.parse(JSON.stringify(messages[messages.length - 1]));
-
-                const toolInvocationPart = lastMessage?.parts?.find(
-                  part => part.type === 'tool-invocation' && part.toolInvocation?.toolCallId === toolCall.toolCallId,
-                ) as ToolInvocationUIPart | undefined;
-
-                if (toolInvocationPart) {
-                  toolInvocationPart.toolInvocation = {
-                    ...toolInvocationPart.toolInvocation,
-                    state: 'result',
-                    result,
-                    ...(observability ? { __mastraObservability: observability } : {}),
-                  };
-                }
-
-                const toolInvocation = lastMessage?.toolInvocations?.find(
-                  toolInvocation => toolInvocation.toolCallId === toolCall.toolCallId,
-                ) as ToolInvocation | undefined;
-
-                if (toolInvocation) {
-                  toolInvocation.state = 'result';
-                  // @ts-expect-error - result property exists when state is 'result'
-                  toolInvocation.result = result;
-                  if (observability) {
-                    (
-                      toolInvocation as unknown as { __mastraObservability?: ClientToolObservabilityEnvelope }
-                    ).__mastraObservability = observability;
-                  }
+                if (isAborted()) {
+                  return;
                 }
 
                 // write the tool result part to the stream
@@ -2733,40 +3981,64 @@ export class Agent extends BaseResource {
                   writer.releaseLock();
                 }
 
-                // Build updated messages for the recursive call
-                // When threadId is present, server has memory - don't re-include original messages to avoid storage duplicates
-                // When no threadId (stateless), include full conversation history for context
-                const newMessages = [...messages.filter(m => m.id !== lastMessage.id), lastMessage];
-                const updatedMessages = threadId
-                  ? newMessages
-                  : [...(Array.isArray(processedParams.messages) ? processedParams.messages : []), ...newMessages];
+                const toolResultMessage = {
+                  role: 'tool' as const,
+                  content: [
+                    {
+                      type: 'tool-result' as const,
+                      toolCallId: toolCall.toolCallId,
+                      toolName: toolCall.toolName,
+                      input: toolCall.args,
+                      result,
+                      ...(observability ? { __mastraObservability: observability } : {}),
+                    },
+                  ],
+                };
 
-                // Recursively call stream with updated messages
+                const updatedMessages = threadId
+                  ? [toolResultMessage]
+                  : [
+                      ...(Array.isArray(processedParams.messages) ? processedParams.messages : []),
+                      ...messages,
+                      toolResultMessage,
+                    ];
+
+                // Recursively call stream with updated messages, refreshing
+                // client tools from the resolver so continuations see current tools
                 this.processStreamResponseLegacy(
                   {
                     ...processedParams,
+                    clientTools: processClientTools(
+                      processedParams.clientToolsResolver?.() ?? processedParams.clientTools,
+                    ),
                     messages: updatedMessages,
                   },
                   writable,
+                  signal,
                 ).catch(error => {
-                  console.error('Error processing stream response:', error);
+                  if (!isAbortError(error)) {
+                    console.error('Error processing stream response:', error);
+                  }
                 });
               }
             }
           } else {
             setTimeout(() => {
               // We can't close the stream in this function, we have to wait until it's done
-              // eslint-disable-next-line @typescript-eslint/no-floating-promises
-              writable.close();
+              writable.close().catch(() => {});
             }, 0);
           }
         },
         lastMessage: undefined,
       }).catch(error => {
-        console.error('Error processing stream response:', error);
+        if (!isAbortError(error)) {
+          console.error('Error processing stream response:', error);
+        }
       });
     } catch (error) {
-      console.error('Error processing stream response:', error);
+      if (!isAbortError(error)) {
+        console.error('Error processing stream response:', error);
+      }
     }
     return response;
   }
@@ -2777,7 +4049,7 @@ export class Agent extends BaseResource {
    * @param requestContext - Optional request context to pass as query parameter
    * @returns Promise containing tool details
    */
-  getTool(toolId: string, requestContext?: RequestContext | Record<string, any>): Promise<GetToolResponse> {
+  getTool(toolId: ToolId, requestContext?: RequestContext | Record<string, any>): Promise<GetToolResponse> {
     return this.request(`/agents/${this.agentId}/tools/${toolId}${this.getQueryString(requestContext)}`);
   }
 
@@ -2788,10 +4060,12 @@ export class Agent extends BaseResource {
    * @returns Promise containing the tool execution results
    */
   executeTool(
-    toolId: string,
-    params: { data: any; requestContext?: RequestContext | Record<string, any> },
-  ): Promise<any> {
-    const body = {
+    toolId: PathParams<'POST /agents/:agentId/tools/:toolId/execute'>['toolId'],
+    params: Omit<Body<'POST /agents/:agentId/tools/:toolId/execute'>, 'requestContext'> & {
+      requestContext?: RequestContext | Record<string, any>;
+    },
+  ): Promise<RouteResponse<'POST /agents/:agentId/tools/:toolId/execute'>> {
+    const body: Body<'POST /agents/:agentId/tools/:toolId/execute'> = {
       data: params.data,
       requestContext: parseClientRequestContext(params.requestContext),
     };
@@ -2806,7 +4080,7 @@ export class Agent extends BaseResource {
    * @param params - Parameters for updating the model
    * @returns Promise containing the updated model
    */
-  updateModel(params: UpdateModelParams): Promise<{ message: string }> {
+  updateModel(params: UpdateModelParams): Promise<RouteResponse<'POST /agents/:agentId/model'>> {
     return this.request(`/agents/${this.agentId}/model`, {
       method: 'POST',
       body: params,
@@ -2817,7 +4091,7 @@ export class Agent extends BaseResource {
    * Resets the agent's model to the original model that was set during construction
    * @returns Promise containing a success message
    */
-  resetModel(): Promise<{ message: string }> {
+  resetModel(): Promise<RouteResponse<'POST /agents/:agentId/model/reset'>> {
     return this.request(`/agents/${this.agentId}/model/reset`, {
       method: 'POST',
       body: {},
@@ -2829,7 +4103,10 @@ export class Agent extends BaseResource {
    * @param params - Parameters for updating the model
    * @returns Promise containing the updated model
    */
-  updateModelInModelList({ modelConfigId, ...params }: UpdateModelInModelListParams): Promise<{ message: string }> {
+  updateModelInModelList({
+    modelConfigId,
+    ...params
+  }: UpdateModelInModelListParams): Promise<RouteResponse<'POST /agents/:agentId/models/:modelConfigId'>> {
     return this.request(`/agents/${this.agentId}/models/${modelConfigId}`, {
       method: 'POST',
       body: params,
@@ -2841,7 +4118,7 @@ export class Agent extends BaseResource {
    * @param params - Parameters for reordering the model list
    * @returns Promise containing the updated model list
    */
-  reorderModelList(params: ReorderModelListParams): Promise<{ message: string }> {
+  reorderModelList(params: ReorderModelListParams): Promise<RouteResponse<'POST /agents/:agentId/models/reorder'>> {
     return this.request(`/agents/${this.agentId}/models/reorder`, {
       method: 'POST',
       body: params,

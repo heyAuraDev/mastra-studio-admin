@@ -1,9 +1,13 @@
+/* eslint-disable react-refresh/only-export-components */
+import type { AgentEditorConfig } from '@mastra/core/agent';
 import { createContext, useContext } from 'react';
+
+export type { AgentEditorConfig } from '@mastra/core/agent';
 import type { UseFormReturn } from 'react-hook-form';
 
 import type { AgentFormValues } from '../components/agent-edit-page/utils/form-validation';
 
-interface AgentEditFormContextValue {
+export interface AgentEditFormContextValue {
   form: UseFormReturn<AgentFormValues>;
   mode: 'create' | 'edit';
   agentId?: string;
@@ -14,6 +18,10 @@ interface AgentEditFormContextValue {
   readOnly?: boolean;
   /** True when editing a code-defined agent (override mode) — limits editable sections */
   isCodeAgentOverride?: boolean;
+  /** True when the editor is running in `source: 'code'` AND the agent is code-defined — saves persist to filesystem. */
+  isCodeSourceAgent?: boolean;
+  /** Field ownership rules from the code-defined agent config. */
+  editorConfig?: AgentEditorConfig;
 }
 
 const AgentEditFormContext = createContext<AgentEditFormContextValue | null>(null);

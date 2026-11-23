@@ -1,4 +1,6 @@
-import { Txt, Icon, cn } from '@mastra/playground-ui';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { Icon } from '@mastra/playground-ui/icons/Icon';
+import { cn } from '@mastra/playground-ui/utils/cn';
 
 export type SectionHeaderProps = {
   title: React.ReactNode;
@@ -9,25 +11,29 @@ export type SectionHeaderProps = {
 
 export function SectionHeader({ title, subtitle, icon, className }: SectionHeaderProps) {
   return (
-    <header className={cn('flex flex-col w-fit', className)}>
-      <Txt as="h2" variant="header-md" className="flex items-center gap-2">
+    <header className={cn('flex w-fit flex-col', className)}>
+      <Txt as="h2" variant="heading" className="flex items-center gap-2">
         {icon && (
-          <Icon size="lg" className="text-accent1">
+          <Icon size="lg" className="text-success-indicator">
             {icon}
           </Icon>
         )}
         {title}
       </Txt>
-      {subtitle && <Txt className="text-ui-md text-neutral3 !font-light">{subtitle}</Txt>}
+      {subtitle && (
+        <Txt variant="body" tone="muted">
+          {subtitle}
+        </Txt>
+      )}
     </header>
   );
 }
 
 export function SubSectionHeader({ title, icon }: SectionHeaderProps) {
   return (
-    <Txt as="h4" variant="ui-sm" className="flex items-center gap-1 text-neutral2 uppercase">
+    <Txt as="h4" variant="caption" tone="faint" className="flex items-center gap-1 uppercase">
       {icon && (
-        <Icon size="sm" className="text-neutral1">
+        <Icon size="xs" className="text-placeholder">
           {icon}
         </Icon>
       )}

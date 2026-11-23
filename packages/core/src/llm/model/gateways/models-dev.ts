@@ -1,29 +1,74 @@
+import { createAlibaba } from '@ai-sdk/alibaba-v7';
 import { createAnthropic } from '@ai-sdk/anthropic-v6';
-import { createCerebras } from '@ai-sdk/cerebras-v5';
-import { createDeepInfra } from '@ai-sdk/deepinfra-v5';
-import { createDeepSeek } from '@ai-sdk/deepseek-v5';
+import { createCerebras } from '@ai-sdk/cerebras-v7';
+import { createDeepInfra } from '@ai-sdk/deepinfra-v7';
+import { createDeepSeek } from '@ai-sdk/deepseek-v7';
 import { createGoogleGenerativeAI } from '@ai-sdk/google-v6';
-import { createGroq } from '@ai-sdk/groq-v6';
+import { createGroq } from '@ai-sdk/groq-v7';
 import { createMistral } from '@ai-sdk/mistral-v6';
-import { createOpenAICompatible } from '@ai-sdk/openai-compatible-v5';
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible-v6';
 import { createOpenAI } from '@ai-sdk/openai-v6';
-import { createPerplexity } from '@ai-sdk/perplexity-v5';
-import { createTogetherAI } from '@ai-sdk/togetherai-v5';
-import { createXai } from '@ai-sdk/xai-v6';
+import { createPerplexity } from '@ai-sdk/perplexity-v6';
+import { createTogetherAI } from '@ai-sdk/togetherai-v7';
+import { createXai } from '@ai-sdk/xai-v7';
 import { createGateway } from '@internal/ai-v6';
-import { createOpenRouter } from '@openrouter/ai-sdk-provider-v5';
+import { createOpenRouter } from '@openrouter/ai-sdk-provider-v6';
 import { parseModelRouterId } from '../gateway-resolver.js';
 import { MastraModelGateway } from './base.js';
-import type { AttachmentCapabilities, GatewayLanguageModel, ProviderConfig } from './base.js';
+import type {
+  AttachmentCapabilities,
+  GatewayLanguageModel,
+  ModelProviderOverride,
+  ModelReasoningOption,
+  ProviderConfig,
+  ReasoningCapabilities,
+  StructuredOutputCapabilities,
+  TemperatureCapabilities,
+} from './base.js';
 import { EXCLUDED_PROVIDERS, MASTRA_USER_AGENT, PROVIDERS_WITH_INSTALLED_PACKAGES } from './constants.js';
+import { interpolateUrlTemplate } from './url-template.js';
 
 interface ModelsDevModelInfo {
   id: string;
   name?: string;
   status?: string;
+  release_date?: string;
   modalities?: { input?: string[]; output?: string[] };
   attachment?: boolean;
+  temperature?: boolean;
+  structured_output?: boolean;
+  // Per-model endpoint/shape/SDK override (models.dev model `provider` block).
+  provider?: { api?: string; shape?: 'responses' | 'completions'; npm?: string };
   [key: string]: unknown;
+}
+
+function stringItems(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter(item => typeof item === 'string') : [];
+}
+
+function isOptionalNumber(value: unknown): value is number | undefined {
+  return value === undefined || typeof value === 'number';
+}
+
+function toReasoningOption(raw: unknown): ModelReasoningOption | undefined {
+  if (!raw || typeof raw !== 'object' || !('type' in raw)) return undefined;
+  if (raw.type === 'toggle') return { type: 'toggle' };
+  if (raw.type === 'effort') {
+    const values = 'values' in raw ? stringItems(raw.values) : [];
+    return values.length > 0 ? { type: 'effort', values } : undefined;
+  }
+  if (raw.type === 'budget_tokens') {
+    const min = 'min' in raw ? raw.min : undefined;
+    const max = 'max' in raw ? raw.max : undefined;
+    if (!isOptionalNumber(min) || !isOptionalNumber(max)) return undefined;
+    return { type: 'budget_tokens', ...(min !== undefined ? { min } : {}), ...(max !== undefined ? { max } : {}) };
+  }
+  return undefined;
+}
+
+function parseReasoningOptions(raw: unknown): ModelReasoningOption[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(toReasoningOption).filter(option => option !== undefined);
 }
 
 interface ModelsDevProviderInfo {
@@ -54,17 +99,13 @@ function selectApiKeyEnvVar({ envVars, providerId }: { envVars?: string[]; provi
   return envVars[0] || fallbackEnvVar;
 }
 
-function interpolateUrlTemplate(url: string, envVars?: typeof process.env): string {
-  return url.replace(/\$\{([^}]+)\}/g, (_match, envVarName: string) => {
-    const key = envVarName.trim();
-    const value = envVars?.[key] ?? process.env[key];
+function resolveApiKeyFromEnv(apiKeyEnvVar: ProviderConfig['apiKeyEnvVar']): string | undefined {
+  const envVars = Array.isArray(apiKeyEnvVar) ? apiKeyEnvVar : [apiKeyEnvVar];
 
-    if (value === undefined || value === null) {
-      throw new Error(`Missing environment variable ${envVarName} required to build provider URL`);
-    }
-
-    return value;
-  });
+  for (const envVar of envVars) {
+    const apiKey = process.env[envVar];
+    if (apiKey) return apiKey;
+  }
 }
 
 // Provider-specific overrides for URL, npm package, and other config.
@@ -73,6 +114,9 @@ function interpolateUrlTemplate(url: string, envVars?: typeof process.env): stri
 // which providers from models.dev should be included in the registry.
 // At runtime, buildUrl() and buildHeaders() use the pre-generated PROVIDER_REGISTRY instead.
 const PROVIDER_OVERRIDES: Record<string, Partial<ProviderConfig>> = {
+  google: {
+    apiKeyEnvVar: ['GOOGLE_API_KEY', 'GOOGLE_GENERATIVE_AI_API_KEY'],
+  },
   mistral: {
     url: 'https://api.mistral.ai/v1',
   },
@@ -97,6 +141,9 @@ export class ModelsDevGateway extends MastraModelGateway {
 
   private providerConfigs: Record<string, ProviderConfig> = {};
   private attachmentCapabilities: AttachmentCapabilities = {};
+  private temperatureCapabilities: TemperatureCapabilities = {};
+  private structuredOutputCapabilities: StructuredOutputCapabilities = {};
+  private reasoningCapabilities: ReasoningCapabilities = {};
 
   constructor(providerConfigs?: Record<string, ProviderConfig>) {
     super();
@@ -110,6 +157,12 @@ export class ModelsDevGateway extends MastraModelGateway {
     }
 
     const data = (await response.json()) as ModelsDevResponse;
+
+    // Reset capability maps so removed providers/models are not retained across syncs
+    this.attachmentCapabilities = {};
+    this.temperatureCapabilities = {};
+    this.structuredOutputCapabilities = {};
+    this.reasoningCapabilities = {};
 
     const providerConfigs: Record<string, ProviderConfig> = {};
 
@@ -135,18 +188,61 @@ export class ModelsDevGateway extends MastraModelGateway {
       const hasApiAndEnv = providerInfo.api && providerInfo.env && providerInfo.env.length > 0;
 
       if (isOpenAICompatible || hasInstalledPackage || hasApiAndEnv) {
-        // Get model IDs from the models object
-        // Filter out deprecated models before collecting model IDs
-        const activeModels = Object.entries(providerInfo.models).filter(
-          ([, modelInfo]) => modelInfo?.status !== 'deprecated',
+        // Get model IDs from the models object.
+        //
+        // Deprecated models are retained rather than dropped. On models.dev,
+        // `status: 'deprecated'` means "still served, scheduled for retirement" —
+        // not "removed". Filtering them out here would break existing users: the
+        // generated model-id union would stop type-checking their configured model,
+        // and the model would silently lose its capability flags and per-model
+        // endpoint/shape overrides (i.e. it would route with provider defaults).
+        // They are reported separately via `deprecatedModels` so surfaces that
+        // offer models for *new* selection can hide or mark them.
+        const allModels = Object.entries(providerInfo.models);
+        const modelIds = allModels.map(([modelId]) => modelId).sort();
+        const modelReleaseDates = Object.fromEntries(
+          allModels.flatMap(([modelId, info]) =>
+            typeof info?.release_date === 'string' && info.release_date ? [[modelId, info.release_date]] : [],
+          ),
         );
-        const modelIds = activeModels.map(([modelId]) => modelId).sort();
+        const deprecatedModelIds = allModels
+          .filter(([, modelInfo]) => modelInfo?.status === 'deprecated')
+          .map(([modelId]) => modelId)
+          .sort();
 
         // Collect model IDs that support attachments
-        const attachmentModels = activeModels
+        const attachmentModels = allModels
           .filter(([, modelInfo]) => modelInfo?.attachment === true)
           .map(([modelId]) => modelId)
           .sort();
+
+        // Collect model IDs that support temperature sampling
+        const temperatureModels = allModels
+          .filter(([, modelInfo]) => modelInfo?.temperature === true)
+          .map(([modelId]) => modelId)
+          .sort();
+
+        const structuredOutputModels = allModels
+          .filter(([, modelInfo]) => modelInfo?.structured_output === true)
+          .map(([modelId]) => modelId)
+          .sort();
+
+        const reasoningByModel: Record<string, ModelReasoningOption[]> = {};
+        for (const [modelId, modelInfo] of allModels) {
+          const reasoningOptions = parseReasoningOptions(modelInfo?.reasoning_options);
+          if (reasoningOptions.length > 0) reasoningByModel[modelId] = reasoningOptions;
+        }
+
+        // Collect per-model endpoint/shape/SDK overrides. Some providers serve
+        // individual models over a different endpoint or request shape than the
+        // provider default (e.g. OpenAI Responses vs chat-completions).
+        const modelOverrides: Record<string, ModelProviderOverride> = {};
+        for (const [modelId, modelInfo] of allModels) {
+          const ov = modelInfo?.provider;
+          if (ov && (ov.api || ov.shape || ov.npm)) {
+            modelOverrides[modelId] = { api: ov.api, shape: ov.shape, npm: ov.npm };
+          }
+        }
 
         // Get the API URL - overrides take priority over models.dev data
         const url = PROVIDER_OVERRIDES[normalizedId]?.url || providerInfo.api;
@@ -175,6 +271,7 @@ export class ModelsDevGateway extends MastraModelGateway {
           apiKeyHeader,
           name: providerInfo.name || providerId.charAt(0).toUpperCase() + providerId.slice(1),
           models: modelIds,
+          ...(Object.keys(modelReleaseDates).length > 0 ? { modelReleaseDates } : {}),
           docUrl: providerInfo.doc, // Include documentation URL if available
           gateway: `models.dev`,
           // Only store npm when it's a non-default SDK (not openai-compatible/gateway) to keep the registry small
@@ -186,9 +283,20 @@ export class ModelsDevGateway extends MastraModelGateway {
             providerInfo.npm !== '@ai-sdk/gateway'
               ? providerInfo.npm
               : undefined),
+          modelOverrides: Object.keys(modelOverrides).length > 0 ? modelOverrides : undefined,
+          deprecatedModels: deprecatedModelIds.length > 0 ? deprecatedModelIds : undefined,
         };
         if (attachmentModels.length > 0) {
           this.attachmentCapabilities[normalizedId] = attachmentModels;
+        }
+        if (temperatureModels.length > 0) {
+          this.temperatureCapabilities[normalizedId] = temperatureModels;
+        }
+        if (structuredOutputModels.length > 0) {
+          this.structuredOutputCapabilities[normalizedId] = structuredOutputModels;
+        }
+        if (Object.keys(reasoningByModel).length > 0) {
+          this.reasoningCapabilities[normalizedId] = reasoningByModel;
         }
       }
     }
@@ -207,20 +315,40 @@ export class ModelsDevGateway extends MastraModelGateway {
     return this.attachmentCapabilities;
   }
 
+  getTemperatureCapabilities(): TemperatureCapabilities {
+    return this.temperatureCapabilities;
+  }
+
+  getStructuredOutputCapabilities(): StructuredOutputCapabilities {
+    return this.structuredOutputCapabilities;
+  }
+
+  getReasoningCapabilities(): ReasoningCapabilities {
+    return this.reasoningCapabilities;
+  }
+
   buildUrl(routerId: string, envVars?: typeof process.env): string | undefined {
-    const { providerId } = parseModelRouterId(routerId);
+    const { providerId, modelId } = parseModelRouterId(routerId);
 
     const config = this.providerConfigs[providerId];
 
-    if (!config?.url) {
+    // A per-model override may point this model at a different endpoint than the
+    // provider default; prefer it when present.
+    const perModelApi = config?.modelOverrides?.[modelId]?.api;
+    const template = perModelApi ?? config?.url;
+
+    // Explicit <PROVIDER>_BASE_URL override wins, even for providers without a registry url template
+    const baseUrlEnvVar = `${providerId.toUpperCase().replace(/-/g, '_')}_BASE_URL`;
+    const customBaseUrl = envVars?.[baseUrlEnvVar] || process.env[baseUrlEnvVar];
+    if (customBaseUrl) {
+      return customBaseUrl;
+    }
+
+    if (!template) {
       return;
     }
 
-    // Check for custom base URL from env vars
-    const baseUrlEnvVar = `${providerId.toUpperCase().replace(/-/g, '_')}_BASE_URL`;
-    const customBaseUrl = envVars?.[baseUrlEnvVar] || process.env[baseUrlEnvVar];
-
-    return customBaseUrl || interpolateUrlTemplate(config.url, envVars);
+    return interpolateUrlTemplate(template, envVars);
   }
 
   getApiKey(modelId: string): Promise<string> {
@@ -234,10 +362,11 @@ export class ModelsDevGateway extends MastraModelGateway {
       throw new Error(`Could not find config for provider ${provider} with model id ${modelId}`);
     }
 
-    const apiKey = typeof config.apiKeyEnvVar === `string` ? process.env[config.apiKeyEnvVar] : undefined; // we only use single string env var for models.dev for now
+    const apiKey = resolveApiKeyFromEnv(config.apiKeyEnvVar);
 
     if (!apiKey) {
-      throw new Error(`Could not find API key process.env.${config.apiKeyEnvVar} for model id ${modelId}`);
+      const envVarDisplay = Array.isArray(config.apiKeyEnvVar) ? config.apiKeyEnvVar.join(' or ') : config.apiKeyEnvVar;
+      throw new Error(`Could not find API key process.env.${envVarDisplay} for model id ${modelId}`);
     }
 
     return Promise.resolve(apiKey);
@@ -258,34 +387,49 @@ export class ModelsDevGateway extends MastraModelGateway {
 
     const mastraHeaders = { 'User-Agent': MASTRA_USER_AGENT, ...headers };
 
+    // Per-model override: a model may be served over a different request shape
+    // than its provider default (e.g. the OpenAI Responses API while the provider
+    // default is chat-completions). Honor `shape` for any provider.
+    const override = this.providerConfigs[providerId]?.modelOverrides?.[modelId];
+    if (override?.shape === 'responses') {
+      return createOpenAI({ apiKey, baseURL, headers: mastraHeaders }).responses(modelId);
+    }
+
     switch (providerId) {
       case 'openai':
-        return createOpenAI({ apiKey, headers: mastraHeaders }).responses(modelId);
+        return createOpenAI({ apiKey, baseURL, headers: mastraHeaders }).responses(modelId);
       case 'gemini':
       case 'google':
-        return createGoogleGenerativeAI({ apiKey, headers: mastraHeaders }).chat(modelId);
+        return createGoogleGenerativeAI({ apiKey, baseURL, headers: mastraHeaders }).chat(modelId);
       case 'anthropic':
-        return createAnthropic({ apiKey, headers: mastraHeaders })(modelId);
+        return createAnthropic({ apiKey, baseURL, headers: mastraHeaders })(modelId);
       case 'mistral':
-        return createMistral({ apiKey, headers: mastraHeaders })(modelId);
+        return createMistral({ apiKey, baseURL, headers: mastraHeaders })(modelId);
       case 'groq':
-        return createGroq({ apiKey, headers: mastraHeaders })(modelId);
+        return createGroq({ apiKey, baseURL, headers: mastraHeaders })(modelId);
       case 'openrouter':
-        return createOpenRouter({ apiKey, headers: mastraHeaders })(modelId) as unknown as GatewayLanguageModel;
+        return createOpenRouter({ apiKey, baseURL, headers: mastraHeaders })(
+          modelId,
+        ) as unknown as GatewayLanguageModel;
       case 'xai':
-        return createXai({ apiKey, headers: mastraHeaders })(modelId);
+        return createXai({ apiKey, baseURL, headers: mastraHeaders }).responses(modelId);
       case 'deepseek':
-        return createDeepSeek({ apiKey, headers: mastraHeaders })(modelId);
-      case 'perplexity':
-        return createPerplexity({ apiKey, headers: mastraHeaders })(modelId);
+        return createDeepSeek({ apiKey, baseURL, headers: mastraHeaders })(modelId);
+      case 'perplexity': {
+        const hasIntegrationHeader = Object.keys(mastraHeaders).some(key => key.toLowerCase() === 'x-pplx-integration');
+        const perplexityHeaders = hasIntegrationHeader
+          ? mastraHeaders
+          : { 'X-Pplx-Integration': MASTRA_USER_AGENT, ...mastraHeaders };
+        return createPerplexity({ apiKey, baseURL, headers: perplexityHeaders })(modelId);
+      }
       case 'cerebras':
-        return createCerebras({ apiKey, headers: mastraHeaders })(modelId);
+        return createCerebras({ apiKey, baseURL, headers: mastraHeaders })(modelId);
       case 'togetherai':
-        return createTogetherAI({ apiKey, headers: mastraHeaders })(modelId);
+        return createTogetherAI({ apiKey, baseURL, headers: mastraHeaders })(modelId);
       case 'deepinfra':
-        return createDeepInfra({ apiKey, headers: mastraHeaders })(modelId);
+        return createDeepInfra({ apiKey, baseURL, headers: mastraHeaders })(modelId);
       case 'vercel':
-        return createGateway({ apiKey, headers: mastraHeaders })(modelId);
+        return createGateway({ apiKey, baseURL, headers: mastraHeaders })(modelId);
       case 'moonshotai':
       case 'moonshotai-cn': {
         // moonshotai uses Anthropic-compatible API endpoint
@@ -293,9 +437,16 @@ export class ModelsDevGateway extends MastraModelGateway {
         return createAnthropic({ apiKey, baseURL, headers: mastraHeaders })(modelId);
       }
       default: {
-        // Check if this provider uses a specific SDK package (e.g., kimi-for-coding uses @ai-sdk/anthropic)
+        // Check if this provider uses a specific SDK package (e.g., kimi-for-coding uses @ai-sdk/anthropic).
+        // A per-model override wins over the provider default.
         const config = this.providerConfigs[providerId];
-        const npm = config?.npm;
+        const npm = override?.npm ?? config?.npm;
+
+        // Pattern match for any alibaba variant (alibaba, alibaba-cn, alibaba-coding-plan, etc.)
+        if (providerId.includes('alibaba')) {
+          if (!baseURL) throw new Error(`No API URL found for ${providerId}/${modelId}`);
+          return createAlibaba({ apiKey, baseURL, headers: mastraHeaders })(modelId);
+        }
 
         if (npm === '@ai-sdk/anthropic') {
           if (!baseURL) throw new Error(`No API URL found for ${providerId}/${modelId}`);
@@ -324,6 +475,10 @@ export class ModelsDevGateway extends MastraModelGateway {
           baseURL,
           headers: mastraHeaders,
           supportsStructuredOutputs: true,
+          // Kimi's coding endpoint only reports usage at the standard top level of a stream chunk when
+          // asked; without stream_options.include_usage it nests usage inside choices[0], which the AI
+          // SDK never reads, so every Kimi step's token counts came back undefined (r325).
+          ...(providerId.startsWith('kimi-code-plan') ? { includeUsage: true } : {}),
         }).chatModel(modelId);
       }
     }

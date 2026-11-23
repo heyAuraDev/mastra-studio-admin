@@ -1,11 +1,13 @@
 import child_process from 'node:child_process';
-import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import util from 'node:util';
 import debug from 'debug';
+import { BUNDLE } from './bundle';
 
-const exec = util.promisify(child_process.exec);
+const execFile = util.promisify(child_process.execFile);
+const availableCodemods = new Set(BUNDLE);
 
 interface TransformOptions {
   dry?: boolean;
@@ -19,40 +21,49 @@ const error = debug('codemod:transform:error');
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-function getJscodeshift(): string {
-  const localJscodeshift = path.resolve(__dirname, '../node_modules/.bin/jscodeshift');
-  return fs.existsSync(localJscodeshift) ? localJscodeshift : 'jscodeshift';
+function getJscodeshiftBin(): string {
+  // jscodeshift is a direct dependency, so resolve its bin script and run it
+  // with the current Node executable. This avoids both shell resolution and
+  // platform-specific .bin shims.
+  const require = createRequire(import.meta.url);
+  return require.resolve('jscodeshift/bin/jscodeshift.js');
 }
 
-function buildCommand(codemodPath: string, targetPath: string, jscodeshift: string, options: TransformOptions): string {
-  // Ignoring everything under `.*/` covers `.mastra/` along with any other
-  // framework build related or otherwise intended-to-be-hidden directories.
-  let command = `${jscodeshift} -t ${codemodPath} ${targetPath} \
-    --parser tsx \
-    --ignore-pattern="**/node_modules/**" \
-    --ignore-pattern="**/.*/**" \
-    --ignore-pattern="**/dist/**" \
-    --ignore-pattern="**/build/**" \
-    --ignore-pattern="**/*.min.js" \
-    --ignore-pattern="**/*.bundle.js"`;
+function buildArgs(codemodPath: string, targetPath: string, options: TransformOptions): string[] {
+  // Ignore hidden directories inside the target without matching hidden
+  // directories that contain the target itself.
+  const hiddenDirectoryPattern = path.join(targetPath, '**/.*/**');
+  const args = [
+    '-t',
+    codemodPath,
+    targetPath,
+    '--parser',
+    'tsx',
+    '--ignore-pattern=**/node_modules/**',
+    `--ignore-pattern=${hiddenDirectoryPattern}`,
+    '--ignore-pattern=**/dist/**',
+    '--ignore-pattern=**/build/**',
+    '--ignore-pattern=**/*.min.js',
+    '--ignore-pattern=**/*.bundle.js',
+  ];
 
   if (options.dry) {
-    command += ' --dry';
+    args.push('--dry');
   }
 
   if (options.print) {
-    command += ' --print';
+    args.push('--print');
   }
 
   if (options.verbose) {
-    command += ' --verbose';
+    args.push('--verbose=2');
   }
 
   if (options.jscodeshift) {
-    command += ` ${options.jscodeshift}`;
+    args.push(...options.jscodeshift.split(' ').filter(Boolean));
   }
 
-  return command;
+  return args;
 }
 
 export type TransformErrors = {
@@ -63,17 +74,13 @@ export type TransformErrors = {
 
 function parseErrors(transform: string, output: string): TransformErrors {
   const errors: TransformErrors = [];
-  const errorRegex = /ERR (.+) Transformation error/g;
-  const syntaxErrorRegex = /SyntaxError: .+/g;
+  // jscodeshift prints one line per failure: `ERR <file> Transformation error (<message>)`,
+  // with newlines in the message already replaced, so filename and message come from the same line.
+  const errorRegex = /^\s*ERR (.+?) Transformation error \((.*)\)\s*$/gm;
 
   let match;
   while ((match = errorRegex.exec(output)) !== null) {
-    const filename = match[1]!;
-    const syntaxErrorMatch = syntaxErrorRegex.exec(output);
-    if (syntaxErrorMatch) {
-      const summary = syntaxErrorMatch[0];
-      errors.push({ transform, filename, summary });
-    }
+    errors.push({ transform, filename: match[1]!, summary: match[2]!.trim() });
   }
 
   return errors;
@@ -99,16 +106,30 @@ export async function transform(
   transformOptions: TransformOptions,
   options: { logStatus: boolean } = { logStatus: true },
 ): Promise<{ errors: TransformErrors; notImplementedErrors: TransformErrors }> {
+  if (!availableCodemods.has(codemod)) {
+    throw new Error(`Unknown codemod "${codemod}". Available codemods: ${BUNDLE.join(', ')}`);
+  }
+
   if (options.logStatus) {
     log(`Applying codemod '${codemod}': ${source}`);
   }
   const codemodPath = path.resolve(__dirname, `./codemods/${codemod}.js`);
   const targetPath = path.resolve(source);
-  const jscodeshift = getJscodeshift();
-  const command = buildCommand(codemodPath, targetPath, jscodeshift, transformOptions);
-  const { stdout } = await exec(command, { encoding: 'utf8' });
+  const args = buildArgs(codemodPath, targetPath, transformOptions);
+  // execFile with an args array (no shell) so paths can't be used for
+  // command injection (CodeQL js/shell-command-injection-from-environment).
+  const { stdout } = await execFile(process.execPath, [getJscodeshiftBin(), ...args], {
+    encoding: 'utf8',
+    // --print and --verbose can legitimately emit more than Node's default 1 MiB buffer.
+    maxBuffer: Infinity,
+  });
   const errors = parseErrors(codemod, stdout);
   const notImplementedErrors = parseNotImplementedErrors(codemod, stdout);
+  // Keep routine v1 bundle runs quiet while its spinner is active, but always
+  // show explicitly requested previews and individual codemod results.
+  if (stdout && (options.logStatus || transformOptions.dry || transformOptions.print || transformOptions.verbose)) {
+    process.stdout.write(stdout);
+  }
   if (options.logStatus) {
     if (errors.length > 0) {
       errors.forEach(({ transform, filename, summary }) => {

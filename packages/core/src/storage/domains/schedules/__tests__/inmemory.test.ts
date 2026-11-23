@@ -84,6 +84,27 @@ describe('InMemorySchedulesStorage', () => {
     });
   });
 
+  describe('legacy heartbeat target read-shim', () => {
+    it('normalizes persisted `type: "heartbeat"` targets to `type: "agent"` on read', async () => {
+      const legacy = makeSchedule({
+        id: 'hb_legacy',
+        nextFireAt: 1_000,
+        target: { type: 'heartbeat', agentId: 'my-agent', prompt: 'check in' } as any,
+      });
+      await storage.createSchedule(legacy);
+
+      const fetched = await storage.getSchedule('hb_legacy');
+      expect(fetched!.target).toEqual({ type: 'agent', agentId: 'my-agent', prompt: 'check in' });
+
+      const listed = await storage.listSchedules();
+      expect(listed.map(s => s.target.type)).toEqual(['agent']);
+
+      const due = await storage.listDueSchedules(10_000);
+      expect(due).toHaveLength(1);
+      expect(due[0]!.target.type).toBe('agent');
+    });
+  });
+
   describe('listSchedules', () => {
     it('returns all schedules when no filter is provided', async () => {
       await storage.createSchedule(makeSchedule({ id: 's1' }));
@@ -139,6 +160,16 @@ describe('InMemorySchedulesStorage', () => {
       const due = await storage.listDueSchedules(10_000, 2);
       expect(due.map(s => s.id)).toEqual(['s1', 's2']);
     });
+
+    it('returns the earliest active schedule first when limited to one row', async () => {
+      await storage.createSchedule(makeSchedule({ id: 's3', nextFireAt: 3_000 }));
+      await storage.createSchedule(makeSchedule({ id: 's1', nextFireAt: 1_000 }));
+      await storage.createSchedule(makeSchedule({ id: 's2', nextFireAt: 2_000 }));
+      await storage.createSchedule(makeSchedule({ id: 'paused', nextFireAt: 500, status: 'paused' }));
+
+      const next = await storage.listDueSchedules(Number.MAX_SAFE_INTEGER, 1);
+      expect(next.map(s => s.id)).toEqual(['s1']);
+    });
   });
 
   describe('updateSchedule', () => {
@@ -169,6 +200,22 @@ describe('InMemorySchedulesStorage', () => {
       expect(fetched!.nextFireAt).toBe(200);
       expect(fetched!.lastFireAt).toBe(150);
       expect(fetched!.lastRunId).toBe('run_1');
+    });
+
+    it('atomically records the final fire and marks the schedule completed', async () => {
+      const sched = makeSchedule({ id: 's1', nextFireAt: 100 });
+      await storage.createSchedule(sched);
+
+      const ok = await storage.updateScheduleNextFire('s1', 100, 100, 150, 'run_1', 'completed');
+      expect(ok).toBe(true);
+
+      const fetched = await storage.getSchedule('s1');
+      expect(fetched).toMatchObject({
+        status: 'completed',
+        nextFireAt: 100,
+        lastFireAt: 150,
+        lastRunId: 'run_1',
+      });
     });
 
     it('returns false and does not update when expected does not match', async () => {

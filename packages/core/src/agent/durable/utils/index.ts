@@ -10,8 +10,11 @@ export {
   deserializeDate,
 } from './serialize-state';
 
+export { createRunMessageList } from './run-message-list';
+
 export {
   resolveRuntimeDependencies,
+  rebuildRunToolsFromMastra,
   resolveModel,
   resolveInternalState,
   resolveTool,
@@ -19,4 +22,5 @@ export {
   extractToolsForModel,
   type ResolvedRuntimeDependencies,
   type ResolveRuntimeOptions,
+  type RebuiltRunTools,
 } from './resolve-runtime';
