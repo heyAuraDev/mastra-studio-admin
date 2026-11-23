@@ -5,47 +5,71 @@ import { TextTransformer } from './text';
 
 function splitTextWithRegex(text: string, separator: string, separatorPosition?: 'start' | 'end'): string[] {
   if (!separator) {
-    return text.split('');
-  }
-
-  if (!separatorPosition) {
-    return text.split(new RegExp(separator)).filter(s => s !== '');
+    // Split by code point, not UTF-16 code unit, so a chunk never ends inside a
+    // surrogate pair (emoji, supplementary-plane CJK) and leaves a lone surrogate.
+    return Array.from(text);
   }
 
   if (!text) {
     return [];
   }
 
-  // Split with capturing group to keep separators
-  const splits = text.split(new RegExp(`(${separator})`));
+  // Slice at full-match boundaries instead of using String.split, which would
+  // inject the pattern's capture groups (or undefined for unmatched ones) into the output.
   const result: string[] = [];
+  let lastIndex = 0;
+  let pendingSeparator = '';
 
-  if (separatorPosition === 'end') {
-    // Process all complete pairs
-    for (let i = 0; i < splits.length - 1; i += 2) {
-      if (i + 1 < splits.length) {
-        // Current text + separator
-        const chunk = splits[i] + (splits[i + 1] || '');
-        if (chunk) result.push(chunk);
-      }
-    }
-    // Handle the last element if it exists and isn't a separator
-    if (splits.length % 2 === 1 && splits[splits.length - 1]) {
-      result.push(splits?.[splits.length - 1]!);
-    }
-  } else {
-    if (splits[0]) result.push(splits[0]);
+  for (const match of text.matchAll(new RegExp(separator, 'g'))) {
+    const matched = match[0];
+    const piece = text.slice(lastIndex, match.index);
 
-    for (let i = 1; i < splits.length - 1; i += 2) {
-      const separator = splits[i];
-      const text = splits[i + 1];
-      if (separator && text) {
-        result.push(separator + text);
-      }
+    if (separatorPosition === 'end') {
+      result.push(piece + matched);
+    } else if (separatorPosition === 'start') {
+      result.push(pendingSeparator + piece);
+      pendingSeparator = matched;
+    } else {
+      result.push(piece);
     }
+
+    lastIndex = match.index + matched.length;
   }
 
+  const tail = text.slice(lastIndex);
+  result.push(separatorPosition === 'start' ? pendingSeparator + tail : tail);
+
   return result.filter(s => s !== '');
+}
+
+/**
+ * Splits `text` on a regex `separator` and records the text each match consumed.
+ * `joiners[i]` is the original text that preceded `splits[i]`, so merged chunks can
+ * be rejoined with what was actually in the document rather than the pattern source.
+ */
+function splitTextWithMatchedSeparators(text: string, separator: string): { splits: string[]; joiners: string[] } {
+  const splits: string[] = [];
+  const joiners: string[] = [];
+  let pending = '';
+  let lastIndex = 0;
+
+  const push = (piece: string) => {
+    if (piece !== '') {
+      splits.push(piece);
+      joiners.push(pending);
+      pending = '';
+    }
+  };
+
+  for (const match of text.matchAll(new RegExp(separator, 'g'))) {
+    if (match[0] === '' && (match.index === 0 || match.index === text.length)) continue;
+    push(text.slice(lastIndex, match.index));
+    pending += match[0];
+    lastIndex = match.index + match[0].length;
+  }
+  push(text.slice(lastIndex));
+
+  return { splits, joiners };
 }
 
 export class CharacterTransformer extends TextTransformer {
@@ -81,25 +105,57 @@ export class CharacterTransformer extends TextTransformer {
 
   private __splitChunk(text: string): string[] {
     const chunks: string[] = [];
-    let currentPosition = 0;
+    const codePointBoundaries = [0];
 
-    while (currentPosition < text.length) {
-      let chunkEnd = currentPosition;
+    // String offsets use UTF-16 code units. Record the offsets between complete
+    // Unicode code points so chunking never starts or ends inside a surrogate pair.
+    for (const codePoint of text) {
+      codePointBoundaries.push(codePointBoundaries[codePointBoundaries.length - 1]! + codePoint.length);
+    }
+
+    const finalBoundaryIndex = codePointBoundaries.length - 1;
+    let currentBoundaryIndex = 0;
+
+    while (currentBoundaryIndex < finalBoundaryIndex) {
+      let chunkEndBoundaryIndex = currentBoundaryIndex;
 
       // Build chunk up to max size
-      while (chunkEnd < text.length && this.lengthFunction(text.slice(currentPosition, chunkEnd + 1)) <= this.maxSize) {
-        chunkEnd++;
+      while (
+        chunkEndBoundaryIndex < finalBoundaryIndex &&
+        this.lengthFunction(
+          text.slice(codePointBoundaries[currentBoundaryIndex], codePointBoundaries[chunkEndBoundaryIndex + 1]),
+        ) <= this.maxSize
+      ) {
+        chunkEndBoundaryIndex++;
       }
 
-      const currentChunk = text.slice(currentPosition, chunkEnd);
-      const chunkLength = this.lengthFunction(currentChunk);
+      // Preserve a code point that is larger than maxSize as one oversized
+      // chunk instead of emitting an empty chunk and silently skipping it.
+      if (chunkEndBoundaryIndex === currentBoundaryIndex) {
+        chunkEndBoundaryIndex++;
+      }
+
+      const chunkEnd = codePointBoundaries[chunkEndBoundaryIndex]!;
+      const currentChunk = text.slice(codePointBoundaries[currentBoundaryIndex], chunkEnd);
       chunks.push(currentChunk);
 
       // If we're at the end, break to avoid tiny chunks
-      if (chunkEnd >= text.length) break;
+      if (chunkEndBoundaryIndex >= finalBoundaryIndex) break;
 
-      // Move position forward by chunk size minus overlap
-      currentPosition += Math.max(1, chunkLength - this.overlap);
+      // Find the largest complete-code-point suffix that fits the requested
+      // overlap in lengthFunction units.
+      let nextBoundaryIndex = chunkEndBoundaryIndex;
+      while (
+        this.overlap > 0 &&
+        nextBoundaryIndex > currentBoundaryIndex &&
+        this.lengthFunction(text.slice(codePointBoundaries[nextBoundaryIndex - 1], chunkEnd)) <= this.overlap
+      ) {
+        nextBoundaryIndex--;
+      }
+
+      // Always advance even if a custom length function reports zero or the
+      // requested overlap covers the entire chunk.
+      currentBoundaryIndex = Math.max(currentBoundaryIndex + 1, nextBoundaryIndex);
     }
 
     return chunks;
@@ -140,19 +196,27 @@ export class RecursiveCharacterTransformer extends TextTransformer {
 
     const _separator = this.isSeparatorRegex ? separator : separator?.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-    const splits = splitTextWithRegex(text, _separator, this.separatorPosition);
+    // Regex separators are rejoined with the text each match consumed, since the
+    // pattern source (e.g. `\n#{1,6} `) is not the text that was in the document.
+    const useMatchedSeparators = this.isSeparatorRegex && !this.separatorPosition && !!_separator;
+    const { splits, joiners } = useMatchedSeparators
+      ? splitTextWithMatchedSeparators(text, _separator)
+      : { splits: splitTextWithRegex(text, _separator, this.separatorPosition), joiners: undefined };
 
     const goodSplits: string[] = [];
+    const goodJoiners: string[] = [];
     const mergeSeparator = this.separatorPosition ? '' : separator;
+    const merge = () => this.mergeSplits(goodSplits, mergeSeparator, joiners ? goodJoiners : undefined);
 
-    for (const s of splits) {
+    splits.forEach((s, index) => {
       if (this.lengthFunction(s) < this.maxSize) {
         goodSplits.push(s);
+        goodJoiners.push(joiners?.[index] ?? '');
       } else {
         if (goodSplits.length > 0) {
-          const mergedText = this.mergeSplits(goodSplits, mergeSeparator);
-          finalChunks.push(...mergedText);
+          finalChunks.push(...merge());
           goodSplits.length = 0;
+          goodJoiners.length = 0;
         }
         if (newSeparators.length === 0) {
           finalChunks.push(s);
@@ -161,11 +225,10 @@ export class RecursiveCharacterTransformer extends TextTransformer {
           finalChunks.push(...otherInfo);
         }
       }
-    }
+    });
 
     if (goodSplits.length > 0) {
-      const mergedText = this.mergeSplits(goodSplits, mergeSeparator);
-      finalChunks.push(...mergedText);
+      finalChunks.push(...merge());
     }
 
     return finalChunks;

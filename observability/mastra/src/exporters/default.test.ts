@@ -267,6 +267,32 @@ describe('DefaultExporter', () => {
           ]),
         });
       });
+
+      it('should only remove parent IDs that refer to spans outside the stored trace', async () => {
+        mockObservabilityStore.observabilityStrategy = {
+          preferred: 'realtime',
+          supported: ['realtime', 'batch-with-updates', 'insert-only'],
+        };
+        const exporter = new DefaultExporter({ strategy: 'realtime', logger: mockLogger });
+        await exporter.init({ mastra: mockMastra });
+
+        const externalRootEvent = createMockEvent(TracingEventType.SPAN_STARTED, 'trace-1', 'external-root');
+        externalRootEvent.exportedSpan.externalParentSpanId = 'external-parent';
+
+        const resumedRootEvent = createMockEvent(TracingEventType.SPAN_STARTED, 'trace-1', 'resumed-root');
+        resumedRootEvent.exportedSpan.parentSpanId = 'suspended-span';
+
+        await exporter.exportTracingEvent(externalRootEvent);
+        await exporter.exportTracingEvent(resumedRootEvent);
+
+        const records = mockObservabilityStore.batchCreateSpans.mock.calls.flatMap((call: any) => call[0].records);
+        expect(records).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ spanId: 'external-root', parentSpanId: null }),
+            expect.objectContaining({ spanId: 'resumed-root', parentSpanId: 'suspended-span' }),
+          ]),
+        );
+      });
     });
 
     describe('Batch-with-updates strategy', () => {
@@ -538,6 +564,82 @@ describe('DefaultExporter', () => {
         expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledTimes(2);
       });
 
+      it('should report a failed flush and retry it after the configured delay without new traffic', async () => {
+        const emitDropEvent = vi.fn();
+        const exporter = new DefaultExporter({
+          strategy: 'batch-with-updates',
+          maxRetries: 3,
+          retryDelayMs: 25,
+          maxBatchSize: 10,
+          logger: mockLogger,
+        });
+        await exporter.init({ mastra: mockMastra, emitDropEvent });
+
+        mockObservabilityStore.batchCreateSpans
+          .mockRejectedValueOnce(new Error('Storage error'))
+          .mockRejectedValueOnce(new Error('Storage error'))
+          .mockResolvedValueOnce(undefined);
+
+        await exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_STARTED));
+        await exporter.flush();
+
+        expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledTimes(1);
+        expect(mockLogger.warn).toHaveBeenCalledWith('Failed to persist observability events', {
+          signal: 'tracing',
+          eventCount: 1,
+          retryAttempt: 1,
+          maxRetries: 3,
+          nextRetryDelayMs: 25,
+          error: 'Storage error',
+        });
+        expect(mockLogger.debug).not.toHaveBeenCalledWith('Batch flushed', expect.anything());
+        expect(emitDropEvent).not.toHaveBeenCalled();
+        expect(timers).toHaveLength(1);
+        expect(timers[0].delay).toBe(25);
+
+        timers[0].fn();
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledTimes(2);
+        expect(timers).toHaveLength(2);
+        expect(timers[1].delay).toBe(50);
+
+        timers[1].fn();
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledTimes(3);
+        expect(emitDropEvent).not.toHaveBeenCalled();
+      });
+
+      it('should use the scheduled retry attempt when a failed batch contains mixed retry counts', async () => {
+        const exporter = new DefaultExporter({
+          strategy: 'batch-with-updates',
+          maxRetries: 3,
+          retryDelayMs: 25,
+          maxBatchSize: 2,
+          logger: mockLogger,
+        });
+        await exporter.init({ mastra: mockMastra });
+
+        mockObservabilityStore.batchCreateSpans.mockRejectedValue(new Error('Storage error'));
+
+        await exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_STARTED, 'trace-1', 'span-1'));
+        await exporter.flush();
+        await exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_STARTED, 'trace-2', 'span-2'));
+
+        expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledTimes(2);
+        expect(mockLogger.warn).toHaveBeenLastCalledWith('Failed to persist observability events', {
+          signal: 'tracing',
+          eventCount: 2,
+          retryAttempt: 1,
+          maxRetries: 3,
+          nextRetryDelayMs: 25,
+          error: 'Storage error',
+        });
+        expect(timers).toHaveLength(1);
+        expect(timers[0].delay).toBe(25);
+      });
+
       it('should drop events after max retries exceeded', async () => {
         const exporter = new DefaultExporter({
           strategy: 'batch-with-updates',
@@ -682,6 +784,7 @@ describe('DefaultExporter', () => {
           }),
         );
         expect(emitDropEvent.mock.calls[0][0]).not.toHaveProperty('error');
+        expect(mockLogger.debug).not.toHaveBeenCalledWith('Batch flushed', expect.anything());
       });
     });
 
@@ -729,6 +832,70 @@ describe('DefaultExporter', () => {
 
         await exporter.shutdown();
       });
+
+      it('should wait for a timer-started write that is still in flight', async () => {
+        const exporter = new DefaultExporter({
+          strategy: 'batch-with-updates',
+          maxBatchSize: 10,
+          logger: mockLogger,
+        });
+        await exporter.init({ mastra: mockMastra });
+
+        let releaseWrite!: () => void;
+        mockObservabilityStore.batchCreateSpans.mockReturnValueOnce(
+          new Promise<void>(resolve => {
+            releaseWrite = resolve;
+          }),
+        );
+
+        await exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_STARTED));
+        // Fire the batch timer: the write takes the batch out of the buffer and is now in flight
+        expect(timers).toHaveLength(1);
+        timers[0].fn();
+        expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledTimes(1);
+
+        let flushed = false;
+        const flushing = exporter.flush().then(() => {
+          flushed = true;
+        });
+        await new Promise(resolve => setImmediate(resolve));
+        expect(flushed).toBe(false);
+
+        releaseWrite();
+        await flushing;
+        expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledTimes(1);
+      });
+
+      it('should write span updates deferred behind an in-flight create', async () => {
+        const exporter = new DefaultExporter({
+          strategy: 'batch-with-updates',
+          maxBatchSize: 10,
+          logger: mockLogger,
+        });
+        await exporter.init({ mastra: mockMastra });
+
+        let releaseWrite!: () => void;
+        mockObservabilityStore.batchCreateSpans.mockReturnValueOnce(
+          new Promise<void>(resolve => {
+            releaseWrite = resolve;
+          }),
+        );
+
+        await exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_STARTED));
+        timers[0].fn();
+        // The span ends while its create is still being written
+        await exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_ENDED));
+
+        const flushing = exporter.flush();
+        await new Promise(resolve => setImmediate(resolve));
+        releaseWrite();
+        await flushing;
+
+        expect(mockObservabilityStore.batchUpdateSpans).toHaveBeenCalledTimes(1);
+        expect(mockObservabilityStore.batchUpdateSpans).toHaveBeenCalledWith({
+          records: [expect.objectContaining({ traceId: 'trace-1', spanId: 'span-1' })],
+        });
+      });
     });
 
     describe('Shutdown', () => {
@@ -746,6 +913,71 @@ describe('DefaultExporter', () => {
         await exporter.shutdown();
 
         expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalled();
+      });
+
+      it('shutdown should wait for a timer-started write that is still in flight', async () => {
+        const exporter = new DefaultExporter({
+          strategy: 'batch-with-updates',
+          maxBatchSize: 10,
+          logger: mockLogger,
+        });
+        await exporter.init({ mastra: mockMastra });
+
+        let releaseWrite!: () => void;
+        mockObservabilityStore.batchCreateSpans.mockReturnValueOnce(
+          new Promise<void>(resolve => {
+            releaseWrite = resolve;
+          }),
+        );
+
+        await exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_STARTED));
+        timers[0].fn();
+
+        let done = false;
+        const shuttingDown = exporter.shutdown().then(() => {
+          done = true;
+        });
+        await new Promise(resolve => setImmediate(resolve));
+        expect(done).toBe(false);
+
+        releaseWrite();
+        await shuttingDown;
+        expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledTimes(1);
+      });
+
+      it('should join the writes still running when it stops after a few rounds', async () => {
+        const exporter = new DefaultExporter({ strategy: 'realtime', logger: mockLogger });
+        await exporter.init({ mastra: mockMastra });
+
+        // Like a server under non-stop traffic: a new event (and, in realtime mode, its write)
+        // arrives before the current write finishes, so a write is always in flight. Writes 1-3
+        // each start the next one; write 4 starts during round 3 and is the last, so flush()
+        // hits the cap with a write still running.
+        let writesInFlight = 0;
+        let writesStarted = 0;
+        mockObservabilityStore.batchCreateSpans.mockImplementation(
+          () =>
+            new Promise<void>(resolve => {
+              writesInFlight++;
+              const startNext = ++writesStarted <= 3;
+              setImmediate(() => {
+                if (startNext) void exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_STARTED));
+                setImmediate(() => {
+                  writesInFlight--;
+                  resolve();
+                });
+              });
+            }),
+        );
+        void exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_STARTED));
+        await new Promise(resolve => setImmediate(resolve));
+
+        await exporter.flush();
+
+        expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringContaining('rounds'), expect.anything());
+        expect(writesInFlight).toBe(0);
+        expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledTimes(4);
+        mockObservabilityStore.batchCreateSpans.mockImplementation(async () => {});
       });
     });
 
@@ -1188,76 +1420,6 @@ describe('DefaultExporter', () => {
               costMetadata: null,
               metadata: null,
               labels: { status: 'ok' },
-            }),
-          ],
-        });
-
-        await exporter.shutdown();
-      });
-
-      it('onScoreEvent should forward to batchCreateScores', async () => {
-        mockObservabilityStore.batchCreateScores = vi.fn().mockResolvedValue(undefined);
-        const exporter = new DefaultExporter({ logger: mockLogger });
-        await exporter.init({ mastra: mockMastra });
-
-        const event: ScoreEvent = {
-          type: 'score',
-          score: {
-            scoreId: 'score-default-test',
-            timestamp: new Date('2026-01-01T00:00:00Z'),
-            traceId: 'trace-1',
-            scorerId: 'relevance',
-            score: 0.85,
-            experimentId: 'exp-1',
-          },
-        };
-
-        await exporter.onScoreEvent(event);
-        await exporter.flush();
-
-        expect(mockObservabilityStore.batchCreateScores).toHaveBeenCalledWith({
-          scores: [
-            expect.objectContaining({
-              scoreId: 'score-default-test',
-              traceId: 'trace-1',
-              scorerId: 'relevance',
-              score: 0.85,
-              experimentId: 'exp-1',
-            }),
-          ],
-        });
-
-        await exporter.shutdown();
-      });
-
-      it('onFeedbackEvent should forward to batchCreateFeedback', async () => {
-        mockObservabilityStore.batchCreateFeedback = vi.fn().mockResolvedValue(undefined);
-        const exporter = new DefaultExporter({ logger: mockLogger });
-        await exporter.init({ mastra: mockMastra });
-
-        const event: FeedbackEvent = {
-          type: 'feedback',
-          feedback: {
-            feedbackId: 'feedback-default-test',
-            timestamp: new Date('2026-01-01T00:00:00Z'),
-            traceId: 'trace-1',
-            source: 'user',
-            feedbackType: 'thumbs',
-            value: 1,
-          },
-        };
-
-        await exporter.onFeedbackEvent(event);
-        await exporter.flush();
-
-        expect(mockObservabilityStore.batchCreateFeedback).toHaveBeenCalledWith({
-          feedbacks: [
-            expect.objectContaining({
-              feedbackId: 'feedback-default-test',
-              traceId: 'trace-1',
-              feedbackSource: 'user',
-              feedbackType: 'thumbs',
-              value: 1,
             }),
           ],
         });

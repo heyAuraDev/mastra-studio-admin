@@ -1,0 +1,67 @@
+{
+  "name": "@mastra/platform-workspace",
+  "version": "1.13.1",
+  "description": "Mastra Platform workspace sandbox and filesystem providers",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsdown --silent --config tsdown.config.ts",
+    "build:lib": "pnpm build",
+    "build:watch": "pnpm build --watch",
+    "test:unit": "vitest run --exclude '**/*.integration.test.ts'",
+    "test:types": "vitest run --typecheck src/template-compatibility.test.ts",
+    "test:cloud": "vitest run --passWithNoTests ./src/**/*.integration.test.ts",
+    "test:watch": "vitest watch",
+    "test": "pnpm test:unit",
+    "lint": "oxlint --type-aware .",
+    "lint:fix": "oxlint --type-aware --fix ."
+  },
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@internal/lint": "workspace:*",
+    "@internal/types-builder": "workspace:*",
+    "@internal/workspace": "workspace:*",
+    "@mastra/core": "workspace:*",
+    "@types/node": "22.19.15",
+    "@vitest/coverage-v8": "catalog:",
+    "@vitest/ui": "catalog:",
+    "tsdown": "0.23.1",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "@mastra/core": ">=1.80.0-0 <2.0.0-0"
+  },
+  "files": [
+    "dist"
+  ],
+  "homepage": "https://mastra.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mastra-ai/mastra.git",
+    "directory": "workspaces/platform-workspace"
+  },
+  "bugs": {
+    "url": "https://github.com/mastra-ai/mastra/issues"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "e2b": "^2.62.0"
+  }
+}

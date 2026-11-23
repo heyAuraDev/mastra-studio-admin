@@ -4,12 +4,22 @@ import type {
   TaskFilter,
   TaskListResult,
   UpdateBackgroundTask,
+  UpdateBackgroundTaskOptions,
 } from '@mastra/core/background-tasks';
-import type { CreateIndexOptions } from '@mastra/core/storage';
+import type {
+  CreateIndexOptions,
+  TABLE_NAMES,
+  PruneOptions,
+  PruneResult,
+  RetentionTablesDescriptor,
+  TableRetentionPolicy,
+} from '@mastra/core/storage';
 import { BackgroundTasksStorage, TABLE_BACKGROUND_TASKS, TABLE_SCHEMAS } from '@mastra/core/storage';
-import { parseSqlIdentifier } from '@mastra/core/utils';
+import { schemaNamePrefix } from '../../../shared/schema-name';
 import { PgDB, resolvePgConfig, generateTableSQL, generateIndexSQL } from '../../db';
 import type { PgDomainConfig } from '../../db';
+import { toPgJson } from '../../db/sanitize-json';
+import { runPrune, resolveTargets } from '../../retention';
 
 function getSchemaName(schema?: string) {
   return schema ? `"${schema}"` : '"public"';
@@ -21,7 +31,7 @@ function getTableName(schemaName?: string) {
 }
 
 function serializeJson(v: unknown): any {
-  if (typeof v === 'object' && v != null) return JSON.stringify(v);
+  if (typeof v === 'object' && v != null) return toPgJson(v);
   return v ?? null;
 }
 
@@ -38,6 +48,15 @@ function parseJson(v: unknown): any {
 
 /** Convert a DB row (snake_case) to a BackgroundTask object (camelCase). */
 function rowToTask(row: Record<string, any>): BackgroundTask {
+  const createdAt = row.createdAtZ || row.createdAt;
+  const startedAt = row.startedAtZ || row.startedAt;
+  const suspendedAt = row.suspendedAtZ || row.suspendedAt;
+  const completedAt = row.completedAtZ || row.completedAt;
+  const leaseExpiresAt = row.leaseExpiresAtZ || row.leaseExpiresAt;
+  // `expiresAtZ` is added with `DEFAULT NOW()` like every Z twin, so rows that
+  // predate the column carry a value there. The nullable naive column is the
+  // source of truth for whether the row has an expiry at all.
+  const expiresAt = row.expiresAt != null ? row.expiresAtZ || row.expiresAt : undefined;
   return {
     id: row.id,
     status: row.status as BackgroundTaskStatus,
@@ -54,22 +73,26 @@ function rowToTask(row: Record<string, any>): BackgroundTask {
     retryCount: Number(row.retry_count),
     maxRetries: Number(row.max_retries),
     timeoutMs: Number(row.timeout_ms),
-    createdAt: row.createdAt instanceof Date ? row.createdAt : new Date(row.createdAt),
-    startedAt: row.startedAt ? (row.startedAt instanceof Date ? row.startedAt : new Date(row.startedAt)) : undefined,
-    suspendedAt: row.suspendedAt
-      ? row.suspendedAt instanceof Date
-        ? row.suspendedAt
-        : new Date(row.suspendedAt)
+    createdAt: createdAt instanceof Date ? createdAt : new Date(createdAt),
+    startedAt: startedAt ? (startedAt instanceof Date ? startedAt : new Date(startedAt)) : undefined,
+    suspendedAt: suspendedAt ? (suspendedAt instanceof Date ? suspendedAt : new Date(suspendedAt)) : undefined,
+    completedAt: completedAt ? (completedAt instanceof Date ? completedAt : new Date(completedAt)) : undefined,
+    ownerId: row.ownerId ?? undefined,
+    // Read the timezone-aware mirror like every other timestamp on this row:
+    // the naive `leaseExpiresAt` column is round-tripped through the driver's
+    // process-local timezone, which would make the lease fence miss.
+    leaseExpiresAt: leaseExpiresAt
+      ? leaseExpiresAt instanceof Date
+        ? leaseExpiresAt
+        : new Date(leaseExpiresAt)
       : undefined,
-    completedAt: row.completedAt
-      ? row.completedAt instanceof Date
-        ? row.completedAt
-        : new Date(row.completedAt)
-      : undefined,
+    expiresAt: expiresAt ? (expiresAt instanceof Date ? expiresAt : new Date(expiresAt)) : undefined,
+    metadata: parseJson(row.metadata),
   };
 }
 
 export class BackgroundTasksPG extends BackgroundTasksStorage {
+  override readonly supportsTaskExpiry = true;
   #db: PgDB;
   #schema: string;
   #skipDefaultIndexes?: boolean;
@@ -77,10 +100,19 @@ export class BackgroundTasksPG extends BackgroundTasksStorage {
 
   static readonly MANAGED_TABLES = [TABLE_BACKGROUND_TASKS] as const;
 
+  /**
+   * Completed background tasks accumulate as dead weight. Anchored on the
+   * timezone-aware `completedAtZ` mirror column: NULL (in-flight) rows are
+   * excluded automatically since `completedAtZ < cutoff` is false for NULL.
+   */
+  static override readonly retentionTables: RetentionTablesDescriptor = {
+    backgroundTasks: { table: TABLE_BACKGROUND_TASKS, column: 'completedAtZ', indexed: true },
+  };
+
   constructor(config: PgDomainConfig) {
     super();
-    const { client, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
-    this.#db = new PgDB({ client, schemaName, skipDefaultIndexes });
+    const { client, readClient, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
+    this.#db = new PgDB({ client, readClient, schemaName, skipDefaultIndexes });
     this.#schema = schemaName || 'public';
     this.#skipDefaultIndexes = skipDefaultIndexes;
     this.#indexes = indexes?.filter(idx => (BackgroundTasksPG.MANAGED_TABLES as readonly string[]).includes(idx.table));
@@ -95,10 +127,46 @@ export class BackgroundTasksPG extends BackgroundTasksStorage {
     await this.#db.alterTable({
       tableName: TABLE_BACKGROUND_TASKS,
       schema: TABLE_SCHEMAS[TABLE_BACKGROUND_TASKS],
-      ifNotExists: ['suspend_payload', 'suspendedAt'],
+      ifNotExists: ['suspend_payload', 'suspendedAt', 'ownerId', 'leaseExpiresAt', 'expiresAt', 'metadata'],
     });
     await this.createDefaultIndexes();
     await this.createCustomIndexes();
+  }
+
+  /**
+   * Lazily ensures a btree index exists on each configured policy's retention
+   * anchor column so age-based `prune()` deletes stay fast on large tables.
+   * Called from the prune path (not init) so only deployments that configure
+   * retention pay the index's write/disk overhead. Best-effort: failures are
+   * logged and pruning proceeds (correct, just slower).
+   * Created even with `skipDefaultIndexes` — retention is an explicit opt-in,
+   * so its supporting index is not part of the default index set.
+   */
+  private async ensureRetentionIndexes(policies: Record<string, TableRetentionPolicy>): Promise<void> {
+    const prefix = this.#schema !== 'public' ? `${schemaNamePrefix(this.#schema)}_` : '';
+    for (const [key, entry] of Object.entries(BackgroundTasksPG.retentionTables)) {
+      if (!entry.indexed || !policies[key]) continue;
+      try {
+        await this.#db.ensureIndex({
+          indexName: `${prefix}mastra_${key}_retention_idx`,
+          tableName: entry.table as TABLE_NAMES,
+          column: entry.column,
+        });
+      } catch (error) {
+        this.logger?.warn?.(`Failed to create retention index for ${entry.table}:`, error);
+      }
+    }
+  }
+
+  /** Delete completed tasks older than the `backgroundTasks` policy's `maxAge`, batched. */
+  async prune(policies: Record<string, TableRetentionPolicy>, options?: PruneOptions): Promise<PruneResult[]> {
+    await this.ensureRetentionIndexes(policies);
+    const targets = resolveTargets({
+      policies,
+      descriptor: BackgroundTasksPG.retentionTables,
+      order: ['backgroundTasks'],
+    });
+    return runPrune({ db: this.#db, domain: 'backgroundTasks', targets, options });
   }
 
   static getDefaultIndexDefs(schemaPrefix: string): CreateIndexOptions[] {
@@ -128,7 +196,7 @@ export class BackgroundTasksPG extends BackgroundTasksStorage {
 
   static getExportDDL(schemaName?: string): string[] {
     const statements: string[] = [];
-    const parsedSchema = schemaName ? parseSqlIdentifier(schemaName, 'schema name') : '';
+    const parsedSchema = schemaName ? schemaNamePrefix(schemaName) : '';
     const schemaPrefix = parsedSchema && parsedSchema !== 'public' ? `${parsedSchema}_` : '';
 
     statements.push(
@@ -148,7 +216,7 @@ export class BackgroundTasksPG extends BackgroundTasksStorage {
   }
 
   getDefaultIndexDefinitions(): CreateIndexOptions[] {
-    const schemaPrefix = this.#schema !== 'public' ? `${this.#schema}_` : '';
+    const schemaPrefix = this.#schema !== 'public' ? `${schemaNamePrefix(this.#schema)}_` : '';
     return BackgroundTasksPG.getDefaultIndexDefs(schemaPrefix);
   }
 
@@ -198,14 +266,28 @@ export class BackgroundTasksPG extends BackgroundTasksStorage {
         max_retries: task.maxRetries,
         timeout_ms: task.timeoutMs,
         createdAt: task.createdAt.toISOString(),
+        createdAtZ: task.createdAt.toISOString(),
         startedAt: task.startedAt?.toISOString() ?? null,
+        startedAtZ: task.startedAt?.toISOString() ?? null,
         suspendedAt: task.suspendedAt?.toISOString() ?? null,
+        suspendedAtZ: task.suspendedAt?.toISOString() ?? null,
         completedAt: task.completedAt?.toISOString() ?? null,
+        completedAtZ: task.completedAt?.toISOString() ?? null,
+        ownerId: task.ownerId ?? null,
+        leaseExpiresAt: task.leaseExpiresAt?.toISOString() ?? null,
+        leaseExpiresAtZ: task.leaseExpiresAt?.toISOString() ?? null,
+        expiresAt: task.expiresAt?.toISOString() ?? null,
+        expiresAtZ: task.expiresAt?.toISOString() ?? null,
+        metadata: serializeJson(task.metadata),
       },
     });
   }
 
-  async updateTask(taskId: string, update: UpdateBackgroundTask): Promise<void> {
+  async updateTask(
+    taskId: string,
+    update: UpdateBackgroundTask,
+    options?: UpdateBackgroundTaskOptions,
+  ): Promise<boolean> {
     const setClauses: string[] = [];
     const params: any[] = [];
     let paramIdx = 1;
@@ -232,22 +314,82 @@ export class BackgroundTasksPG extends BackgroundTasksStorage {
     }
     if ('startedAt' in update) {
       setClauses.push(`"startedAt" = $${paramIdx++}`);
-      params.push(update.startedAt?.toISOString() ?? null);
+      setClauses.push(`"startedAtZ" = $${paramIdx++}`);
+      const val = update.startedAt?.toISOString() ?? null;
+      params.push(val, val);
     }
     if ('suspendedAt' in update) {
       setClauses.push(`"suspendedAt" = $${paramIdx++}`);
-      params.push(update.suspendedAt?.toISOString() ?? null);
+      setClauses.push(`"suspendedAtZ" = $${paramIdx++}`);
+      const val = update.suspendedAt?.toISOString() ?? null;
+      params.push(val, val);
     }
     if ('completedAt' in update) {
       setClauses.push(`"completedAt" = $${paramIdx++}`);
-      params.push(update.completedAt?.toISOString() ?? null);
+      setClauses.push(`"completedAtZ" = $${paramIdx++}`);
+      const val = update.completedAt?.toISOString() ?? null;
+      params.push(val, val);
+    }
+    if ('ownerId' in update) {
+      setClauses.push(`"ownerId" = $${paramIdx++}`);
+      params.push(update.ownerId ?? null);
+    }
+    if ('leaseExpiresAt' in update) {
+      setClauses.push(`"leaseExpiresAt" = $${paramIdx++}`);
+      setClauses.push(`"leaseExpiresAtZ" = $${paramIdx++}`);
+      const val = update.leaseExpiresAt?.toISOString() ?? null;
+      params.push(val, val);
+    }
+    if ('expiresAt' in update) {
+      setClauses.push(`"expiresAt" = $${paramIdx++}`);
+      setClauses.push(`"expiresAtZ" = $${paramIdx++}`);
+      const val = update.expiresAt?.toISOString() ?? null;
+      params.push(val, val);
+    }
+    if ('metadata' in update) {
+      setClauses.push(`"metadata" = $${paramIdx++}`);
+      params.push(serializeJson(update.metadata));
     }
 
-    if (setClauses.length === 0) return;
+    if (setClauses.length === 0) return false;
 
     const table = getTableName(getSchemaName(this.#schema));
     params.push(taskId);
-    await this.#db.client.none(`UPDATE ${table} SET ${setClauses.join(', ')} WHERE "id" = $${paramIdx}`, params);
+    let where = `"id" = $${paramIdx++}`;
+    if (options?.expectedStatus) {
+      where += ` AND "status" = $${paramIdx++}`;
+      params.push(options.expectedStatus);
+    }
+    if (options?.expectedOwnerId !== undefined) {
+      if (options.expectedOwnerId === null) {
+        where += ` AND "ownerId" IS NULL`;
+      } else {
+        where += ` AND "ownerId" = $${paramIdx++}`;
+        params.push(options.expectedOwnerId);
+      }
+    }
+    if (options?.expectedLeaseExpiresAt !== undefined) {
+      // Fence on the timezone-aware column, matching the read in `rowToTask`:
+      // the naive column would be re-parsed in the process-local timezone and
+      // never compare equal, silently blocking stale-task recovery.
+      if (options.expectedLeaseExpiresAt === null) {
+        where += ` AND "leaseExpiresAtZ" IS NULL`;
+      } else {
+        where += ` AND "leaseExpiresAtZ" = $${paramIdx++}`;
+        params.push(options.expectedLeaseExpiresAt.toISOString());
+      }
+    }
+    if (options?.expectedSuspendedAt !== undefined) {
+      // Timezone-aware column, for the same reason as the lease fence above.
+      if (options.expectedSuspendedAt === null) {
+        where += ` AND "suspendedAtZ" IS NULL`;
+      } else {
+        where += ` AND "suspendedAtZ" = $${paramIdx++}`;
+        params.push(options.expectedSuspendedAt.toISOString());
+      }
+    }
+    const result = await this.#db.client.query(`UPDATE ${table} SET ${setClauses.join(', ')} WHERE ${where}`, params);
+    return (result.rowCount ?? 0) > 0;
   }
 
   async getTask(taskId: string): Promise<BackgroundTask | null> {
@@ -300,7 +442,17 @@ export class BackgroundTasksPG extends BackgroundTasksStorage {
           ? '"suspendedAt"'
           : filter.dateFilterBy === 'completedAt'
             ? '"completedAt"'
-            : '"createdAt"';
+            : filter.dateFilterBy === 'expiresAt'
+              ? '"expiresAtZ"'
+              : '"createdAt"';
+    // Presence lives on the nullable naive column (see rowToTask); compare
+    // times on the timezone-aware twin.
+    if (filter.hasExpiresAt !== undefined) {
+      conditions.push(filter.hasExpiresAt ? '"expiresAt" IS NOT NULL' : '"expiresAt" IS NULL');
+    }
+    if (filter.dateFilterBy === 'expiresAt' && (filter.fromDate || filter.toDate)) {
+      conditions.push('"expiresAt" IS NOT NULL');
+    }
     if (filter.fromDate) {
       conditions.push(`${dateCol} >= $${paramIdx++}`);
       params.push(filter.fromDate.toISOString());
@@ -313,7 +465,7 @@ export class BackgroundTasksPG extends BackgroundTasksStorage {
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
     // Count total matching rows (before pagination)
-    const countResult = await this.#db.client.oneOrNone<{ count: string }>(
+    const countResult = await this.#db.readClient.oneOrNone<{ count: string }>(
       `SELECT COUNT(*) as count FROM ${table} ${where}`,
       params.slice(0, paramIdx - 1),
     );
@@ -340,7 +492,7 @@ export class BackgroundTasksPG extends BackgroundTasksStorage {
       }
     }
 
-    const rows = await this.#db.client.manyOrNone(sql, params);
+    const rows = await this.#db.readClient.manyOrNone(sql, params);
     return { tasks: rows.map(rowToTask), total };
   }
 
@@ -369,7 +521,17 @@ export class BackgroundTasksPG extends BackgroundTasksStorage {
           ? '"suspendedAt"'
           : filter.dateFilterBy === 'completedAt'
             ? '"completedAt"'
-            : '"createdAt"';
+            : filter.dateFilterBy === 'expiresAt'
+              ? '"expiresAtZ"'
+              : '"createdAt"';
+    // Presence lives on the nullable naive column (see rowToTask); compare
+    // times on the timezone-aware twin.
+    if (filter.hasExpiresAt !== undefined) {
+      conditions.push(filter.hasExpiresAt ? '"expiresAt" IS NOT NULL' : '"expiresAt" IS NULL');
+    }
+    if (filter.dateFilterBy === 'expiresAt' && (filter.fromDate || filter.toDate)) {
+      conditions.push('"expiresAt" IS NOT NULL');
+    }
     if (filter.fromDate) {
       conditions.push(`${dateCol} >= $${paramIdx++}`);
       params.push(filter.fromDate.toISOString());
@@ -390,7 +552,7 @@ export class BackgroundTasksPG extends BackgroundTasksStorage {
 
   async getRunningCount(): Promise<number> {
     const table = getTableName(getSchemaName(this.#schema));
-    const result = await this.#db.client.oneOrNone<{ count: string }>(
+    const result = await this.#db.readClient.oneOrNone<{ count: string }>(
       `SELECT COUNT(*) FROM ${table} WHERE "status" = 'running'`,
     );
     return Number(result?.count ?? 0);
@@ -398,7 +560,7 @@ export class BackgroundTasksPG extends BackgroundTasksStorage {
 
   async getRunningCountByAgent(agentId: string): Promise<number> {
     const table = getTableName(getSchemaName(this.#schema));
-    const result = await this.#db.client.oneOrNone<{ count: string }>(
+    const result = await this.#db.readClient.oneOrNone<{ count: string }>(
       `SELECT COUNT(*) FROM ${table} WHERE "status" = 'running' AND "agent_id" = $1`,
       [agentId],
     );

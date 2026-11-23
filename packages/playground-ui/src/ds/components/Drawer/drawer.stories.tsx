@@ -2,10 +2,10 @@ import type { Meta, StoryObj } from '@storybook/react-vite';
 import * as React from 'react';
 
 import { Button } from '../Button';
+import { Field, FieldLabel } from '../Field';
 import { Input } from '../Input';
-import { Label } from '../Label';
+import { createDrawerHandle } from './create-drawer-handle';
 import {
-  createDrawerHandle,
   Drawer,
   DrawerBackdrop,
   DrawerBody,
@@ -21,6 +21,7 @@ import {
   DrawerTrigger,
   DrawerViewport,
 } from './drawer';
+import { raisedSurfaceStyle } from '@/ds/primitives/raised-surface';
 
 const meta: Meta<typeof Drawer> = {
   title: 'Feedback/Drawer',
@@ -45,11 +46,13 @@ export const Default: Story = {
           <DrawerDescription>You are all caught up. Good job!</DrawerDescription>
         </DrawerHeader>
         <DrawerBody>
-          <p className="text-ui-sm text-neutral4">Swipe down or press the close button to dismiss this sheet.</p>
+          <p className="text-caption text-muted-foreground">
+            Swipe down or press the close button to dismiss this sheet.
+          </p>
         </DrawerBody>
         <DrawerFooter>
           <DrawerClose asChild>
-            <Button variant="outline">Close</Button>
+            <Button>Close</Button>
           </DrawerClose>
         </DrawerFooter>
       </DrawerContent>
@@ -57,76 +60,215 @@ export const Default: Story = {
   ),
 };
 
-export const Right: Story = {
+const sideOptions = [
+  {
+    side: 'bottom',
+    label: 'Bottom',
+    title: 'Notifications',
+    description: 'A panel that slides up from the bottom edge.',
+    body: 'Swipe down or press the close button to dismiss this sheet.',
+  },
+  {
+    side: 'right',
+    label: 'Right',
+    title: 'Library',
+    description: 'A panel that slides in from the right edge.',
+    body: 'Swipe right to dismiss, or use the close button.',
+  },
+  {
+    side: 'left',
+    label: 'Left',
+    title: 'Navigation',
+    description: 'A panel that slides in from the left edge.',
+    body: 'Swipe left to dismiss, or use the close button.',
+  },
+  {
+    side: 'top',
+    label: 'Top',
+    title: 'Announcement',
+    description: 'A panel that slides in from the top edge.',
+    body: 'Swipe up to dismiss, or use the close button.',
+  },
+] as const;
+
+export const Sides: Story = {
   render: () => (
-    <Drawer side="right">
-      <DrawerTrigger asChild>
-        <Button>Open right drawer</Button>
-      </DrawerTrigger>
-      <DrawerContent>
-        <DrawerHeader>
-          <DrawerTitle>Library</DrawerTitle>
-          <DrawerDescription>A panel that slides in from the right edge.</DrawerDescription>
-        </DrawerHeader>
-        <DrawerBody>
-          <p className="text-ui-sm text-neutral4">Swipe right to dismiss, or use the close button.</p>
-        </DrawerBody>
-        <DrawerFooter>
-          <DrawerClose asChild>
-            <Button variant="outline">Close</Button>
-          </DrawerClose>
-        </DrawerFooter>
-      </DrawerContent>
-    </Drawer>
+    <div className="flex flex-wrap justify-center gap-2">
+      {sideOptions.map(({ side, label, title, description, body }) => (
+        <Drawer key={side} side={side}>
+          <DrawerTrigger asChild>
+            <Button>{label}</Button>
+          </DrawerTrigger>
+          <DrawerContent>
+            <DrawerHeader>
+              <DrawerTitle>{title}</DrawerTitle>
+              <DrawerDescription>{description}</DrawerDescription>
+            </DrawerHeader>
+            <DrawerBody>
+              <p className="text-caption text-muted-foreground">{body}</p>
+            </DrawerBody>
+            <DrawerFooter>
+              <DrawerClose asChild>
+                <Button>Close</Button>
+              </DrawerClose>
+            </DrawerFooter>
+          </DrawerContent>
+        </Drawer>
+      ))}
+    </div>
   ),
 };
 
-export const Left: Story = {
-  render: () => (
-    <Drawer side="left">
-      <DrawerTrigger asChild>
-        <Button>Open left drawer</Button>
-      </DrawerTrigger>
-      <DrawerContent>
-        <DrawerHeader>
-          <DrawerTitle>Navigation</DrawerTitle>
-          <DrawerDescription>A panel that slides in from the left edge.</DrawerDescription>
-        </DrawerHeader>
-        <DrawerBody>
-          <p className="text-ui-sm text-neutral4">Swipe left to dismiss, or use the close button.</p>
-        </DrawerBody>
-        <DrawerFooter>
-          <DrawerClose asChild>
-            <Button variant="outline">Close</Button>
-          </DrawerClose>
-        </DrawerFooter>
-      </DrawerContent>
-    </Drawer>
-  ),
+type RepositoryPanelProps = {
+  title?: string;
+  description?: string;
 };
 
-export const Top: Story = {
+function RepositoryPanel({
+  title = 'Repository setup',
+  description = 'Select the repository and branch to attach to this project.',
+}: RepositoryPanelProps) {
+  return (
+    <DrawerContent>
+      <DrawerHeader>
+        <DrawerTitle>{title}</DrawerTitle>
+        <DrawerDescription>{description}</DrawerDescription>
+      </DrawerHeader>
+      <DrawerBody className="grid content-start gap-4">
+        <Field className="gap-1.5">
+          <FieldLabel>Repository</FieldLabel>
+          <Input defaultValue="mastra-ai/mastra" />
+        </Field>
+        <Field className="gap-1.5">
+          <FieldLabel>Branch</FieldLabel>
+          <Input defaultValue="main" />
+        </Field>
+      </DrawerBody>
+      <DrawerFooter>
+        <DrawerClose asChild>
+          <Button>Cancel</Button>
+        </DrawerClose>
+        <DrawerClose asChild>
+          <Button>Save</Button>
+        </DrawerClose>
+      </DrawerFooter>
+    </DrawerContent>
+  );
+}
+
+function WorkspaceSurface({ children }: { children: React.ReactNode }) {
+  const [deployments, setDeployments] = React.useState(12);
+
+  return (
+    <div className="min-h-140 bg-sidebar p-4 sm:p-6">
+      <div className="mx-auto grid max-w-6xl gap-4">
+        <div className="flex flex-col gap-4 rounded-lg border border-border bg-fill p-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="grid gap-1">
+            <h2 className="text-heading text-foreground">Deployments</h2>
+            <p className="text-caption text-muted-foreground">{deployments} active preview environments</p>
+          </div>
+          <div className="flex flex-wrap gap-2">{children}</div>
+        </div>
+
+        <div className="grid gap-4 lg:grid-cols-[1.4fr_0.8fr]">
+          <div className="rounded-lg border border-border bg-background p-4">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div>
+                <h3 className="text-subheading text-foreground">Recent runs</h3>
+                <p className="text-caption text-muted-foreground">Production checks across connected branches</p>
+              </div>
+              <Button onClick={() => setDeployments(count => count + 1)}>Queue run</Button>
+            </div>
+            <div className="grid gap-2">
+              {['main', 'release/canary', 'codex/drawer-floating-variant'].map((branch, index) => (
+                <div
+                  key={branch}
+                  className={`${raisedSurfaceStyle} flex items-center justify-between rounded-md px-3 py-2`}
+                >
+                  <span className="text-column text-foreground">{branch}</span>
+                  <span className="text-meta text-muted-foreground">{index === 0 ? 'Ready' : 'Building'}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-border bg-background p-4">
+            <h3 className="text-subheading text-foreground">Environment</h3>
+            <div className="mt-3 grid gap-3">
+              <div className="rounded-md bg-card p-3">
+                <p className="text-meta text-muted-foreground">Region</p>
+                <p className="text-caption text-foreground">eu-west-1</p>
+              </div>
+              <div className="rounded-md bg-card p-3">
+                <p className="text-meta text-muted-foreground">Runtime</p>
+                <p className="text-caption text-foreground">Node.js 22</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export const FloatingOverlayModes: Story = {
   render: () => (
-    <Drawer side="top">
-      <DrawerTrigger asChild>
-        <Button>Open top drawer</Button>
-      </DrawerTrigger>
-      <DrawerContent>
-        <DrawerHeader>
-          <DrawerTitle>Announcement</DrawerTitle>
-          <DrawerDescription>A panel that slides in from the top edge.</DrawerDescription>
-        </DrawerHeader>
-        <DrawerBody>
-          <p className="text-ui-sm text-neutral4">Swipe up to dismiss, or use the close button.</p>
-        </DrawerBody>
-        <DrawerFooter>
-          <DrawerClose asChild>
-            <Button variant="outline">Close</Button>
-          </DrawerClose>
-        </DrawerFooter>
-      </DrawerContent>
-    </Drawer>
+    <WorkspaceSurface>
+      <Drawer side="right" variant="floating">
+        <DrawerTrigger asChild>
+          <Button>No overlay</Button>
+        </DrawerTrigger>
+        <RepositoryPanel title="No overlay" description="The workspace remains available while the panel is open." />
+      </Drawer>
+
+      <Drawer side="right" variant="floating" overlay="transparent">
+        <DrawerTrigger asChild>
+          <Button>Transparent overlay</Button>
+        </DrawerTrigger>
+        <RepositoryPanel
+          title="Transparent overlay"
+          description="Outside clicks dismiss the panel without drawing a dimmed backdrop."
+        />
+      </Drawer>
+
+      <Drawer side="right" variant="floating" overlay="visible">
+        <DrawerTrigger asChild>
+          <Button>Visible overlay</Button>
+        </DrawerTrigger>
+        <RepositoryPanel
+          title="Visible overlay"
+          description="The floating panel uses the standard modal backdrop treatment."
+        />
+      </Drawer>
+    </WorkspaceSurface>
   ),
+  parameters: {
+    layout: 'fullscreen',
+  },
+};
+
+const sizeOptions = [
+  { size: 'md', label: 'Medium', description: 'The default width: 32rem for floating drawers.' },
+  { size: 'lg', label: 'Large', description: '42rem, for side panels with code blocks or wide forms.' },
+  { size: 'xl', label: 'Extra large', description: '56rem, for detail views that need the room.' },
+] as const;
+
+export const Sizes: Story = {
+  render: () => (
+    <WorkspaceSurface>
+      {sizeOptions.map(({ size, label, description }) => (
+        <Drawer key={size} side="right" variant="floating" size={size}>
+          <DrawerTrigger asChild>
+            <Button>{label}</Button>
+          </DrawerTrigger>
+          <RepositoryPanel title={label} description={description} />
+        </Drawer>
+      ))}
+    </WorkspaceSurface>
+  ),
+  parameters: {
+    layout: 'fullscreen',
+  },
 };
 
 function ControlledExample() {
@@ -134,8 +276,8 @@ function ControlledExample() {
 
   return (
     <div className="flex flex-col items-center gap-3">
-      <p className="text-ui-sm text-neutral4">
-        Drawer is <span className="text-neutral6">{open ? 'open' : 'closed'}</span>
+      <p className="text-caption text-muted-foreground">
+        Drawer is <span className="text-foreground">{open ? 'open' : 'closed'}</span>
       </p>
       <Button onClick={() => setOpen(true)}>Open from outside</Button>
       <Drawer side="right" open={open} onOpenChange={setOpen}>
@@ -145,9 +287,7 @@ function ControlledExample() {
             <DrawerDescription>Open state is owned by the parent component.</DrawerDescription>
           </DrawerHeader>
           <DrawerFooter>
-            <Button variant="outline" onClick={() => setOpen(false)}>
-              Close from outside
-            </Button>
+            <Button onClick={() => setOpen(false)}>Close from outside</Button>
           </DrawerFooter>
         </DrawerContent>
       </Drawer>
@@ -171,18 +311,18 @@ export const WithForm: Story = {
           <DrawerDescription>Make changes to your profile. Save when you are done.</DrawerDescription>
         </DrawerHeader>
         <DrawerBody className="grid gap-4">
-          <div className="grid gap-1.5">
-            <Label htmlFor="drawer-name">Name</Label>
-            <Input id="drawer-name" defaultValue="John Doe" />
-          </div>
-          <div className="grid gap-1.5">
-            <Label htmlFor="drawer-username">Username</Label>
-            <Input id="drawer-username" defaultValue="@johndoe" />
-          </div>
+          <Field className="gap-1.5">
+            <FieldLabel>Name</FieldLabel>
+            <Input defaultValue="John Doe" />
+          </Field>
+          <Field className="gap-1.5">
+            <FieldLabel>Username</FieldLabel>
+            <Input defaultValue="@johndoe" />
+          </Field>
         </DrawerBody>
         <DrawerFooter>
           <DrawerClose asChild>
-            <Button variant="outline">Cancel</Button>
+            <Button>Cancel</Button>
           </DrawerClose>
           <DrawerClose asChild>
             <Button>Save changes</Button>
@@ -207,7 +347,7 @@ export const Nested: Story = {
         <DrawerBody>
           <Drawer>
             <DrawerTrigger asChild>
-              <Button variant="outline">Security settings</Button>
+              <Button>Security settings</Button>
             </DrawerTrigger>
             <DrawerContent>
               <DrawerHeader>
@@ -215,7 +355,7 @@ export const Nested: Story = {
                 <DrawerDescription>Review sign-in activity and update your preferences.</DrawerDescription>
               </DrawerHeader>
               <DrawerBody>
-                <ul className="list-disc pl-5 text-ui-sm text-neutral4">
+                <ul className="list-disc pl-5 text-caption text-muted-foreground">
                   <li>Passkeys enabled</li>
                   <li>2FA via authenticator app</li>
                   <li>3 signed-in devices</li>
@@ -223,16 +363,18 @@ export const Nested: Story = {
                 <div className="mt-4">
                   <Drawer>
                     <DrawerTrigger asChild>
-                      <Button variant="outline">Advanced options</Button>
+                      <Button>Advanced options</Button>
                     </DrawerTrigger>
                     <DrawerContent>
                       <DrawerHeader>
                         <DrawerTitle>Advanced</DrawerTitle>
                         <DrawerDescription>A third level to demonstrate deep nesting.</DrawerDescription>
                       </DrawerHeader>
-                      <DrawerBody className="grid gap-1.5">
-                        <Label htmlFor="drawer-device">Device name</Label>
-                        <Input id="drawer-device" defaultValue="Personal laptop" />
+                      <DrawerBody>
+                        <Field className="gap-1.5">
+                          <FieldLabel>Device name</FieldLabel>
+                          <Input defaultValue="Personal laptop" />
+                        </Field>
                       </DrawerBody>
                       <DrawerFooter>
                         <DrawerClose asChild>
@@ -245,7 +387,7 @@ export const Nested: Story = {
               </DrawerBody>
               <DrawerFooter>
                 <DrawerClose asChild>
-                  <Button variant="outline">Close</Button>
+                  <Button>Close</Button>
                 </DrawerClose>
               </DrawerFooter>
             </DrawerContent>
@@ -253,7 +395,7 @@ export const Nested: Story = {
         </DrawerBody>
         <DrawerFooter>
           <DrawerClose asChild>
-            <Button variant="outline">Close</Button>
+            <Button>Close</Button>
           </DrawerClose>
         </DrawerFooter>
       </DrawerContent>
@@ -276,12 +418,12 @@ export const SnapPoints: Story = {
         </DrawerHeader>
         <DrawerBody className="grid gap-3">
           {Array.from({ length: 16 }, (_, index) => (
-            <div key={index} className="h-12 shrink-0 rounded-md bg-surface4" />
+            <div key={index} className="h-12 shrink-0 rounded-md bg-muted" />
           ))}
         </DrawerBody>
         <DrawerFooter>
           <DrawerClose asChild>
-            <Button variant="outline">Close</Button>
+            <Button>Close</Button>
           </DrawerClose>
         </DrawerFooter>
       </DrawerContent>
@@ -289,38 +431,47 @@ export const SnapPoints: Story = {
   ),
 };
 
+// Escape hatch: no backdrop + viewport opts out of pointer events.
 export const NonModal: Story = {
   render: () => (
     <Drawer side="right" modal={false} disablePointerDismissal>
       <DrawerTrigger asChild>
         <Button>Open non-modal drawer</Button>
       </DrawerTrigger>
-      <DrawerContent hideBackdrop>
-        <DrawerHeader>
-          <DrawerTitle>Non-modal drawer</DrawerTitle>
-          <DrawerDescription>
-            Does not trap focus or dim the page. Outside clicks are ignored — use the close button.
-          </DrawerDescription>
-        </DrawerHeader>
-        <DrawerFooter>
-          <DrawerClose asChild>
-            <Button variant="outline">Close</Button>
-          </DrawerClose>
-        </DrawerFooter>
-      </DrawerContent>
+      <DrawerPortal>
+        <DrawerViewport className="pointer-events-none">
+          <DrawerPopup className="pointer-events-auto">
+            <DrawerHeader>
+              <DrawerTitle>Non-modal drawer</DrawerTitle>
+              <DrawerDescription>
+                Does not trap focus or dim the page. Outside clicks are ignored — use the close button.
+              </DrawerDescription>
+            </DrawerHeader>
+            <DrawerFooter>
+              <DrawerClose asChild>
+                <Button>Close</Button>
+              </DrawerClose>
+            </DrawerFooter>
+          </DrawerPopup>
+        </DrawerViewport>
+      </DrawerPortal>
     </Drawer>
   ),
 };
 
+// Escape hatch: portal scoped to a parent box instead of `document.body`.
 function SwipeToOpenExample() {
   const [container, setContainer] = React.useState<HTMLDivElement | null>(null);
 
   return (
-    <div ref={setContainer} className="relative h-80 w-96 overflow-hidden rounded-xl border border-border1 bg-surface2">
+    <div
+      ref={setContainer}
+      className="relative h-80 w-96 overflow-hidden rounded-xl border border-border bg-background"
+    >
       <Drawer side="right" modal={false}>
-        <DrawerSwipeArea className="absolute inset-y-0 right-0 z-10 w-10 border-l border-dashed border-border2 bg-surface4/40" />
+        <DrawerSwipeArea className="absolute inset-y-0 right-0 z-10 w-10 border-l border-dashed border-border-strong bg-muted/40" />
         <div className="flex h-full items-center justify-center px-12 text-center">
-          <p className="text-ui-sm text-neutral3">Swipe from the right edge to open the drawer.</p>
+          <p className="text-caption text-muted-foreground">Swipe from the right edge to open the drawer.</p>
         </div>
         <DrawerPortal container={container}>
           <DrawerBackdrop className="absolute" />
@@ -332,7 +483,7 @@ function SwipeToOpenExample() {
               </DrawerHeader>
               <DrawerFooter>
                 <DrawerClose asChild>
-                  <Button variant="outline">Close</Button>
+                  <Button>Close</Button>
                 </DrawerClose>
               </DrawerFooter>
             </DrawerPopup>
@@ -357,7 +508,7 @@ function ActionSheetExample() {
       <DrawerTrigger asChild>
         <Button>Open action sheet</Button>
       </DrawerTrigger>
-      <DrawerContent hideCloseButton hideHandle>
+      <DrawerContent>
         <DrawerHeader className="sr-only">
           <DrawerTitle>Profile actions</DrawerTitle>
           <DrawerDescription>Choose an action for this user.</DrawerDescription>
@@ -374,10 +525,10 @@ function ActionSheetExample() {
             </Button>
           ))}
         </div>
-        <DrawerFooter className="border-t border-border1">
+        <DrawerFooter className="border-t border-border">
           <Button
             variant="ghost"
-            className="w-full justify-center rounded-none text-negative1"
+            className="w-full justify-center rounded-none text-destructive-foreground"
             onClick={() => setOpen(false)}
           >
             Block user
@@ -457,7 +608,7 @@ const profileDrawer = createDrawerHandle<ProfilePayload>();
 function DetachedTriggersExample() {
   return (
     <div className="flex flex-col items-center gap-3">
-      <p className="text-ui-sm text-neutral4">Triggers live outside the drawer and pass it a payload.</p>
+      <p className="text-caption text-muted-foreground">Triggers live outside the drawer and pass it a payload.</p>
       <div className="flex gap-2">
         <DrawerTrigger
           handle={profileDrawer}
@@ -471,7 +622,7 @@ function DetachedTriggersExample() {
           payload={{ title: 'Settings', description: 'Manage your workspace settings.' }}
           asChild
         >
-          <Button variant="outline">Settings</Button>
+          <Button>Settings</Button>
         </DrawerTrigger>
       </div>
       <Drawer side="right" handle={profileDrawer}>
@@ -483,7 +634,7 @@ function DetachedTriggersExample() {
             </DrawerHeader>
             <DrawerFooter>
               <DrawerClose asChild>
-                <Button variant="outline">Close</Button>
+                <Button>Close</Button>
               </DrawerClose>
             </DrawerFooter>
           </DrawerContent>

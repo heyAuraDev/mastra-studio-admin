@@ -16,6 +16,7 @@ import type {
   UpdateSpanArgs,
   BatchDeleteTracesArgs,
   BatchUpdateSpansArgs,
+  BatchUpdateUnendedSpansResponse,
   BatchCreateSpansArgs,
   CreateSpanArgs,
   GetSpanArgs,
@@ -26,19 +27,49 @@ import type {
   GetTraceResponse,
   GetTraceLightResponse,
   LightSpanRecord,
+  PruneOptions,
+  PruneResult,
+  RetentionTablesDescriptor,
+  TableRetentionPolicy,
 } from '@mastra/core/storage';
 import { parseSqlIdentifier } from '@mastra/core/utils';
 import { LibSQLDB, resolveClient } from '../../db';
 import type { LibSQLDomainConfig } from '../../db';
 import { transformFromSqlRow } from '../../db/utils';
+import { runPrune, resolveTargets } from '../../retention';
 
 export class ObservabilityLibSQL extends ObservabilityStorage {
+  /**
+   * Spans are the only physical table; traces are derived from them. Spans
+   * anchor on `startedAt` (not `createdAt`), stored as an ISO-8601 string.
+   */
+  static override readonly retentionTables: RetentionTablesDescriptor = {
+    spans: { table: TABLE_SPANS, column: 'startedAt', indexed: true },
+  };
+
   #db: LibSQLDB;
+  #persistenceLocation: 'local' | 'remote' | undefined;
+
+  override get persistenceLocation(): 'local' | 'remote' | undefined {
+    return this.#persistenceLocation;
+  }
 
   constructor(config: LibSQLDomainConfig) {
     super();
     const client = resolveClient(config);
-    this.#db = new LibSQLDB({ client, maxRetries: config.maxRetries, initialBackoffMs: config.initialBackoffMs });
+    // Embedded replicas still write a local file even when a sync URL is set.
+    this.#persistenceLocation =
+      config.embeddedReplica || client.protocol === 'file'
+        ? 'local'
+        : ['http', 'https', 'ws', 'wss'].includes(client.protocol)
+          ? 'remote'
+          : undefined;
+    this.#db = new LibSQLDB({
+      client,
+      maxRetries: config.maxRetries,
+      initialBackoffMs: config.initialBackoffMs,
+      getLogger: () => this.logger,
+    });
   }
 
   async init(): Promise<void> {
@@ -53,6 +84,16 @@ export class ObservabilityLibSQL extends ObservabilityStorage {
 
   async dangerouslyClearAll(): Promise<void> {
     await this.#db.deleteData({ tableName: TABLE_SPANS });
+  }
+
+  /** Delete spans older than the `spans` policy's `maxAge`, batched. */
+  async prune(policies: Record<string, TableRetentionPolicy>, options?: PruneOptions): Promise<PruneResult[]> {
+    const targets = resolveTargets({
+      policies,
+      descriptor: ObservabilityLibSQL.retentionTables,
+      order: ['spans'],
+    });
+    return runPrune({ db: this.#db, domain: 'observability', targets, options, logger: this.logger });
   }
 
   /**
@@ -565,27 +606,30 @@ export class ObservabilityLibSQL extends ObservabilityStorage {
     }
   }
 
-  async batchUpdateSpans(args: BatchUpdateSpansArgs): Promise<void> {
+  #toSpanUpdates(records: BatchUpdateSpansArgs['records']) {
     const now = new Date().toISOString();
+    return records.map(record => {
+      const data: Record<string, any> = { ...record.updates };
+      if (data.endedAt instanceof Date) {
+        data.endedAt = data.endedAt.toISOString();
+      }
+      if (data.startedAt instanceof Date) {
+        data.startedAt = data.startedAt.toISOString();
+      }
+      data.updatedAt = now;
 
+      return {
+        keys: { spanId: record.spanId, traceId: record.traceId },
+        data,
+      };
+    });
+  }
+
+  async batchUpdateSpans(args: BatchUpdateSpansArgs): Promise<void> {
     try {
       return this.#db.batchUpdate({
         tableName: TABLE_SPANS,
-        updates: args.records.map(record => {
-          const data: Record<string, any> = { ...record.updates };
-          if (data.endedAt instanceof Date) {
-            data.endedAt = data.endedAt.toISOString();
-          }
-          if (data.startedAt instanceof Date) {
-            data.startedAt = data.startedAt.toISOString();
-          }
-          data.updatedAt = now;
-
-          return {
-            keys: { spanId: record.spanId, traceId: record.traceId },
-            data,
-          };
-        }),
+        updates: this.#toSpanUpdates(args.records),
       });
     } catch (error) {
       throw new MastraError(
@@ -599,7 +643,32 @@ export class ObservabilityLibSQL extends ObservabilityStorage {
     }
   }
 
+  async batchUpdateUnendedSpans(args: BatchUpdateSpansArgs): Promise<BatchUpdateUnendedSpansResponse> {
+    try {
+      const changed = await this.#db.batchUpdateReportingChanges({
+        tableName: TABLE_SPANS,
+        updates: this.#toSpanUpdates(args.records).map(update => ({
+          ...update,
+          keys: { ...update.keys, endedAt: null },
+        })),
+      });
+      return {
+        updated: args.records.filter((_, index) => changed[index]).map(({ traceId, spanId }) => ({ traceId, spanId })),
+      };
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('LIBSQL', 'BATCH_UPDATE_UNENDED_SPANS', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.USER,
+        },
+        error,
+      );
+    }
+  }
+
   async batchDeleteTraces(args: BatchDeleteTracesArgs): Promise<void> {
+    this.assertUnscopedBatchDeleteTraces(args);
     try {
       const keys = args.traceIds.map(traceId => ({ traceId }));
       return this.#db.batchDelete({

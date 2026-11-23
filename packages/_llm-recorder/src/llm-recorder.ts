@@ -89,7 +89,7 @@ export type LLMTestMode = 'auto' | 'update' | 'replay' | 'live' | 'record';
  */
 function isUpdateMode(): boolean {
   if (process.env.UPDATE_RECORDINGS === 'true') return true;
-  return process.argv.includes('--update-recordings');
+  return process.argv.includes('--update-recordings') || process.argv.includes('-U');
 }
 
 /**
@@ -341,7 +341,19 @@ export const LLM_API_HOSTS = [
 /**
  * Headers to skip when storing (sensitive + compression)
  */
-const SKIP_HEADERS = ['authorization', 'x-api-key', 'api-key', 'content-encoding', 'transfer-encoding', 'set-cookie'];
+const SKIP_HEADERS = [
+  'authorization',
+  'x-api-key',
+  'api-key',
+  'content-encoding',
+  'transfer-encoding',
+  'set-cookie',
+  // Account metadata that should not end up in committed fixtures
+  'openai-organization',
+  'openai-project',
+  'anthropic-organization-id',
+  'anthropic-workspace-id',
+];
 
 /**
  * Module-scoped active recorder instance.
@@ -615,11 +627,19 @@ function findRecording(
   url: string,
   body: unknown,
   usedHashes?: Set<string>,
+  exactReplayCounts?: Map<string, number>,
 ): ReplayRecording | undefined {
-  // 1. Exact hash match (fast path)
-  const exact = recordings.find(r => isExactRecordingMatch(r, hash));
-  if (exact) {
-    return exact;
+  // 1. Exact hash match (fast path). Multiple recordings can share a hash when
+  //    the same request produced different responses (retries, colliding test
+  //    variants) — consume them in record order, then keep serving the last one.
+  const exactMatches = recordings.filter(r => isExactRecordingMatch(r, hash));
+  if (exactMatches.length === 1) {
+    return exactMatches[0];
+  }
+  if (exactMatches.length > 1) {
+    const served = exactReplayCounts?.get(hash) ?? 0;
+    exactReplayCounts?.set(hash, served + 1);
+    return exactMatches[Math.min(served, exactMatches.length - 1)];
   }
 
   if (recordings.length === 0) {
@@ -821,6 +841,11 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
   const recordings: LLMRecording[] = [];
   const isRecordMode = mode === 'record';
   const fuzzyUsedHashes = new Set<string>();
+  // Tracks how many exact matches have been served per hash so that multiple
+  // recordings sharing a hash (same request, different responses) replay in
+  // record order. Intentionally NOT reset between tests — record order spans
+  // the whole test file. See the dedup comment in save().
+  const exactReplayCounts = new Map<string, number>();
   let saved = false;
 
   // Create handlers for each LLM API host (or a filtered subset)
@@ -887,82 +912,81 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
             });
 
             return createStreamingResponse(recordings[recordings.length - 1]!, options);
-          } else {
-            const headers = filterHeaders(realResponse.headers);
-            const responseContentType = realResponse.headers.get('content-type')?.toLowerCase() || '';
-            const requestBinaryArtifact = parsedRequest.binary
-              ? writeBinaryArtifact({
-                  recordingsDir,
-                  hash,
-                  kind: 'request',
-                  contentType: parsedRequest.binary.contentType,
-                  bytes: parsedRequest.binary.bytes,
-                })
-              : undefined;
-
-            let responseBody: unknown;
-            let responseBinaryArtifact: LLMBinaryArtifact | undefined;
-
-            if (responseContentType.includes('application/json') || responseContentType.includes('+json')) {
-              const responseText = await realResponse.text();
-              try {
-                responseBody = JSON.parse(responseText);
-              } catch {
-                responseBody = responseText;
-              }
-            } else if (responseContentType.startsWith('text/')) {
-              responseBody = await realResponse.text();
-            } else {
-              const responseBuffer = await realResponse.arrayBuffer();
-              const responseBytes = new Uint8Array(responseBuffer);
-              responseBinaryArtifact = writeBinaryArtifact({
+          }
+          const headers = filterHeaders(realResponse.headers);
+          const responseContentType = realResponse.headers.get('content-type')?.toLowerCase() || '';
+          const requestBinaryArtifact = parsedRequest.binary
+            ? writeBinaryArtifact({
                 recordingsDir,
                 hash,
-                kind: 'response',
-                contentType: responseContentType || 'application/octet-stream',
-                bytes: responseBytes,
-              });
-              responseBody = {
-                __binary: true,
-                contentType: responseBinaryArtifact.contentType,
-                size: responseBinaryArtifact.size,
-              };
-            }
+                kind: 'request',
+                contentType: parsedRequest.binary.contentType,
+                bytes: parsedRequest.binary.bytes,
+              })
+            : undefined;
 
-            recordings.push({
+          let responseBody: unknown;
+          let responseBinaryArtifact: LLMBinaryArtifact | undefined;
+
+          if (responseContentType.includes('application/json') || responseContentType.includes('+json')) {
+            const responseText = await realResponse.text();
+            try {
+              responseBody = JSON.parse(responseText);
+            } catch {
+              responseBody = responseText;
+            }
+          } else if (responseContentType.startsWith('text/')) {
+            responseBody = await realResponse.text();
+          } else {
+            const responseBuffer = await realResponse.arrayBuffer();
+            const responseBytes = new Uint8Array(responseBuffer);
+            responseBinaryArtifact = writeBinaryArtifact({
+              recordingsDir,
               hash,
-              request: {
-                url,
-                method: 'POST',
-                body,
-                timestamp: currentDate,
-                ...(requestBinaryArtifact ? { binaryArtifact: requestBinaryArtifact } : {}),
-              },
-              response: {
-                status: realResponse.status,
-                statusText: realResponse.statusText,
-                headers,
-                body: responseBody,
-                ...(responseBinaryArtifact ? { binaryArtifact: responseBinaryArtifact } : {}),
-                isStreaming: false,
-              },
+              kind: 'response',
+              contentType: responseContentType || 'application/octet-stream',
+              bytes: responseBytes,
             });
+            responseBody = {
+              __binary: true,
+              contentType: responseBinaryArtifact.contentType,
+              size: responseBinaryArtifact.size,
+            };
+          }
 
-            if (responseBinaryArtifact) {
-              return new HttpResponse(readBinaryArtifact(recordingsDir, responseBinaryArtifact), {
-                status: realResponse.status,
-                statusText: realResponse.statusText,
-                headers,
-              });
-            }
+          recordings.push({
+            hash,
+            request: {
+              url,
+              method: 'POST',
+              body,
+              timestamp: currentDate,
+              ...(requestBinaryArtifact ? { binaryArtifact: requestBinaryArtifact } : {}),
+            },
+            response: {
+              status: realResponse.status,
+              statusText: realResponse.statusText,
+              headers,
+              body: responseBody,
+              ...(responseBinaryArtifact ? { binaryArtifact: responseBinaryArtifact } : {}),
+              isStreaming: false,
+            },
+          });
 
-            const responseText = typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody);
-            return new HttpResponse(responseText, {
+          if (responseBinaryArtifact) {
+            return new HttpResponse(readBinaryArtifact(recordingsDir, responseBinaryArtifact), {
               status: realResponse.status,
               statusText: realResponse.statusText,
               headers,
             });
           }
+
+          const responseText = typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody);
+          return new HttpResponse(responseText, {
+            status: realResponse.status,
+            statusText: realResponse.statusText,
+            headers,
+          });
         } catch (error) {
           console.error(`[llm-recorder] Error recording:`, error);
           throw error;
@@ -974,7 +998,7 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
           console.log(`[llm-recorder]   Available hashes: ${savedRecordings.map(r => r.hash).join(', ')}`);
         }
 
-        const recording = findRecording(savedRecordings, hash, url, body, fuzzyUsedHashes);
+        const recording = findRecording(savedRecordings, hash, url, body, fuzzyUsedHashes, exactReplayCounts);
 
         if (!recording) {
           console.error(`[llm-recorder] No recording found for: ${url}${model ? ` (model: ${model})` : ''}`);
@@ -1028,7 +1052,9 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
 
         if (recording.response.isStreaming) {
           return createStreamingResponse(recording, options);
-        } else {
+        }
+        // Keep the response body scoped away from the request body used above.
+        {
           if (recording.response.binaryArtifact) {
             return new HttpResponse(readBinaryArtifact(recordingsDir, recording.response.binaryArtifact), {
               status: recording.response.status,
@@ -1105,11 +1131,22 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
         ...(existingMeta?.createdAt ? { updatedAt: now } : {}),
       };
 
-      // Deduplicate recordings by hash — identical requests across tests share one entry
-      const seen = new Set<string>();
+      // Deduplicate recordings by hash — identical requests across tests share one entry,
+      // but ONLY when their responses are also identical. When the same request produced
+      // different responses (e.g. a retry after a malformed response, or two test variants
+      // whose normalized requests collide but got different model outputs), every entry is
+      // kept in record order and replay consumes them sequentially, so each recorded
+      // request/response chain replays exactly as it happened.
+      const seenResponsesByHash = new Map<string, Set<string>>();
       const dedupedRecordings = recordings.filter(r => {
-        if (seen.has(r.hash)) return false;
-        seen.add(r.hash);
+        const responseKey = JSON.stringify(r.response);
+        let seen = seenResponsesByHash.get(r.hash);
+        if (!seen) {
+          seen = new Set();
+          seenResponsesByHash.set(r.hash, seen);
+        }
+        if (seen.has(responseKey)) return false;
+        seen.add(responseKey);
         return true;
       });
 

@@ -1,67 +1,64 @@
-import { getMainContentContentClassName, CollapsiblePanel, PanelSeparator } from '@mastra/playground-ui';
-import { Panel, useDefaultLayout, Group } from 'react-resizable-panels';
+import { useThreadsPanel } from '@mastra/playground-ui/domains/agents/chat';
+import { AgentConversationLayout } from '@mastra/playground-ui/domains/agents/components/agent-conversation-layout';
+import { useEffect, useRef } from 'react';
+import type { PanelImperativeHandle } from 'react-resizable-panels';
+import { useMemoryTimeline } from '../context/memory-timeline-context';
 
 export interface AgentLayoutProps {
   agentId: string;
   children: React.ReactNode;
   leftSlot?: React.ReactNode;
   rightSlot?: React.ReactNode;
+  leftDrawerLabel?: string;
+  rightDrawerLabel?: string;
   browserOverlay?: React.ReactNode;
 }
 
-export const AgentLayout = ({ agentId, children, leftSlot, rightSlot, browserOverlay }: AgentLayoutProps) => {
-  const { defaultLayout, onLayoutChange } = useDefaultLayout({
-    id: `agent-layout-v2-${agentId}`,
-    storage: localStorage,
-  });
+const MEMORY_DETAIL_LEFT_PANEL_DEFAULT_RESTORE = '300px';
 
-  const computedClassName = getMainContentContentClassName({
-    isCentered: false,
-    isDivided: true,
-    hasLeftServiceColumn: Boolean(leftSlot),
-  });
+export const AgentLayout = ({
+  agentId,
+  children,
+  leftSlot,
+  rightSlot,
+  leftDrawerLabel,
+  rightDrawerLabel,
+  browserOverlay,
+}: AgentLayoutProps) => {
+  const { isPanelOpen: isMemoryTimelineOpen } = useMemoryTimeline();
+  const threadsPanel = useThreadsPanel();
+  const leftPanelRef = useRef<PanelImperativeHandle | null>(null);
+  const wasMemoryTimelineOpen = useRef(false);
+  const sizeBeforeMemoryDetail = useRef<string | null>(null);
+
+  useEffect(() => {
+    const leftPanel = leftPanelRef.current;
+    if (!leftPanel) return;
+
+    const wasOpen = wasMemoryTimelineOpen.current;
+    wasMemoryTimelineOpen.current = isMemoryTimelineOpen;
+
+    if (isMemoryTimelineOpen && !wasOpen) {
+      sizeBeforeMemoryDetail.current = `${leftPanel.getSize().inPixels}px`;
+      leftPanel.resize('50%');
+    } else if (!isMemoryTimelineOpen && wasOpen) {
+      leftPanel.resize(sizeBeforeMemoryDetail.current ?? MEMORY_DETAIL_LEFT_PANEL_DEFAULT_RESTORE);
+      sizeBeforeMemoryDetail.current = null;
+    }
+  }, [isMemoryTimelineOpen]);
 
   return (
-    <div className="relative h-full w-full overflow-hidden">
-      <Group className={computedClassName} defaultLayout={defaultLayout} onLayoutChange={onLayoutChange}>
-        {leftSlot && (
-          <>
-            <CollapsiblePanel
-              direction="left"
-              id="left-slot"
-              minSize={200}
-              maxSize={'30%'}
-              defaultSize={200}
-              collapsedSize={60}
-              collapsible={true}
-            >
-              {leftSlot}
-            </CollapsiblePanel>
-            <PanelSeparator />
-          </>
-        )}
-        <Panel id="main-slot" className="grid overflow-y-auto relative">
-          {children}
-        </Panel>
-        {rightSlot && (
-          <>
-            <PanelSeparator />
-            <CollapsiblePanel
-              direction="right"
-              id="right-slot"
-              minSize={300}
-              maxSize={'50%'}
-              defaultSize="30%"
-              collapsedSize={60}
-              collapsible={true}
-            >
-              {rightSlot}
-            </CollapsiblePanel>
-          </>
-        )}
-      </Group>
-      {/* Browser modal overlay - center view mode */}
-      {browserOverlay}
-    </div>
+    <AgentConversationLayout
+      layoutId={`agent-layout-v6-${agentId}`}
+      leftSlot={leftSlot}
+      rightSlot={rightSlot}
+      leftDrawerLabel={leftDrawerLabel}
+      rightDrawerLabel={rightDrawerLabel}
+      browserOverlay={browserOverlay}
+      leftPanelRef={leftPanelRef}
+      onLeftPanelRegister={threadsPanel?.registerPanel}
+    >
+      {children}
+    </AgentConversationLayout>
   );
 };

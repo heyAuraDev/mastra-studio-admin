@@ -17,7 +17,7 @@ describe.for([['pnpm'] as const])(`%s cloudflare deployer`, ([pkgManager]) => {
       const registry = inject('registry');
 
       fixturePath = await mkdtemp(join(tmpdir(), `mastra-cloudflare-deployer-test-${pkgManager}-`));
-      process.env.npm_config_registry = registry;
+      process.env.pnpm_config_registry = registry;
       await setupDeployerProject(fixturePath, tag, pkgManager, 'cloudflare');
     },
     10 * 60 * 1000,
@@ -45,6 +45,11 @@ describe.for([['pnpm'] as const])(`%s cloudflare deployer`, ([pkgManager]) => {
       expect(Object.keys(body)).toEqual(['weatherTool']);
     });
   }
+
+  it('stubs the optional @opentelemetry/api peer that wrangler cannot resolve (#27037)', async () => {
+    const config = JSON.parse(await readFile(join(fixturePath, '.mastra', 'output', 'wrangler.json'), 'utf-8'));
+    expect(config.alias['@opentelemetry/api']).toBe('./opentelemetry-api-stub.mjs');
+  });
 
   describe('wrangler dev', async () => {
     const port = await getPort();

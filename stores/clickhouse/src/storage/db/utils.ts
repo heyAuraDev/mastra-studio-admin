@@ -30,7 +30,18 @@ import {
   TABLE_FAVORITES,
   TABLE_SCHEDULES,
   TABLE_SCHEDULE_TRIGGERS,
+  TABLE_TOOL_PROVIDER_CONNECTIONS,
+  TABLE_NOTIFICATIONS,
+  TABLE_HARNESS_SESSIONS,
+  TABLE_THREAD_STATE,
+  TABLE_WORKFLOW_DEFINITIONS,
+  TABLE_KNOWLEDGE_NODES,
+  TABLE_KNOWLEDGE_RECORDS,
+  TABLE_KNOWLEDGE_MENTIONS,
+  TABLE_KNOWLEDGE_ACTIVITY,
+  TABLE_KNOWLEDGE_SEMANTIC_OUTBOX,
 } from '@mastra/core/storage';
+import type { ClickhouseReplicationConfig } from './replication';
 
 export const TABLE_ENGINES: Record<TABLE_NAMES, string> = {
   [TABLE_MESSAGES]: `MergeTree()`,
@@ -64,12 +75,43 @@ export const TABLE_ENGINES: Record<TABLE_NAMES, string> = {
   [TABLE_SKILL_VERSIONS]: `MergeTree()`,
   [TABLE_SKILL_BLOBS]: `ReplacingMergeTree()`,
   [TABLE_FAVORITES]: `ReplacingMergeTree()`,
+  [TABLE_TOOL_PROVIDER_CONNECTIONS]: `ReplacingMergeTree()`,
   mastra_background_tasks: `ReplacingMergeTree()`,
   [TABLE_SCHEDULES]: `ReplacingMergeTree()`,
   [TABLE_SCHEDULE_TRIGGERS]: `MergeTree()`,
+  [TABLE_NOTIFICATIONS]: `ReplacingMergeTree()`,
+  [TABLE_HARNESS_SESSIONS]: `ReplacingMergeTree()`,
   mastra_channel_installations: `ReplacingMergeTree()`,
   mastra_channel_config: `ReplacingMergeTree()`,
+  [TABLE_THREAD_STATE]: `ReplacingMergeTree()`,
+  [TABLE_WORKFLOW_DEFINITIONS]: `ReplacingMergeTree()`,
+  [TABLE_KNOWLEDGE_NODES]: `ReplacingMergeTree()`,
+  [TABLE_KNOWLEDGE_RECORDS]: `ReplacingMergeTree()`,
+  [TABLE_KNOWLEDGE_MENTIONS]: `ReplacingMergeTree()`,
+  [TABLE_KNOWLEDGE_ACTIVITY]: `ReplacingMergeTree()`,
+  [TABLE_KNOWLEDGE_SEMANTIC_OUTBOX]: `ReplacingMergeTree()`,
 };
+
+/**
+ * Bloom-filter skip indexes for lookups on columns outside the sort key.
+ *
+ * These tables are keyed `(createdAt, id)` (or `(createdAt, run_id, ...)` for
+ * workflow snapshots), so every lookup by id, thread, resource or run would
+ * otherwise scan every granule. Added idempotently at init; existing parts are
+ * covered as merges and retention rewrite them (or via `MATERIALIZE INDEX`).
+ */
+export const TABLE_SKIP_INDEXES: Partial<Record<TABLE_NAMES, readonly string[]>> = {
+  [TABLE_MESSAGES]: ['id', 'thread_id', 'resourceId'],
+  [TABLE_THREADS]: ['id', 'resourceId'],
+  [TABLE_RESOURCES]: ['id'],
+  [TABLE_WORKFLOW_SNAPSHOT]: ['run_id'],
+  [TABLE_SCORERS]: ['id', 'runId', 'scorerId', 'entityId', 'traceId'],
+};
+
+/** Name of the skip index {@link TABLE_SKIP_INDEXES} declares for `column`. */
+export function skipIndexName(column: string): string {
+  return `idx_${column}`;
+}
 
 export const COLUMN_TYPES: Record<StorageColumn['type'], string> = {
   text: 'String',
@@ -99,6 +141,7 @@ export type ClickhouseConfig = {
   url: string;
   username: string;
   password: string;
+  replication?: ClickhouseReplicationConfig;
   ttl?: {
     [TableKey in TABLE_NAMES]?: {
       row?: { interval: number; unit: IntervalUnit; ttlKey?: string };
@@ -114,7 +157,17 @@ export type ClickhouseConfig = {
 };
 
 // List of fields that should be parsed as JSON
-const JSON_FIELDS = ['content', 'attributes', 'metadata', 'input', 'output', 'error', 'scope', 'links'];
+const JSON_FIELDS = [
+  'content',
+  'attributes',
+  'metadata',
+  'input',
+  'output',
+  'error',
+  'scope',
+  'links',
+  'stopReasonContext',
+];
 
 // Fields that should be null instead of empty string when empty
 const NULLABLE_STRING_FIELDS = ['parentSpanId', 'error'];

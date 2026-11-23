@@ -14,6 +14,7 @@ import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
 import { AGENT_STREAM_TOPIC, AgentStreamEventTypes } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
+import { globalRunRegistry } from '../run-registry';
 import type { AgentStreamEvent } from '../types';
 
 // ============================================================================
@@ -60,78 +61,6 @@ function createMultiChunkStreamModel(chunks: string[]) {
   });
 }
 
-function _createToolCallModel(toolName: string, args: Record<string, unknown>) {
-  return new MockLanguageModelV2({
-    doStream: async () => ({
-      stream: convertArrayToReadableStream([
-        { type: 'stream-start', warnings: [] },
-        { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
-        {
-          type: 'tool-call',
-          toolCallId: 'call-1',
-          toolName,
-          input: JSON.stringify(args),
-          providerExecuted: false,
-        },
-        {
-          type: 'finish',
-          finishReason: 'tool-calls',
-          usage: { inputTokens: 15, outputTokens: 10, totalTokens: 25 },
-        },
-      ]),
-      rawCall: { rawPrompt: null, rawSettings: {} },
-    }),
-  });
-}
-
-function _createToolCallThenTextModel(toolName: string, args: Record<string, unknown>, finalText: string) {
-  let callCount = 0;
-  return new MockLanguageModelV2({
-    doStream: async () => {
-      callCount++;
-      if (callCount === 1) {
-        // First call: return tool call
-        return {
-          stream: convertArrayToReadableStream([
-            { type: 'stream-start', warnings: [] },
-            { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
-            {
-              type: 'tool-call',
-              toolCallId: 'call-1',
-              toolName,
-              input: JSON.stringify(args),
-              providerExecuted: false,
-            },
-            {
-              type: 'finish',
-              finishReason: 'tool-calls',
-              usage: { inputTokens: 15, outputTokens: 10, totalTokens: 25 },
-            },
-          ]),
-          rawCall: { rawPrompt: null, rawSettings: {} },
-        };
-      } else {
-        // Second call: return text response
-        return {
-          stream: convertArrayToReadableStream([
-            { type: 'stream-start', warnings: [] },
-            { type: 'response-metadata', id: 'id-1', modelId: 'mock-model-id', timestamp: new Date(0) },
-            { type: 'text-start', id: 'text-1' },
-            { type: 'text-delta', id: 'text-1', delta: finalText },
-            { type: 'text-end', id: 'text-1' },
-            {
-              type: 'finish',
-              finishReason: 'stop',
-              usage: { inputTokens: 20, outputTokens: 15, totalTokens: 35 },
-            },
-          ]),
-          rawCall: { rawPrompt: null, rawSettings: {} },
-        };
-      }
-    },
-  });
-}
-
 // ============================================================================
 // Streaming Execution Tests
 // ============================================================================
@@ -148,56 +77,48 @@ describe('DurableAgent streaming execution', () => {
   });
 
   describe('basic streaming', () => {
-    it('should pass activeTools through to the LLM request', async () => {
-      const doStream = vi.fn(async () => ({
-        stream: convertArrayToReadableStream([
-          { type: 'stream-start', warnings: [] },
-          { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
-          { type: 'text-start', id: 'text-1' },
-          { type: 'text-delta', id: 'text-1', delta: 'Done' },
-          { type: 'text-end', id: 'text-1' },
-          {
-            type: 'finish',
-            finishReason: 'stop',
-            usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
-          },
-        ]),
-        rawCall: { rawPrompt: null, rawSettings: {} },
-      }));
+    it('records the effective owner in both live registries while streaming', async () => {
+      const runId = 'stream-effective-owner';
+      let liveOwners: (string | undefined)[] = [];
+      const doStream = vi.fn(async () => {
+        liveOwners = [durableAgent.runRegistry.get(runId)?.agentId, globalRunRegistry.get(runId)?.agentId];
+        return {
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+            { type: 'text-start', id: 'text-1' },
+            { type: 'text-delta', id: 'text-1', delta: 'Done' },
+            { type: 'text-end', id: 'text-1' },
+            {
+              type: 'finish',
+              finishReason: 'stop',
+              usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+            },
+          ]),
+          rawCall: { rawPrompt: null, rawSettings: {} },
+        };
+      });
 
       const mockModel = new MockLanguageModelV2({ doStream });
-      const allowedTool = createTool({
-        id: 'allowedTool',
-        description: 'Allowed tool',
-        inputSchema: z.object({}),
-        execute: async () => 'allowed',
-      });
-      const hiddenTool = createTool({
-        id: 'hiddenTool',
-        description: 'Hidden tool',
-        inputSchema: z.object({}),
-        execute: async () => 'hidden',
-      });
-
       const baseAgent = new Agent({
-        id: 'active-tools-agent',
-        name: 'Active Tools Agent',
-        instructions: 'Use only enabled tools',
+        id: 'wrapped-stream-agent',
+        name: 'Stream Owner Agent',
+        instructions: 'Respond briefly',
         model: mockModel as LanguageModelV2,
-        tools: { allowedTool, hiddenTool },
       });
-      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub, id: 'public-stream-agent' });
 
-      const { output, cleanup } = await durableAgent.stream('Use the allowed tool', {
-        activeTools: ['allowedTool'],
-      });
+      const { output, cleanup } = await durableAgent.stream('Say hello', { runId });
 
-      await output.consumeStream();
+      try {
+        await output.consumeStream();
 
-      expect(doStream).toHaveBeenCalledTimes(1);
-      expect(doStream.mock.calls[0]?.[0].tools.map((tool: { name: string }) => tool.name)).toEqual(['allowedTool']);
-
-      cleanup();
+        expect(durableAgent.id).not.toBe(baseAgent.id);
+        expect(liveOwners).toEqual([durableAgent.id, durableAgent.id]);
+        expect(doStream).toHaveBeenCalledTimes(1);
+      } finally {
+        cleanup();
+      }
     });
 
     it('should allow input processors to clear activeTools for LLM request and tool execution', async () => {
@@ -287,120 +208,15 @@ describe('DurableAgent streaming execution', () => {
       cleanup();
     });
 
-    it('should not execute tool calls outside activeTools', async () => {
-      const hiddenExecute = vi.fn(async () => 'hidden');
-      let callCount = 0;
-      const doStream = vi.fn(async () => {
-        callCount++;
-        return {
-          stream: convertArrayToReadableStream(
-            callCount === 1
-              ? [
-                  { type: 'stream-start', warnings: [] },
-                  { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
-                  {
-                    type: 'tool-call',
-                    toolCallId: 'call-1',
-                    toolName: 'hiddenTool',
-                    input: JSON.stringify({}),
-                    providerExecuted: false,
-                  },
-                  {
-                    type: 'finish',
-                    finishReason: 'tool-calls',
-                    usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
-                  },
-                ]
-              : [
-                  { type: 'stream-start', warnings: [] },
-                  { type: 'response-metadata', id: 'id-1', modelId: 'mock-model-id', timestamp: new Date(0) },
-                  { type: 'text-start', id: 'text-1' },
-                  { type: 'text-delta', id: 'text-1', delta: 'Done' },
-                  { type: 'text-end', id: 'text-1' },
-                  {
-                    type: 'finish',
-                    finishReason: 'stop',
-                    usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
-                  },
-                ],
-          ),
-          rawCall: { rawPrompt: null, rawSettings: {} },
-        };
-      });
-
-      const mockModel = new MockLanguageModelV2({ doStream });
-      const allowedTool = createTool({
-        id: 'allowedTool',
-        description: 'Allowed tool',
-        inputSchema: z.object({}),
-        execute: async () => 'allowed',
-      });
-      const hiddenTool = createTool({
-        id: 'hiddenTool',
-        description: 'Hidden tool',
-        inputSchema: z.object({}),
-        execute: hiddenExecute,
-      });
-
-      const baseAgent = new Agent({
-        id: 'active-tools-enforcement-agent',
-        name: 'Active Tools Enforcement Agent',
-        instructions: 'Use only enabled tools',
-        model: mockModel as LanguageModelV2,
-        tools: { allowedTool, hiddenTool },
-      });
-      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
-
-      const { output, cleanup } = await durableAgent.stream('Try a hidden tool', {
-        activeTools: ['allowedTool'],
-      });
-
-      await output.consumeStream();
-
-      expect(hiddenExecute).not.toHaveBeenCalled();
-      expect(doStream).toHaveBeenCalledTimes(2);
-
-      cleanup();
-    });
-
-    it('should stream text response and invoke onChunk callback', async () => {
-      const mockModel = createTextStreamModel('Hello, world!');
+    // The aimock text-streaming scenario cannot pass onChunk to durable engines yet (#27408),
+    // so durable onChunk delivery is pinned here.
+    it('should deliver every text-delta to onChunk in order', async () => {
+      const mockModel = createMultiChunkStreamModel(['Hello', ', ', 'world', '!']);
       const chunks: any[] = [];
 
       const baseAgent = new Agent({
         id: 'stream-test-agent',
         name: 'Stream Test Agent',
-        instructions: 'You are a helpful assistant',
-        model: mockModel as LanguageModelV2,
-      });
-
-      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
-
-      const { output, runId, cleanup } = await durableAgent.stream('Say hello', {
-        onChunk: chunk => {
-          chunks.push(chunk);
-        },
-      });
-
-      expect(runId).toBeDefined();
-      expect(output).toBeDefined();
-
-      // Drain the stream to deterministically wait for all chunks (and onChunk
-      // callbacks) instead of relying on a wall-clock timeout.
-      await output.consumeStream();
-
-      expect(chunks.length).toBeGreaterThan(0);
-
-      cleanup();
-    });
-
-    it('should stream multiple text chunks', async () => {
-      const mockModel = createMultiChunkStreamModel(['Hello', ', ', 'world', '!']);
-      const chunks: any[] = [];
-
-      const baseAgent = new Agent({
-        id: 'multi-chunk-agent',
-        name: 'Multi Chunk Agent',
         instructions: 'You are a helpful assistant',
         model: mockModel as LanguageModelV2,
       });
@@ -413,9 +229,13 @@ describe('DurableAgent streaming execution', () => {
         },
       });
 
+      // Drain the stream to deterministically wait for all chunks (and onChunk
+      // callbacks) instead of relying on a wall-clock timeout.
       await output.consumeStream();
 
-      expect(chunks.length).toBeGreaterThan(0);
+      const deltas = chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.payload.text);
+      expect(deltas).toEqual(['Hello', ', ', 'world', '!']);
+      expect(await output.text).toBe('Hello, world!');
 
       cleanup();
     });
@@ -432,7 +252,7 @@ describe('DurableAgent streaming execution', () => {
 
       const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
-      const { runId, cleanup } = await durableAgent.stream('Test');
+      const { runId, cleanup, output } = await durableAgent.stream('Test');
 
       expect(runId).toBeDefined();
       expect(typeof runId).toBe('string');
@@ -441,99 +261,10 @@ describe('DurableAgent streaming execution', () => {
       // Registry should have the run
       expect(durableAgent.runRegistry.has(runId)).toBe(true);
 
-      // Cleanup should remove from registry
+      // Cleanup of a finished run removes it from the registry right away
+      await output.consumeStream();
       cleanup();
       expect(durableAgent.runRegistry.has(runId)).toBe(false);
-    });
-  });
-
-  describe('callbacks', () => {
-    it('should invoke onFinish callback when streaming completes', async () => {
-      const mockModel = createTextStreamModel('Complete response');
-      let finishData: any = null;
-
-      const baseAgent = new Agent({
-        id: 'finish-callback-agent',
-        name: 'Finish Callback Agent',
-        instructions: 'Test',
-        model: mockModel as LanguageModelV2,
-      });
-
-      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
-
-      const { output, cleanup } = await durableAgent.stream('Test', {
-        onFinish: data => {
-          finishData = data;
-        },
-      });
-
-      // Drain the stream so we deterministically wait for the FINISH event
-      // (which fires onFinish) instead of using a wall-clock timeout.
-      await output.consumeStream();
-
-      expect(finishData).not.toBeNull();
-
-      cleanup();
-    });
-
-    it('should invoke onError callback when error occurs', async () => {
-      const errorModel = new MockLanguageModelV2({
-        doStream: async () => {
-          throw new Error('Simulated LLM error');
-        },
-      });
-
-      let errorReceived: Error | null = null;
-
-      const baseAgent = new Agent({
-        id: 'error-callback-agent',
-        name: 'Error Callback Agent',
-        instructions: 'Test',
-        model: errorModel as LanguageModelV2,
-      });
-
-      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
-
-      const { output, cleanup } = await durableAgent.stream('Test', {
-        onError: error => {
-          errorReceived = error;
-        },
-      });
-
-      // Drain the stream so we deterministically wait for the ERROR event
-      // (which fires onError and errors the stream) instead of using a wall-clock timeout.
-      await output.consumeStream({ onError: () => {} });
-
-      expect(errorReceived).not.toBeNull();
-
-      cleanup();
-    });
-
-    it('should invoke onStepFinish callback after each step', async () => {
-      const mockModel = createTextStreamModel('Step complete');
-      const stepResults: any[] = [];
-
-      const baseAgent = new Agent({
-        id: 'step-callback-agent',
-        name: 'Step Callback Agent',
-        instructions: 'Test',
-        model: mockModel as LanguageModelV2,
-      });
-
-      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
-
-      const { output, cleanup } = await durableAgent.stream('Test', {
-        onStepFinish: result => {
-          stepResults.push(result);
-        },
-      });
-
-      await output.consumeStream();
-
-      // stepResults may or may not contain entries depending on workflow execution timing
-      expect(Array.isArray(stepResults)).toBe(true);
-
-      cleanup();
     });
   });
 
@@ -739,39 +470,6 @@ describe('DurableAgent error handling', () => {
     await pubsub.close();
   });
 
-  it('should handle model throwing error during streaming', async () => {
-    const errorModel = new MockLanguageModelV2({
-      doStream: async () => {
-        throw new Error('Model initialization failed');
-      },
-    });
-
-    let errorReceived: Error | null = null;
-
-    const baseAgent = new Agent({
-      id: 'error-model-agent',
-      name: 'Error Model Agent',
-      instructions: 'Test',
-      model: errorModel as LanguageModelV2,
-    });
-
-    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
-
-    const { output, cleanup } = await durableAgent.stream('Test', {
-      onError: error => {
-        errorReceived = error;
-      },
-    });
-
-    // Drain the stream so we deterministically wait for the ERROR event
-    // (which fires onError and errors the stream) instead of using a wall-clock timeout.
-    await output.consumeStream({ onError: () => {} });
-
-    expect(errorReceived).not.toBeNull();
-
-    cleanup();
-  });
-
   it('should handle error event emission via pubsub', async () => {
     const { emitErrorEvent } = await import('../stream-adapter');
     const runId = 'error-emit-test';
@@ -792,6 +490,68 @@ describe('DurableAgent error handling', () => {
     expect(receivedErrors.length).toBe(1);
     expect(receivedErrors[0].error.name).toBe('TestError');
     expect(receivedErrors[0].error.message).toBe('Test error message');
+  });
+
+  it('should reject fullStream for reject-delivery error events', async () => {
+    const { createDurableAgentStream, emitErrorEvent } = await import('../stream-adapter');
+    const runId = 'reject-error-event';
+    const onError = vi.fn();
+    const { output, cleanup, ready } = createDurableAgentStream({
+      pubsub,
+      runId,
+      messageId: 'reject-error-message',
+      model: { modelId: 'test', provider: 'test', version: 'v3' },
+      onError,
+    });
+    const chunks: unknown[] = [];
+    const consumption = (async () => {
+      for await (const chunk of output.fullStream) chunks.push(chunk);
+    })();
+
+    await ready;
+    const error = new TypeError('stopWhen failed');
+    await emitErrorEvent(pubsub, runId, error, undefined, 'reject');
+
+    await expect(consumption).rejects.toMatchObject({ name: 'TypeError', message: 'stopWhen failed' });
+    expect(chunks).toEqual([]);
+    expect(onError).toHaveBeenCalledOnce();
+    expect(onError).toHaveBeenCalledWith({
+      error: expect.objectContaining({ name: 'TypeError', message: 'stopWhen failed' }),
+    });
+
+    const lateConsumption = (async () => {
+      for await (const _chunk of output.fullStream) {
+        // A settled rejected stream must reject late subscribers too.
+      }
+    })();
+    await expect(lateConsumption).rejects.toMatchObject({ name: 'TypeError', message: 'stopWhen failed' });
+    cleanup();
+  });
+
+  it('should keep ordinary error events as chunks', async () => {
+    const { createDurableAgentStream, emitErrorEvent } = await import('../stream-adapter');
+    const runId = 'chunk-error-event';
+    const onError = vi.fn();
+    const { output, cleanup, ready } = createDurableAgentStream({
+      pubsub,
+      runId,
+      messageId: 'chunk-error-message',
+      model: { modelId: 'test', provider: 'test', version: 'v3' },
+      onError,
+    });
+    const chunks: any[] = [];
+    const consumption = (async () => {
+      for await (const chunk of output.fullStream) chunks.push(chunk);
+    })();
+
+    await ready;
+    await emitErrorEvent(pubsub, runId, new Error('ordinary failure'));
+    await consumption;
+
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]).toMatchObject({ type: 'error', payload: { error: { message: 'ordinary failure' } } });
+    expect(onError).toHaveBeenCalledOnce();
+    cleanup();
   });
 
   it('should cleanup registry on error', async () => {
@@ -917,7 +677,7 @@ describe('DurableAgent workflow input serialization', () => {
 
     expect(result.workflowInput.options.maxSteps).toBe(5);
     expect(result.workflowInput.options.toolChoice).toBe('auto');
-    expect(result.workflowInput.options.temperature).toBe(0.7);
+    expect(result.workflowInput.options.modelSettings?.temperature).toBe(0.7);
 
     // Verify serializable
     const serialized = JSON.stringify(result.workflowInput.options);

@@ -9,7 +9,11 @@ import type {
   ConfigSelector,
   ConfigSelectorOptions,
   FeedbackInput,
+  FeedbackReplacementInput,
   FeedbackEvent,
+  FeedbackReplacementEvent,
+  FeedbackReviewStatusEvent,
+  FeedbackReviewStatusInput,
   ObservabilityEntrypoint,
   ObservabilityDropEvent,
   ObservabilityInstance,
@@ -19,18 +23,15 @@ import type {
 } from '@mastra/core/observability';
 import type { ObservabilityStorage } from '@mastra/core/storage';
 import { routeToHandler } from './bus/route-event';
+import type { ObservabilityHandler } from './bus/route-event';
 import { createClientObservabilityProxy } from './client';
 import { SamplingStrategyType, observabilityRegistryConfigSchema, observabilityConfigValueSchema } from './config';
 import type { ObservabilityInstanceConfig, ObservabilityRegistryConfig } from './config';
 import { MastraPlatformExporter, MastraStorageExporter } from './exporters';
 import { BaseObservabilityInstance, DefaultObservabilityInstance } from './instances';
-import {
-  buildFeedbackEvent,
-  buildScoreEvent,
-  buildRecordedFeedbackEventFromTrace,
-  buildRecordedScoreEventFromTrace,
-  hydrateRecordedTrace,
-} from './recorded';
+import { isMastraBuiltInStorageExporter } from './instances/platform-policy';
+import { setPricingGateways } from './metrics/pricing-registry';
+import { buildFeedbackEvent, buildScoreEvent, hydrateRecordedTrace } from './recorded';
 import { ObservabilityRegistry } from './registry';
 import { SensitiveDataFilter } from './span_processors';
 import type { SensitiveDataFilterOptions } from './span_processors';
@@ -45,13 +46,33 @@ function isInstance(
 }
 
 /**
- * Top-level observability entrypoint. Manages a registry of ObservabilityInstance
- * configurations and provides instance selection via config selectors.
+ * Manages observability instances and selects their configurations for Mastra operations.
+ * Configure instances and exporters to collect and export telemetry.
+ *
+ * @example
+ * `yourObservabilityConfig` defines your observability instances and exporters.
+ * ```typescript
+ * import { Mastra } from '@mastra/core/mastra';
+ * import { Observability } from '@mastra/observability';
+ *
+ * const mastra = new Mastra({
+ *   observability: new Observability(yourObservabilityConfig),
+ * });
+ * ```
+ *
+ * @see For related observability documentation bundled in `@mastra/core`, locate
+ * `@mastra/core/package.json` with your project's resolver or package-manager
+ * tooling, then read `dist/docs/SKILL.md` from that package root and follow its
+ * observability reference links. Use package-manager tools for virtual or archived packages.
+ *
+ * @see [Observability documentation](https://mastra.ai/docs/observability/overview)
+ * if packaged docs are unavailable.
  */
 export class Observability extends MastraBase implements ObservabilityEntrypoint {
   #registry = new ObservabilityRegistry();
   #mastra?: Mastra;
   #clientObservabilityProxy?: ClientObservabilityProxy;
+  #pendingPersistedEvents = new Set<Promise<void>>();
 
   constructor(config: ObservabilityRegistryConfig) {
     super({
@@ -202,6 +223,7 @@ export class Observability extends MastraBase implements ObservabilityEntrypoint
     const instances = this.listInstances();
     const { mastra } = options;
     this.#mastra = mastra;
+    setPricingGateways(() => Object.values(mastra.listGateways?.() ?? {}));
 
     const mastraEnvironment = mastra.getEnvironment?.();
 
@@ -219,13 +241,17 @@ export class Observability extends MastraBase implements ObservabilityEntrypoint
       exporters.forEach(exporter => {
         // Initialize exporter if it has an init method
         if ('init' in exporter && typeof exporter.init === 'function') {
-          try {
-            exporter.init({ mastra, config, emitDropEvent });
-          } catch (error) {
+          const handleInitError = (error: unknown) => {
             this.logger?.warn('Failed to initialize observability exporter', {
               exporterName: exporter.name,
               error: error instanceof Error ? error.message : String(error),
             });
+          };
+
+          try {
+            void Promise.resolve(exporter.init({ mastra, config, emitDropEvent })).catch(handleInitError);
+          } catch (error) {
+            handleInitError(error);
           }
         }
       });
@@ -283,38 +309,8 @@ export class Observability extends MastraBase implements ObservabilityEntrypoint
     const targetTraceId = args.traceId ?? args.correlationContext?.traceId;
     const targetSpanId = args.spanId ?? args.correlationContext?.spanId;
 
-    if (args.correlationContext) {
-      await this.#emitRecordedEvent(
-        buildScoreEvent({
-          ...(targetTraceId ? { traceId: targetTraceId } : {}),
-          ...(targetSpanId ? { spanId: targetSpanId } : {}),
-          correlationContext: args.correlationContext,
-          score: args.score,
-        }),
-      );
-      return;
-    }
-
-    if (!args.traceId) {
-      return;
-    }
-
-    const trace = await this.#getStoredTrace(args.traceId);
-    if (!trace) {
-      return;
-    }
-
-    const event = buildRecordedScoreEventFromTrace({
-      trace,
-      spanId: args.spanId,
-      score: args.score,
-    });
-
-    if (!event) {
-      return;
-    }
-
-    await this.#emitRecordedEvent(event);
+    if (!targetTraceId && !args.correlationContext) return;
+    await this.#emitRecordedEvent(buildScoreEvent({ ...args, traceId: targetTraceId, spanId: targetSpanId }));
   }
 
   async addFeedback(args: {
@@ -323,41 +319,57 @@ export class Observability extends MastraBase implements ObservabilityEntrypoint
     correlationContext?: CorrelationContext;
     feedback: FeedbackInput;
   }): Promise<void> {
-    const targetTraceId = args.traceId ?? args.correlationContext?.traceId;
-    const targetSpanId = args.spanId ?? args.correlationContext?.spanId;
+    const traceId = args.traceId ?? args.correlationContext?.traceId;
+    const spanId = args.spanId ?? args.correlationContext?.spanId;
+    if (!traceId && !args.correlationContext) return;
+    await this.#emitRecordedEvent(buildFeedbackEvent({ ...args, traceId, spanId }));
+  }
 
-    if (args.correlationContext) {
-      await this.#emitRecordedEvent(
-        buildFeedbackEvent({
-          ...(targetTraceId ? { traceId: targetTraceId } : {}),
-          ...(targetSpanId ? { spanId: targetSpanId } : {}),
-          correlationContext: args.correlationContext,
-          feedback: args.feedback,
-        }),
-      );
-      return;
+  async replaceFeedback(args: FeedbackReplacementInput): Promise<void> {
+    if (
+      !args.traceId?.trim() ||
+      !args.feedback.feedbackId?.trim() ||
+      !Number.isFinite(args.feedback.timestamp?.getTime())
+    ) {
+      throw new Error('Feedback replacement requires traceId, feedbackId, and the original timestamp');
     }
-
-    if (!args.traceId) {
-      return;
-    }
-
-    const trace = await this.#getStoredTrace(args.traceId);
-    if (!trace) {
-      return;
-    }
-
-    const event = buildRecordedFeedbackEventFromTrace({
-      trace,
-      spanId: args.spanId,
-      feedback: args.feedback,
+    await this.#emitRecordedEvent({
+      type: 'feedback_replacement',
+      feedback: {
+        ...args.feedback,
+        traceId: args.traceId,
+        spanId: args.spanId,
+        correlationContext: args.correlationContext,
+      },
     });
+  }
 
-    if (!event) {
-      return;
+  async updateFeedbackReviewStatus(args: FeedbackReviewStatusInput): Promise<void> {
+    if (!args.feedbackId?.trim() || !['needs-review', 'reviewed'].includes(args.reviewStatus)) {
+      throw new Error('Feedback review update requires feedbackId and a valid reviewStatus');
     }
+    await this.#emitRecordedEvent({
+      type: 'feedback_review_status',
+      feedback: { feedbackId: args.feedbackId, reviewStatus: args.reviewStatus },
+    });
+  }
 
-    await this.#emitRecordedEvent(event);
+  /** @internal Queue an HTTP-created record; flush/shutdown await delivery without holding the HTTP response open. */
+  async __exportPersistedEvent(
+    event: ScoreEvent | FeedbackEvent | FeedbackReplacementEvent | FeedbackReviewStatusEvent,
+  ): Promise<void> {
+    const storageExporters = new Set<ObservabilityHandler>(
+      this.#getRecordedTraceInstance()?.getExporters().filter(isMastraBuiltInStorageExporter),
+    );
+    const pending = this.#emitRecordedEvent(event, handler => !storageExporters.has(handler));
+    this.#pendingPersistedEvents.add(pending);
+    void pending.then(
+      () => this.#pendingPersistedEvents.delete(pending),
+      error => {
+        this.#pendingPersistedEvents.delete(pending);
+        this.logger.error('Failed to notify exporters of persisted feedback/score', { error, eventType: event.type });
+      },
+    );
   }
 
   /** Register a named observability instance, optionally marking it as default. */
@@ -407,9 +419,23 @@ export class Observability extends MastraBase implements ObservabilityEntrypoint
     this.#registry.clear();
   }
 
+  /** Flush all registered instances without shutting down. */
+  async flush(): Promise<void> {
+    await this.#drainPersistedEvents();
+    await this.#registry.flush();
+  }
+
   /** Shut down all registered instances, flushing any pending data. */
   async shutdown(): Promise<void> {
+    await this.#drainPersistedEvents();
     await this.#registry.shutdown();
+  }
+
+  /** Let custom handlers finish filling exporter buffers before the instance lifecycle drains them. */
+  async #drainPersistedEvents(): Promise<void> {
+    while (this.#pendingPersistedEvents.size > 0) {
+      await Promise.allSettled([...this.#pendingPersistedEvents]);
+    }
   }
 
   /**
@@ -440,20 +466,15 @@ export class Observability extends MastraBase implements ObservabilityEntrypoint
     return (await storage.getStore('observability')) ?? null;
   }
 
-  async #getStoredTrace(traceId: string) {
-    const observabilityStorage = await this.#getObservabilityStorage();
-    if (!observabilityStorage) {
-      return null;
-    }
-
-    return observabilityStorage.getTrace({ traceId });
-  }
-
   #getRecordedTraceInstance(): ObservabilityInstance | undefined {
     return this.getDefaultInstance() ?? Array.from(this.listInstances().values())[0];
   }
 
-  async #emitRecordedEvent(event: ScoreEvent | FeedbackEvent): Promise<void> {
+  /** Dispatch independently; the standard bus tracks delivery, while custom instances return handler promises. */
+  async #emitRecordedEvent(
+    event: ScoreEvent | FeedbackEvent | FeedbackReplacementEvent | FeedbackReviewStatusEvent,
+    shouldHandle?: (handler: ObservabilityHandler) => boolean,
+  ): Promise<void> {
     const instance = this.#getRecordedTraceInstance();
     if (!instance) {
       this.logger?.debug(
@@ -466,14 +487,17 @@ export class Observability extends MastraBase implements ObservabilityEntrypoint
     }
 
     if (instance instanceof BaseObservabilityInstance) {
-      instance.__emitRecordedEvent(event);
+      instance.__emitRecordedEvent(event, shouldHandle);
       return;
     }
 
     const bridge = instance.getBridge();
     const handlerResults = [
-      ...instance.getExporters().map(exporter => routeToHandler(exporter, event, this.logger)),
-      ...(bridge ? [routeToHandler(bridge, event, this.logger)] : []),
+      ...instance
+        .getExporters()
+        .filter(exporter => !shouldHandle || shouldHandle(exporter))
+        .map(exporter => routeToHandler(exporter, event, this.logger)),
+      ...(bridge && (!shouldHandle || shouldHandle(bridge)) ? [routeToHandler(bridge, event, this.logger)] : []),
     ].filter((result): result is Promise<void> => !!result && typeof result.then === 'function');
 
     if (handlerResults.length > 0) {

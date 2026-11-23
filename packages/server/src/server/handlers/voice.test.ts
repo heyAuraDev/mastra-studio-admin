@@ -1,10 +1,16 @@
+import { Readable } from 'node:stream';
 import { Agent } from '@mastra/core/agent';
 import { Mastra } from '@mastra/core/mastra';
 import type { MastraVoice } from '@mastra/core/voice';
 import { CompositeVoice } from '@mastra/core/voice';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createTestServerContext } from './test-utils';
-import { GET_SPEAKERS_ROUTE, GENERATE_SPEECH_ROUTE, TRANSCRIBE_SPEECH_ROUTE } from './voice';
+import {
+  GET_SPEAKERS_ROUTE,
+  GENERATE_SPEECH_DEPRECATED_ROUTE,
+  GENERATE_SPEECH_ROUTE,
+  TRANSCRIBE_SPEECH_ROUTE,
+} from './voice';
 
 vi.mock('@mastra/core/voice');
 
@@ -153,54 +159,171 @@ describe('Voice Handlers', () => {
     });
 
     it('should generate speech successfully', async () => {
-      const mockAudioStream = {
-        [Symbol.asyncIterator]: async function* () {
-          yield Buffer.from('test audio data');
-        },
-      };
-
       const agent = createAgentWithVoice({ voice: new CompositeVoice({}) });
 
       vi.spyOn(agent, 'getVoice').mockReturnValue({
-        speak: vi.fn().mockResolvedValue(mockAudioStream),
+        speak: vi.fn().mockResolvedValue(Readable.from(Buffer.from('test audio data'))),
       } as any);
 
-      const audioStream = await GENERATE_SPEECH_ROUTE.handler({
+      const result = await GENERATE_SPEECH_ROUTE.handler({
         ...createTestServerContext({ mastra: new Mastra({ logger: false, agents: { 'test-agent': agent } }) }),
         agentId: 'test-agent',
         text: 'test',
         speakerId: '1',
       });
 
-      expect(audioStream).toBeDefined();
-      expect(audioStream[Symbol.asyncIterator]).toBeDefined();
+      const response = result as unknown as Response;
+      expect(response).toBeInstanceOf(Response);
+      expect(response.headers.get('Content-Type')).toBe('audio/mpeg');
+    });
+
+    describe('speaker and options forwarding', () => {
+      async function callSpeak(route: typeof GENERATE_SPEECH_ROUTE, body: Record<string, unknown>) {
+        const agent = createAgentWithVoice({ voice: new CompositeVoice({}) });
+        const speak = vi.fn().mockResolvedValue(Readable.from(Buffer.from('audio')));
+        vi.spyOn(agent, 'getVoice').mockReturnValue({ speak } as any);
+        await route.handler({
+          ...createTestServerContext({ mastra: new Mastra({ logger: false, agents: { 'test-agent': agent } }) }),
+          agentId: 'test-agent',
+          text: 'hello',
+          ...body,
+        } as any);
+        return speak;
+      }
+
+      it('forwards options.speaker and other provider options', async () => {
+        const speak = await callSpeak(GENERATE_SPEECH_ROUTE, { options: { speaker: 'nova', speed: 1.2 } });
+        expect(speak).toHaveBeenCalledWith('hello', { speaker: 'nova', speed: 1.2 });
+      });
+
+      it('still supports the legacy top-level speakerId', async () => {
+        const speak = await callSpeak(GENERATE_SPEECH_ROUTE, { speakerId: 'alloy' });
+        expect(speak).toHaveBeenCalledWith('hello', { speaker: 'alloy' });
+      });
+
+      it('prefers options.speaker over speakerId', async () => {
+        const speak = await callSpeak(GENERATE_SPEECH_ROUTE, { speakerId: 'alloy', options: { speaker: 'nova' } });
+        expect(speak).toHaveBeenCalledWith('hello', { speaker: 'nova' });
+      });
+
+      it('forwards options on the deprecated speak route', async () => {
+        const speak = await callSpeak(GENERATE_SPEECH_DEPRECATED_ROUTE, { options: { speaker: 'nova' } });
+        expect(speak).toHaveBeenCalledWith('hello', { speaker: 'nova' });
+      });
+
+      it('accepts options in the request body schema', () => {
+        const parsed = GENERATE_SPEECH_ROUTE.bodySchema!.parse({ text: 'hi', options: { speaker: 'nova' } });
+        expect(parsed).toEqual({ text: 'hi', options: { speaker: 'nova' } });
+      });
+
+      it('keeps provider-specific options and rejects a non-string options.speaker', () => {
+        const schema = GENERATE_SPEECH_ROUTE.bodySchema!;
+        expect(schema.parse({ text: 'hi', options: { speaker: 'nova', speed: 1.2 } })).toEqual({
+          text: 'hi',
+          options: { speaker: 'nova', speed: 1.2 },
+        });
+        expect(schema.safeParse({ text: 'hi', speakerId: 'alloy', options: { speaker: 42 } }).success).toBe(false);
+      });
     });
 
     it('should generate speech successfully with dynamic instructions', async () => {
-      const mockAudioStream = {
-        [Symbol.asyncIterator]: async function* () {
-          yield Buffer.from('test audio data');
-        },
-      };
-
       const agent = createAgentWithVoice({
         voice: new CompositeVoice({}),
         instructions: () => 'You are a dynamic assistant',
       });
 
       vi.spyOn(agent, 'getVoice').mockReturnValue({
-        speak: vi.fn().mockResolvedValue(mockAudioStream),
+        speak: vi.fn().mockResolvedValue(Readable.from(Buffer.from('test audio data'))),
       } as any);
 
-      const audioStream = await GENERATE_SPEECH_ROUTE.handler({
+      const result = await GENERATE_SPEECH_ROUTE.handler({
         ...createTestServerContext({ mastra: new Mastra({ logger: false, agents: { 'test-agent': agent } }) }),
         agentId: 'test-agent',
         text: 'test',
         speakerId: '1',
       });
 
-      expect(audioStream).toBeDefined();
-      expect(audioStream[Symbol.asyncIterator]).toBeDefined();
+      const response = result as unknown as Response;
+      expect(response).toBeInstanceOf(Response);
+      expect(response.headers.get('Content-Type')).toBe('audio/mpeg');
+    });
+
+    it('should convert a Node Readable stream to a Web ReadableStream response', async () => {
+      const agent = createAgentWithVoice({ voice: new CompositeVoice({}) });
+
+      vi.spyOn(agent, 'getVoice').mockReturnValue({
+        speak: vi.fn().mockResolvedValue(Readable.from(Buffer.from('audio-bytes'))),
+      } as any);
+
+      const result = await GENERATE_SPEECH_ROUTE.handler({
+        ...createTestServerContext({ mastra: new Mastra({ logger: false, agents: { 'test-agent': agent } }) }),
+        agentId: 'test-agent',
+        text: 'test',
+        speakerId: '1',
+      });
+
+      const response = result as unknown as Response;
+      expect(response).toBeInstanceOf(Response);
+      expect(response.headers.get('Content-Type')).toBe('audio/mpeg');
+
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      expect(Buffer.from(bytes).toString()).toBe('audio-bytes');
+    });
+
+    it('should pass through an existing Web ReadableStream unchanged', async () => {
+      const webStream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3]));
+          controller.close();
+        },
+      });
+
+      const agent = createAgentWithVoice({ voice: new CompositeVoice({}) });
+
+      vi.spyOn(agent, 'getVoice').mockReturnValue({
+        speak: vi.fn().mockResolvedValue(webStream),
+      } as any);
+
+      const result = await GENERATE_SPEECH_ROUTE.handler({
+        ...createTestServerContext({ mastra: new Mastra({ logger: false, agents: { 'test-agent': agent } }) }),
+        agentId: 'test-agent',
+        text: 'test',
+        speakerId: '1',
+      });
+
+      const response = result as unknown as Response;
+      expect(response).toBeInstanceOf(Response);
+      expect(response.headers.get('Content-Type')).toBe('audio/mpeg');
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      expect(Array.from(bytes)).toEqual([1, 2, 3]);
+    });
+
+    it('should return a Response of raw audio bytes (audio/mpeg), not JSON-encoded chunks', async () => {
+      const audioBytes = new Uint8Array([0xff, 0xf3, 0x00, 0x01]);
+      const agent = createAgentWithVoice({ voice: new CompositeVoice({}) });
+
+      vi.spyOn(agent, 'getVoice').mockReturnValue({
+        speak: vi.fn().mockResolvedValue(Readable.from(Buffer.from(audioBytes))),
+      } as any);
+
+      const result = await GENERATE_SPEECH_ROUTE.handler({
+        ...createTestServerContext({ mastra: new Mastra({ logger: false, agents: { 'test-agent': agent } }) }),
+        agentId: 'test-agent',
+        text: 'test',
+        speakerId: '1',
+      });
+
+      const response = result as unknown as Response;
+      expect(response).toBeInstanceOf(Response);
+      expect(response.headers.get('Content-Type')).toBe('audio/mpeg');
+
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      // Raw audio bytes pass through untouched...
+      expect(Array.from(bytes)).toEqual([0xff, 0xf3, 0x00, 0x01]);
+      // ...and are NOT JSON-encoded with a record separator.
+      const asText = Buffer.from(bytes).toString('utf-8');
+      expect(asText).not.toContain('\x1e');
+      expect(asText).not.toContain('{"0":');
     });
   });
 

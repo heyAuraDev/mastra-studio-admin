@@ -1,66 +1,63 @@
 import { test, expect } from '@playwright/test';
-import { resetStorage } from '../__utils__/reset-storage';
-import { expectCurrentBreadcrumb } from '../__utils__/route-header';
 
-test.beforeEach(async () => {
-  await resetStorage();
-});
+test.describe('Settings page', () => {
+  test.describe('when the settings page is visited', () => {
+    test('shows the page title', async ({ page }) => {
+      await page.goto('/settings');
 
-test.afterEach(async () => {
-  await resetStorage();
-});
+      await expect(page).toHaveTitle(/Mastra Studio/);
+      await expect(page.getByRole('heading', { level: 1, name: 'Settings' })).toBeVisible();
+    });
 
-test('has page title', async ({ page }) => {
-  await page.goto('/settings');
+    test('shows the theme selector defaulting to the system theme', async ({ page }) => {
+      await page.goto('/settings');
 
-  await expect(page).toHaveTitle(/Mastra Studio/);
-  await expectCurrentBreadcrumb(page, 'Settings');
-});
+      const selector = page.getByRole('radiogroup', { name: 'Theme' });
 
-test('renders settings form', async ({ page }) => {
-  await page.goto('/settings');
+      await expect(selector).toBeVisible();
+      await expect(selector.getByRole('radio', { name: 'System' })).toBeChecked();
+    });
+  });
 
-  const form = page.locator('form');
-  await expect(form).toBeVisible();
-});
+  test.describe('when the light theme is selected', () => {
+    test('applies the light theme and persists it across reloads', async ({ page }) => {
+      await page.goto('/settings');
 
-test('shows theme selector with dark default', async ({ page }) => {
-  await page.goto('/settings');
+      const selector = page.getByRole('radiogroup', { name: 'Theme' });
 
-  const selector = page.getByLabel('Theme mode');
+      await selector.getByRole('radio', { name: 'Light' }).click();
 
-  await expect(selector).toBeVisible();
-  await expect(selector).toContainText('Dark');
-});
+      await expect(selector.getByRole('radio', { name: 'Light' })).toBeChecked();
+      await expect(page.locator('html')).toHaveClass(/light/);
 
-test('applies selected light theme', async ({ page }) => {
-  await page.goto('/settings');
+      await page.reload();
 
-  const selector = page.getByLabel('Theme mode');
+      await expect(page.locator('html')).toHaveClass(/light/);
+      await expect(selector.getByRole('radio', { name: 'Light' })).toBeChecked();
+    });
+  });
 
-  await selector.click();
-  await page.getByRole('option', { name: 'Light' }).click();
+  test.describe('when the system theme mode is selected', () => {
+    test('persists the system theme mode across reloads', async ({ page }) => {
+      await page.emulateMedia({ colorScheme: 'dark' });
+      await page.goto('/settings');
 
-  await expect(selector).toContainText('Light');
-  await expect(page.locator('html')).toHaveClass(/light/);
+      const selector = page.getByRole('radiogroup', { name: 'Theme' });
 
-  await page.reload();
+      await selector.getByRole('radio', { name: 'Light' }).click();
+      await expect(selector.getByRole('radio', { name: 'Light' })).toBeChecked();
+      await selector.getByRole('radio', { name: 'System' }).click();
 
-  await expect(page.locator('html')).toHaveClass(/light/);
-  await expect(page.getByLabel('Theme mode')).toContainText('Light');
-});
+      await expect(selector.getByRole('radio', { name: 'System' })).toBeChecked();
+      await expect(page.locator('html')).toHaveClass(/dark/);
 
-test('persists system theme mode', async ({ page }) => {
-  await page.goto('/settings');
+      await page.reload();
 
-  const selector = page.getByLabel('Theme mode');
+      await expect(selector.getByRole('radio', { name: 'System' })).toBeChecked();
+      await expect(page.locator('html')).toHaveClass(/dark/);
 
-  await selector.click();
-  await page.getByRole('option', { name: 'System' }).click();
-
-  await expect(selector).toContainText('System');
-
-  await page.reload();
-
-  await expect(page.getByLabel('Theme mode')).toContainText('System');
+      await page.emulateMedia({ colorScheme: 'light' });
+      await expect(page.locator('html')).toHaveClass(/light/);
+    });
+  });
 });

@@ -1,7 +1,8 @@
-import { VisuallyHidden } from '@radix-ui/react-visually-hidden';
-import { ChevronRightIcon } from 'lucide-react';
 import React from 'react';
 import { HoverCard, HoverCardContent, HoverCardTrigger } from '@/ds/components/HoverCard';
+import { Txt } from '@/ds/components/Txt';
+import { IconChevronRightMedium } from '@/ds/icons/central/IconChevronRightMedium';
+import { VisuallyHidden } from '@/ds/primitives/visually-hidden';
 import type { LinkComponent } from '@/ds/types/link-component';
 import { cn } from '@/lib/utils';
 
@@ -14,7 +15,8 @@ export type KeyValueListItemValue = {
 
 export type KeyValueListItemData = {
   key: string;
-  label: string;
+  /** Plain text in most cases; a node when the label itself is interactive (e.g. a link). */
+  label: React.ReactNode;
   value: Value;
   icon?: React.ReactNode;
   separator?: React.ReactNode;
@@ -39,17 +41,17 @@ export function KeyValueList({ data, className, labelsAreHidden, isLoading, Link
   }
 
   return (
-    <dl className={cn('grid grid-cols-[auto_1fr] gap-x-4 items-start content-start', className)}>
-      {data.map(({ label, value, icon, separator }, index) => {
+    <dl className={cn('grid grid-cols-[auto_1fr] content-start items-start gap-x-4', className)}>
+      {data.map(({ key, label, value, icon, separator }, index) => {
         const isValueItemArray = Array.isArray(value);
 
         return (
-          <React.Fragment key={label + index}>
-            <dt className={cn('text-neutral3 text-ui-md flex items-center gap-8 justify-between min-h-9')}>
+          <React.Fragment key={key ?? index}>
+            <dt className={cn('flex min-h-9 items-center justify-between gap-8 text-body text-muted-foreground')}>
               <span
                 className={cn(
                   'flex items-center gap-2',
-                  '[&>svg]:w-[1.4em] [&>svg]:h-[1.4em] [&>svg]:text-neutral3 [&>svg]:opacity-50',
+                  '[&>svg]:size-[1.4em] [&>svg]:text-muted-foreground [&>svg]:opacity-50',
                   {
                     '[&>svg]:opacity-20': isLoading,
                   },
@@ -58,22 +60,22 @@ export function KeyValueList({ data, className, labelsAreHidden, isLoading, Link
                 {icon} <LabelWrapper>{label}</LabelWrapper>
               </span>
               {!labelsAreHidden && (
-                <span className={cn('text-neutral3', '[&>svg]:w-[1em] [&>svg]:h-[1em] [&>svg]:text-neutral3')}>
+                <span className={cn('text-muted-foreground', '[&>svg]:size-[1em] [&>svg]:text-muted-foreground')}>
                   {separator}
                 </span>
               )}
             </dt>
             <dd
               className={cn(
-                'flex flex-wrap gap-2 py-1 min-h-9 text-ui-md items-center text-neutral5 text-wrap',
-                '[&>a]:text-neutral5 [&>a]:max-w-full [&>a]:w-auto truncate [&>a]:bg-surface4 [&>a]:transition-colors [&>a]:flex [&>a]:items-center [&>a]:gap-2 [&>a]:pt-0.5 [&>a]:pb-0.5 [&>a]:px-2 [&>a]:rounded-md [&>a]:text-ui-md [&>a]:min-h-7 [&>a]:leading-none',
-                '[&>a:hover]:text-neutral6 [&>a:hover]:bg-surface6',
-                '[&>a>svg]:w-[1em] [&>a>svg]:h-[1em] [&>a>svg]:text-neutral3 [&>a>svg]:ml-[-0.5em]',
+                'flex min-h-9 flex-wrap items-center gap-2 py-1 text-body text-wrap text-foreground',
+                'truncate [&>a]:flex [&>a]:min-h-7 [&>a]:w-auto [&>a]:max-w-full [&>a]:items-center [&>a]:gap-2 [&>a]:rounded-md [&>a]:bg-muted [&>a]:px-2 [&>a]:py-0.5 [&>a]:text-body [&>a]:leading-none [&>a]:text-foreground [&>a]:transition-colors',
+                '[&>a:hover]:bg-fill-subtle [&>a:hover]:text-foreground',
+                '[&>a>svg]:ml-[-0.5em] [&>a>svg]:size-[1em] [&>a>svg]:text-muted-foreground',
               )}
             >
               {isLoading ? (
                 <span
-                  className={cn('bg-surface4 rounded-e-lg w-full')}
+                  className={cn('w-full rounded-e-lg bg-muted')}
                   style={{ width: `${Math.floor(Math.random() * (90 - 30 + 1)) + 50}%` }}
                 >
                   &nbsp;
@@ -84,7 +86,7 @@ export function KeyValueList({ data, className, labelsAreHidden, isLoading, Link
                     return (
                       <RelationWrapper description={item.description} key={item.id}>
                         <Link href={item.path}>
-                          {item?.name} <ChevronRightIcon />
+                          {item?.name} <IconChevronRightMedium />
                         </Link>
                       </RelationWrapper>
                     );
@@ -93,7 +95,7 @@ export function KeyValueList({ data, className, labelsAreHidden, isLoading, Link
                     return (
                       <RelationWrapper description={item.description} key={item.id}>
                         <a href={item.path}>
-                          {item?.name} <ChevronRightIcon />
+                          {item?.name} <IconChevronRightMedium />
                         </a>
                       </RelationWrapper>
                     );
@@ -101,7 +103,15 @@ export function KeyValueList({ data, className, labelsAreHidden, isLoading, Link
                   return <span key={item.id}>{item?.name}</span>;
                 })
               ) : (
-                <>{value ? value : <span className="text-neutral3 text-ui-sm">n/a</span>}</>
+                <>
+                  {value ? (
+                    value
+                  ) : (
+                    <Txt as="span" variant="caption" tone="muted">
+                      n/a
+                    </Txt>
+                  )}
+                </>
               )}
             </dd>
           </React.Fragment>

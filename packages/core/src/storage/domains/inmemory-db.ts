@@ -12,6 +12,7 @@ import type {
   StorageFavoriteType,
   StorageWorkspaceType,
   StorageSkillType,
+  StorageToolProviderConnection,
   StorageWorkflowRun,
   ObservationalMemoryRecord,
   DatasetRecord,
@@ -32,6 +33,8 @@ import type { PromptBlockVersion } from './prompt-blocks';
 import type { Schedule, ScheduleTrigger } from './schedules/base';
 import type { ScorerDefinitionVersion } from './scorer-definitions';
 import type { SkillVersion } from './skills';
+import type { WorkflowDefinition } from './workflow-definitions';
+import type { StoredStateColumns, WorkflowRunEntry, WorkflowRunHeader } from './workflows/journal';
 import type { WorkspaceVersion } from './workspaces';
 
 /**
@@ -46,6 +49,31 @@ export class InMemoryDB {
   readonly messages = new Map<string, StorageMessageType>();
   readonly resources = new Map<string, StorageResourceType>();
   readonly workflows = new Map<string, StorageWorkflowRun>();
+  /** Storage v2 run headers, keyed like `workflows`. */
+  readonly workflowRunHeaders = new Map<
+    string,
+    {
+      workflow_name: string;
+      run_id: string;
+      resourceId?: string;
+      header: WorkflowRunHeader;
+      lastSeq: number;
+      runToken: string;
+      /** See `StoredWorkflowRunHeader.startStateSeq`. */
+      startStateSeq: number;
+      /** Set once another run's `state-base`, or a draft, builds on this run's state: its checkpoints then keep the earlier state entries. */
+      stateShared?: boolean;
+      createdAt: Date;
+      updatedAt: Date;
+    } & StoredStateColumns
+  >();
+  /** Storage v2 run entries in `seq` order, keyed like `workflowRunHeaders`. */
+  readonly workflowRunEntries = new Map<string, WorkflowRunEntry[]>();
+  /** Workflows-domain run ownership, keyed by runId. */
+  readonly runOwners = new Map<string, { generation: number; ownerId: string; leaseExpiresAt: Date | null }>();
+  /** Memory-domain run fences, keyed by runId. */
+  readonly runFences = new Map<string, { generation: number; ownerId: string }>();
+  readonly workflowDefinitions = new Map<string, WorkflowDefinition>();
   readonly scores = new Map<string, ScoreRowData>();
   readonly traces = new Map<string, TraceEntry>();
   readonly metricRecords: MetricRecord[] = [];
@@ -100,6 +128,11 @@ export class InMemoryDB {
   readonly scheduleTriggers: ScheduleTrigger[] = [];
 
   /**
+   * Tool provider connections keyed by `${authorId}\u0000${providerId}\u0000${connectionId}`.
+   */
+  readonly toolProviderConnections = new Map<string, StorageToolProviderConnection>();
+
+  /**
    * Clears all data from all collections.
    * Useful for testing.
    */
@@ -108,6 +141,11 @@ export class InMemoryDB {
     this.messages.clear();
     this.resources.clear();
     this.workflows.clear();
+    this.workflowRunHeaders.clear();
+    this.workflowRunEntries.clear();
+    this.runOwners.clear();
+    this.runFences.clear();
+    this.workflowDefinitions.clear();
     this.scores.clear();
     this.traces.clear();
     this.metricRecords.length = 0;
@@ -145,5 +183,6 @@ export class InMemoryDB {
     this.backgroundTasks.clear();
     this.schedules.clear();
     this.scheduleTriggers.length = 0;
+    this.toolProviderConnections.clear();
   }
 }

@@ -1,9 +1,11 @@
-import { JSONSchemaForm, jsonSchemaToFields, ScrollArea } from '@mastra/playground-ui';
-import type { JsonSchema, SchemaField } from '@mastra/playground-ui';
-import { Plus, PlusIcon } from 'lucide-react';
+import { JSONSchemaForm, jsonSchemaToFields } from '@mastra/playground-ui/components/JSONSchemaForm';
+import type { SchemaField } from '@mastra/playground-ui/components/JSONSchemaForm';
+import { ScrollArea } from '@mastra/playground-ui/components/ScrollArea';
+import { IconPlusMedium } from '@mastra/playground-ui/icons/central/IconPlusMedium';
+import type { JsonSchema } from '@mastra/playground-ui/utils/json-schema';
+
 import { useCallback, useMemo } from 'react';
 import { useWatch } from 'react-hook-form';
-
 import { useAgentEditFormContext } from '../../context/agent-edit-form-context';
 
 function RecursiveFieldRenderer({
@@ -16,15 +18,15 @@ function RecursiveFieldRenderer({
   depth: number;
 }) {
   return (
-    <div className="py-2 ">
+    <div className="py-2">
       <JSONSchemaForm.Field key={field.id} field={field} parentPath={parentPath} depth={depth}>
         <div className="space-y-2 px-2">
-          <div className="flex flex-row gap-4 items-center">
+          <div className="flex flex-row items-center gap-4">
             <JSONSchemaForm.FieldName placeholder="Variable name" className="w-64" />
             <JSONSchemaForm.FieldType placeholder="Type" />
             <JSONSchemaForm.FieldOptional />
             <JSONSchemaForm.FieldNullable />
-            <JSONSchemaForm.FieldRemove aria-label="Remove Variable" />
+            <JSONSchemaForm.FieldRemove aria-label="Remove variable" />
           </div>
         </div>
 
@@ -40,7 +42,7 @@ function RecursiveFieldRenderer({
             )}
           </JSONSchemaForm.FieldList>
           <JSONSchemaForm.AddField variant="ghost" size="sm" className="mt-2">
-            <PlusIcon className="w-3 h-3 mr-1" />
+            <IconPlusMedium className="mr-1 size-icon-xs" />
             Add nested variable
           </JSONSchemaForm.AddField>
         </JSONSchemaForm.NestedFields>
@@ -66,7 +68,7 @@ export function VariablesPage() {
 
   return (
     <ScrollArea className="h-full">
-      <section className="flex flex-col gap-6">
+      <section className="flex flex-col gap-4">
         <div className={readOnly ? 'pointer-events-none opacity-60' : ''}>
           <JSONSchemaForm.Root onChange={handleVariablesChange} defaultValue={initialFields} maxDepth={5}>
             <JSONSchemaForm.FieldList>
@@ -77,7 +79,7 @@ export function VariablesPage() {
 
             <div className="p-2">
               <JSONSchemaForm.AddField>
-                <Plus />
+                <IconPlusMedium />
                 Add variable
               </JSONSchemaForm.AddField>
             </div>

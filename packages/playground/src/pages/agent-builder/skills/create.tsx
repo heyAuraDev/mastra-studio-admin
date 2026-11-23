@@ -1,0 +1,41 @@
+import { Button } from '@mastra/playground-ui/components/Button';
+import { IconArrowLeft } from '@mastra/playground-ui/icons/central/IconArrowLeft';
+import { useStoredSkills } from '@mastra/react/hooks/agents';
+import { useStoredWorkspaces } from '@mastra/react/hooks/workspace';
+import { Navigate, useNavigate } from 'react-router';
+import { SkillBuilderStarter } from '@/domains/agent-builder/components/skill-starter/skill-builder-starter';
+import { useBuilderSettings } from '@/domains/agent-builder/hooks/use-builder-settings';
+import { usePermissions } from '@/domains/auth/hooks/use-permissions';
+
+export default function AgentBuilderSkillsCreate() {
+  const { hasPermission, rbacEnabled } = usePermissions();
+  const canWrite = !rbacEnabled || hasPermission('stored-skills:write');
+  // Warm caches the edit page needs on first paint.
+  useStoredSkills({ queryOptions: { enabled: canWrite } });
+  useStoredWorkspaces();
+  useBuilderSettings();
+  const navigate = useNavigate();
+
+  if (!canWrite) {
+    return <Navigate to="/agent-builder/skills" replace />;
+  }
+  return (
+    <>
+      <div className="absolute top-3 left-3 z-10 md:top-6 md:left-6">
+        <Button
+          size="icon-sm"
+          variant="ghost"
+          onClick={() =>
+            navigate('/agent-builder/skills', {
+              viewTransition: true,
+            })
+          }
+          tooltip="Skills list"
+        >
+          <IconArrowLeft />
+        </Button>
+      </div>
+      <SkillBuilderStarter />
+    </>
+  );
+}

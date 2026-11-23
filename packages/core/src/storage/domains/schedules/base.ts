@@ -1,26 +1,112 @@
+import type { AgentSignalAttributes, AgentSignalType } from '../../../agent/signals';
+import type { ScheduleIfActive, ScheduleIfIdle } from '../../../schedules/types';
 import { StorageDomain } from '../base';
 
 /**
  * Discriminated union describing what a schedule fires.
  *
- * Only the `workflow` variant is implemented in v1. Future targets
- * (e.g. `agent-signal`) can be added without a schema migration.
+ * `workflow` targets publish a `workflow.start` event on the `workflows`
+ * pubsub topic and are processed by the orchestration worker. `agent`
+ * targets publish an `agent-schedule.fire` event on the `agent-schedules`
+ * pubsub topic and are processed by the {@link AgentScheduleWorker}, which
+ * runs the referenced agent directly (no workflow indirection).
  */
-export type ScheduleTarget = {
+export type ScheduleTarget = WorkflowScheduleTarget | AgentScheduleTarget;
+
+export type WorkflowScheduleTarget = {
   type: 'workflow';
   workflowId: string;
   inputData?: unknown;
   initialState?: unknown;
   requestContext?: Record<string, unknown>;
+  /**
+   * Resource this schedule's runs are attributed to. When set, every run the
+   * schedule fires (via the cron scheduler or a manual fire) is created and
+   * persisted with this `resourceId`, so scheduled runs can be correlated and
+   * filtered per resource in multi-tenant setups. Pure run-attribution
+   * metadata — unlike an agent schedule's `resourceId`, it is not part of the
+   * schedule's identity and can be changed with a partial update.
+   */
+  resourceId?: string;
+  /**
+   * Content hash of the target workflow's serialized step graph, written by
+   * declarative schedule reconciliation on deploy. At claim time the
+   * scheduler compares this against the hash of its *locally registered*
+   * workflow and refuses to claim the fire on mismatch, fencing out
+   * not-yet-cycled instances from older builds that would otherwise execute
+   * a stale step graph (#19169). Absent on rows created by older versions
+   * and on imperative (API-created) schedules — those are unfenced.
+   *
+   * @internal — managed by `Mastra.registerDeclarativeSchedules()`.
+   */
+  definitionHash?: string;
 };
 
+// Agent-schedule semantic types are owned by the schedules feature module
+// and re-exported here so callers describing schedule rows can reach them
+// through the storage barrel.
+export type { ScheduleIfActive, ScheduleIfIdle } from '../../../schedules/types';
+
+/**
+ * Schedule target that fires an agent run on a cron. The agent-schedule
+ * worker reads these fields and runs the referenced agent directly —
+ * either via `sendSignal` (when `threadId` is set) or `agent.generate`
+ * (threadless). The agent's `runId` is recorded on the trigger row for
+ * UI linkability into chat / observability traces.
+ */
+export type AgentScheduleTarget = {
+  type: 'agent';
+  agentId: string;
+  prompt: string;
+  /**
+   * Free-form label for distinguishing multiple schedules on the same
+   * agent/thread (e.g. `'morning-checkin'`). Optional; filterable via
+   * `mastra.schedules.list({ name })`.
+   */
+  name?: string;
+  /** Threaded agent schedules send a signal into this thread. */
+  threadId?: string;
+  /** Required when `threadId` is set. */
+  resourceId?: string;
+  /** Signal type used by threaded agent schedules. Defaults to `'notification'`. */
+  signalType?: AgentSignalType;
+  /** XML tag the signal renders as. Defaults to `'schedule'`. */
+  tagName?: string;
+  /** Signal attributes rendered onto the XML tag. */
+  attributes?: AgentSignalAttributes;
+  /** Provider options merged into the schedule signal payload on every fire. JSON-safe. */
+  providerOptions?: Record<string, unknown>;
+  /** Options applied when the target thread is actively streaming. Threaded only. */
+  ifActive?: ScheduleIfActive;
+  /** Options applied when the target thread is idle (incl. serializable streamOptions). Threaded only. */
+  ifIdle?: ScheduleIfIdle;
+  /** Arbitrary metadata stored alongside the schedule row. */
+  metadata?: Record<string, unknown>;
+  requestContext?: Record<string, unknown>;
+};
+
+/**
+ * Read-shim for schedule rows persisted before the heartbeat → schedules
+ * rename: maps a legacy `target.type: 'heartbeat'` discriminator to the
+ * current `'agent'` value. Every {@link SchedulesStorage} implementation
+ * MUST run row targets through this at deserialization time so legacy rows
+ * keep dispatching. Never used on the write path — new rows always persist
+ * `'agent'`.
+ */
+export function normalizeScheduleTarget(target: ScheduleTarget): ScheduleTarget {
+  if ((target as { type: string }).type === 'heartbeat') {
+    return { ...target, type: 'agent' } as AgentScheduleTarget;
+  }
+  return target;
+}
+
 /** Lifecycle status of a schedule row. */
-export type ScheduleStatus = 'active' | 'paused';
+export type ScheduleStatus = 'active' | 'paused' | 'completed';
 
 /**
  * Polymorphic owner of a schedule. Workflow schedules created via
- * `createWorkflow({ schedule })` leave both fields null. Heartbeat
- * schedules created via `agent.setHeartbeat(...)` set
+ * `createWorkflow({ schedule })` leave both fields null. Agent
+ * schedules created via `mastra.schedules.create(...)` set
  * `ownerType: 'agent'` and `ownerId` to the agent id. Future schedule
  * types (tenant-owned, workflow-owned, etc.) can use the same shape
  * without a migration.
@@ -37,16 +123,21 @@ export type ScheduleOwnerType = 'agent' | (string & {});
 export type Schedule = {
   id: string;
   target: ScheduleTarget;
+  /** Cron expression. Empty string for one-off schedules (see `runAt`). */
   cron: string;
   timezone?: string;
   status: ScheduleStatus;
+  /** One-off fire time (ms epoch). When set, the schedule fires once and then becomes `completed`. */
+  runAt?: number;
+  /** Bounded cron end (ms epoch). The schedule never fires after `endAt` and becomes `completed`. */
+  endAt?: number;
   nextFireAt: number;
   lastFireAt?: number;
   lastRunId?: string;
   createdAt: number;
   updatedAt: number;
   metadata?: Record<string, unknown>;
-  /** Optional owner classification (e.g. 'agent' for heartbeats). */
+  /** Optional owner classification (e.g. 'agent' for agent schedules). */
   ownerType?: ScheduleOwnerType;
   /** Optional owner identifier paired with `ownerType`. */
   ownerId?: string;
@@ -55,16 +146,42 @@ export type Schedule = {
 /**
  * Outcome of an individual schedule trigger attempt.
  *
- * `published` and `failed` cover scheduler tick fires. Heartbeat
- * outcomes (`acked`, `alerted`, `deferred`, `appended-from-queue`,
- * `dropped-stale`, `dropped-superseded`, `dropped-busy`, `skipped`)
- * are recorded by the heartbeat workflow. `failed` covers any
- * unhandled error during a fire or drain.
+ * Shared across all schedule target types (workflows, agents, …).
+ *
+ * Workflow outcomes:
+ * - `published`  — workflow run was successfully dispatched to the workflow
+ *                  engine. Write-once at dispatch time; the trigger row is
+ *                  not updated when the run later completes.
+ * - `failed`     — dispatch threw (workflow or agent schedule).
+ *
+ * Agent-schedule outcomes (terminal — written after the run/signal resolves):
+ * - `succeeded`  — the scheduled agent run finished without error.
+ * - `delivered`  — the schedule signal joined an active run on the target
+ *                  thread instead of starting a new one (`ifActive: 'deliver'`).
+ * - `persisted`  — the signal was saved to memory without triggering a run
+ *                  (`ifActive: 'persist'` or `ifIdle: 'persist'`).
+ * - `discarded`  — the signal was dropped without effect
+ *                  (`ifActive: 'discard'` or `ifIdle: 'discard'`).
+ * - `skipped`    — the user `prepare` hook returned `null`, asking the worker
+ *                  to skip this fire entirely.
+ * - `aborted`    — the agent run was aborted mid-stream.
+ *
+ * Legacy outcomes (no longer written, kept readable for rows persisted by
+ * older builds so that listing/exhaustive handling does not break):
+ * - `acked`, `alerted`, `deferred`, `appended-from-queue`, `dropped-stale`,
+ *   `dropped-superseded`, `dropped-busy`.
  */
 export type ScheduleTriggerOutcome =
   | 'published'
-  | 'failed'
+  | 'succeeded'
+  | 'delivered'
+  | 'persisted'
+  | 'discarded'
   | 'skipped'
+  | 'aborted'
+  | 'failed'
+  // Legacy queue/notification outcomes — never written by current code, but
+  // older trigger rows may still carry them. Retained so reads stay typed.
   | 'acked'
   | 'alerted'
   | 'deferred'
@@ -74,17 +191,25 @@ export type ScheduleTriggerOutcome =
   | 'dropped-busy';
 
 /**
- * Distinguishes a tick-loop schedule fire from a deferred drain event.
- * Drain rows reference the original fire via `parentTriggerId`.
+ * Distinguishes a tick-loop schedule fire from a deferred drain event or a
+ * manual ("fire now") invocation. Drain rows reference the original fire
+ * via `parentTriggerId`.
  */
-export type ScheduleTriggerKind = 'schedule-fire' | 'queue-drain';
+export type ScheduleTriggerKind = 'schedule-fire' | 'queue-drain' | 'manual';
 
 /** Audit record produced for each trigger attempt. */
 export type ScheduleTrigger = {
   /** Stable trigger row id. Generated by storage when omitted on write. */
   id?: string;
   scheduleId: string;
-  /** May be null for drain rows that have no associated workflow run. */
+  /**
+   * Identifier of the downstream run produced by this fire.
+   *
+   * For workflow targets this is the workflow run id (`sched_<scheduleId>_<ts>`).
+   * For agent targets this is the agent run id recorded by the
+   * {@link AgentScheduleWorker} after the agent run starts. May be null for
+   * drain rows or fires that failed before producing a run id.
+   */
   runId: string | null;
   scheduledFireAt: number;
   actualFireAt: number;
@@ -119,13 +244,16 @@ export type ScheduleTriggerListOptions = {
 
 /** Fields that can be patched via {@link SchedulesStorage.updateSchedule}. */
 export type ScheduleUpdate = Partial<
-  Pick<Schedule, 'cron' | 'timezone' | 'status' | 'nextFireAt' | 'metadata' | 'target' | 'ownerType' | 'ownerId'>
+  Pick<
+    Schedule,
+    'cron' | 'timezone' | 'status' | 'nextFireAt' | 'metadata' | 'target' | 'ownerType' | 'ownerId' | 'runAt' | 'endAt'
+  >
 >;
 
 /**
  * Abstract storage domain for workflow schedules.
  *
- * Powers the {@link WorkflowScheduler}: the scheduler's tick loop polls
+ * Powers the {@link Scheduler}: the scheduler's tick loop polls
  * `listDueSchedules`, atomically advances `nextFireAt` via
  * `updateScheduleNextFire` (CAS), publishes a `workflow.start` event on
  * the `workflows` pubsub topic, and records the trigger via `recordTrigger`.
@@ -152,7 +280,10 @@ export abstract class SchedulesStorage extends StorageDomain {
   abstract listSchedules(filter?: ScheduleFilter): Promise<Schedule[]>;
 
   /**
-   * List schedules whose `nextFireAt <= now` and whose `status === 'active'`.
+   * List schedules whose `nextFireAt <= now` and whose `status === 'active'`,
+   * ordered by `nextFireAt` ascending. Adapters must apply that ordering
+   * before `limit`: the scheduler relies on `listDueSchedules(Number.MAX_SAFE_INTEGER, 1)`
+   * to find the earliest active fire without loading every schedule.
    * Used by the scheduler tick loop.
    */
   abstract listDueSchedules(now: number, limit?: number): Promise<Schedule[]>;
@@ -167,6 +298,9 @@ export abstract class SchedulesStorage extends StorageDomain {
    * Returns true if the row's `nextFireAt` matched `expectedNextFireAt` and
    * was advanced to `newNextFireAt`. Returns false if another instance
    * already advanced it (meaning the caller should skip publishing).
+   *
+   * When `newStatus` is provided, the row's status is written in the same
+   * atomic update.
    */
   abstract updateScheduleNextFire(
     id: string,
@@ -174,6 +308,7 @@ export abstract class SchedulesStorage extends StorageDomain {
     newNextFireAt: number,
     lastFireAt: number,
     lastRunId: string,
+    newStatus?: ScheduleStatus,
   ): Promise<boolean>;
 
   /** Delete a schedule and its trigger history. */

@@ -23,6 +23,8 @@
  * 2. **Pluggable Cache**: Use InMemoryServerCache (default) or custom backends (Redis, etc.)
  * 3. **Cache Inheritance**: Durable agents inherit cache from Mastra if not explicitly provided
  * 4. **Durable Execution**: Run agentic loops on workflow engines (Inngest, evented, etc.)
+ * 5. **Crash Recovery**: In-flight runs persist their state; a fresh process over the
+ *    same storage can resume them via `recover(runId)` / `recoverActiveRuns()`
  *
  * @example Basic usage with resumable streams
  * ```typescript
@@ -45,18 +47,19 @@
  *
  * @example Custom cache backend (e.g., Redis)
  * ```typescript
- * import { RedisServerCache } from '@mastra/redis'; // hypothetical
+ * import { RedisServerCache } from '@mastra/redis';
+ * import Redis from 'ioredis';
  *
  * const durableAgent = createDurableAgent({
  *   agent,
- *   cache: new RedisServerCache({ url: 'redis://...' }),
+ *   cache: new RedisServerCache({ client: new Redis('redis://...') }),
  * });
  * ```
  *
  * @example Cache inheritance from Mastra
  * ```typescript
  * const mastra = new Mastra({
- *   cache: new RedisServerCache({ url: 'redis://...' }),
+ *   cache: new RedisServerCache({ client: new Redis('redis://...') }),
  *   agents: {
  *     myAgent: createDurableAgent({ agent }), // Inherits Redis cache from Mastra
  *   },
@@ -80,6 +83,7 @@ export {
   type DurableAgentStreamOptions,
   type DurableAgentStreamResult,
 } from './durable-agent';
+export { applyReservedMemoryContextKeys } from '../helpers';
 
 // EventedAgent class (extends DurableAgent with fire-and-forget execution)
 export { EventedAgent, isEventedAgentClass, type EventedAgentConfig } from './evented-agent';
@@ -88,13 +92,52 @@ export { EventedAgent, isEventedAgentClass, type EventedAgentConfig } from './ev
 export { createEventedAgent, isEventedAgent, type CreateEventedAgentOptions } from './create-evented-agent';
 
 // Stream until idle (durable variant)
-export { runDurableStreamUntilIdle, type DurableStreamUntilIdleDeps } from './durable-stream-until-idle';
+export {
+  runDurableStreamUntilIdle,
+  runResumeDurableStreamUntilIdle,
+  type DurableStreamUntilIdleDeps,
+} from './durable-stream-until-idle';
+export {
+  getRunStreamSlot,
+  getScopeStreamSlot,
+  untilIdleHandlesBackgroundTask,
+} from '../../loop/shared/stream-until-idle-helpers';
 
 // Preparation utilities
 export { prepareForDurableExecution, type PreparationOptions, type PreparationResult } from './preparation';
+export { persistDurableRunInput } from './persist-run-input';
+export { validateModelTimeoutSettings } from '../../llm/model/model-settings';
 
 // Run registry for non-serializable state
-export { RunRegistry, ExtendedRunRegistry, type ExtendedRunRegistryEntry } from './run-registry';
+export {
+  RunRegistry,
+  ExtendedRunRegistry,
+  globalRunRegistry,
+  getRunRegistryEntry,
+  setRunRegistryEntry,
+  deleteRunRegistryEntry,
+  takeRunScorerInstances,
+  type ExtendedRunRegistryEntry,
+} from './run-registry';
+
+// Shared resumeGenerate argument normalization (Agent order + deprecated runId-first order)
+export { normalizeResumeGenerateArgs } from './utils/resume-generate-args';
+
+// Lets shared test suites simulate a process crash
+export { __resetExecutionFencesForTests } from './execution-fence';
+
+// Shared thread-stream runtime, so durable-agent integrations outside core
+// (e.g. @mastra/inngest) can register their runs the same way DurableAgent does.
+export { agentThreadStreamRuntime } from '../thread-stream-runtime';
+
+// Per-segment abort controller, shared with durable-agent integrations outside core
+export { createRunAbortController, type RunAbortController } from './run-abort';
+
+// Run bus + replay cache resolution, shared with durable-agent integrations outside core
+export { AgentStreamBus } from '../streams/bus';
+
+// Step-finish response message diffs, shared with durable-agent integrations outside core
+export { diffResponseMessages, type ResponseMessagesCursor } from '../streams/response-messages';
 
 // Stream adapter for pubsub-based streaming
 export {
@@ -104,13 +147,35 @@ export {
   emitStepFinishEvent,
   emitFinishEvent,
   emitErrorEvent,
+  emitAbortEvent,
   emitSuspendedEvent,
   type DurableAgentStreamOptions as StreamAdapterOptions,
   type DurableAgentStreamResult as StreamAdapterResult,
 } from './stream-adapter';
 
+// Detach an observer's fullStream subscription when its consumer stops reading,
+// shared with durable-agent integrations outside core
+export { detachFullStreamOnEnd } from './observe-full-stream';
+
 // Constants
-export { AGENT_STREAM_TOPIC, AgentStreamEventTypes, DurableAgentDefaults, DurableStepIds } from './constants';
+export {
+  AGENT_STREAM_TOPIC,
+  AGENT_CONTROL_TOPIC,
+  AgentStreamEventTypes,
+  AgentControlEventTypes,
+  DURABLE_STOP_WHEN_ERROR_ID,
+  DurableAgentDefaults,
+  DurableStepIds,
+} from './constants';
+export {
+  publishAbortRequest,
+  requestAcknowledgedAbort,
+  subscribeToAbortRequests,
+  ensureRemoteAbortListener,
+  readRunDeadline,
+  RUN_DEADLINE_KEY,
+} from './abort-transport';
+export type { RunDeadline } from './abort-transport';
 
 // Types
 export type {
@@ -119,6 +184,7 @@ export type {
   SerializableModelConfig,
   SerializableDurableState,
   SerializableDurableOptions,
+  SerializableModelSettings,
   DurableAgenticWorkflowInput,
   // Step I/O types
   DurableLLMStepOutput,
@@ -131,6 +197,7 @@ export type {
   AgentStreamEvent,
   AgentChunkEventData,
   AgentStepFinishEventData,
+  DurableAgentStepFinishResult,
   AgentFinishEventData,
   AgentErrorEventData,
   AgentSuspendedEventData,
@@ -151,16 +218,24 @@ export {
 // Utility functions for runtime resolution
 export {
   resolveRuntimeDependencies,
+  rebuildRunToolsFromMastra,
   resolveModel,
   resolveInternalState,
   resolveTool,
   toolRequiresApproval,
   type ResolvedRuntimeDependencies,
   type ResolveRuntimeOptions,
+  type RebuiltRunTools,
 } from './utils/resolve-runtime';
 
 // Workflow creation
-export { createDurableAgenticWorkflow, type DurableAgenticWorkflowOptions } from './workflows';
+export {
+  createDurableAgenticWorkflow,
+  runDurableFinishSideEffects,
+  type DurableAgenticWorkflowOptions,
+  type DurableFinishSideEffectsOptions,
+  type DurableFinishSideEffectsResult,
+} from './workflows';
 
 // Workflow steps (for advanced customization)
 export {
@@ -168,11 +243,14 @@ export {
   createDurableLLMExecutionStep,
   createDurableToolCallStep,
   createDurableLLMMappingStep,
+  createDurableIsTaskCompleteStep,
+  createDurableGoalStep,
 } from './workflows/steps';
 
 // Shared workflow utilities
 export {
-  executeDurableToolCalls,
+  executeDurableAgentScorers,
+  loadRunStoredMessages,
   modelConfigSchema,
   modelListEntrySchema,
   accumulatedUsageSchema,
@@ -182,12 +260,27 @@ export {
   calculateAccumulatedUsage,
   buildStepRecord,
   createBaseIterationStateUpdate,
+  resolveDurableToolCallConcurrency,
 } from './workflows/shared';
 export type {
-  ToolExecutionContext,
-  ToolExecutionError,
+  ExecuteDurableAgentScorersParams,
   BaseIterationState,
   AccumulatedUsage,
   IterationStateUpdateInput,
   StepRecord,
 } from './workflows/shared';
+
+// Deprecated pre-unification tool-execution helpers, kept so the public
+// surface stays additive at patch level. Removed in v2.
+export { executeDurableToolCalls } from './workflows/deprecated-tool-execution';
+export type { ToolExecutionContext, ToolExecutionError } from './workflows/deprecated-tool-execution';
+
+// Snapshot pruning hook shared with external durable engines (e.g. Inngest)
+export { pruneAgentLoopSnapshot } from '../../loop/workflows/prune-snapshot';
+
+// Shared runtime outcome classification for external durable engines.
+export { endRunSpansWithError } from './run-registry';
+/** @internal The span pair a resumed or recovered execution reports under, shared with external durable engines. */
+export { carrySegmentSpans, liveSegmentSpan, segmentSpanData, type SegmentSpanData } from './segment-spans';
+/** @internal Runtime instrumentation helpers. */
+export { agentLoopTermination, executionFailureTermination } from '../../loop/shared/execution-outcome';

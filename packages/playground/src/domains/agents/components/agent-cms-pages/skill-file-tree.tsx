@@ -1,10 +1,21 @@
 import { v4 as uuid } from '@lukeed/uuid';
-import { Button, TooltipProvider, Tree } from '@mastra/playground-ui';
-import { File, FileCode, FileJson, FileText, Folder, FolderOpen, FolderPlus, Image, Plus, Trash2 } from 'lucide-react';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { TooltipProvider } from '@mastra/playground-ui/components/Tooltip';
+import { Tree } from '@mastra/playground-ui/components/Tree';
+import { IconFileBend } from '@mastra/playground-ui/icons/central/IconFileBend';
+import { IconFileText } from '@mastra/playground-ui/icons/central/IconFileText';
+
+import { IconFolder1 } from '@mastra/playground-ui/icons/central/IconFolder1';
+import { IconFolderAddRight } from '@mastra/playground-ui/icons/central/IconFolderAddRight';
+import { IconFolderOpen } from '@mastra/playground-ui/icons/central/IconFolderOpen';
+import { IconImages1 } from '@mastra/playground-ui/icons/central/IconImages1';
+import { IconPlusMedium } from '@mastra/playground-ui/icons/central/IconPlusMedium';
+import { IconScript } from '@mastra/playground-ui/icons/central/IconScript';
+import { TrashIcon } from '@mastra/playground-ui/icons/TrashIcon';
 import type { MouseEvent, ReactNode } from 'react';
 import { useCallback, useRef, useState } from 'react';
-
 import type { InMemoryFileNode } from '../agent-edit-page/utils/form-validation';
+import { STRUCTURAL_IDS } from './skill-file-tree-utils';
 
 export interface SkillFileTreeProps {
   files: InMemoryFileNode[];
@@ -14,59 +25,6 @@ export interface SkillFileTreeProps {
   readOnly?: boolean;
 }
 
-// Well-known IDs for structural nodes
-const STRUCTURAL_IDS = new Set(['root', 'skill-md', 'license-md', 'references', 'scripts', 'assets']);
-
-function slugify(name: string): string {
-  return name
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
-
-export function createInitialStructure(name: string): InMemoryFileNode[] {
-  const slug = slugify(name) || 'untitled';
-  return [
-    {
-      id: 'root',
-      name: slug,
-      type: 'folder',
-      children: [
-        { id: 'skill-md', name: 'SKILL.md', type: 'file', content: '' },
-        { id: 'license-md', name: 'LICENSE.md', type: 'file', content: '' },
-        { id: 'references', name: 'references', type: 'folder', children: [] },
-        { id: 'scripts', name: 'scripts', type: 'folder', children: [] },
-        { id: 'assets', name: 'assets', type: 'folder', children: [] },
-      ],
-    },
-  ];
-}
-
-export function updateRootFolderName(files: InMemoryFileNode[], name: string): InMemoryFileNode[] {
-  const slug = slugify(name) || 'untitled';
-  return files.map(node => (node.id === 'root' ? { ...node, name: slug } : node));
-}
-
-export function extractSkillInstructions(files: InMemoryFileNode[]): string {
-  const root = files.find(n => n.id === 'root');
-  if (!root?.children) return '';
-  const skillMd = root.children.find(n => n.id === 'skill-md');
-  return skillMd?.content ?? '';
-}
-
-export function extractSkillLicense(files: InMemoryFileNode[]): string | undefined {
-  const root = files.find(n => n.id === 'root');
-  if (!root?.children) return undefined;
-  const licenseMd = root.children.find(n => n.id === 'license-md');
-  const content = licenseMd?.content?.trim();
-  return content || undefined;
-}
-
-export function isImageContent(content: string | undefined): boolean {
-  return !!content && content.startsWith('data:image/');
-}
-
 function getFileIcon(name: string): ReactNode {
   const ext = name.split('.').pop()?.toLowerCase();
   switch (ext) {
@@ -74,26 +32,30 @@ function getFileIcon(name: string): ReactNode {
     case 'tsx':
     case 'js':
     case 'jsx':
-      return <FileCode className="text-blue-400" />;
+      return <IconScript className="text-badge-blue-indicator" />;
     case 'json':
-      return <FileJson className="text-yellow-400" />;
+      return <IconFileText className="text-badge-amber-indicator" />;
     case 'md':
     case 'mdx':
-      return <FileText className="text-neutral4" />;
+      return <IconFileText className="text-muted-foreground" />;
     case 'png':
     case 'jpg':
     case 'jpeg':
     case 'gif':
     case 'svg':
     case 'webp':
-      return <Image className="text-purple-400" />;
+      return <IconImages1 className="text-badge-purple-indicator" />;
     default:
-      return <File className="text-neutral4" />;
+      return <IconFileBend className="text-muted-foreground" />;
   }
 }
 
 function getFolderIcon(isOpen: boolean): ReactNode {
-  return isOpen ? <FolderOpen className="text-amber-400" /> : <Folder className="text-amber-400" />;
+  return isOpen ? (
+    <IconFolderOpen className="text-badge-amber-indicator" />
+  ) : (
+    <IconFolder1 className="text-badge-amber-indicator" />
+  );
 }
 
 function insertNode(nodes: InMemoryFileNode[], parentId: string, newNode: InMemoryFileNode): InMemoryFileNode[] {
@@ -138,23 +100,11 @@ function containsNode(nodes: InMemoryFileNode[], targetId: string): boolean {
   return false;
 }
 
-export function updateNodeContent(nodes: InMemoryFileNode[], nodeId: string, content: string): InMemoryFileNode[] {
-  return nodes.map(node => {
-    if (node.id === nodeId) {
-      return { ...node, content };
-    }
-    if (node.children) {
-      return { ...node, children: updateNodeContent(node.children, nodeId, content) };
-    }
-    return node;
-  });
-}
-
 function FolderAddAction({ tooltip, onClick }: { tooltip: string; onClick: () => void }) {
   return (
     <span className="opacity-0 group-hover:opacity-100">
       <Button size="icon-sm" variant="ghost" tooltip={tooltip} onClick={onClick}>
-        <Plus />
+        <IconPlusMedium />
       </Button>
     </span>
   );
@@ -164,10 +114,10 @@ function FolderActions({ onAddFile, onAddFolder }: { onAddFile: () => void; onAd
   return (
     <span className="flex opacity-0 group-hover:opacity-100">
       <Button size="icon-sm" variant="ghost" tooltip="New file" onClick={onAddFile}>
-        <Plus />
+        <IconPlusMedium />
       </Button>
       <Button size="icon-sm" variant="ghost" tooltip="New folder" onClick={onAddFolder}>
-        <FolderPlus />
+        <IconFolderAddRight />
       </Button>
     </span>
   );
@@ -185,7 +135,7 @@ function FileDeleteAction({ nodeId, onRemove }: { nodeId: string; onRemove: (id:
           onRemove(nodeId);
         }}
       >
-        <Trash2 />
+        <TrashIcon />
       </Button>
     </span>
   );
@@ -226,10 +176,10 @@ function UserNodeList({
                 !readOnly && (
                   <span className="flex opacity-0 group-hover:opacity-100">
                     <Button size="icon-sm" variant="ghost" tooltip="New file" onClick={() => onAddFile(node.id)}>
-                      <Plus />
+                      <IconPlusMedium />
                     </Button>
                     <Button size="icon-sm" variant="ghost" tooltip="New folder" onClick={() => onAddFolder(node.id)}>
-                      <FolderPlus />
+                      <IconFolderAddRight />
                     </Button>
                     <Button
                       size="icon-sm"
@@ -240,7 +190,7 @@ function UserNodeList({
                         onRemove(node.id);
                       }}
                     >
-                      <Trash2 />
+                      <TrashIcon />
                     </Button>
                   </span>
                 )

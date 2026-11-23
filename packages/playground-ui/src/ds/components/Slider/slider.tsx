@@ -2,10 +2,11 @@ import { Slider as SliderPrimitive } from '@base-ui/react/slider';
 
 import { cn } from '@/lib/utils';
 
-export type SliderProps = Omit<SliderPrimitive.Root.Props, 'onValueChange' | 'onValueCommitted'> & {
-  onValueChange?: (value: number[], eventDetails: SliderPrimitive.Root.ChangeEventDetails) => void;
-  onValueCommitted?: (value: number[], eventDetails: SliderPrimitive.Root.CommitEventDetails) => void;
-};
+export type SliderProps = Omit<SliderPrimitive.Root.Props, 'onValueChange' | 'onValueCommitted'> &
+  Pick<SliderPrimitive.Thumb.Props, 'getAriaLabel'> & {
+    onValueChange?: (value: number[], eventDetails: SliderPrimitive.Root.ChangeEventDetails) => void;
+    onValueCommitted?: (value: number[], eventDetails: SliderPrimitive.Root.CommitEventDetails) => void;
+  };
 
 function toArray(value: number | readonly number[]): number[] {
   if (typeof value === 'number') {
@@ -22,9 +23,13 @@ const Slider = ({
   max = 100,
   onValueChange,
   onValueCommitted,
+  'aria-label': ariaLabel,
+  'aria-labelledby': ariaLabelledBy,
+  getAriaLabel,
   ...props
 }: SliderProps) => {
-  const values = Array.isArray(value) ? value : Array.isArray(defaultValue) ? defaultValue : [min];
+  const currentValue = value ?? defaultValue ?? min;
+  const values = typeof currentValue === 'number' ? [currentValue] : currentValue;
 
   return (
     <SliderPrimitive.Root
@@ -40,22 +45,22 @@ const Slider = ({
     >
       <SliderPrimitive.Control
         className={cn(
-          'relative flex w-full touch-none items-center select-none group cursor-pointer',
+          'group relative flex w-full cursor-pointer touch-none items-center select-none',
           'data-[orientation=horizontal]:py-3',
-          'data-[orientation=vertical]:px-3 data-[orientation=vertical]:h-full data-[orientation=vertical]:w-auto data-[orientation=vertical]:flex-col',
-          'data-[disabled]:opacity-50 data-[disabled]:pointer-events-none data-[disabled]:cursor-not-allowed',
+          'data-[orientation=vertical]:h-full data-[orientation=vertical]:w-auto data-[orientation=vertical]:flex-col data-[orientation=vertical]:px-3',
+          'data-[disabled]:pointer-events-none data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50',
         )}
       >
         <SliderPrimitive.Track
           className={cn(
-            'relative grow overflow-hidden rounded-full bg-neutral6/20 select-none',
+            'relative grow overflow-hidden rounded-full bg-fill-strong select-none',
             'data-[orientation=horizontal]:h-1.5 data-[orientation=horizontal]:w-full',
             'data-[orientation=vertical]:h-full data-[orientation=vertical]:w-1.5',
           )}
         >
           <SliderPrimitive.Indicator
             className={cn(
-              'bg-neutral6 select-none',
+              'bg-foreground select-none',
               'data-[orientation=horizontal]:h-full',
               'data-[orientation=vertical]:w-full',
             )}
@@ -65,13 +70,16 @@ const Slider = ({
           <SliderPrimitive.Thumb
             key={index}
             index={index}
+            aria-label={ariaLabel}
+            aria-labelledby={ariaLabelledBy}
+            getAriaLabel={getAriaLabel}
             className={cn(
-              'relative block w-2.5 h-5 shrink-0 rounded-full bg-neutral2 border-2 border-neutral6 outline-hidden select-none',
+              'relative block h-5 w-2.5 shrink-0 rounded-full border-2 border-foreground bg-placeholder outline-hidden select-none',
               'after:absolute after:-inset-2 after:content-[""]',
               'transition-shadow duration-normal',
-              'hover:ring-2 hover:ring-neutral6/30',
-              'has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-neutral6/60',
-              'data-[orientation=vertical]:w-5 data-[orientation=vertical]:h-2.5',
+              'hover:ring-1 hover:ring-border-hover',
+              'has-[:focus-visible]:outline-1 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-border-focus has-[:focus-visible]:outline-solid',
+              'data-[orientation=vertical]:h-2.5 data-[orientation=vertical]:w-5',
               'data-[disabled]:pointer-events-none',
             )}
           />

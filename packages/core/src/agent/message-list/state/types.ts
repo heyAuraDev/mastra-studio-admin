@@ -1,5 +1,6 @@
 import type { UIMessage as UIMessageV4, CoreMessage as CoreMessageV4 } from '@internal/ai-sdk-v4';
 import type * as AIV5 from '@internal/ai-sdk-v5';
+import type { ProviderErrorFacts } from '../../../error/provider-error';
 import type { AIV5Type } from '../types';
 
 export type MessageSource =
@@ -33,6 +34,26 @@ export type MastraStepStartPart = {
   model?: string;
 } & MastraPartExtensions;
 
+// Persisted record of a terminal agent failure (retries, error processors and
+// fallback models all exhausted). Deliberately stores only JSON-safe fields:
+// stack traces, causes and other custom properties stay on the runtime error
+// surfaces (stream chunk, onError, result.error) and are never written to
+// thread history. Provider HTTP failures (AI SDK `APICallError`) also keep the
+// status code, a bounded copy of the response body, the provider request id,
+// the model the request named and the provider facts a reload classifies by
+// (every code, the provider's own reason sentence), because their `message` is
+// often just the HTTP status text.
+export type MastraErrorPart = {
+  type: 'error';
+  error: {
+    name: string;
+    message: string;
+    responseBody?: string;
+    requestId?: string;
+    modelId?: string;
+  } & ProviderErrorFacts;
+} & MastraPartExtensions;
+
 // Approval payload stored alongside tool invocations so v6 approval flows can
 // round-trip through MessageList.
 export type MastraToolApproval = {
@@ -44,6 +65,8 @@ export type MastraToolApproval = {
 export type MastraToolInvocation = Omit<LegacyToolInvocation, 'state'> & {
   state: LegacyToolInvocation['state'] | 'approval-requested' | 'approval-responded' | 'output-error' | 'output-denied';
   result?: unknown;
+  /** Set alongside `state: 'result'` when the tool executor reported a failure. */
+  isError?: boolean;
   errorText?: string;
   rawInput?: unknown;
   approval?: MastraToolApproval;
@@ -56,6 +79,8 @@ export type MastraToolInvocationPart = Omit<LegacyToolInvocationPart, 'toolInvoc
   title?: string;
   preliminary?: boolean;
   createdAt?: number;
+  /** Epoch ms of the latest state change (approval response, result, error). */
+  updatedAt?: number;
 };
 
 export type MastraSourceDocumentPart = {
@@ -73,14 +98,17 @@ export type MastraSourceUrlPart = Omit<LegacySourcePart, 'providerMetadata'> & {
   createdAt?: number;
 };
 
+// Named alias so TypeScript caches the Exclude expansion and avoids TS2589 when
+// MastraMessagePart is used alongside deeply-generic libraries like @hono/zod-openapi.
+type UIV4NonMastraPart = Exclude<UIMessageV4['parts'][number], { type: 'tool-invocation' | 'source' | 'step-start' }>;
+
 // Canonical stored part type. It starts from the v4 UI part model and extends
 // it with provider metadata, AI SDK v5 data parts, and v6-only persisted parts
 // such as approval-aware tool invocations and source documents.
 export type MastraMessagePart =
-  | PartWithProviderMetadata<
-      Exclude<UIMessageV4['parts'][number], { type: 'tool-invocation' | 'source' | 'step-start' }>
-    >
+  | PartWithProviderMetadata<UIV4NonMastraPart>
   | MastraStepStartPart
+  | MastraErrorPart
   | MastraToolInvocationPart
   | MastraSourceUrlPart
   | MastraSourceDocumentPart

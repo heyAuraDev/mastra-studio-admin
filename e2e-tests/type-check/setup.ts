@@ -4,10 +4,12 @@ import { glob as globby } from 'tinyglobby';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import getPort from 'get-port';
+import { execFileSync } from 'node:child_process';
 import { copyFile, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { startRegistry } from '../_local-registry-setup';
+import { setupPublishedRegistryFromEnv, startRegistry } from '../_local-registry-setup';
 import { publishPackages } from '../_local-registry-setup/publish';
+import { E2E_TAG, getSuitePublishFilters } from '../_local-registry-setup/publish-roots.js';
 import { createRequire } from 'node:module';
 
 let require = global.require;
@@ -18,7 +20,13 @@ if (typeof require === 'undefined') {
 export default async function setup(project: TestProject) {
   const __dirname = dirname(fileURLToPath(import.meta.url));
   const rootDir = join(__dirname, '..', '..');
-  const tag = 'type-check-test';
+  const publishedRegistryTeardown = await setupPublishedRegistryFromEnv(project);
+  if (publishedRegistryTeardown) {
+    return publishedRegistryTeardown;
+  }
+
+  const tag = E2E_TAG;
+  execFileSync('pnpm', ['--filter', './packages/mcp', 'build:lib'], { cwd: rootDir, stdio: 'inherit' });
   const teardown = await prepareMonorepo(rootDir, globby, tag);
 
   const verdaccioPath = require.resolve('verdaccio/bin/verdaccio');
@@ -32,7 +40,7 @@ export default async function setup(project: TestProject) {
   project.provide('tag', tag);
   project.provide('registry', registry.toString());
 
-  await publishPackages(['--filter="@mastra/core..."', '--filter="@mastra/client-js..."'], tag, rootDir, registry);
+  await publishPackages(await getSuitePublishFilters(rootDir, 'type-check'), tag, rootDir, registry);
 
   return () => {
     teardown();

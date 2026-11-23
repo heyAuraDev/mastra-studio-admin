@@ -5,13 +5,11 @@ import type { Mastra } from '../../../mastra';
 import type {
   ErrorProcessorOrWorkflow,
   InputProcessorOrWorkflow,
+  LLMRequestProcessorOrWorkflow,
   OutputProcessorOrWorkflow,
-  ProcessorState,
 } from '../../../processors';
 import type { RequestContext } from '../../../request-context';
 import type { Agent } from '../../agent';
-import { MessageList } from '../../message-list';
-import type { CreatedAgentSignal } from '../../signals';
 import type { AgentExecuteOnFinishOptions } from '../../types';
 
 export type AgentCapabilities = {
@@ -26,6 +24,8 @@ export type AgentCapabilities = {
   convertTools: Agent['convertTools'];
   runInputProcessors: Agent['__runInputProcessors'];
   executeOnFinish: (args: AgentExecuteOnFinishOptions) => Promise<void>;
+  /** Called when the run suspends (e.g. for tool approval), before it can be resumed. */
+  onRunSuspended?: () => void;
   outputProcessors?:
     | OutputProcessorOrWorkflow[]
     | ((args: {
@@ -39,17 +39,24 @@ export type AgentCapabilities = {
         overrides?: InputProcessorOrWorkflow[];
       }) => Promise<InputProcessorOrWorkflow[]> | InputProcessorOrWorkflow[]);
   llmRequestInputProcessors?:
-    | InputProcessorOrWorkflow[]
+    | LLMRequestProcessorOrWorkflow[]
     | ((args: {
         requestContext: RequestContext;
         overrides?: InputProcessorOrWorkflow[];
-      }) => Promise<InputProcessorOrWorkflow[]> | InputProcessorOrWorkflow[]);
+        errorOverrides?: ErrorProcessorOrWorkflow[];
+      }) => Promise<LLMRequestProcessorOrWorkflow[]> | LLMRequestProcessorOrWorkflow[]);
+  /**
+   * The function form resolves the run's error processors once and reports whether the caller
+   * configured any themselves (excluding framework defaults).
+   */
   errorProcessors?:
     | ErrorProcessorOrWorkflow[]
     | ((args: {
         requestContext: RequestContext;
         overrides?: ErrorProcessorOrWorkflow[];
-      }) => Promise<ErrorProcessorOrWorkflow[]> | ErrorProcessorOrWorkflow[]);
+      }) =>
+        | Promise<{ errorProcessors: ErrorProcessorOrWorkflow[]; hasConfiguredErrorProcessors: boolean }>
+        | { errorProcessors: ErrorProcessorOrWorkflow[]; hasConfiguredErrorProcessors: boolean });
   llm: MastraLLMVNext;
 };
 
@@ -73,16 +80,14 @@ export const storageThreadSchema = z.object({
   metadata: z.record(z.string(), z.any()).optional(),
 });
 
-export const prepareToolsStepOutputSchema = z.object({
-  convertedTools: z.record(z.string(), z.any()),
-});
+// Step outputs in the evented prepare-stream workflow only carry JSON-safe
+// markers — class instances (MessageList, Tools) and Maps (processorStates) live
+// on the factory-closure runScope instead. See ./run-scope.ts.
+export const prepareToolsStepOutputSchema = z.object({});
 
 export const prepareMemoryStepOutputSchema = z.object({
   threadExists: z.boolean(),
   thread: storageThreadSchema.optional(),
-  messageList: z.instanceof(MessageList),
-  /** Shared processor states map that persists across loop iterations for both input and output processors */
-  processorStates: z.instanceof(Map<string, ProcessorState>),
   /** Tripwire data when input processor triggered abort */
   tripwire: z
     .object({
@@ -92,8 +97,6 @@ export const prepareMemoryStepOutputSchema = z.object({
       processorId: z.string().optional(),
     })
     .optional(),
-  /** Signal inputs already stored in the initial message list that still need stream data-part echoes. */
-  initialSignalEchoes: z.array(z.custom<CreatedAgentSignal>()).optional(),
 });
 
 export type PrepareMemoryStepOutput = z.infer<typeof prepareMemoryStepOutputSchema>;

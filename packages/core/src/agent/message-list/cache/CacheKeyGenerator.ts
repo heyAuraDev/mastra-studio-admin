@@ -1,9 +1,11 @@
 import type { UIMessage as UIMessageV4 } from '@internal/ai-sdk-v4';
 import * as AIV5 from '@internal/ai-sdk-v5';
 
-import { getImageCacheKey } from '../prompt/image-utils';
+import { getImageCacheKey, resolveFilePartMediaTypeAndData } from '../prompt/image-utils';
 import type { AIV5Type, CoreMessageV4 } from '../types';
 import { getResponseProviderItemKeys } from '../utils/response-item-metadata';
+import { appendReasoningIdentityKeys, hashIdentityValue } from './reasoning-identity';
+import { stableStringify } from './stable-stringify';
 import type { MastraMessagePart, UIMessageV4Part } from './types';
 
 function appendResponseProviderItemKeys(cacheKey: string, ...providerSources: unknown[]): string {
@@ -31,6 +33,8 @@ function appendResponseProviderItemKeys(cacheKey: string, ...providerSources: un
  * - Same message content should always produce the same key
  * - Different content should produce different keys
  * - Provider metadata (e.g., OpenAI/Azure OpenAI text, reasoning, and tool itemId) must be included for proper distinction
+ * - Reasoning identity held in any provider namespace (signatures, redacted data, item ids) is included,
+ *   so empty-text reasoning blocks from different steps stay distinct without provider-specific helpers
  */
 export class CacheKeyGenerator {
   /**
@@ -61,9 +65,9 @@ export class CacheKeyGenerator {
     }
     if (part.type === 'reasoning') {
       cacheKey += part.reasoning;
-      cacheKey += part.details.reduce((prev, current) => {
+      cacheKey += (part.details ?? []).reduce((prev, current) => {
         if (current.type === 'text') {
-          return prev + current.text.length + (current.signature?.length || 0);
+          return prev + (current.text?.length ?? 0) + (current.signature?.length || 0);
         }
         return prev;
       }, 0);
@@ -90,10 +94,22 @@ export class CacheKeyGenerator {
       if (partAny && Object.hasOwn(partAny, 'providerMetadata')) {
         cacheKey = appendResponseProviderItemKeys(cacheKey, partAny.providerMetadata);
       }
+
+      // Other providers (Anthropic, Bedrock, Gemini, ...) carry reasoning identity such as
+      // signatures or redacted data in metadata or in reasoning details. Fold it in generically.
+      cacheKey = appendReasoningIdentityKeys(cacheKey, partAny?.providerMetadata);
+      for (const detail of part.details ?? []) {
+        const identity = detail.type === 'text' ? detail.signature : detail.data;
+        if (identity) cacheKey += `|${detail.type}:${hashIdentityValue(identity)}`;
+      }
     }
     if (part.type === 'file') {
-      cacheKey += part.data;
-      cacheKey += part.mimeType;
+      // Stored parts can be v5-shaped (`mediaType`/`url`) even though this union only
+      // describes v4 (`mimeType`/`data`); both fields read as `undefined` otherwise,
+      // collapsing distinct v5 file parts onto the same cache key. Mirrors #17366.
+      const { mediaType, data } = resolveFilePartMediaTypeAndData(part);
+      cacheKey += data;
+      cacheKey += mediaType;
     }
 
     return cacheKey;
@@ -109,7 +125,7 @@ export class CacheKeyGenerator {
       if (part.type.startsWith('data-')) {
         // Stringify data for proper cache key comparison since data can be any type
         const data = (part as AIV5Type.DataUIPart<AIV5.UIDataTypes>).data;
-        key += JSON.stringify(data);
+        key += stableStringify(data); // order-independent: jsonb vs text storage may reorder keys
       } else {
         // Cast to UIMessageV4Part since we've already handled data-* parts above
         key += CacheKeyGenerator.fromAIV4Part(part as UIMessageV4Part);
@@ -135,6 +151,8 @@ export class CacheKeyGenerator {
         key += part.text.length;
         const partAny = part as any;
         key = appendResponseProviderItemKeys(key, partAny.providerMetadata, partAny.providerOptions);
+        key = appendReasoningIdentityKeys(key, partAny.providerMetadata, partAny.providerOptions);
+        if (part.signature) key += `|signature:${hashIdentityValue(part.signature)}`;
       }
       if (part.type === 'tool-call') {
         key += part.toolCallId;
@@ -154,6 +172,7 @@ export class CacheKeyGenerator {
       }
       if (part.type === 'redacted-reasoning') {
         key += part.data.length;
+        key += `|${hashIdentityValue(part.data)}`;
       }
     }
     return key;
@@ -177,6 +196,7 @@ export class CacheKeyGenerator {
       if (part.type === 'reasoning') {
         key += part.text;
         key = appendResponseProviderItemKeys(key, (part as any).providerMetadata);
+        key = appendReasoningIdentityKeys(key, (part as any).providerMetadata);
       }
       if (part.type === 'file') {
         key += part.url.length;
@@ -202,6 +222,7 @@ export class CacheKeyGenerator {
       if (part.type === 'reasoning') {
         key += part.text.length;
         key = appendResponseProviderItemKeys(key, (part as any).providerOptions);
+        key = appendReasoningIdentityKeys(key, (part as any).providerOptions);
       }
       if (part.type === 'tool-call') {
         key += part.toolCallId;

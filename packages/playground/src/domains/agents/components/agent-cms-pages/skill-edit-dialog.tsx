@@ -1,131 +1,480 @@
 import type { StoredSkillResponse } from '@mastra/client-js';
-import { Button, Input, SideDialog, Txt } from '@mastra/playground-ui';
-import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@mastra/playground-ui/components/Select';
+import { SideDialog } from '@mastra/playground-ui/components/SideDialog';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@mastra/playground-ui/components/Tooltip';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { SkillSimpleForm } from '@mastra/playground-ui/domains/skills/skill-simple-form';
+import { IconCheckmark2Medium } from '@mastra/playground-ui/icons/central/IconCheckmark2Medium';
+import { IconChevronDownMedium } from '@mastra/playground-ui/icons/central/IconChevronDownMedium';
+import { IconChevronRightMedium } from '@mastra/playground-ui/icons/central/IconChevronRightMedium';
+import { IconExclamationTriangle } from '@mastra/playground-ui/icons/central/IconExclamationTriangle';
+import { IconGlobe } from '@mastra/playground-ui/icons/central/IconGlobe';
+import { IconLock } from '@mastra/playground-ui/icons/central/IconLock';
+import { IconPencil } from '@mastra/playground-ui/icons/central/IconPencil';
 
+import { IconSettingsSliderHor } from '@mastra/playground-ui/icons/central/IconSettingsSliderHor';
+import { IconSquareBehindSquare1 } from '@mastra/playground-ui/icons/central/IconSquareBehindSquare1';
+import { Icon } from '@mastra/playground-ui/icons/Icon';
+import { SkillIcon } from '@mastra/playground-ui/icons/SkillIcon';
+import { controlStateColorTransition } from '@mastra/playground-ui/primitives/transitions';
+import { quietTextHover } from '@mastra/playground-ui/primitives/typography';
+import { cn } from '@mastra/playground-ui/utils/cn';
+import { toast } from '@mastra/playground-ui/utils/toast';
+import { useAuthCapabilities } from '@mastra/react/hooks/auth';
+import { useWorkspaceInfo, useStoredWorkspaces } from '@mastra/react/hooks/workspace';
+import { nanoid } from 'nanoid';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useCreateSkill } from '../../hooks/use-create-skill';
+import { useUpdateSkill } from '../../hooks/use-update-skill';
 import type { InMemoryFileNode } from '../agent-edit-page/utils/form-validation';
-import { createInitialStructure, updateRootFolderName } from './skill-file-tree';
+import { SkillChatComposer } from './skill-chat-composer';
+import {
+  createInitialStructure,
+  extractSkillInstructions,
+  updateNodeContent,
+  updateRootFolderName,
+} from './skill-file-tree-utils';
 import { SkillFolder } from './skill-folder';
-import { useWorkspaces } from '@/domains/workspace/hooks';
+import { AgentColorProvider } from '@/domains/agent-builder/contexts/agent-color-context';
+import { useBuilderSettings } from '@/domains/agent-builder/hooks/use-builder-settings';
+import { useDefaultVisibility } from '@/domains/auth/hooks/use-default-visibility';
+
+type DialogMode = 'simple' | 'advanced';
 
 export interface SkillEditDialogProps {
   isOpen: boolean;
   onClose: () => void;
-  onSkillCreated: (skill: StoredSkillResponse, workspaceId: string) => void;
-  readOnly?: boolean;
+  onSkillCreated?: (skill: StoredSkillResponse, workspaceId: string) => void;
+  onSkillUpdated?: (skill: StoredSkillResponse) => void;
+  /** When provided, opens in view/edit mode for an existing skill */
+  skill?: StoredSkillResponse;
+  /** Current user ID for ownership checks */
+  currentUserId?: string;
+  /** Whether the current user is an admin (enables advanced file-tree mode) */
+  isAdmin?: boolean;
+  /**
+   * Optional copy action shown when viewing a public skill the user does not own.
+   * Call site is responsible for prompting for a name and invoking the copy mutation.
+   */
+  onCopy?: (skill: StoredSkillResponse) => void;
 }
 
-export function SkillEditDialog({ isOpen, onClose, onSkillCreated, readOnly }: SkillEditDialogProps) {
+export function SkillEditDialog({
+  isOpen,
+  onClose,
+  onSkillCreated,
+  onSkillUpdated,
+  skill,
+  currentUserId,
+  isAdmin,
+  onCopy,
+}: SkillEditDialogProps) {
+  const [mode, setMode] = useState<DialogMode>('simple');
+  const [isEditing, setIsEditing] = useState(false);
+  const [chatSessionKey, setChatSessionKey] = useState(() => nanoid());
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
+  const [visibility, setVisibility] = useState<'private' | 'public'>('private');
+  const [instructions, setInstructions] = useState('');
   const [workspaceId, setWorkspaceId] = useState('');
   const [files, setFiles] = useState<InMemoryFileNode[]>([]);
+  // In create mode, form is hidden until agent populates fields or user expands it
+  const [showForm, setShowForm] = useState(false);
   const prevNameRef = useRef('');
   const createSkill = useCreateSkill();
-  const { data: workspacesData } = useWorkspaces();
+  const updateSkill = useUpdateSkill();
+  const { data: workspacesData } = useStoredWorkspaces();
+  const { data: builderSettings } = useBuilderSettings();
+  const { data: authCapabilities } = useAuthCapabilities();
+  const authEnabled = !!authCapabilities?.enabled;
+  const defaultVisibility = useDefaultVisibility();
   const workspaceOptions = useMemo(
-    () => (workspacesData?.workspaces ?? []).map(ws => ({ value: ws.id, label: ws.name })),
+    () =>
+      (workspacesData?.workspaces ?? [])
+        .filter(ws => ws.status !== 'archived')
+        .sort((a, b) => (b.runtimeRegistered ? 1 : 0) - (a.runtimeRegistered ? 1 : 0))
+        .map(ws => ({ value: ws.id, label: ws.name })),
     [workspacesData],
   );
+  const { data: workspaceInfo } = useWorkspaceInfo({
+    workspaceId: workspaceId || undefined,
+    queryOptions: { enabled: !!workspaceId },
+  });
+  // Skill files are written through the /fs routes, which cannot reach a filesystem that comes from a resolver.
+  const hasDynamicFilesystem = !!workspaceInfo?.capabilities?.hasDynamicFilesystem;
+  const hasFilesystem = (workspaceInfo?.capabilities?.hasFilesystem ?? true) && !hasDynamicFilesystem;
 
+  const builderDefaultWorkspaceId = useMemo(() => {
+    const ws = builderSettings?.configuration?.agent?.workspace as { type: string; workspaceId?: string } | undefined;
+    return ws?.type === 'id' ? ws.workspaceId : undefined;
+  }, [builderSettings]);
+
+  const isExistingSkill = !!skill;
+  const isOwner = !skill || !currentUserId || skill.authorId === currentUserId;
+  const isViewMode = isExistingSkill && !isEditing;
+  const isReadOnly = isViewMode || !isOwner;
+  const hasFields = !!(name.trim() || description.trim() || instructions.trim());
+
+  // Reset state when dialog opens/closes or skill changes
   useEffect(() => {
     if (isOpen) {
-      setName('');
-      setDescription('');
-      setWorkspaceId(workspaceOptions.length === 1 ? workspaceOptions[0].value : '');
-      setFiles([]);
-      prevNameRef.current = '';
-    }
-  }, [isOpen, workspaceOptions]);
-
-  const handleNameChange = useCallback(
-    (newName: string) => {
-      setName(newName);
-
-      const hasStructure = files.some(n => n.id === 'root');
-
-      if (!hasStructure && newName.trim()) {
-        setFiles(createInitialStructure(newName));
-      } else if (hasStructure) {
-        setFiles(prev => updateRootFolderName(prev, newName));
+      if (skill) {
+        // View/edit mode for existing skill
+        setName(skill.name ?? '');
+        setDescription(skill.description ?? '');
+        setVisibility(skill.visibility ?? defaultVisibility);
+        setInstructions(skill.instructions ?? '');
+        setIsEditing(false);
+        setMode('simple');
+        setShowForm(true); // Always show form for existing skills
+        if (skill.files?.length) {
+          setFiles(skill.files as InMemoryFileNode[]);
+        } else {
+          const initial = createInitialStructure(skill.name ?? 'untitled');
+          setFiles(skill.instructions ? updateNodeContent(initial, 'skill-md', skill.instructions) : initial);
+        }
+        setWorkspaceId(builderDefaultWorkspaceId ?? (workspaceOptions.length === 1 ? workspaceOptions[0].value : ''));
+      } else {
+        // Create mode — start chat-first
+        setName('');
+        setDescription('');
+        setVisibility(defaultVisibility);
+        setInstructions('');
+        setWorkspaceId(builderDefaultWorkspaceId ?? (workspaceOptions.length === 1 ? workspaceOptions[0].value : ''));
+        setFiles([]);
+        setIsEditing(false);
+        setMode('simple');
+        setShowForm(false); // Hide form until agent fills or user expands
       }
+      prevNameRef.current = '';
+      setChatSessionKey(nanoid());
+    }
+  }, [isOpen, skill, workspaceOptions, builderDefaultWorkspaceId, defaultVisibility]);
 
-      prevNameRef.current = newName;
-    },
-    [files],
-  );
+  const handleNameChange = useCallback((newName: string) => {
+    setName(newName);
+    setInstructions(currentInstructions => {
+      // Read latest instructions via functional updater (no-op on the value)
+      setFiles(prev => {
+        const hasStructure = prev.some(n => n.id === 'root');
+        if (!hasStructure && newName.trim()) {
+          const initial = createInitialStructure(newName);
+          return currentInstructions ? updateNodeContent(initial, 'skill-md', currentInstructions) : initial;
+        } else if (hasStructure) {
+          return updateRootFolderName(prev, newName);
+        }
+        return prev;
+      });
+      return currentInstructions; // don't change instructions
+    });
+    prevNameRef.current = newName;
+  }, []);
+
+  const handleInstructionsChange = useCallback((newInstructions: string) => {
+    setInstructions(newInstructions);
+    setFiles(prev => {
+      const hasStructure = prev.some(n => n.id === 'root');
+      if (hasStructure) {
+        return updateNodeContent(prev, 'skill-md', newInstructions);
+      }
+      return prev;
+    });
+  }, []);
+
+  // Keep instructions state in sync when the file tree changes (e.g. admin
+  // edits SKILL.md directly in the code editor in advanced mode).
+  const handleFilesChange = useCallback((newFiles: InMemoryFileNode[]) => {
+    setFiles(newFiles);
+    const skillMdContent = extractSkillInstructions(newFiles);
+    setInstructions(skillMdContent);
+  }, []);
+
+  const handleFieldsPopulated = useCallback(() => {
+    setShowForm(true);
+  }, []);
 
   const handleSave = useCallback(async () => {
-    const result = await createSkill.mutateAsync({
-      name,
-      description,
-      workspaceId,
-      files,
-    });
-    onSkillCreated(result, workspaceId);
-    onClose();
-  }, [name, description, workspaceId, files, createSkill, onSkillCreated, onClose]);
+    let filesToSave = files;
+    if (!filesToSave.some(n => n.id === 'root') && name.trim()) {
+      // No file structure yet — create it
+      filesToSave = createInitialStructure(name);
+    }
+    // Always sync instructions state into SKILL.md before saving.
+    // This is the authoritative source — handleFilesChange keeps it in sync
+    // with any direct SKILL.md edits made in advanced mode.
+    if (instructions && filesToSave.some(n => n.id === 'root')) {
+      filesToSave = updateNodeContent(filesToSave, 'skill-md', instructions);
+    }
+
+    if (isExistingSkill && skill) {
+      let result: StoredSkillResponse;
+      try {
+        result = await updateSkill.mutateAsync({
+          id: skill.id,
+          name,
+          description,
+          visibility,
+          instructions,
+        });
+      } catch (error) {
+        toast.error(`Failed to update skill: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        return;
+      }
+      onSkillUpdated?.(result);
+      onClose();
+    } else {
+      let result: StoredSkillResponse;
+      try {
+        result = await createSkill.mutateAsync({
+          name,
+          description,
+          visibility,
+          workspaceId,
+          files: filesToSave,
+        });
+      } catch (error) {
+        toast.error(`Failed to create skill: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        return;
+      }
+      onSkillCreated?.(result, workspaceId);
+      onClose();
+    }
+  }, [
+    name,
+    description,
+    visibility,
+    instructions,
+    workspaceId,
+    files,
+    isExistingSkill,
+    skill,
+    createSkill,
+    updateSkill,
+    onSkillCreated,
+    onSkillUpdated,
+    onClose,
+  ]);
+
+  const isPending = createSkill.isPending || updateSkill.isPending;
+
+  const dialogTitle = isExistingSkill ? (isEditing ? 'Edit Skill' : 'Skill Details') : 'Add Skill';
 
   return (
     <SideDialog
-      dialogTitle="Add Skill"
-      dialogDescription="Configure skill details and workspace files"
+      dialogTitle={dialogTitle}
+      dialogDescription={isExistingSkill ? 'View or edit skill details' : 'Describe what your skill should do'}
       isOpen={isOpen}
       onClose={onClose}
       className="h-full"
     >
       <SideDialog.Top>
-        <span className="flex-1">New Skill</span>
-        {!readOnly && (
-          <Button
-            variant="primary"
-            size="sm"
-            onClick={handleSave}
-            disabled={!name.trim() || !workspaceId || createSkill.isPending}
-            className="mr-6"
-          >
-            {createSkill.isPending ? 'Creating...' : 'Save'}
-          </Button>
-        )}
+        <SideDialog.Heading as="h2" className="flex-1 items-center">
+          {dialogTitle}
+          {isViewMode && skill?.visibility === 'private' && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="shrink-0 text-muted-foreground" aria-label="Private skill">
+                  <Icon size="xs">
+                    <IconLock />
+                  </Icon>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>Only visible to you</TooltipContent>
+            </Tooltip>
+          )}
+        </SideDialog.Heading>
+        <div className="mr-6 flex items-center gap-2">
+          {isViewMode && isOwner && (
+            <Button size="sm" onClick={() => setIsEditing(true)} icon={<IconPencil />}>
+              Edit
+            </Button>
+          )}
+          {isViewMode && !isOwner && onCopy && skill && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button size="sm" onClick={() => onCopy(skill)} icon={<IconSquareBehindSquare1 />}>
+                  Copy
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Make your own private copy you can edit</TooltipContent>
+            </Tooltip>
+          )}
+          {!isReadOnly && (
+            <>
+              {authEnabled && (
+                <Select value={visibility} onValueChange={next => setVisibility(next)}>
+                  <SelectTrigger size="sm" aria-label="Visibility" className="w-fit gap-1.5">
+                    <SelectValue placeholder="Visibility" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="private">
+                      <span className="flex items-center gap-2">
+                        <IconLock className="size-icon-sm" />
+                        Private
+                      </span>
+                    </SelectItem>
+                    <SelectItem value="public">
+                      <span className="flex items-center gap-2">
+                        <IconGlobe className="size-icon-sm" />
+                        Public
+                      </span>
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              )}
+              <Button
+                icon={isExistingSkill ? <IconCheckmark2Medium /> : <SkillIcon />}
+                variant="primary"
+                size="sm"
+                onClick={handleSave}
+                disabled={!name.trim() || isPending}
+              >
+                {isPending ? 'Saving...' : isExistingSkill ? 'Save' : 'Create'}
+              </Button>
+            </>
+          )}
+        </div>
       </SideDialog.Top>
 
-      <SideDialog.Content className="overflow-y-auto h-full grid-rows-[auto_1fr]">
-        <div className="flex flex-col gap-4">
-          <div className="flex flex-col gap-1.5">
-            <Txt as="label" variant="ui-sm" className="text-neutral3">
-              Name
-            </Txt>
-            <Input
-              value={name}
-              onChange={e => handleNameChange(e.target.value)}
-              placeholder="Skill name"
-              disabled={readOnly}
-            />
-          </div>
-
-          <div className="flex flex-col gap-1.5">
-            <Txt as="label" variant="ui-sm" className="text-neutral3">
-              Description
-            </Txt>
-            <Input
-              value={description}
-              onChange={e => setDescription(e.target.value)}
-              placeholder="Brief description of the skill"
-              disabled={readOnly}
-            />
-          </div>
-        </div>
-
-        <div className="h-full border border-border1 rounded-lg overflow-hidden">
-          <SkillFolder
-            files={files}
-            onChange={setFiles}
-            readOnly={readOnly}
-            workspaceOptions={workspaceOptions}
-            workspaceId={workspaceId}
-            setWorkspaceId={setWorkspaceId}
+      <SideDialog.Content className="h-full overflow-y-auto">
+        {isReadOnly ? (
+          /* View mode — just show the form */
+          <SkillSimpleForm
+            name={name}
+            onNameChange={handleNameChange}
+            description={description}
+            onDescriptionChange={setDescription}
+            instructions={instructions}
+            onInstructionsChange={handleInstructionsChange}
+            readOnly
           />
-        </div>
+        ) : (
+          /* Create/Edit mode — single scrollable column: chat on top, form below */
+          <div className="flex flex-col gap-4">
+            {/* Chat section — always on top */}
+            <AgentColorProvider agentId={skill?.id ?? chatSessionKey}>
+              <SkillChatComposer
+                sessionKey={chatSessionKey}
+                hasFields={hasFields}
+                onFieldsPopulated={handleFieldsPopulated}
+                formState={{ name, description, instructions }}
+                onNameChange={handleNameChange}
+                onDescriptionChange={setDescription}
+                onInstructionsChange={handleInstructionsChange}
+              />
+            </AgentColorProvider>
+
+            {/* Form section — revealed after agent populates or user expands */}
+            {showForm ? (
+              <div className="border-t border-border pt-4">
+                <button
+                  onClick={() => setShowForm(false)}
+                  className={cn('mb-3 flex items-center gap-1.5', quietTextHover, controlStateColorTransition)}
+                >
+                  <IconChevronDownMedium className="size-icon-xs" />
+                  <Txt as="span" variant="caption" className="block">
+                    Hide skill details
+                  </Txt>
+                </button>
+
+                {isAdmin && (!hasFilesystem || !workspaceId) && (
+                  <div className="mb-4 flex items-start gap-2 rounded-lg bg-warning-subtle p-3 text-warning-subtle-foreground">
+                    <IconExclamationTriangle className="mt-0.5 size-icon-md shrink-0" />
+                    <Txt as="span" variant="caption">
+                      {!workspaceId
+                        ? 'No workspace available. The skill will be saved to the database only.'
+                        : hasDynamicFilesystem
+                          ? "This workspace resolves its filesystem per request, so skill files can't be written to it. The skill will be saved to the database only."
+                          : 'No workspace filesystem configured. The skill will be saved to the database only.'}
+                    </Txt>
+                  </div>
+                )}
+
+                {mode === 'simple' ? (
+                  <>
+                    <SkillSimpleForm
+                      name={name}
+                      onNameChange={handleNameChange}
+                      description={description}
+                      onDescriptionChange={setDescription}
+                      instructions={instructions}
+                      onInstructionsChange={handleInstructionsChange}
+                    />
+
+                    {isAdmin && (
+                      <button
+                        onClick={() => {
+                          // Ensure file tree has latest instructions before switching
+                          const hasStructure = files.some(n => n.id === 'root');
+                          if (!hasStructure && name.trim()) {
+                            setFiles(
+                              instructions
+                                ? updateNodeContent(createInitialStructure(name), 'skill-md', instructions)
+                                : createInitialStructure(name),
+                            );
+                          } else if (hasStructure && instructions) {
+                            setFiles(prev => updateNodeContent(prev, 'skill-md', instructions));
+                          }
+                          setMode('advanced');
+                        }}
+                        className={cn('mt-3 flex items-center gap-1.5', quietTextHover, controlStateColorTransition)}
+                      >
+                        <IconSettingsSliderHor className="size-icon-sm" />
+                        <Txt as="span" variant="caption" className="block">
+                          Advanced mode
+                        </Txt>
+                        <IconChevronRightMedium className="size-icon-xs" />
+                      </button>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    {isAdmin && (
+                      <button
+                        onClick={() => {
+                          // Pull SKILL.md edits back into the simple form
+                          const extracted = extractSkillInstructions(files);
+                          if (extracted) {
+                            setInstructions(extracted);
+                          }
+                          setMode('simple');
+                        }}
+                        className={cn('mb-3 flex items-center gap-1.5', quietTextHover, controlStateColorTransition)}
+                      >
+                        <IconPencil className="size-icon-sm" />
+                        <Txt as="span" variant="caption" className="block">
+                          Simple mode
+                        </Txt>
+                        <IconChevronRightMedium className="size-icon-xs" />
+                      </button>
+                    )}
+                    <SkillFolder
+                      files={files}
+                      onChange={handleFilesChange}
+                      readOnly={false}
+                      workspaceId={workspaceId}
+                      setWorkspaceId={setWorkspaceId}
+                      workspaceOptions={workspaceOptions}
+                    />
+                  </>
+                )}
+              </div>
+            ) : (
+              <div className="border-t border-border pt-3">
+                <button
+                  onClick={() => setShowForm(true)}
+                  className={cn('flex items-center gap-1.5', quietTextHover, controlStateColorTransition)}
+                >
+                  <IconChevronRightMedium className="size-icon-xs" />
+                  <Txt as="span" variant="caption" className="block">
+                    {hasFields ? 'Show skill details' : 'or fill in manually'}
+                  </Txt>
+                </button>
+              </div>
+            )}
+          </div>
+        )}
       </SideDialog.Content>
     </SideDialog>
   );

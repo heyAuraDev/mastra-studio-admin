@@ -1,5 +1,440 @@
 # @mastra/voice-xai-realtime
 
+## 0.2.19-alpha.0
+
+### Patch Changes
+
+- Raised the minimum `ws` version to 8.23.0, which limits pending automatic pongs and terminates the connection when that limit is exceeded. ([#30840](https://github.com/mastra-ai/mastra/pull/30840))
+
+## 0.2.18
+
+### Patch Changes
+
+- Updated dependencies [[`e1a2036`](https://github.com/mastra-ai/mastra/commit/e1a20364af31f433d0f91cb3f5ce8e49eb45b615), [`056d35d`](https://github.com/mastra-ai/mastra/commit/056d35d943316bdf657e4a504b2082cb6c14c075), [`04803ea`](https://github.com/mastra-ai/mastra/commit/04803ea00e168759ed3e28ce8a65977df7355df9)]:
+  - @mastra/schema-compat@1.4.0
+
+## 0.2.18-alpha.2
+
+### Patch Changes
+
+- Updated dependencies [[`e1a2036`](https://github.com/mastra-ai/mastra/commit/e1a20364af31f433d0f91cb3f5ce8e49eb45b615)]:
+  - @mastra/schema-compat@1.4.0-alpha.2
+
+## 0.2.18-alpha.1
+
+### Patch Changes
+
+- Updated dependencies [[`056d35d`](https://github.com/mastra-ai/mastra/commit/056d35d943316bdf657e4a504b2082cb6c14c075)]:
+  - @mastra/schema-compat@1.4.0-alpha.1
+
+## 0.2.18-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`04803ea`](https://github.com/mastra-ai/mastra/commit/04803ea00e168759ed3e28ce8a65977df7355df9)]:
+  - @mastra/schema-compat@1.3.18-alpha.0
+
+## 0.2.17
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`ws@^8.22.0` ↗︎](https://www.npmjs.com/package/ws/v/8.22.0) (from `^8.21.3`, in `dependencies`)
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+  - Updated dependency [`@types/ws@^8.18.2` ↗︎](https://www.npmjs.com/package/@types/ws/v/8.18.2) (from `^8.18.1`, in `devDependencies`)
+- Updated dependencies [[`ce5d473`](https://github.com/mastra-ai/mastra/commit/ce5d4731eeeb44779748852618b95c5cb6485bed)]:
+  - @mastra/schema-compat@1.3.17
+
+## 0.2.17-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`ws@^8.22.0` ↗︎](https://www.npmjs.com/package/ws/v/8.22.0) (from `^8.21.3`, in `dependencies`)
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+  - Updated dependency [`@types/ws@^8.18.2` ↗︎](https://www.npmjs.com/package/@types/ws/v/8.18.2) (from `^8.18.1`, in `devDependencies`)
+- Updated dependencies [[`ce5d473`](https://github.com/mastra-ai/mastra/commit/ce5d4731eeeb44779748852618b95c5cb6485bed)]:
+  - @mastra/schema-compat@1.3.17-alpha.0
+
+## 0.2.16
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+- Updated dependencies [[`fae54c5`](https://github.com/mastra-ai/mastra/commit/fae54c57917cd1f527937ca42b5ab7dfe1d55a2a)]:
+  - @mastra/schema-compat@1.3.16
+
+## 0.2.16-alpha.0
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+- Updated dependencies [[`fae54c5`](https://github.com/mastra-ai/mastra/commit/fae54c57917cd1f527937ca42b5ab7dfe1d55a2a)]:
+  - @mastra/schema-compat@1.3.16-alpha.0
+
+## 0.2.15
+
+### Patch Changes
+
+- Updated dependencies [[`c6230e3`](https://github.com/mastra-ai/mastra/commit/c6230e30f76b4b912bad68f426d730da1cb67d83), [`cb015a1`](https://github.com/mastra-ai/mastra/commit/cb015a1be6560cbaf4deaef219cb02e63b263bc3)]:
+  - @mastra/schema-compat@1.3.15
+
+## 0.2.15-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`c6230e3`](https://github.com/mastra-ai/mastra/commit/c6230e30f76b4b912bad68f426d730da1cb67d83), [`cb015a1`](https://github.com/mastra-ai/mastra/commit/cb015a1be6560cbaf4deaef219cb02e63b263bc3)]:
+  - @mastra/schema-compat@1.3.15-alpha.0
+
+## 0.2.14
+
+### Patch Changes
+
+- Updated dependencies [[`ca92c02`](https://github.com/mastra-ai/mastra/commit/ca92c02696427baad81dd7a61b049ef37c332452)]:
+  - @mastra/schema-compat@1.3.14
+
+## 0.2.14-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`ca92c02`](https://github.com/mastra-ai/mastra/commit/ca92c02696427baad81dd7a61b049ef37c332452)]:
+  - @mastra/schema-compat@1.3.14-alpha.0
+
+## 0.2.13
+
+### Patch Changes
+
+- Updated dependencies [[`4ac8bc7`](https://github.com/mastra-ai/mastra/commit/4ac8bc76e97278370f4ee0efabe71e9295f8f03f)]:
+  - @mastra/schema-compat@1.3.13
+
+## 0.2.13-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`4ac8bc7`](https://github.com/mastra-ai/mastra/commit/4ac8bc76e97278370f4ee0efabe71e9295f8f03f)]:
+  - @mastra/schema-compat@1.3.13-alpha.0
+
+## 0.2.12
+
+### Patch Changes
+
+- Updated dependencies [[`3f50f2a`](https://github.com/mastra-ai/mastra/commit/3f50f2a59068fc91ef7ccc513e5d93845faa298e), [`3913a33`](https://github.com/mastra-ai/mastra/commit/3913a33fd5b13dc226b1ed6253c9357cb392dd04), [`08a0aea`](https://github.com/mastra-ai/mastra/commit/08a0aea2f2af12276e333c62aaf368a9240ff68f)]:
+  - @mastra/schema-compat@1.3.12
+
+## 0.2.12-alpha.1
+
+### Patch Changes
+
+- Updated dependencies [[`3f50f2a`](https://github.com/mastra-ai/mastra/commit/3f50f2a59068fc91ef7ccc513e5d93845faa298e)]:
+  - @mastra/schema-compat@1.3.12-alpha.1
+
+## 0.2.12-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`3913a33`](https://github.com/mastra-ai/mastra/commit/3913a33fd5b13dc226b1ed6253c9357cb392dd04), [`08a0aea`](https://github.com/mastra-ai/mastra/commit/08a0aea2f2af12276e333c62aaf368a9240ff68f)]:
+  - @mastra/schema-compat@1.3.12-alpha.0
+
+## 0.2.11
+
+### Patch Changes
+
+- Fixed a WebSocket denial-of-service advisory by updating ws to 8.21.3. ([#24027](https://github.com/mastra-ai/mastra/pull/24027))
+
+- Updated dependencies [[`5085475`](https://github.com/mastra-ai/mastra/commit/5085475c0da226e618eb3ee2676d347788c3fb00), [`fef227a`](https://github.com/mastra-ai/mastra/commit/fef227a8b7cb0ad7f68087e26d1fd2051054a61a), [`6c781fd`](https://github.com/mastra-ai/mastra/commit/6c781fda62eb0b0b74d016f188ed0b2db5cfdceb)]:
+  - @mastra/schema-compat@1.3.11
+
+## 0.2.11-alpha.1
+
+### Patch Changes
+
+- Updated dependencies [[`5085475`](https://github.com/mastra-ai/mastra/commit/5085475c0da226e618eb3ee2676d347788c3fb00), [`6c781fd`](https://github.com/mastra-ai/mastra/commit/6c781fda62eb0b0b74d016f188ed0b2db5cfdceb)]:
+  - @mastra/schema-compat@1.3.11-alpha.1
+
+## 0.2.11-alpha.0
+
+### Patch Changes
+
+- Fixed a WebSocket denial-of-service advisory by updating ws to 8.21.3. ([#24027](https://github.com/mastra-ai/mastra/pull/24027))
+
+- Updated dependencies [[`fef227a`](https://github.com/mastra-ai/mastra/commit/fef227a8b7cb0ad7f68087e26d1fd2051054a61a)]:
+  - @mastra/schema-compat@1.3.11-alpha.0
+
+## 0.2.10
+
+### Patch Changes
+
+- Updated dependencies [[`ffe16f1`](https://github.com/mastra-ai/mastra/commit/ffe16f17447449b7155f1f15992e3c9e5f6511ac), [`80608ed`](https://github.com/mastra-ai/mastra/commit/80608ede1a9e5d7d8488ac511245bf327e8987e3)]:
+  - @mastra/schema-compat@1.3.10
+
+## 0.2.10-alpha.1
+
+### Patch Changes
+
+- Updated dependencies [[`ffe16f1`](https://github.com/mastra-ai/mastra/commit/ffe16f17447449b7155f1f15992e3c9e5f6511ac)]:
+  - @mastra/schema-compat@1.3.10-alpha.1
+
+## 0.2.10-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`80608ed`](https://github.com/mastra-ai/mastra/commit/80608ede1a9e5d7d8488ac511245bf327e8987e3)]:
+  - @mastra/schema-compat@1.3.10-alpha.0
+
+## 0.2.9
+
+### Patch Changes
+
+- Updated dependencies [[`40f3647`](https://github.com/mastra-ai/mastra/commit/40f36478291d6098f762fc639d545357732b77b4)]:
+  - @mastra/schema-compat@1.3.9
+
+## 0.2.9-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`40f3647`](https://github.com/mastra-ai/mastra/commit/40f36478291d6098f762fc639d545357732b77b4)]:
+  - @mastra/schema-compat@1.3.9-alpha.0
+
+## 0.2.8
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+- Updated dependencies [[`e983f74`](https://github.com/mastra-ai/mastra/commit/e983f749873189f767f509eb33d1a3596c0f1c74), [`28ce924`](https://github.com/mastra-ai/mastra/commit/28ce924276eeca492e6a360e5482ed20c2785ef6)]:
+  - @mastra/schema-compat@1.3.8
+
+## 0.2.8-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Updated dependencies [[`e983f74`](https://github.com/mastra-ai/mastra/commit/e983f749873189f767f509eb33d1a3596c0f1c74)]:
+  - @mastra/schema-compat@1.3.8-alpha.1
+
+## 0.2.8-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+- Updated dependencies [[`28ce924`](https://github.com/mastra-ai/mastra/commit/28ce924276eeca492e6a360e5482ed20c2785ef6)]:
+  - @mastra/schema-compat@1.3.8-alpha.0
+
+## 0.2.7
+
+### Patch Changes
+
+- Updated dependencies [[`cf418b6`](https://github.com/mastra-ai/mastra/commit/cf418b65efb81997e9b8dc7638eee363c5d96c96)]:
+  - @mastra/schema-compat@1.3.7
+
+## 0.2.7-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`cf418b6`](https://github.com/mastra-ai/mastra/commit/cf418b65efb81997e9b8dc7638eee363c5d96c96)]:
+  - @mastra/schema-compat@1.3.7-alpha.0
+
+## 0.2.6
+
+### Patch Changes
+
+- Updated dependencies [[`6bff877`](https://github.com/mastra-ai/mastra/commit/6bff877e214695ff8d9c84b06c13a6e6bcf9f1ed), [`f5a17d9`](https://github.com/mastra-ai/mastra/commit/f5a17d95c19e7d4149996932bd8d1905089f031d), [`5dba2a4`](https://github.com/mastra-ai/mastra/commit/5dba2a41600385751f5aace79878904e1972609d), [`9be8878`](https://github.com/mastra-ai/mastra/commit/9be8878dcf0388e84fc4873e0eec27bd49b881a4)]:
+  - @mastra/schema-compat@1.3.6
+
+## 0.2.6-alpha.3
+
+### Patch Changes
+
+- Updated dependencies [[`5dba2a4`](https://github.com/mastra-ai/mastra/commit/5dba2a41600385751f5aace79878904e1972609d)]:
+  - @mastra/schema-compat@1.3.6-alpha.3
+
+## 0.2.6-alpha.2
+
+### Patch Changes
+
+- Updated dependencies [[`6bff877`](https://github.com/mastra-ai/mastra/commit/6bff877e214695ff8d9c84b06c13a6e6bcf9f1ed)]:
+  - @mastra/schema-compat@1.3.6-alpha.2
+
+## 0.2.6-alpha.1
+
+### Patch Changes
+
+- Updated dependencies [[`9be8878`](https://github.com/mastra-ai/mastra/commit/9be8878dcf0388e84fc4873e0eec27bd49b881a4)]:
+  - @mastra/schema-compat@1.3.6-alpha.1
+
+## 0.2.6-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`f5a17d9`](https://github.com/mastra-ai/mastra/commit/f5a17d95c19e7d4149996932bd8d1905089f031d)]:
+  - @mastra/schema-compat@1.3.6-alpha.0
+
+## 0.2.5
+
+### Patch Changes
+
+- Updated dependencies [[`14562d6`](https://github.com/mastra-ai/mastra/commit/14562d6ea724ed4ccb9fb079d016ec7ab1bd92a4)]:
+  - @mastra/schema-compat@1.3.5
+
+## 0.2.5-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`14562d6`](https://github.com/mastra-ai/mastra/commit/14562d6ea724ed4ccb9fb079d016ec7ab1bd92a4)]:
+  - @mastra/schema-compat@1.3.5-alpha.0
+
+## 0.2.4
+
+### Patch Changes
+
+- Updated dependencies [[`bc1121a`](https://github.com/mastra-ai/mastra/commit/bc1121a7bb98f7cd73e82e3a7913a667a9fa9911), [`171c3a2`](https://github.com/mastra-ai/mastra/commit/171c3a23f36199ad1354166fb515b22b57f310c2), [`6789ab4`](https://github.com/mastra-ai/mastra/commit/6789ab4191ddcd32a932898b360b191e80cee1a9)]:
+  - @mastra/schema-compat@1.3.4
+
+## 0.2.4-alpha.2
+
+### Patch Changes
+
+- Updated dependencies [[`171c3a2`](https://github.com/mastra-ai/mastra/commit/171c3a23f36199ad1354166fb515b22b57f310c2)]:
+  - @mastra/schema-compat@1.3.4-alpha.2
+
+## 0.2.4-alpha.1
+
+### Patch Changes
+
+- Updated dependencies [[`bc1121a`](https://github.com/mastra-ai/mastra/commit/bc1121a7bb98f7cd73e82e3a7913a667a9fa9911)]:
+  - @mastra/schema-compat@1.3.4-alpha.1
+
+## 0.2.4-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`6789ab4`](https://github.com/mastra-ai/mastra/commit/6789ab4191ddcd32a932898b360b191e80cee1a9)]:
+  - @mastra/schema-compat@1.3.4-alpha.0
+
+## 0.2.3
+
+### Patch Changes
+
+- Updated the ws dependency to ^8.21.0 to pull in fixes for an uninitialized memory disclosure (GHSA-58qx-3vcg-4xpx) and a memory exhaustion denial-of-service (GHSA-96hv-2xvq-fx4p) in the WebSocket server. ([#18789](https://github.com/mastra-ai/mastra/pull/18789))
+
+- Updated dependencies [[`1042cb4`](https://github.com/mastra-ai/mastra/commit/1042cb4da227c0a1315a6362262be3058866c5f8)]:
+  - @mastra/schema-compat@1.3.3
+
+## 0.2.3-alpha.1
+
+### Patch Changes
+
+- Updated the ws dependency to ^8.21.0 to pull in fixes for an uninitialized memory disclosure (GHSA-58qx-3vcg-4xpx) and a memory exhaustion denial-of-service (GHSA-96hv-2xvq-fx4p) in the WebSocket server. ([#18789](https://github.com/mastra-ai/mastra/pull/18789))
+
+## 0.2.3-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`1042cb4`](https://github.com/mastra-ai/mastra/commit/1042cb4da227c0a1315a6362262be3058866c5f8)]:
+  - @mastra/schema-compat@1.3.3-alpha.0
+
+## 0.2.2
+
+### Patch Changes
+
+- Updated dependencies [[`d0702ee`](https://github.com/mastra-ai/mastra/commit/d0702eedc1594cb2d0d83476440cfc2ec8820adb), [`9feeaa0`](https://github.com/mastra-ai/mastra/commit/9feeaa0f9a1af07039e5b4f22b932b0cb18617e8), [`213feb8`](https://github.com/mastra-ai/mastra/commit/213feb87bfdd1d8ec00ea660e218f9bcfcb34e7b)]:
+  - @mastra/schema-compat@1.3.2
+
+## 0.2.2-alpha.1
+
+### Patch Changes
+
+- Updated dependencies [[`d0702ee`](https://github.com/mastra-ai/mastra/commit/d0702eedc1594cb2d0d83476440cfc2ec8820adb)]:
+  - @mastra/schema-compat@1.3.2-alpha.1
+
+## 0.2.2-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`9feeaa0`](https://github.com/mastra-ai/mastra/commit/9feeaa0f9a1af07039e5b4f22b932b0cb18617e8), [`213feb8`](https://github.com/mastra-ai/mastra/commit/213feb87bfdd1d8ec00ea660e218f9bcfcb34e7b)]:
+  - @mastra/schema-compat@1.3.2-alpha.0
+
+## 0.2.1
+
+### Patch Changes
+
+- Updated dependencies [[`d5fa3cd`](https://github.com/mastra-ai/mastra/commit/d5fa3cda1788c3cb93a361a3c6ec47de6ba21e98)]:
+  - @mastra/schema-compat@1.3.1
+
+## 0.2.1-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`d5fa3cd`](https://github.com/mastra-ai/mastra/commit/d5fa3cda1788c3cb93a361a3c6ec47de6ba21e98)]:
+  - @mastra/schema-compat@1.3.1-alpha.0
+
+## 0.2.0
+
+### Minor Changes
+
+- Random bump ([#18178](https://github.com/mastra-ai/mastra/pull/18178))
+
+### Patch Changes
+
+- Updated dependencies [[`b04369d`](https://github.com/mastra-ai/mastra/commit/b04369d6b167c698ef103981171a8bf92808e756)]:
+  - @mastra/schema-compat@1.3.0
+
+## 0.2.0-alpha.0
+
+### Minor Changes
+
+- Random bump ([#18178](https://github.com/mastra-ai/mastra/pull/18178))
+
+### Patch Changes
+
+- Updated dependencies [[`b04369d`](https://github.com/mastra-ai/mastra/commit/b04369d6b167c698ef103981171a8bf92808e756)]:
+  - @mastra/schema-compat@1.3.0-alpha.0
+
+## 0.1.4
+
+### Patch Changes
+
+- Security remediation for the 2026-06-17 "easy-day-js" supply-chain incident. Patch bump to publish clean versions and move the `latest` dist-tag forward, superseding the compromised versions that declared the malicious `easy-day-js` dependency. ([#18056](https://github.com/mastra-ai/mastra/pull/18056))
+
+- Updated dependencies [[`77a2351`](https://github.com/mastra-ai/mastra/commit/77a2351ee79296e360bce822cb3391f7cfd6489d)]:
+  - @mastra/schema-compat@1.2.14
+
+## 0.1.4-alpha.0
+
+### Patch Changes
+
+- Security remediation for the 2026-06-17 "easy-day-js" supply-chain incident. Patch bump to publish clean versions and move the `latest` dist-tag forward, superseding the compromised versions that declared the malicious `easy-day-js` dependency. ([#18056](https://github.com/mastra-ai/mastra/pull/18056))
+
+- Updated dependencies [[`77a2351`](https://github.com/mastra-ai/mastra/commit/77a2351ee79296e360bce822cb3391f7cfd6489d)]:
+  - @mastra/schema-compat@1.2.14-alpha.0
+
+## 0.1.2
+
+### Patch Changes
+
+- Updated dependencies [[`9b1adf7`](https://github.com/mastra-ai/mastra/commit/9b1adf7f39943c869182106bc4016e793b3304ac)]:
+  - @mastra/schema-compat@1.2.12
+
+## 0.1.1
+
+### Patch Changes
+
+- Updated dependencies [[`00eca42`](https://github.com/mastra-ai/mastra/commit/00eca4252393aa114dc8c9a5e1da68df91fa06cf), [`ff9d743`](https://github.com/mastra-ai/mastra/commit/ff9d743f71d7e072927725c0d700632aca0c1fee)]:
+  - @mastra/schema-compat@1.2.11
+
+## 0.1.1-alpha.0
+
+### Patch Changes
+
+- Updated dependencies [[`00eca42`](https://github.com/mastra-ai/mastra/commit/00eca4252393aa114dc8c9a5e1da68df91fa06cf), [`ff9d743`](https://github.com/mastra-ai/mastra/commit/ff9d743f71d7e072927725c0d700632aca0c1fee)]:
+  - @mastra/schema-compat@1.2.11-alpha.0
+
 ## 0.1.0
 
 ### Minor Changes

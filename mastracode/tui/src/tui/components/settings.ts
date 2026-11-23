@@ -1,0 +1,708 @@
+/**
+ * General settings component.
+ * Uses pi-tui's SettingsList for a clean overlay with
+ * notifications, YOLO mode, and thinking level configuration.
+ *
+ * Changes apply immediately — Esc closes the panel.
+ */
+
+import { Box, Container, SelectList, SettingsList, Spacer, Text, matchesKey } from '@earendil-works/pi-tui';
+import type { Focusable, SelectItem, SettingItem } from '@earendil-works/pi-tui';
+import type { ExperimentalAgent, StorageBackend, WebSearchProviderSetting } from '@mastra/code-sdk/onboarding/settings';
+import type { NotificationMode } from '../notify.js';
+import { theme, getSettingsListTheme, getSelectListTheme } from '../theme.js';
+import { MaskedInput } from './masked-input.js';
+import { getThinkingLevelsForModel } from './thinking-settings.js';
+
+// =============================================================================
+// Types
+// =============================================================================
+export interface SettingsConfig {
+  notifications: NotificationMode;
+  yolo: boolean;
+  thinkingLevel: string;
+  currentModelId: string;
+  escapeAsCancel: boolean;
+  mouse: { dialogs: boolean; input: boolean };
+  previewLines: number;
+  storageBackend: StorageBackend;
+  pgConnectionString: string;
+  libsqlUrl: string;
+  experimentalGithubSignals: boolean;
+  experimentalCrossAgentSignals: boolean;
+  experimentalScheduleTools: boolean;
+  experimentalKnowledge: boolean;
+  experimentalAgent: ExperimentalAgent | null;
+  backgroundToolsEnabled: boolean;
+  webSearchProvider: WebSearchProviderSetting;
+  tavilyKeyAvailable: boolean;
+  parallelKeyAvailable: boolean;
+}
+
+export interface SettingsCallbacks {
+  onNotificationsChange: (mode: NotificationMode) => void;
+  onYoloChange: (enabled: boolean) => void;
+  onThinkingLevelChange: (level: string) => void;
+  onEscapeAsCancelChange: (enabled: boolean) => void;
+  onMouseChange: (mouse: { dialogs: boolean; input: boolean }) => void;
+  onPreviewLinesChange: (lines: number) => void;
+  onStorageBackendChange: (backend: StorageBackend, connectionUrl?: string) => void;
+  onExperimentalGithubSignalsChange: (enabled: boolean) => boolean | void | Promise<boolean | void>;
+  onExperimentalCrossAgentSignalsChange: (enabled: boolean) => boolean | void | Promise<boolean | void>;
+  onExperimentalScheduleToolsChange: (enabled: boolean) => void;
+  onExperimentalKnowledgeChange: (enabled: boolean) => void;
+  onExperimentalAgentChange: (agent: ExperimentalAgent | null) => void;
+  onBackgroundToolsChange: (enabled: boolean) => void;
+  onWebSearchProviderChange: (provider: WebSearchProviderSetting) => void;
+  onApiKeys?: () => void;
+  onClose: () => void;
+}
+
+const MOUSE_CHOICES = [
+  {
+    value: 'off',
+    label: 'Off',
+    dialogs: false,
+    input: false,
+    description: 'The terminal keeps the mouse (native scrolling and selection)',
+  },
+  {
+    value: 'dialogs',
+    label: 'Dialogs only',
+    dialogs: true,
+    input: false,
+    description: 'Click, hover and scroll in dialogs and slash suggestions',
+  },
+  {
+    value: 'input',
+    label: 'Input box only',
+    dialogs: false,
+    input: true,
+    description: 'Typing or editing captures the mouse for the input box',
+  },
+  { value: 'all', label: 'Dialogs + input box', dialogs: true, input: true, description: 'Both of the above' },
+] as const;
+
+function mouseChoice(mouse: { dialogs: boolean; input: boolean }) {
+  return MOUSE_CHOICES.find(c => c.dialogs === mouse.dialogs && c.input === mouse.input) ?? MOUSE_CHOICES[0];
+}
+
+function mouseLabel(mouse: { dialogs: boolean; input: boolean }): string {
+  return mouseChoice(mouse).label;
+}
+
+// =============================================================================
+// Select Submenu (reusable for any enum-style setting)
+// =============================================================================
+
+class SelectSubmenu extends SelectList {
+  constructor(
+    items: SelectItem[],
+    currentValue: string,
+    onSelect: (value: string) => void | Promise<void>,
+    onBack: () => void,
+  ) {
+    super(items, Math.min(items.length, 8), getSelectListTheme());
+
+    const currentIndex = items.findIndex(i => i.value === currentValue);
+    if (currentIndex !== -1) {
+      this.setSelectedIndex(currentIndex);
+    }
+
+    this.onSelect = async (item: SelectItem) => {
+      await onSelect(item.value);
+    };
+    this.onCancel = onBack;
+  }
+}
+
+// =============================================================================
+// Storage Backend Submenu (backend selector → optional PG connection input)
+// =============================================================================
+
+class StorageBackendSubmenu extends Container {
+  private phase: 'select' | 'connection' = 'select';
+  private pendingBackend: StorageBackend = 'libsql';
+  private selectList: SelectList;
+  private input!: MaskedInput;
+  private onDone: (backend: StorageBackend, connectionUrl?: string) => void;
+  private onBack: () => void;
+  private currentPgConnectionString: string;
+  private currentLibsqlUrl: string;
+
+  constructor(
+    currentBackend: StorageBackend,
+    currentPgConnectionString: string,
+    currentLibsqlUrl: string,
+    onDone: (backend: StorageBackend, connectionUrl?: string) => void,
+    onBack: () => void,
+  ) {
+    super();
+    this.onDone = onDone;
+    this.onBack = onBack;
+    this.currentPgConnectionString = currentPgConnectionString;
+    this.currentLibsqlUrl = currentLibsqlUrl;
+
+    // Phase 1: backend selection
+    const items: SelectItem[] = [
+      {
+        value: 'libsql',
+        label: '  LibSQL',
+        description: 'Local file-based SQLite or remote Turso URL',
+      },
+      {
+        value: 'pg',
+        label: '  PostgreSQL',
+        description: 'Remote PostgreSQL (requires connection string)',
+      },
+    ];
+
+    this.selectList = new SelectList(items, items.length, getSelectListTheme());
+    const currentIndex = items.findIndex(i => i.value === currentBackend);
+    if (currentIndex !== -1) this.selectList.setSelectedIndex(currentIndex);
+
+    this.selectList.onSelect = (item: SelectItem) => {
+      this.pendingBackend = item.value as StorageBackend;
+      this.showConnectionInput();
+    };
+    this.selectList.onCancel = onBack;
+
+    this.addChild(this.selectList);
+  }
+
+  private showConnectionInput(): void {
+    this.phase = 'connection';
+    this.clear();
+
+    if (this.pendingBackend === 'pg') {
+      this.addChild(new Text(theme.bold(theme.fg('accent', 'PostgreSQL Connection')), 0, 0));
+      this.addChild(new Spacer(1));
+      this.addChild(new Text(theme.fg('muted', 'Enter a connection string:'), 0, 0));
+      this.addChild(new Text(theme.fg('dim', 'e.g. postgresql://user:pass@localhost:5432/mydb'), 0, 0));
+    } else {
+      this.addChild(new Text(theme.bold(theme.fg('accent', 'LibSQL Connection')), 0, 0));
+      this.addChild(new Spacer(1));
+      this.addChild(new Text(theme.fg('muted', 'Enter a URL or leave empty for default local file:'), 0, 0));
+      this.addChild(new Text(theme.fg('dim', 'e.g. libsql://your-db.turso.io'), 0, 0));
+    }
+    this.addChild(new Spacer(1));
+
+    this.input = new MaskedInput();
+    const currentValue = this.pendingBackend === 'pg' ? this.currentPgConnectionString : this.currentLibsqlUrl;
+    if (currentValue) {
+      this.input.setValue(currentValue);
+    }
+    this.addChild(this.input);
+
+    this.addChild(new Spacer(1));
+    this.addChild(new Text(theme.fg('dim', 'Enter to save · Esc to go back'), 0, 0));
+  }
+
+  handleInput(data: string): void {
+    if (this.phase === 'select') {
+      this.selectList.handleInput(data);
+      return;
+    }
+
+    // Connection string input phase
+    if (matchesKey(data, 'enter') || data === '\r' || data === '\n') {
+      const value = this.input.getValue().trim();
+      if (this.pendingBackend === 'pg') {
+        // PG requires a connection string
+        if (value) {
+          this.onDone('pg', value);
+        }
+      } else {
+        // LibSQL: empty = default local file, non-empty = custom URL
+        this.onDone('libsql', value || undefined);
+      }
+      return;
+    }
+
+    if (matchesKey(data, 'escape') || data === '\x1b' || data === '\x1b\x1b') {
+      this.onBack();
+      return;
+    }
+
+    this.input.handleInput(data);
+  }
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+function previewLinesLabel(lines: number): string {
+  return lines === 0 ? 'None' : `${lines} line${lines === 1 ? '' : 's'}`;
+}
+
+function webSearchProviderLabel(provider: WebSearchProviderSetting): string {
+  if (provider === 'tavily') return 'Tavily';
+  if (provider === 'parallel') return 'Parallel';
+  return 'Auto';
+}
+
+function storageLabel(config: SettingsConfig): string {
+  if (config.storageBackend === 'pg') return 'PostgreSQL';
+  if (config.libsqlUrl) return `LibSQL (${config.libsqlUrl})`;
+  return 'LibSQL (local file)';
+}
+
+// =============================================================================
+// Settings Component
+// =============================================================================
+
+export class SettingsComponent extends Box implements Focusable {
+  private settingsList: SettingsList;
+  private _focused = false;
+
+  get focused(): boolean {
+    return this._focused;
+  }
+  set focused(value: boolean) {
+    this._focused = value;
+  }
+
+  constructor(config: SettingsConfig, callbacks: SettingsCallbacks) {
+    super(4, 2, (text: string) => theme.bg('overlayBg', text));
+
+    // Title
+    this.addChild(new Text(theme.bold(theme.fg('accent', 'Settings')), 0, 0));
+    this.addChild(new Spacer(1));
+
+    // Build settings items
+    const notificationModes: {
+      value: NotificationMode;
+      label: string;
+      desc: string;
+    }[] = [
+      { value: 'off', label: 'Off', desc: 'No notifications' },
+      { value: 'bell', label: 'Bell', desc: 'Terminal bell (\\x07)' },
+      { value: 'system', label: 'System', desc: 'Native OS notification' },
+      { value: 'both', label: 'Both', desc: 'Bell + system notification' },
+    ];
+
+    const thinkingLevels = getThinkingLevelsForModel(config.currentModelId).map(level => ({
+      value: level.id,
+      label: level.label,
+      desc: level.description,
+    }));
+
+    const getNotifLabel = (mode: NotificationMode) => notificationModes.find(m => m.value === mode)?.label ?? mode;
+
+    const getThinkingLabel = (level: string) => thinkingLevels.find(l => l.value === level)?.label ?? level;
+
+    const items: SettingItem[] = [
+      {
+        id: 'notifications',
+        label: 'Notifications',
+        description: 'How to alert when the agent needs attention',
+        currentValue: getNotifLabel(config.notifications),
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            notificationModes.map(m => ({
+              value: m.value,
+              label: `  ${m.label}`,
+              description: m.desc,
+            })),
+            config.notifications,
+            value => {
+              config.notifications = value as NotificationMode;
+              callbacks.onNotificationsChange(config.notifications);
+              done(getNotifLabel(config.notifications));
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'yolo',
+        label: 'YOLO mode',
+        description: 'Auto-approve all tool calls without confirmation',
+        currentValue: config.yolo ? 'On' : 'Off',
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            [
+              {
+                value: 'on',
+                label: '  On',
+                description: 'Auto-approve all tools',
+              },
+              {
+                value: 'off',
+                label: '  Off',
+                description: 'Require approval for tools',
+              },
+            ],
+            config.yolo ? 'on' : 'off',
+            value => {
+              config.yolo = value === 'on';
+              callbacks.onYoloChange(config.yolo);
+              done(config.yolo ? 'On' : 'Off');
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'thinking',
+        label: 'Thinking level',
+        description: 'Reasoning depth level',
+        currentValue: getThinkingLabel(config.thinkingLevel),
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            thinkingLevels.map(l => ({
+              value: l.value,
+              label: `  ${l.label}`,
+              description: l.desc,
+            })),
+            config.thinkingLevel,
+            value => {
+              config.thinkingLevel = value;
+              callbacks.onThinkingLevelChange(value);
+              done(getThinkingLabel(value));
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'escapeAsCancel',
+        label: 'Escape cancels',
+        description: 'Use Escape to cancel/clear (Ctrl+C always works).',
+        currentValue: config.escapeAsCancel ? 'On' : 'Off',
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            [
+              {
+                value: 'on',
+                label: '  On',
+                description: 'Escape clears input / aborts',
+              },
+              {
+                value: 'off',
+                label: '  Off',
+                description: 'Only Ctrl+C clears / aborts',
+              },
+            ],
+            config.escapeAsCancel ? 'on' : 'off',
+            value => {
+              config.escapeAsCancel = value === 'on';
+              callbacks.onEscapeAsCancelChange(config.escapeAsCancel);
+              done(config.escapeAsCancel ? 'On' : 'Off');
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'mouse',
+        label: 'Mouse',
+        description:
+          'Use the mouse in dialogs and slash suggestions, in the input box while typing, or both. Off leaves the mouse to the terminal.',
+        currentValue: mouseLabel(config.mouse),
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            MOUSE_CHOICES.map(choice => ({
+              value: choice.value,
+              label: `  ${choice.label}`,
+              description: choice.description,
+            })),
+            mouseChoice(config.mouse).value,
+            value => {
+              const choice = MOUSE_CHOICES.find(c => c.value === value)!;
+              config.mouse = { dialogs: choice.dialogs, input: choice.input };
+              callbacks.onMouseChange(config.mouse);
+              done(choice.label);
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'previewLines',
+        label: 'Preview lines',
+        description: 'Preview lines shown under each tool, including shell output. Set to None to hide previews.',
+        currentValue: previewLinesLabel(config.previewLines),
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            [0, 1, 2, 4, 8].map(lines => ({
+              value: String(lines),
+              label: `  ${previewLinesLabel(lines)}`,
+              description:
+                lines === 0
+                  ? 'Hide tool previews and shell output'
+                  : `Show up to ${lines} preview line${lines === 1 ? '' : 's'}`,
+            })),
+            String(config.previewLines),
+            value => {
+              config.previewLines = Number(value);
+              callbacks.onPreviewLinesChange(config.previewLines);
+              done(previewLinesLabel(config.previewLines));
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'webSearchProvider',
+        label: 'Web search provider',
+        description: 'Default provider for web_search/web_extract. Providers require their API key.',
+        currentValue: webSearchProviderLabel(config.webSearchProvider),
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            [
+              {
+                value: 'auto',
+                label: '  Auto',
+                description: 'First configured provider key (Tavily, then Parallel)',
+              },
+              {
+                value: 'tavily',
+                label: config.tavilyKeyAvailable ? '  Tavily' : '  Tavily (unavailable)',
+                description: config.tavilyKeyAvailable
+                  ? 'Always use Tavily'
+                  : 'Missing TAVILY_API_KEY — set it to use Tavily',
+              },
+              {
+                value: 'parallel',
+                label: config.parallelKeyAvailable ? '  Parallel' : '  Parallel (unavailable)',
+                description: config.parallelKeyAvailable
+                  ? 'Always use Parallel'
+                  : 'Missing PARALLEL_API_KEY — set it to use Parallel',
+              },
+            ],
+            config.webSearchProvider,
+            value => {
+              // Providers without their API key are shown but not selectable.
+              if (value === 'tavily' && !config.tavilyKeyAvailable) return;
+              if (value === 'parallel' && !config.parallelKeyAvailable) return;
+              config.webSearchProvider = value as WebSearchProviderSetting;
+              callbacks.onWebSearchProviderChange(config.webSearchProvider);
+              done(webSearchProviderLabel(config.webSearchProvider));
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'experimentalGithubSignals',
+        label: 'Experimental GitHub signals',
+        description: 'Enable local-first GitHub PR subscriptions with gitcrawl (restart required).',
+        currentValue: config.experimentalGithubSignals ? 'On' : 'Off',
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            [
+              {
+                value: 'on',
+                label: '  On',
+                description: 'Enable GitHub signal processor and PR subscription tools',
+              },
+              {
+                value: 'off',
+                label: '  Off',
+                description: 'Disable GitHub signal processor and tools',
+              },
+            ],
+            config.experimentalGithubSignals ? 'on' : 'off',
+            async value => {
+              const nextValue = value === 'on';
+              const accepted = await callbacks.onExperimentalGithubSignalsChange(nextValue);
+              config.experimentalGithubSignals = accepted === false ? !nextValue : nextValue;
+              done(config.experimentalGithubSignals ? 'On' : 'Off');
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'experimentalCrossAgentSignals',
+        label: 'Experimental cross-agent communication',
+        description:
+          'Enable thread ownership advertisement, peer discovery, and agent connection tools (restart required).',
+        currentValue: config.experimentalCrossAgentSignals ? 'On' : 'Off',
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            [
+              {
+                value: 'on',
+                label: '  On',
+                description: 'Enable cross-agent connection tools and thread ownership advertisement',
+              },
+              {
+                value: 'off',
+                label: '  Off',
+                description: 'Disable cross-agent communication',
+              },
+            ],
+            config.experimentalCrossAgentSignals ? 'on' : 'off',
+            async value => {
+              const nextValue = value === 'on';
+              const accepted = await callbacks.onExperimentalCrossAgentSignalsChange(nextValue);
+              config.experimentalCrossAgentSignals = accepted === false ? !nextValue : nextValue;
+              done(config.experimentalCrossAgentSignals ? 'On' : 'Off');
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'experimentalScheduleTools',
+        label: 'Experimental schedule tools',
+        description: 'Let the agent create and manage /schedules on its thread (restart required).',
+        currentValue: config.experimentalScheduleTools ? 'On' : 'Off',
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            [
+              {
+                value: 'on',
+                label: '  On',
+                description: 'Give the agent schedule_create, schedule_list, schedule_update, and schedule_run',
+              },
+              {
+                value: 'off',
+                label: '  Off',
+                description: 'Only you can manage schedules, with /schedules',
+              },
+            ],
+            config.experimentalScheduleTools ? 'on' : 'off',
+            value => {
+              const enabled = value === 'on';
+              callbacks.onExperimentalScheduleToolsChange(enabled);
+              config.experimentalScheduleTools = enabled;
+              done(enabled ? 'On' : 'Off');
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'experimentalKnowledge',
+        label: 'Experimental Knowledge',
+        description:
+          'Give the agent Knowledge it can search, write and pin, stored with Mastra Code (restart required).',
+        currentValue: config.experimentalKnowledge ? 'On' : 'Off',
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            [
+              {
+                value: 'on',
+                label: '  On',
+                description:
+                  'Add knowledge_list, knowledge_search, knowledge_read, knowledge_page, knowledge_note and knowledge_pin',
+              },
+              { value: 'off', label: '  Off', description: 'No Knowledge tools or pinned context' },
+            ],
+            config.experimentalKnowledge ? 'on' : 'off',
+            value => {
+              const enabled = value === 'on';
+              callbacks.onExperimentalKnowledgeChange(enabled);
+              config.experimentalKnowledge = enabled;
+              done(enabled ? 'On' : 'Off');
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'experimentalAgent',
+        label: 'Experimental agent',
+        description: 'Run the coding agent on the durable or evented runtime (restart required).',
+        currentValue:
+          config.experimentalAgent === 'durable'
+            ? 'Durable'
+            : config.experimentalAgent === 'evented'
+              ? 'Evented'
+              : 'Off',
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            [
+              { value: 'off', label: '  Off', description: 'Use the standard coding agent' },
+              { value: 'durable', label: '  Durable', description: 'Use resumable durable agent streams' },
+              {
+                value: 'evented',
+                label: '  Evented',
+                description: 'Run the agent loop on the evented workflow engine',
+              },
+            ],
+            config.experimentalAgent ?? 'off',
+            value => {
+              config.experimentalAgent = value === 'off' ? null : (value as ExperimentalAgent);
+              callbacks.onExperimentalAgentChange(config.experimentalAgent);
+              done(
+                config.experimentalAgent === 'durable'
+                  ? 'Durable'
+                  : config.experimentalAgent === 'evented'
+                    ? 'Evented'
+                    : 'Off',
+              );
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'backgroundToolsEnabled',
+        label: 'Experimental background tools',
+        description: 'Allow eligible tools to run in the background (restart required).',
+        currentValue: config.backgroundToolsEnabled ? 'On' : 'Off',
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            [
+              { value: 'on', label: '  On', description: 'Enable background tools and the activity center' },
+              { value: 'off', label: '  Off', description: 'Keep background tools disabled' },
+            ],
+            config.backgroundToolsEnabled ? 'on' : 'off',
+            value => {
+              const enabled = value === 'on';
+              callbacks.onBackgroundToolsChange(enabled);
+              config.backgroundToolsEnabled = enabled;
+              done(enabled ? 'On' : 'Off');
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'storageBackend',
+        label: 'Storage backend',
+        description: 'Database backend for threads, memory, and agent data (restart required)',
+        currentValue: storageLabel(config),
+        submenu: (_currentValue, done) =>
+          new StorageBackendSubmenu(
+            config.storageBackend,
+            config.pgConnectionString,
+            config.libsqlUrl,
+            (backend: StorageBackend, connectionUrl?: string) => {
+              config.storageBackend = backend;
+              if (backend === 'pg' && connectionUrl !== undefined) {
+                config.pgConnectionString = connectionUrl;
+              } else if (backend === 'libsql') {
+                config.libsqlUrl = connectionUrl ?? '';
+              }
+              callbacks.onStorageBackendChange(backend, connectionUrl);
+              done(storageLabel(config));
+            },
+            () => done(),
+          ),
+      },
+    ];
+
+    if (callbacks.onApiKeys) {
+      items.push({
+        id: 'apiKeys',
+        label: 'API Keys',
+        description: 'Add, update, or remove API keys for model providers',
+        currentValue: 'Manage →',
+        submenu: (_currentValue, done) => {
+          done();
+          callbacks.onApiKeys!();
+          return new Text('', 0, 0);
+        },
+      });
+    }
+
+    this.settingsList = new SettingsList(
+      items,
+      10,
+      getSettingsListTheme(),
+      (_id, _newValue) => {
+        // All changes handled via submenu callbacks
+      },
+      callbacks.onClose,
+    );
+
+    this.addChild(this.settingsList);
+  }
+
+  handleInput(data: string): void {
+    this.settingsList.handleInput(data);
+  }
+}

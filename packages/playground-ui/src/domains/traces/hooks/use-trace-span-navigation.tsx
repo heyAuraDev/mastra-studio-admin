@@ -1,6 +1,6 @@
-import type { LightSpanRecord } from '@mastra/core/storage';
 import { useMemo } from 'react';
 import { formatHierarchicalSpans } from '../components/format-hierarchical-spans';
+import type { LightSpanRecord } from '../types';
 import { getAllSpanIds } from './get-all-span-ids';
 
 /**
@@ -16,11 +16,20 @@ export function useTraceSpanNavigation(
 
   const featuredSpanIdx = featuredSpanId ? timelineSpanIds.indexOf(featuredSpanId) : -1;
 
-  const handlePreviousSpan = featuredSpanIdx > 0 ? () => onSpanChange(timelineSpanIds[featuredSpanIdx - 1]) : undefined;
+  const handlePreviousSpan =
+    featuredSpanIdx > 0
+      ? () => {
+          const spanId = timelineSpanIds[featuredSpanIdx - 1];
+          if (spanId !== undefined) onSpanChange(spanId);
+        }
+      : undefined;
 
   const handleNextSpan =
     featuredSpanIdx >= 0 && featuredSpanIdx < timelineSpanIds.length - 1
-      ? () => onSpanChange(timelineSpanIds[featuredSpanIdx + 1])
+      ? () => {
+          const spanId = timelineSpanIds[featuredSpanIdx + 1];
+          if (spanId !== undefined) onSpanChange(spanId);
+        }
       : undefined;
 
   return { handlePreviousSpan, handleNextSpan, timelineSpanIds };

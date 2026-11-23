@@ -1,22 +1,27 @@
+import { Mastra } from '@mastra/core';
+import { registerApiRoute } from '@mastra/core/server';
+import { createRoute } from '@mastra/server/server-adapter';
+import type { ServerRoute } from '@mastra/server/server-adapter';
+import {
+  createRouteAdapterTestSuite,
+  createDefaultTestContext,
+  createStreamWithSensitiveData,
+  createStreamWithUnserializableChunk,
+  expectSerializedStreamChunks,
+  consumeSSEStream,
+  createMultipartTestSuite,
+  createBodyLimitTestSuite,
+} from '@mastra/server-adapters-test-suite';
 import type {
   AdapterTestContext,
   AdapterSetupOptions,
   HttpRequest,
   HttpResponse,
-} from '@internal/server-adapter-test-utils';
-import {
-  createRouteAdapterTestSuite,
-  createDefaultTestContext,
-  createStreamWithSensitiveData,
-  consumeSSEStream,
-  createMultipartTestSuite,
-} from '@internal/server-adapter-test-utils';
-import { Mastra } from '@mastra/core';
-import { registerApiRoute } from '@mastra/core/server';
-import type { ServerRoute } from '@mastra/server/server-adapter';
+} from '@mastra/server-adapters-test-suite';
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { z } from 'zod';
 import { MastraServer } from '../index';
 
 function sleep(ms: number): Promise<void> {
@@ -37,6 +42,7 @@ async function waitFor(assertion: () => boolean, timeout = 500): Promise<void> {
 describe('Fastify Server Adapter', () => {
   createRouteAdapterTestSuite({
     suiteName: 'Fastify Adapter Integration Tests',
+    supportsPostQueryRequestContext: true,
 
     setupAdapter: async (context: AdapterTestContext, options?: AdapterSetupOptions) => {
       // Create Fastify app
@@ -82,13 +88,13 @@ describe('Fastify Server Adapter', () => {
         const fetchOptions: RequestInit = {
           method: httpRequest.method,
           headers: {
-            'Content-Type': 'application/json',
+            ...(httpRequest.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
             ...(httpRequest.headers || {}),
           },
         };
 
         // Add body for POST/PUT/PATCH/DELETE
-        if (httpRequest.body && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(httpRequest.method)) {
+        if (httpRequest.body !== undefined && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(httpRequest.method)) {
           fetchOptions.body = JSON.stringify(httpRequest.body);
         }
 
@@ -107,6 +113,8 @@ describe('Fastify Server Adapter', () => {
         const isStream =
           contentType.includes('text/plain') ||
           contentType.includes('text/event-stream') ||
+          contentType.includes('audio/') ||
+          contentType.includes('application/octet-stream') ||
           transferEncoding === 'chunked';
 
         if (isStream && response.body) {
@@ -117,30 +125,29 @@ describe('Fastify Server Adapter', () => {
             stream: response.body,
             headers,
           };
-        } else {
-          // JSON response - check content type to decide how to parse
-          let data: unknown;
-          const responseContentType = response.headers.get('content-type') || '';
-
-          if (responseContentType.includes('application/json')) {
-            try {
-              data = await response.json();
-            } catch {
-              // If JSON parsing fails, return empty object
-              data = {};
-            }
-          } else {
-            // Not JSON content type, read as text
-            data = await response.text();
-          }
-
-          return {
-            status: response.status,
-            type: 'json',
-            data,
-            headers,
-          };
         }
+        // JSON response - check content type to decide how to parse
+        let data: unknown;
+        const responseContentType = response.headers.get('content-type') || '';
+
+        if (responseContentType.includes('application/json')) {
+          try {
+            data = await response.json();
+          } catch {
+            // If JSON parsing fails, return empty object
+            data = {};
+          }
+        } else {
+          // Not JSON content type, read as text
+          data = await response.text();
+        }
+
+        return {
+          status: response.status,
+          type: 'json',
+          data,
+          headers,
+        };
       } finally {
         // Always close server
         await app.close();
@@ -221,6 +228,129 @@ describe('Fastify Server Adapter', () => {
       const finish = chunks.find(c => c.type === 'finish');
       expect(finish).toBeDefined();
       expect(finish.payload.metadata.request).toBeUndefined();
+    });
+
+    it('should pass SSE comment chunks through without data wrapping', async () => {
+      app = Fastify();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/sse-comment',
+        responseType: 'stream',
+        streamFormat: 'sse',
+        handler: async () =>
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(': heartbeat\n\n');
+              controller.enqueue({ type: 'text-delta', payload: { text: 'hello' } });
+              controller.close();
+            },
+          }),
+      };
+
+      app.addHook('preHandler', adapter.createContextMiddleware());
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const address = await app.listen({ port: 0 });
+
+      const response = await fetch(`${address}/test/sse-comment`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(text).toContain(': heartbeat\n\n');
+      expect(text).toContain('data: {"type":"text-delta","payload":{"text":"hello"}}\n\n');
+      expect(text).not.toContain('data: ": heartbeat');
+    });
+
+    it('should write SSE connected comment when sseFlushOnConnect is true', async () => {
+      app = Fastify();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/sse-flush',
+        responseType: 'stream',
+        streamFormat: 'sse',
+        sseFlushOnConnect: true,
+        handler: async () =>
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'text-delta', payload: { text: 'hello' } });
+              controller.close();
+            },
+          }),
+      };
+
+      app.addHook('preHandler', adapter.createContextMiddleware());
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const address = await app.listen({ port: 0 });
+
+      const response = await fetch(`${address}/test/sse-flush`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      const connectedIndex = text.indexOf(': connected\n\n');
+      const dataIndex = text.indexOf('data: ');
+      expect(connectedIndex).toBeGreaterThanOrEqual(0);
+      expect(dataIndex).toBeGreaterThanOrEqual(0);
+      expect(connectedIndex).toBeLessThan(dataIndex);
+    });
+
+    it('should not write SSE connected comment when sseFlushOnConnect is not set', async () => {
+      app = Fastify();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/sse-no-flush',
+        responseType: 'stream',
+        streamFormat: 'sse',
+        handler: async () =>
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'text-delta', payload: { text: 'hello' } });
+              controller.close();
+            },
+          }),
+      };
+
+      app.addHook('preHandler', adapter.createContextMiddleware());
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const address = await app.listen({ port: 0 });
+
+      const response = await fetch(`${address}/test/sse-no-flush`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(text).not.toContain(': connected');
+      expect(text).toContain('data: ');
     });
 
     it('should NOT redact sensitive data when streamOptions.redact is false', async () => {
@@ -355,6 +485,58 @@ describe('Fastify Server Adapter', () => {
       const textDelta = chunks.find(c => c.type === 'text-delta');
       expect(textDelta).toBeDefined();
       expect(textDelta.textDelta).toBe('Hello');
+    });
+  });
+
+  // Repro for https://github.com/mastra-ai/mastra/issues/17821 — a chunk that
+  // JSON.stringify can't handle (e.g. a BigInt step output) used to throw inside
+  // the stream loop and silently close the HTTP stream.
+  describe('Stream Chunk Serialization', () => {
+    let context: AdapterTestContext;
+    let app: FastifyInstance | null = null;
+
+    beforeEach(async () => {
+      context = await createDefaultTestContext();
+    });
+
+    afterEach(async () => {
+      if (app) {
+        app.server.closeAllConnections?.();
+        await app.close();
+        app = null;
+      }
+    });
+
+    it('serializes BigInt chunks and skips unserializable chunks without killing the stream', async () => {
+      app = Fastify();
+
+      const adapter = new MastraServer({
+        app,
+        mastra: context.mastra,
+      });
+
+      const testRoute: ServerRoute<any, any, any> = {
+        method: 'POST',
+        path: '/test/unserializable-stream',
+        responseType: 'stream',
+        streamFormat: 'sse',
+        handler: async () => createStreamWithUnserializableChunk(),
+      };
+
+      app.addHook('preHandler', adapter.createContextMiddleware());
+      await adapter.registerRoute(app, testRoute, { prefix: '' });
+
+      const address = await app.listen({ port: 0 });
+
+      const response = await fetch(`${address}/test/unserializable-stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+
+      expect(response.status).toBe(200);
+      const chunks = await consumeSSEStream(response.body);
+      expectSerializedStreamChunks(chunks);
     });
   });
 
@@ -755,6 +937,69 @@ describe('Fastify Server Adapter', () => {
       expect(data).toEqual({ message: 'Hello from custom route!' });
       await app.close();
     });
+
+    it('registers createRoute routes from customApiRoutes with runtime validation', async () => {
+      const route = createRoute({
+        method: 'POST',
+        path: '/custom/validated',
+        responseType: 'json',
+        requiresAuth: false,
+        bodySchema: z.object({ name: z.string() }),
+        handler: async ({ name }) => ({ greeting: `Hello, ${name}` }),
+      });
+      const protectedRoute = createRoute({
+        method: 'GET',
+        path: '/custom/secure',
+        responseType: 'json',
+        requiresAuth: true,
+        handler: async () => ({ secret: true }),
+      });
+
+      const mastra = new Mastra({ server: { apiRoutes: [route, protectedRoute] } });
+      const originalGetServer = mastra.getServer.bind(mastra);
+      mastra.getServer = () =>
+        ({
+          ...originalGetServer(),
+          auth: {
+            authenticateToken: async (token: string) => (token === 'valid-token' ? { id: 'user-1' } : null),
+            authorize: async () => true,
+          },
+        }) as any;
+      const app = Fastify();
+
+      const adapter = new MastraServer({ app, mastra });
+      await adapter.init();
+      const address = await app.listen({ port: 0 });
+
+      try {
+        const invalidResponse = await fetch(`${address}/custom/validated`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 42 }),
+        });
+        expect(invalidResponse.status).toBe(400);
+        await expect(invalidResponse.json()).resolves.toMatchObject({ error: 'Invalid request body' });
+
+        const validResponse = await fetch(`${address}/custom/validated`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'Ada' }),
+        });
+        expect(validResponse.status).toBe(200);
+        await expect(validResponse.json()).resolves.toEqual({ greeting: 'Hello, Ada' });
+
+        const unauthenticated = await fetch(`${address}/custom/secure`);
+        expect(unauthenticated.status).toBe(401);
+
+        const authenticated = await fetch(`${address}/custom/secure`, {
+          headers: { Authorization: 'Bearer valid-token' },
+        });
+        expect(authenticated.status).toBe(200);
+        await expect(authenticated.json()).resolves.toEqual({ secret: true });
+      } finally {
+        await app.close();
+      }
+    });
   });
 
   describe('Custom route stream disconnect handling', () => {
@@ -854,5 +1099,64 @@ describe('Fastify Server Adapter', () => {
       expect(cancel).not.toHaveBeenCalled();
       expect(signalAbort).not.toHaveBeenCalled();
     });
+  });
+
+  describe('Channel webhook diagnostics', () => {
+    it('warns for an unregistered channel webhook when no custom API routes exist', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const app = Fastify();
+      const adapter = new MastraServer({ app, mastra: new Mastra({}) });
+
+      try {
+        await adapter.init();
+
+        const response = await app.inject({
+          method: 'POST',
+          url: '/api/agents/support/channels/slack/webhook',
+        });
+
+        expect(response.statusCode).toBe(404);
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining('channels.adapters configuration'),
+          expect.objectContaining({ agentId: 'support', platform: 'slack' }),
+        );
+      } finally {
+        warnSpy.mockRestore();
+        await app.close();
+      }
+    });
+  });
+
+  createBodyLimitTestSuite({
+    suiteName: 'Body Size Limit',
+
+    createApp: () => Fastify({ logger: false }),
+
+    setupAdapter: (app, mastra, bodyLimitOptions) => {
+      const adapter = new MastraServer({ app, mastra, bodyLimitOptions });
+      adapter.registerContextMiddleware();
+      return { adapter, app };
+    },
+
+    registerRoute: (adapter, app, route) => adapter.registerRoute(app, route, { prefix: '' }),
+
+    executeRequest: async (app, method, url, options = {}) => {
+      const parsedUrl = new URL(url);
+      const injectOptions: any = {
+        method,
+        url: parsedUrl.pathname + parsedUrl.search,
+        headers: options.headers || {},
+      };
+
+      if (options.body) {
+        injectOptions.payload = options.body;
+        injectOptions.headers['content-type'] = 'application/json';
+      }
+
+      const response = await app.inject(injectOptions);
+      return { status: response.statusCode };
+    },
+
+    cleanupApp: app => app.close(),
   });
 });

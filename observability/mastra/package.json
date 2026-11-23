@@ -1,13 +1,12 @@
 {
   "name": "@mastra/observability",
-  "version": "1.14.0-alpha.1",
+  "version": "1.24.3-alpha.0",
   "description": "Core observability package for Mastra - includes tracing and scoring features",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
-    "dist",
-    "CHANGELOG.md"
+    "dist"
   ],
   "exports": {
     ".": {
@@ -23,11 +22,14 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "build": "tsup --silent --config tsup.config.ts",
+    "build": "tsdown --silent --config tsdown.config.ts",
     "build:watch": "pnpm build --watch",
+    "prepack": "tsx ../../scripts/generate-package-docs.ts",
     "test": "vitest run",
     "test:watch": "vitest watch",
-    "lint": "eslint ."
+    "lint": "oxlint --type-aware .",
+    "lint:fix": "oxlint --type-aware --fix .",
+    "generate:pricing": "tsx scripts/generate-pricing.ts"
   },
   "license": "Apache-2.0",
   "devDependencies": {
@@ -39,8 +41,8 @@
     "@types/node": "22.19.15",
     "@vitest/coverage-v8": "catalog:",
     "@vitest/ui": "catalog:",
-    "eslint": "^10.2.1",
-    "tsup": "^8.5.1",
+    "tsdown": "0.23.1",
+    "tsx": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:",
     "zod": "catalog:"

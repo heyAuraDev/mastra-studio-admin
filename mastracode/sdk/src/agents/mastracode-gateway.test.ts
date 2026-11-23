@@ -1,0 +1,392 @@
+/**
+ * Scenario tests for MastraCodeGateway auth resolution and model claiming.
+ *
+ * The gateway uses a module-level AuthStorage that reads auth.json from the app
+ * data dir. We point MASTRA_APP_DATA_DIR at a temp dir, write credentials, and
+ * call reloadAuthStorage() so the module instance picks them up.
+ */
+
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// The gateway constructs a module-level AuthStorage at import time, binding its
+// auth.json path from MASTRA_APP_DATA_DIR. Set the env var (in a hoisted block
+// that runs before the import below) so that instance reads from a temp dir we
+// control, isolating the test from the developer's real credentials.
+const { appDataDir } = vi.hoisted(() => {
+  const dir = `${process.env.TMPDIR ?? '/tmp'}/mastracode-gateway-appdata-${process.pid}-${Date.now()}`;
+  process.env.MASTRA_APP_DATA_DIR = dir;
+  return { appDataDir: dir };
+});
+
+import { MastraCodeGateway, reloadAuthStorage } from './mastracode-gateway.js';
+
+mkdirSync(appDataDir, { recursive: true });
+
+function writeAuthJson(data: Record<string, unknown>): void {
+  writeFileSync(join(appDataDir, 'auth.json'), JSON.stringify(data), 'utf8');
+  reloadAuthStorage();
+}
+
+function createGateway(): MastraCodeGateway {
+  return new MastraCodeGateway({
+    mastraGatewayBaseUrl: 'https://gateway.example.com',
+    routeThroughMastraGateway: false,
+    customProviders: [],
+    settingsPath: join(tmpdir(), 'nonexistent-settings.json'),
+  });
+}
+
+describe('MastraCodeGateway', () => {
+  const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
+  const prevOpenAIKey = process.env.OPENAI_API_KEY;
+  const prevKimiApiKey = process.env.KIMI_API_KEY;
+
+  beforeEach(() => {
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.KIMI_API_KEY;
+    writeAuthJson({});
+  });
+
+  afterEach(() => {
+    if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
+    if (prevOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = prevOpenAIKey;
+    if (prevKimiApiKey === undefined) delete process.env.KIMI_API_KEY;
+    else process.env.KIMI_API_KEY = prevKimiApiKey;
+  });
+
+  afterAll(() => {
+    rmSync(appDataDir, { recursive: true, force: true });
+  });
+
+  describe('handlesModel', () => {
+    it('claims a bare anthropic model id when logged in via OAuth', () => {
+      writeAuthJson({
+        anthropic: { type: 'oauth', access: 'a', refresh: 'r', expires: Date.now() + 1_000_000 },
+      });
+
+      expect(createGateway().handlesModel('anthropic/claude-opus-4-8')).toBe(true);
+    });
+
+    it('claims a prefixed mastracode/anthropic id via OAuth', () => {
+      writeAuthJson({
+        anthropic: { type: 'oauth', access: 'a', refresh: 'r', expires: Date.now() + 1_000_000 },
+      });
+
+      expect(createGateway().handlesModel('mastracode/anthropic/claude-opus-4-8')).toBe(true);
+    });
+
+    it('claims a bare openai model id when the openai-codex OAuth slot is set', () => {
+      writeAuthJson({
+        'openai-codex': { type: 'oauth', access: 'a', refresh: 'r', expires: Date.now() + 1_000_000 },
+      });
+
+      expect(createGateway().handlesModel('openai/gpt-5.5')).toBe(true);
+    });
+
+    it('claims a model when a stored api key exists', () => {
+      writeAuthJson({
+        'apikey:anthropic': { type: 'api_key', key: 'sk-test' },
+      });
+
+      expect(createGateway().handlesModel('anthropic/claude-opus-4-8')).toBe(true);
+    });
+
+    it('does not claim a model with no credentials', () => {
+      writeAuthJson({});
+
+      expect(createGateway().handlesModel('anthropic/claude-opus-4-8')).toBe(false);
+    });
+
+    it('stops claiming a model after another store removes its api key and the catalog refreshes', async () => {
+      writeAuthJson({
+        'apikey:302ai': { type: 'api_key', key: 'sk-302ai' },
+      });
+      const gateway = createGateway();
+      expect(gateway.handlesModel('302ai/MiniMax-M1')).toBe(true);
+
+      // `/api-keys` deletes through the TUI's own AuthStorage instance, which only
+      // updates auth.json on disk — not this gateway's store.
+      writeFileSync(join(appDataDir, 'auth.json'), JSON.stringify({}), 'utf8');
+      await gateway.fetchProviders();
+
+      expect(gateway.handlesModel('302ai/MiniMax-M1')).toBe(false);
+    });
+
+    it('does not claim an id without a provider and model', () => {
+      writeAuthJson({
+        anthropic: { type: 'oauth', access: 'a', refresh: 'r', expires: Date.now() + 1_000_000 },
+      });
+
+      expect(createGateway().handlesModel('anthropic')).toBe(false);
+    });
+  });
+
+  describe('resolveProviderAuth', () => {
+    it('returns an oauth bearer token for an OAuth-logged-in provider', () => {
+      writeAuthJson({
+        anthropic: { type: 'oauth', access: 'a', refresh: 'r', expires: Date.now() + 1_000_000 },
+      });
+
+      const auth = MastraCodeGateway.resolveProviderAuth({
+        gatewayId: 'mastracode',
+        providerId: 'anthropic',
+        modelId: 'claude-opus-4-8',
+        routerId: 'anthropic/claude-opus-4-8',
+      });
+      expect(auth?.bearerToken).toBe('oauth');
+    });
+
+    it('uses stored Kimi OAuth credentials before an API key', () => {
+      process.env.KIMI_API_KEY = 'sk-kimi-test';
+      writeAuthJson({
+        'kimi-for-coding': {
+          type: 'oauth',
+          access: 'a',
+          refresh: 'r',
+          expires: Date.now() + 1_000_000,
+          deviceId: '0123456789abcdef0123456789abcdef',
+        },
+      });
+
+      const auth = MastraCodeGateway.resolveProviderAuth({
+        gatewayId: 'mastracode',
+        providerId: 'kimi-for-coding',
+        modelId: 'kimi-for-coding',
+        routerId: 'kimi-for-coding/kimi-for-coding',
+      });
+
+      expect(auth).toEqual({ bearerToken: 'oauth', source: 'gateway' });
+    });
+
+    it('finds a Kimi API key stored under the catalog provider id', () => {
+      // `/api-keys` saves under the row's provider id, and Factory tenants saved
+      // `kimi-code-plan-cn` keys before it was mapped to `kimi-for-coding`.
+      writeAuthJson({
+        'apikey:kimi-code-plan-cn': { type: 'api_key', key: 'sk-kimi-stored' },
+      });
+
+      const auth = MastraCodeGateway.resolveProviderAuth({
+        gatewayId: 'mastracode',
+        providerId: 'kimi-code-plan-cn',
+        modelId: 'k3',
+        routerId: 'kimi-code-plan-cn/k3',
+      });
+
+      expect(auth).toEqual({ apiKey: 'sk-kimi-stored', source: 'gateway' });
+    });
+
+    it('returns undefined when the provider has no credentials', () => {
+      writeAuthJson({});
+
+      const auth = MastraCodeGateway.resolveProviderAuth({
+        gatewayId: 'mastracode',
+        providerId: 'anthropic',
+        modelId: 'claude-opus-4-8',
+        routerId: 'anthropic/claude-opus-4-8',
+      });
+      expect(auth).toBeUndefined();
+    });
+  });
+
+  describe('custom providers', () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    it("keeps the gateway key away from a custom provider named like the gateway model's provider", async () => {
+      const requests: Array<{ url: string; auth: string | null }> = [];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: unknown, init?: RequestInit) => {
+          const headers = new Headers(init?.headers);
+          requests.push({ url: String(url), auth: headers.get('authorization') ?? headers.get('x-api-key') });
+          return new Response('{}', { status: 500 });
+        }),
+      );
+      const gateway = new MastraCodeGateway({
+        mastraGatewayBaseUrl: 'https://gateway.example.com',
+        mastraGatewayApiKey: 'org-gateway-key',
+        routeThroughMastraGateway: true,
+        customProviders: [
+          {
+            name: 'Anthropic',
+            url: 'https://custom.example.com/v1',
+            apiKey: 'custom-key',
+            models: ['claude-opus-5.5'],
+          },
+        ],
+        settingsPath: join(tmpdir(), 'nonexistent-settings.json'),
+      });
+
+      const model = gateway.resolveLanguageModel({
+        providerId: 'anthropic',
+        modelId: 'claude-opus-5.5',
+        apiKey:
+          gateway.resolveAuth({
+            gatewayId: 'mastracode',
+            providerId: 'anthropic',
+            modelId: 'claude-opus-5.5',
+            routerId: 'mastracode/anthropic/claude-opus-5.5',
+          })?.apiKey ?? '',
+      });
+      await Promise.resolve(
+        model.doGenerate({ prompt: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }),
+      ).catch(() => undefined);
+
+      expect(requests.length).toBeGreaterThan(0);
+      expect(requests.every(request => new URL(request.url).host !== 'custom.example.com')).toBe(true);
+    });
+  });
+
+  describe('Anthropic prompt caching through the Mastra gateway', () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    async function captureGatewayRequest(
+      anthropicPromptCacheScope?: 'conversation' | 'system',
+      gatewayApiKey = 'msk-gateway-test',
+      followUp: any[] = [],
+    ) {
+      const requests: Array<{ headers: Headers; body: any }> = [];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (_url: unknown, init?: RequestInit) => {
+          requests.push({ headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) });
+          return new Response('{}', { status: 500 });
+        }),
+      );
+      const gateway = new MastraCodeGateway({
+        mastraGatewayBaseUrl: 'https://gateway.example.com',
+        mastraGatewayApiKey: gatewayApiKey,
+        routeThroughMastraGateway: true,
+        customProviders: [],
+        settingsPath: join(tmpdir(), 'nonexistent-settings.json'),
+        anthropicPromptCacheScope,
+      });
+      const model = gateway.resolveLanguageModel({
+        providerId: 'anthropic',
+        modelId: 'claude-opus-5.5',
+        apiKey: gatewayApiKey,
+        headers: { 'x-thread-id': 'thread-1' },
+      });
+      await Promise.resolve(
+        model.doGenerate({
+          prompt: [
+            { role: 'system', content: 'Instructions' },
+            { role: 'system', content: 'Memory' },
+            { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+            ...followUp,
+          ],
+        }),
+      ).catch(() => undefined);
+
+      expect(requests).toHaveLength(1);
+      return requests[0]!;
+    }
+
+    it('marks the last system message and the latest message for the main agent', async () => {
+      const { headers, body } = await captureGatewayRequest();
+
+      expect(body.model).toBe('anthropic/claude-opus-5-5');
+      const marker = { type: 'ephemeral', ttl: '1h' };
+      expect(body.messages[0].content.at(-1).cache_control).toBeUndefined();
+      expect(body.messages[1].content.at(-1).cache_control).toEqual(marker);
+      expect(body.messages[2].content.at(-1).cache_control).toEqual(marker);
+      expect(headers.get('x-gateway-strict-capabilities')).toBe('false');
+      expect(headers.get('x-thread-id')).toBe('thread-1');
+      expect(headers.get('authorization')).toBe('Bearer msk-gateway-test');
+    });
+
+    it('recognizes the other organization key prefix', async () => {
+      const { headers, body } = await captureGatewayRequest('conversation', 'mskv2_test');
+
+      expect(body.messages[2].content.at(-1).cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+      expect(headers.get('x-gateway-strict-capabilities')).toBe('false');
+    });
+
+    it('marks a tool result when it is the latest message, as in an agent loop', async () => {
+      const { body } = await captureGatewayRequest('conversation', 'msk-gateway-test', [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', toolCallId: 'call-1', toolName: 'view', input: { path: 'a.txt' } }],
+        },
+        {
+          role: 'tool',
+          content: [
+            {
+              type: 'tool-result',
+              toolCallId: 'call-1',
+              toolName: 'view',
+              output: { type: 'text', value: 'contents' },
+            },
+          ],
+        },
+      ]);
+
+      const marked = body.messages.filter((message: unknown) => JSON.stringify(message).includes('cache_control'));
+      expect(marked.map((message: { role: string }) => message.role)).toEqual(['system', 'tool']);
+      expect(body.messages.at(-1).role).toBe('tool');
+    });
+
+    it('marks only the last system message for background calls', async () => {
+      const { body } = await captureGatewayRequest('system');
+
+      expect(body.messages[1].content.at(-1).cache_control).toEqual({ type: 'ephemeral', ttl: '5m' });
+      expect(body.messages[2].content.at(-1).cache_control).toBeUndefined();
+    });
+
+    it('leaves the prompt alone for a project key, where the gateway manages memory', async () => {
+      const { headers, body } = await captureGatewayRequest('conversation', 'msk_project_test');
+
+      expect(JSON.stringify(body)).not.toContain('cache_control');
+      expect(headers.has('x-gateway-strict-capabilities')).toBe(false);
+    });
+  });
+
+  it('keeps the gateway key away from Moonshot when a gateway Kimi model runs', async () => {
+    const hosts: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: unknown) => {
+        hosts.push(new URL(String(url)).host);
+        return new Response('{}', { status: 500 });
+      }),
+    );
+    const gateway = new MastraCodeGateway({
+      mastraGatewayBaseUrl: 'https://gateway.example.com',
+      mastraGatewayApiKey: 'org-gateway-key',
+      routeThroughMastraGateway: true,
+      customProviders: [],
+      settingsPath: join(tmpdir(), 'nonexistent-settings.json'),
+    });
+
+    const model = gateway.resolveLanguageModel({
+      providerId: 'moonshotai',
+      modelId: 'kimi-k2.6',
+      apiKey: 'org-gateway-key',
+    });
+    await Promise.resolve(
+      model.doGenerate({ prompt: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }),
+    ).catch(() => undefined);
+    vi.unstubAllGlobals();
+
+    expect(hosts).toEqual(['gateway.example.com']);
+  });
+
+  describe('gateway API key accessors', () => {
+    it('keeps the previous accessor as a compatibility alias', () => {
+      writeAuthJson({
+        'apikey:mastra-gateway': { type: 'api_key', key: 'msk-test' },
+      });
+
+      expect(MastraCodeGateway.getMastraGatewayApiKey()).toBe('msk-test');
+      expect(MastraCodeGateway.getMemoryGatewayApiKey()).toBe('msk-test');
+
+      const getMemoryGatewayApiKey = MastraCodeGateway.getMemoryGatewayApiKey;
+      expect(getMemoryGatewayApiKey()).toBe('msk-test');
+    });
+  });
+});

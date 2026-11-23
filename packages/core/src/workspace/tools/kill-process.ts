@@ -2,7 +2,7 @@ import { z } from 'zod/v4';
 import { createTool } from '../../tools';
 import { WORKSPACE_TOOLS } from '../constants';
 import { SandboxFeatureNotSupportedError } from '../errors';
-import { emitWorkspaceMetadata, requireSandbox } from './helpers';
+import { emitWorkspaceMetadata, getDynamicSandboxCacheKeyHint, requireSandbox } from './helpers';
 import { truncateOutput, sandboxToModelOutput } from './output-helpers';
 import { startWorkspaceSpan } from './tracing';
 
@@ -14,6 +14,7 @@ export const killProcessTool = createTool({
 
 Use this to stop a long-running background process that was started with execute_command (background: true). Returns the last ${KILL_TAIL_LINES} lines of output.`,
   toModelOutput: sandboxToModelOutput,
+  outputSchema: z.string(),
   inputSchema: z.object({
     pid: z.string().describe('The process ID of the background process to kill'),
   }),
@@ -48,12 +49,15 @@ Use this to stop a long-running background process that was started with execute
       const killed = await sandbox.processes.kill(pid);
 
       if (!killed) {
-        await context?.writer?.custom({
-          type: 'data-sandbox-exit',
-          data: { exitCode: handle?.exitCode ?? -1, success: false, killed: false, toolCallId },
-        });
+        // A process that was never found has no exit to report.
+        if (handle?.exitCode !== undefined) {
+          await context?.writer?.custom({
+            type: 'data-sandbox-exit',
+            data: { exitCode: handle.exitCode, success: false, killed: false, toolCallId },
+          });
+        }
         span.end({ success: false });
-        return `Process ${pid} was not found or had already exited.`;
+        return `Process ${pid} was not found or had already exited.${getDynamicSandboxCacheKeyHint(workspace)}`;
       }
 
       await context?.writer?.custom({

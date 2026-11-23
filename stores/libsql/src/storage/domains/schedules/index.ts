@@ -1,4 +1,3 @@
-import type { Client, InValue } from '@libsql/client';
 import type {
   Schedule,
   ScheduleFilter,
@@ -7,11 +6,23 @@ import type {
   ScheduleStatus,
   ScheduleTarget,
   ScheduleUpdate,
+  PruneOptions,
+  PruneResult,
+  RetentionTablesDescriptor,
+  TableRetentionPolicy,
 } from '@mastra/core/storage';
-import { SchedulesStorage, TABLE_SCHEDULES, TABLE_SCHEDULE_TRIGGERS, TABLE_SCHEMAS } from '@mastra/core/storage';
+import {
+  normalizeScheduleTarget,
+  SchedulesStorage,
+  TABLE_SCHEDULES,
+  TABLE_SCHEDULE_TRIGGERS,
+  TABLE_SCHEMAS,
+} from '@mastra/core/storage';
 import { LibSQLDB, resolveClient } from '../../db';
 import type { LibSQLDomainConfig } from '../../db';
+import type { SqliteClient as Client, SqliteInValue as InValue } from '../../db/client';
 import { buildSelectColumns } from '../../db/utils';
+import { runPrune, resolveTargets } from '../../retention';
 
 function parseJson<T = unknown>(val: unknown): T | undefined {
   if (val == null) return undefined;
@@ -37,7 +48,7 @@ function rowToSchedule(row: Record<string, any>): Schedule {
   }
   const schedule: Schedule = {
     id: String(row.id),
-    target,
+    target: normalizeScheduleTarget(target),
     cron: String(row.cron),
     status: String(row.status) as ScheduleStatus,
     nextFireAt: toNumber(row.next_fire_at),
@@ -51,6 +62,8 @@ function rowToSchedule(row: Record<string, any>): Schedule {
   if (metadata !== undefined) schedule.metadata = metadata;
   if (row.owner_type != null) schedule.ownerType = String(row.owner_type) as Schedule['ownerType'];
   if (row.owner_id != null) schedule.ownerId = String(row.owner_id);
+  if (row.run_at != null) schedule.runAt = toNumber(row.run_at);
+  if (row.end_at != null) schedule.endAt = toNumber(row.end_at);
   return schedule;
 }
 
@@ -73,6 +86,15 @@ function rowToTrigger(row: Record<string, any>): ScheduleTrigger {
 }
 
 export class SchedulesLibSQL extends SchedulesStorage {
+  /**
+   * The fire/run history (`schedule_triggers`, one row per fire) is the growth
+   * table; schedule definitions are config and excluded. Anchored on
+   * `actual_fire_at`, a bigint epoch-ms column (numeric comparison, not ISO).
+   */
+  static override readonly retentionTables: RetentionTablesDescriptor = {
+    triggers: { table: TABLE_SCHEDULE_TRIGGERS, column: 'actual_fire_at', indexed: true, anchorType: 'epoch-ms' },
+  };
+
   #db: LibSQLDB;
   #client: Client;
 
@@ -80,18 +102,51 @@ export class SchedulesLibSQL extends SchedulesStorage {
     super();
     const client = resolveClient(config);
     this.#client = client;
-    this.#db = new LibSQLDB({ client, maxRetries: config.maxRetries, initialBackoffMs: config.initialBackoffMs });
+    this.#db = new LibSQLDB({
+      client,
+      maxRetries: config.maxRetries,
+      initialBackoffMs: config.initialBackoffMs,
+      getLogger: () => this.logger,
+    });
   }
 
   async init(): Promise<void> {
+    await this.#migrateLegacyTriggersTable();
+
     await this.#db.createTable({
       tableName: TABLE_SCHEDULES,
       schema: TABLE_SCHEMAS[TABLE_SCHEDULES],
     });
+    for (const column of ['run_at', 'end_at']) {
+      try {
+        await this.#db.alterTable({
+          tableName: TABLE_SCHEDULES,
+          schema: TABLE_SCHEMAS[TABLE_SCHEDULES],
+          ifNotExists: [column],
+        });
+      } catch (error) {
+        if (!(await this.#db.hasColumn(TABLE_SCHEDULES, column))) throw error;
+      }
+    }
     await this.#db.createTable({
       tableName: TABLE_SCHEDULE_TRIGGERS,
       schema: TABLE_SCHEMAS[TABLE_SCHEDULE_TRIGGERS],
     });
+    // Tables created before ownership support lack these columns. Another
+    // process sharing the database may add them between our check and ALTER;
+    // that duplicate-column failure is fine once both columns exist.
+    try {
+      await this.#db.alterTable({
+        tableName: TABLE_SCHEDULES,
+        schema: TABLE_SCHEMAS[TABLE_SCHEDULES],
+        ifNotExists: ['owner_type', 'owner_id'],
+      });
+    } catch (error) {
+      const migrated =
+        (await this.#db.hasColumn(TABLE_SCHEDULES, 'owner_type')) &&
+        (await this.#db.hasColumn(TABLE_SCHEDULES, 'owner_id'));
+      if (!migrated) throw error;
+    }
 
     await this.#client.batch(
       [
@@ -108,9 +163,63 @@ export class SchedulesLibSQL extends SchedulesStorage {
     );
   }
 
+  /**
+   * Trigger tables created before the ownership/audit schema change are keyed
+   * by `run_id` (NOT NULL) and store `status` instead of `outcome`. SQLite
+   * cannot change a primary key or rename-and-retype in place, so the table is
+   * rebuilt in the current shape inside one write transaction. Legacy run ids
+   * are unique, so they become the new row ids.
+   */
+  async #migrateLegacyTriggersTable(): Promise<void> {
+    const isLegacy = async () =>
+      (await this.#db.hasColumn(TABLE_SCHEDULE_TRIGGERS, 'status')) &&
+      !(await this.#db.hasColumn(TABLE_SCHEDULE_TRIGGERS, 'outcome'));
+    if (!(await isLegacy())) return;
+
+    const shadow = `${TABLE_SCHEDULE_TRIGGERS}__legacy_rebuild`;
+    try {
+      await this.#client.batch(
+        [
+          `DROP TABLE IF EXISTS "${shadow}"`,
+          `CREATE TABLE "${shadow}" (
+            "id" TEXT NOT NULL PRIMARY KEY,
+            "schedule_id" TEXT NOT NULL,
+            "run_id" TEXT,
+            "scheduled_fire_at" INTEGER NOT NULL,
+            "actual_fire_at" INTEGER NOT NULL,
+            "outcome" TEXT NOT NULL,
+            "error" TEXT,
+            "trigger_kind" TEXT NOT NULL,
+            "parent_trigger_id" TEXT,
+            "metadata" TEXT
+          )`,
+          `INSERT INTO "${shadow}" ("id", "schedule_id", "run_id", "scheduled_fire_at", "actual_fire_at", "outcome", "error", "trigger_kind")
+           SELECT "run_id", "schedule_id", "run_id", "scheduled_fire_at", "actual_fire_at", "status", "error", 'schedule-fire'
+           FROM "${TABLE_SCHEDULE_TRIGGERS}"`,
+          `DROP TABLE "${TABLE_SCHEDULE_TRIGGERS}"`,
+          `ALTER TABLE "${shadow}" RENAME TO "${TABLE_SCHEDULE_TRIGGERS}"`,
+        ],
+        'write',
+      );
+    } catch (error) {
+      // Another process sharing this database may have rebuilt the table first.
+      if (await isLegacy()) throw error;
+    }
+  }
+
   async dangerouslyClearAll(): Promise<void> {
     await this.#db.deleteData({ tableName: TABLE_SCHEDULE_TRIGGERS });
     await this.#db.deleteData({ tableName: TABLE_SCHEDULES });
+  }
+
+  /** Delete schedule fire history older than the `triggers` policy's `maxAge`, batched. */
+  async prune(policies: Record<string, TableRetentionPolicy>, options?: PruneOptions): Promise<PruneResult[]> {
+    const targets = resolveTargets({
+      policies,
+      descriptor: SchedulesLibSQL.retentionTables,
+      order: ['triggers'],
+    });
+    return runPrune({ db: this.#db, domain: 'schedules', targets, options, logger: this.logger });
   }
 
   async createSchedule(schedule: Schedule): Promise<Schedule> {
@@ -134,6 +243,8 @@ export class SchedulesLibSQL extends SchedulesStorage {
         metadata: schedule.metadata ?? null,
         owner_type: schedule.ownerType ?? null,
         owner_id: schedule.ownerId ?? null,
+        run_at: schedule.runAt ?? null,
+        end_at: schedule.endAt ?? null,
       },
     });
     return schedule;
@@ -234,6 +345,14 @@ export class SchedulesLibSQL extends SchedulesStorage {
       setClauses.push('owner_id = ?');
       params.push((patch.ownerId as string | undefined) ?? null);
     }
+    if ('runAt' in patch) {
+      setClauses.push('run_at = ?');
+      params.push(patch.runAt ?? null);
+    }
+    if ('endAt' in patch) {
+      setClauses.push('end_at = ?');
+      params.push(patch.endAt ?? null);
+    }
 
     setClauses.push('updated_at = ?');
     params.push(Date.now());
@@ -262,12 +381,13 @@ export class SchedulesLibSQL extends SchedulesStorage {
     newNextFireAt: number,
     lastFireAt: number,
     lastRunId: string,
+    newStatus?: ScheduleStatus,
   ): Promise<boolean> {
     const result = await this.#client.execute({
       sql: `UPDATE ${TABLE_SCHEDULES}
-            SET next_fire_at = ?, last_fire_at = ?, last_run_id = ?, updated_at = ?
+            SET next_fire_at = ?, last_fire_at = ?, last_run_id = ?, updated_at = ?, status = COALESCE(?, status)
             WHERE id = ? AND next_fire_at = ? AND status = ?`,
-      args: [newNextFireAt, lastFireAt, lastRunId, Date.now(), id, expectedNextFireAt, 'active'],
+      args: [newNextFireAt, lastFireAt, lastRunId, Date.now(), newStatus ?? null, id, expectedNextFireAt, 'active'],
     });
     return (result.rowsAffected ?? 0) > 0;
   }

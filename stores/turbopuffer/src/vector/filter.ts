@@ -6,7 +6,12 @@ import type {
   BlacklistedRootOperators,
 } from '@mastra/core/vector/filter';
 import { BaseFilterTranslator } from '@mastra/core/vector/filter';
-import type { FilterCondition, FilterConnective, FilterOperator, Filters } from '@turbopuffer/turbopuffer';
+import type { Filter } from '@turbopuffer/turbopuffer/resources/custom';
+
+type TurbopufferFilter = Filter;
+type FilterCondition = Extract<Filter, [string, string, any]>;
+type FilterConnective = 'And' | 'Or';
+type FilterOperator = FilterCondition[1];
 
 type TurbopufferOperatorValueMap = Omit<OperatorValueMap, '$regex' | '$options' | '$elemMatch'>;
 
@@ -27,7 +32,10 @@ export type TurbopufferVectorFilter = VectorFilter<
  * Mastra filters: { field: { $gt: 10 } }
  * Turbopuffer filters: ["And", [["field", "Gt", 10]]]
  */
-export class TurbopufferFilterTranslator extends BaseFilterTranslator<TurbopufferVectorFilter, Filters | undefined> {
+export class TurbopufferFilterTranslator extends BaseFilterTranslator<
+  TurbopufferVectorFilter,
+  TurbopufferFilter | undefined
+> {
   protected override getSupportedOperators(): OperatorSupport {
     return {
       ...BaseFilterTranslator.DEFAULT_OPERATORS,
@@ -56,7 +64,7 @@ export class TurbopufferFilterTranslator extends BaseFilterTranslator<Turbopuffe
   /**
    * Convert the Mastra filter to Turbopuffer format
    */
-  translate(filter?: TurbopufferVectorFilter): Filters | undefined {
+  translate(filter?: TurbopufferVectorFilter): TurbopufferFilter | undefined {
     if (this.isEmpty(filter)) {
       return undefined;
     }
@@ -73,13 +81,13 @@ export class TurbopufferFilterTranslator extends BaseFilterTranslator<Turbopuffe
       return ['And', [result as FilterCondition]];
     }
 
-    return result as Filters;
+    return result as TurbopufferFilter;
   }
 
   /**
    * Recursively translate a filter node
    */
-  private translateNode(node: TurbopufferVectorFilter): Filters | FilterCondition {
+  private translateNode(node: TurbopufferVectorFilter): TurbopufferFilter | FilterCondition {
     // Handle empty or null nodes
     if (node === null || node === undefined || Object.keys(node).length === 0) {
       return ['And', []];
@@ -150,14 +158,13 @@ export class TurbopufferFilterTranslator extends BaseFilterTranslator<Turbopuffe
           // For multiple comparison operators on one field
           const conditions = operators.map(op => this.translateOperator(field, op, value[op]));
           return ['And', conditions] as unknown as FilterCondition;
-        } else {
-          // For nested objects with multiple fields
-          const conditions = operators.map(op => {
-            const nestedField = `${field}.${op}`;
-            return this.translateFieldCondition(nestedField, value[op]);
-          });
-          return ['And', conditions] as unknown as FilterCondition;
         }
+        // For nested objects with multiple fields
+        const conditions = operators.map(op => {
+          const nestedField = `${field}.${op}`;
+          return this.translateFieldCondition(nestedField, value[op]);
+        });
+        return ['And', conditions] as unknown as FilterCondition;
       }
 
       // Single operator
@@ -179,7 +186,7 @@ export class TurbopufferFilterTranslator extends BaseFilterTranslator<Turbopuffe
   /**
    * Translate a logical operator
    */
-  private translateLogical(operator: string, conditions: any[]): Filters {
+  private translateLogical(operator: string, conditions: any[]): TurbopufferFilter {
     // Map Mastra logical operators to Turbopuffer
     const logicalOp: FilterConnective = operator === '$and' ? 'And' : 'Or';
 

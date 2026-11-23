@@ -28,13 +28,29 @@ type FilterOperator = {
 
 type OperatorFn = (key: string, paramIndex: number, value?: any) => FilterOperator;
 
+const getTextExtractExpr = (key: string) => {
+  const jsonPathKey = parseJsonPathKey(key);
+  if (!key.includes('.')) {
+    return `metadata->>'${jsonPathKey}'`;
+  }
+  return `metadata#>>'{${jsonPathKey}}'`;
+};
+
+const getJsonExtractExpr = (key: string) => {
+  const jsonPathKey = parseJsonPathKey(key);
+  if (!key.includes('.')) {
+    return `metadata->'${jsonPathKey}'`;
+  }
+  return `metadata#>'{${jsonPathKey}}'`;
+};
+
 const createBasicOperator = (symbol: string) => {
   return (key: string, paramIndex: number) => {
-    const jsonPathKey = parseJsonPathKey(key);
+    const textExtract = getTextExtractExpr(key);
     return {
-      sql: `CASE 
-        WHEN $${paramIndex}::text IS NULL THEN metadata#>>'{${jsonPathKey}}' IS ${symbol === '=' ? '' : 'NOT'} NULL
-        ELSE metadata#>>'{${jsonPathKey}}' ${symbol} $${paramIndex}::text
+      sql: `CASE
+        WHEN $${paramIndex}::text IS NULL THEN ${textExtract} IS ${symbol === '=' ? '' : 'NOT'} NULL
+        ELSE ${textExtract} ${symbol} $${paramIndex}::text
       END`,
       needsValue: true,
     };
@@ -43,7 +59,8 @@ const createBasicOperator = (symbol: string) => {
 
 const createNumericOperator = (symbol: string) => {
   return (key: string, paramIndex: number, value?: any) => {
-    const jsonPathKey = parseJsonPathKey(key);
+    const textExtract = getTextExtractExpr(key);
+    const jsonExtract = getJsonExtractExpr(key);
 
     // Check if the value is a number or can be parsed as a number
     const isNumeric =
@@ -51,17 +68,22 @@ const createNumericOperator = (symbol: string) => {
 
     // Use numeric comparison for numbers, text comparison for strings/dates
     if (isNumeric) {
+      // JSONB metadata is schemaless, so a candidate row may hold a non-numeric
+      // value at this path (e.g. { price: 'N/A' }). Casting the column to ::numeric
+      // unconditionally makes Postgres raise 22P02 and fail the ENTIRE query instead
+      // of that row simply not matching. Guard the cast with jsonb_typeof so only
+      // number-typed rows are compared and everything else is excluded, mirroring the
+      // $size/$in pattern already used in this file and MongoDB-style range semantics.
       return {
-        sql: `(metadata#>>'{${jsonPathKey}}')::numeric ${symbol} $${paramIndex}::numeric`,
-        needsValue: true,
-      };
-    } else {
-      // Use text comparison for strings (including ISO 8601 dates which sort correctly)
-      return {
-        sql: `metadata#>>'{${jsonPathKey}}' ${symbol} $${paramIndex}::text`,
+        sql: `(CASE WHEN jsonb_typeof(${jsonExtract}) = 'number' THEN (${textExtract})::numeric ${symbol} $${paramIndex}::numeric ELSE NULL END)`,
         needsValue: true,
       };
     }
+    // Use text comparison for strings (including ISO 8601 dates which sort correctly)
+    return {
+      sql: `${textExtract} ${symbol} $${paramIndex}::text`,
+      needsValue: true,
+    };
   };
 };
 
@@ -73,38 +95,56 @@ function buildElemMatchConditions(value: any, paramIndex: number): { sql: string
   const conditions: string[] = [];
   const values: any[] = [];
 
-  Object.entries(value).forEach(([field, val]) => {
-    const nextParamIndex = paramIndex + values.length;
-
-    let paramOperator;
-    let paramKey;
-    let paramValue;
-
-    if (field.startsWith('$')) {
-      paramOperator = field;
-      paramKey = '';
-      paramValue = val;
-    } else if (typeof val === 'object' && !Array.isArray(val)) {
-      const [op, opValue] = Object.entries(val || {})[0] || [];
-      paramOperator = op;
-      paramKey = field;
-      paramValue = opValue;
-    } else {
-      paramOperator = '$eq';
-      paramKey = field;
-      paramValue = val;
+  function buildFieldCondition(field: string, operator: string, operatorValue: any): string {
+    if (operator === '$not') {
+      const nested = Object.entries(operatorValue as Record<string, unknown>);
+      if (nested.length === 0) {
+        throw new Error('$not requires at least one operator');
+      }
+      return `NOT (COALESCE(${nested.map(([nestedOp, nestedValue]) => buildFieldCondition(field, nestedOp, nestedValue)).join(' AND ')}, FALSE))`;
     }
 
-    const operatorFn = FILTER_OPERATORS[paramOperator as OperatorType];
+    const operatorFn = FILTER_OPERATORS[operator as OperatorType];
     if (!operatorFn) {
-      throw new Error(`Invalid operator: ${paramOperator}`);
+      throw new Error(`Invalid operator: ${operator}`);
     }
-    const result = operatorFn(paramKey, nextParamIndex, paramValue);
+    const scalarElement = field.startsWith('$');
+    const result = operatorFn(scalarElement ? '' : field, paramIndex + values.length, operatorValue);
 
-    const sql = result.sql.replaceAll('metadata#>>', 'elem#>>');
-    conditions.push(sql);
+    // Rewrite column references to the current element; scalar arrays have no field key.
+    const sql = result.sql
+      .replaceAll('metadata->>', 'elem->>')
+      .replaceAll('metadata->', 'elem->')
+      .replaceAll('metadata#>>', 'elem#>>')
+      .replaceAll('metadata#>', 'elem#>')
+      .replaceAll('metadata ?', 'elem ?');
+    const elementSql = scalarElement
+      ? sql.replaceAll("elem->>''", "elem #>> '{}'").replaceAll("elem->''", 'elem')
+      : sql;
     if (result.needsValue) {
-      values.push(paramValue);
+      const transformedValue = result.transformValue ? result.transformValue() : operatorValue;
+      if (operator === '$elemMatch') {
+        values.push(...transformedValue);
+      } else {
+        values.push(transformedValue);
+      }
+    }
+    return elementSql;
+  }
+
+  Object.entries(value).forEach(([field, val]) => {
+    const operators: [string, any][] = field.startsWith('$')
+      ? [[field, val]]
+      : typeof val === 'object' && val !== null && !Array.isArray(val)
+        ? Object.entries(val)
+        : [['$eq', val]];
+
+    if (operators.length === 0) {
+      throw new Error(`$elemMatch field ${field} requires at least one operator`);
+    }
+
+    for (const [operator, operatorValue] of operators) {
+      conditions.push(buildFieldCondition(field, operator, operatorValue));
     }
   });
 
@@ -125,55 +165,57 @@ const FILTER_OPERATORS: Record<OperatorType, OperatorFn> = {
 
   // Array Operators
   $in: (key, paramIndex) => {
-    const jsonPathKey = parseJsonPathKey(key);
+    const textExtract = getTextExtractExpr(key);
+    const jsonExtract = getJsonExtractExpr(key);
     return {
       sql: `(
         CASE
-          WHEN jsonb_typeof(metadata->'${jsonPathKey}') = 'array' THEN
+          WHEN jsonb_typeof(${jsonExtract}) = 'array' THEN
             EXISTS (
-              SELECT 1 FROM jsonb_array_elements_text(metadata->'${jsonPathKey}') as elem
+              SELECT 1 FROM jsonb_array_elements_text(${jsonExtract}) as elem
               WHERE elem = ANY($${paramIndex}::text[])
             )
-          ELSE metadata#>>'{${jsonPathKey}}' = ANY($${paramIndex}::text[])
+          ELSE ${textExtract} = ANY($${paramIndex}::text[])
         END
       )`,
       needsValue: true,
     };
   },
   $nin: (key, paramIndex) => {
-    const jsonPathKey = parseJsonPathKey(key);
+    const textExtract = getTextExtractExpr(key);
+    const jsonExtract = getJsonExtractExpr(key);
     return {
       sql: `(
         CASE
-          WHEN jsonb_typeof(metadata->'${jsonPathKey}') = 'array' THEN
+          WHEN jsonb_typeof(${jsonExtract}) = 'array' THEN
             NOT EXISTS (
-              SELECT 1 FROM jsonb_array_elements_text(metadata->'${jsonPathKey}') as elem
+              SELECT 1 FROM jsonb_array_elements_text(${jsonExtract}) as elem
               WHERE elem = ANY($${paramIndex}::text[])
             )
-          ELSE metadata#>>'{${jsonPathKey}}' != ALL($${paramIndex}::text[])
+          ELSE ${textExtract} != ALL($${paramIndex}::text[])
         END
       )`,
       needsValue: true,
     };
   },
   $all: (key, paramIndex) => {
-    const jsonPathKey = parseJsonPathKey(key);
+    const jsonExtract = getJsonExtractExpr(key);
     return {
-      sql: `CASE WHEN array_length($${paramIndex}::text[], 1) IS NULL THEN false 
-            ELSE (metadata#>'{${jsonPathKey}}')::jsonb ?& $${paramIndex}::text[] END`,
+      sql: `CASE WHEN array_length($${paramIndex}::text[], 1) IS NULL THEN false
+            ELSE (${jsonExtract})::jsonb ?& $${paramIndex}::text[] END`,
       needsValue: true,
     };
   },
   $elemMatch: (key: string, paramIndex: number, value: any): FilterOperator => {
     const { sql, values } = buildElemMatchConditions(value, paramIndex);
-    const jsonPathKey = parseJsonPathKey(key);
+    const jsonExtract = getJsonExtractExpr(key);
     return {
       sql: `(
         CASE
-          WHEN jsonb_typeof(metadata->'${jsonPathKey}') = 'array' THEN
+          WHEN jsonb_typeof(${jsonExtract}) = 'array' THEN
             EXISTS (
-              SELECT 1 
-              FROM jsonb_array_elements(metadata->'${jsonPathKey}') as elem
+              SELECT 1
+              FROM jsonb_array_elements(${jsonExtract}) as elem
               WHERE ${sql}
             )
           ELSE FALSE
@@ -185,17 +227,13 @@ const FILTER_OPERATORS: Record<OperatorType, OperatorFn> = {
   },
   // Element Operators
   $exists: (key, paramIndex, value) => {
-    const jsonPathKey = parseJsonPathKey(key);
-    // If value is false, check that the key does NOT exist
-    if (value === false) {
-      return {
-        sql: `NOT (metadata ? '${jsonPathKey}')`,
-        needsValue: false,
-      };
-    }
-    // Otherwise (true or truthy), check that the key exists
+    // `?` only checks top-level keys. Nested paths use `#>`, which yields SQL NULL only when the path is missing
+    // (a JSON null value still counts as existing, matching `?` semantics).
+    const existsSql = key.includes('.')
+      ? `${getJsonExtractExpr(key)} IS NOT NULL`
+      : `metadata ? '${parseJsonPathKey(key)}'`;
     return {
-      sql: `metadata ? '${jsonPathKey}'`,
+      sql: value === false ? `NOT (${existsSql})` : existsSql,
       needsValue: false,
     };
   },
@@ -203,27 +241,28 @@ const FILTER_OPERATORS: Record<OperatorType, OperatorFn> = {
   // Logical Operators
   $and: key => ({ sql: `(${key})`, needsValue: false }),
   $or: key => ({ sql: `(${key})`, needsValue: false }),
-  $not: key => ({ sql: `NOT (${key})`, needsValue: false }),
+  $not: key => ({ sql: `(${key})`, needsValue: false }),
   $nor: key => ({ sql: `NOT (${key})`, needsValue: false }),
 
   // Regex Operators
   $regex: (key, paramIndex) => {
-    const jsonPathKey = parseJsonPathKey(key);
+    const textExtract = getTextExtractExpr(key);
     return {
-      sql: `metadata#>>'{${jsonPathKey}}' ~ $${paramIndex}`,
+      sql: `${textExtract} ~ $${paramIndex}`,
       needsValue: true,
     };
   },
 
   $contains: (key, paramIndex, value: any) => {
-    const jsonPathKey = parseJsonPathKey(key);
+    const textExtract = getTextExtractExpr(key);
+    const jsonExtract = getJsonExtractExpr(key);
     let sql;
     if (Array.isArray(value)) {
-      sql = `(metadata->'${jsonPathKey}') ?& $${paramIndex}`;
+      sql = `(${jsonExtract}) ?& $${paramIndex}`;
     } else if (typeof value === 'string') {
-      sql = `metadata->>'${jsonPathKey}' ILIKE '%' || $${paramIndex} || '%' ESCAPE '\\'`;
+      sql = `${textExtract} ILIKE '%' || $${paramIndex} || '%' ESCAPE '\\'`;
     } else {
-      sql = `metadata->>'${jsonPathKey}' = $${paramIndex}`;
+      sql = `${textExtract} = $${paramIndex}`;
     }
     return {
       sql,
@@ -245,12 +284,12 @@ const FILTER_OPERATORS: Record<OperatorType, OperatorFn> = {
   //   },
   // }),
   $size: (key: string, paramIndex: number) => {
-    const jsonPathKey = parseJsonPathKey(key);
+    const jsonExtract = getJsonExtractExpr(key);
     return {
       sql: `(
       CASE
-        WHEN jsonb_typeof(metadata#>'{${jsonPathKey}}') = 'array' THEN 
-          jsonb_array_length(metadata#>'{${jsonPathKey}}') = $${paramIndex}
+        WHEN jsonb_typeof(${jsonExtract}) = 'array' THEN
+          jsonb_array_length(${jsonExtract}) = $${paramIndex}
         ELSE FALSE
       END
     )`,
@@ -288,7 +327,7 @@ export function buildDeleteFilterQuery(filter: PGVectorFilter): FilterResult {
     // If condition is not a FilterCondition object, assume it's an equality check
     if (!value || typeof value !== 'object') {
       values.push(value);
-      return `metadata#>>'{${parseJsonPathKey(key)}}' = $${values.length}`;
+      return `${getTextExtractExpr(key)} = $${values.length}`;
     }
 
     // Handle operator conditions
@@ -411,11 +450,9 @@ export function buildDeleteFilterQuery(filter: PGVectorFilter): FilterResult {
       const entries = Object.entries(f || {});
       if (entries.length === 0) return '';
 
-      const [firstKey, firstValue] = entries[0] || [];
-      if (['$and', '$or', '$not', '$nor'].includes(firstKey as string)) {
-        return buildCondition(firstKey as string, firstValue, parentPath);
-      }
-      return entries.map(([k, v]) => buildCondition(k, v, parentPath)).join(` ${joinOperator} `);
+      // The keys of one branch are an implicit AND: `{ a: 1, b: 2 }` matches only when both hold.
+      const branchConditions = entries.map(([k, v]) => buildCondition(k, v, parentPath));
+      return branchConditions.length === 1 ? branchConditions[0]! : `(${branchConditions.join(' AND ')})`;
     });
 
     const joined = conditions.join(` ${joinOperator} `);
@@ -447,7 +484,7 @@ export function buildFilterQuery(filter: PGVectorFilter, minScore: number, topK:
     // If condition is not a FilterCondition object, assume it's an equality check
     if (!value || typeof value !== 'object') {
       values.push(value);
-      return `metadata#>>'{${parseJsonPathKey(key)}}' = $${values.length}`;
+      return `${getTextExtractExpr(key)} = $${values.length}`;
     }
 
     // Handle operator conditions
@@ -570,11 +607,9 @@ export function buildFilterQuery(filter: PGVectorFilter, minScore: number, topK:
       const entries = Object.entries(f || {});
       if (entries.length === 0) return '';
 
-      const [firstKey, firstValue] = entries[0] || [];
-      if (['$and', '$or', '$not', '$nor'].includes(firstKey as string)) {
-        return buildCondition(firstKey as string, firstValue, parentPath);
-      }
-      return entries.map(([k, v]) => buildCondition(k, v, parentPath)).join(` ${joinOperator} `);
+      // The keys of one branch are an implicit AND: `{ a: 1, b: 2 }` matches only when both hold.
+      const branchConditions = entries.map(([k, v]) => buildCondition(k, v, parentPath));
+      return branchConditions.length === 1 ? branchConditions[0]! : `(${branchConditions.join(' AND ')})`;
     });
 
     const joined = conditions.join(` ${joinOperator} `);

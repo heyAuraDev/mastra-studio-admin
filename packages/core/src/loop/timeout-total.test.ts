@@ -1,0 +1,254 @@
+import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Mastra } from '../mastra';
+import type { Processor } from '../processors';
+import type { ModelManagerModelConfig } from '../stream/types';
+import { loop } from './loop';
+import {
+  createMessageListWithUserMessage,
+  createTestMastra,
+  createTestModels,
+  defaultSettings,
+  mockDate,
+  testUsage,
+} from './test-utils/utils';
+import { isMastraTimeoutError, MastraTimeoutError } from './timeout';
+
+const hangingModel = (id: string): ModelManagerModelConfig => ({
+  id,
+  maxRetries: 0,
+  model: new MockLanguageModelV2({
+    doStream: () => new Promise(() => {}),
+    doGenerate: () => new Promise(() => {}),
+  }),
+});
+
+const respondingModel = (id: string, text: string): ModelManagerModelConfig => ({
+  id,
+  maxRetries: 0,
+  model: new MockLanguageModelV2({
+    doStream: async () => ({
+      stream: convertArrayToReadableStream([
+        { type: 'text-start', id: 'text-1' },
+        { type: 'text-delta', id: 'text-1', delta: text },
+        { type: 'text-end', id: 'text-1' },
+        { type: 'finish', finishReason: 'stop', usage: testUsage },
+      ]),
+    }),
+  }),
+});
+
+describe('modelSettings.timeout.totalMs', () => {
+  const mastraRef: { current?: Mastra } = {};
+  let dispose: (() => Promise<void>) | undefined;
+
+  beforeEach(async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(mockDate);
+    const created = await createTestMastra();
+    mastraRef.current = created.mastra;
+    dispose = created.dispose;
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    await dispose?.();
+    mastraRef.current = undefined;
+    dispose = undefined;
+  });
+
+  const runLoop = async ({
+    models,
+    totalMs,
+    abortSignal,
+    outputProcessors,
+    beforeDeadlineSave,
+  }: {
+    models: ModelManagerModelConfig[];
+    totalMs?: number;
+    abortSignal?: AbortSignal;
+    outputProcessors?: Processor[];
+    beforeDeadlineSave?: () => Promise<void>;
+  }) => {
+    const settings = defaultSettings();
+    const result = loop({
+      ...settings,
+      mastra: mastraRef.current as any,
+      methodType: 'stream',
+      runId: 'test-run-id',
+      messageList: createMessageListWithUserMessage(),
+      models,
+      modelSettings: { ...settings.modelSettings, timeout: totalMs ? { totalMs } : undefined },
+      options: { ...settings.options, abortSignal, beforeDeadlineSave },
+      outputProcessors,
+    } as any);
+
+    const chunks: any[] = [];
+    for await (const chunk of result.fullStream) {
+      chunks.push(chunk);
+    }
+    return chunks;
+  };
+
+  it('terminates a hanging run with a total-timeout error chunk', async () => {
+    const chunks = await runLoop({ models: [hangingModel('slow')], totalMs: 100 });
+
+    const errorChunk = chunks.find(chunk => chunk.type === 'error');
+    expect(errorChunk).toBeDefined();
+    expect(isMastraTimeoutError(errorChunk.payload.error)).toBe(true);
+    expect(errorChunk.payload.error.timeoutType).toBe('total');
+    expect(chunks.some(chunk => chunk.type === 'finish')).toBe(false);
+  });
+
+  it('does not fall back to the next model when the total budget is exhausted', async () => {
+    const fallback = respondingModel('fallback', 'from fallback');
+    const doStream = vi.spyOn(fallback.model as any, 'doStream');
+
+    const chunks = await runLoop({ models: [hangingModel('slow'), fallback], totalMs: 100 });
+
+    expect(chunks.some(chunk => chunk.type === 'error')).toBe(true);
+    expect(doStream).not.toHaveBeenCalled();
+  });
+
+  it('leaves a run that finishes within the budget untouched', async () => {
+    const chunks = await runLoop({ models: createTestModels(), totalMs: 30_000 });
+
+    expect(chunks.some(chunk => chunk.type === 'error')).toBe(false);
+    expect(chunks.some(chunk => chunk.type === 'finish')).toBe(true);
+  });
+
+  it('is inert when no total budget is configured', async () => {
+    const chunks = await runLoop({ models: createTestModels() });
+
+    expect(chunks.some(chunk => chunk.type === 'error')).toBe(false);
+    expect(chunks.some(chunk => chunk.type === 'finish')).toBe(true);
+  });
+
+  it.each([
+    [50, '`modelSettings.timeout` must be an object'],
+    [{ totalMs: 0 }, '`modelSettings.timeout.totalMs` must be a positive, finite number'],
+  ])('rejects invalid call-level timeout settings: %j', (timeout, errorMessage) => {
+    const settings = defaultSettings();
+
+    expect(() =>
+      loop({
+        ...settings,
+        mastra: mastraRef.current as any,
+        methodType: 'stream',
+        runId: 'test-run-id',
+        messageList: createMessageListWithUserMessage(),
+        models: createTestModels(),
+        modelSettings: { ...settings.modelSettings, timeout },
+      } as any),
+    ).toThrow(errorMessage);
+  });
+
+  it('still honours a caller-supplied abort signal', async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error('user cancelled')), 50);
+
+    const chunks = await runLoop({
+      models: [hangingModel('slow')],
+      totalMs: 30_000,
+      abortSignal: controller.signal,
+    });
+
+    // An abort settles the run through the normal abort path (which still emits a finish
+    // chunk); what matters is that it is not misreported as a timeout.
+    const errorChunk = chunks.find(chunk => chunk.type === 'error');
+    if (errorChunk) {
+      expect(isMastraTimeoutError(errorChunk.payload.error)).toBe(false);
+    }
+  });
+
+  it.each([undefined, 30_000])(
+    'ends as an abort when the caller signal aborts with a parent run timeout (totalMs %s)',
+    async totalMs => {
+      // A sub-agent's caller signal carries the parent run's own total-timeout error.
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new MastraTimeoutError({ timeoutType: 'total', timeoutMs: 50 })), 50);
+
+      const chunks = await runLoop({ models: [hangingModel('slow')], totalMs, abortSignal: controller.signal });
+
+      expect(chunks.some(chunk => chunk.type === 'abort')).toBe(true);
+    },
+  );
+
+  // The deadline pass runs the output processors, and with them the memory write. It is only for
+  // callers that supply the write check, so it never writes without one.
+  it.each([
+    ['skips', false],
+    ['runs', true],
+  ])('%s the deadline output pass when the write check is supplied: %s', async (_label, withCheck) => {
+    const events: string[] = [];
+    const probe: Processor = {
+      id: 'probe',
+      processOutputResult: async ({ messages }) => {
+        events.push('output-pass');
+        return messages;
+      },
+    };
+    const beforeDeadlineSave = withCheck
+      ? async () => {
+          events.push('write-check');
+        }
+      : undefined;
+
+    const chunks = await runLoop({
+      models: [hangingModel('slow')],
+      totalMs: 100,
+      outputProcessors: [probe],
+      beforeDeadlineSave,
+    });
+
+    expect(chunks.some(chunk => chunk.type === 'error')).toBe(true);
+    expect(events).toEqual(withCheck ? ['write-check', 'output-pass'] : []);
+  });
+
+  // The deadline error reaches the caller once the save wait elapses, so a retry can save its answer
+  // while a slow write check is still pending. The cut-off reply must keep the time of the deadline.
+  it('stamps the cut-off reply with the deadline time, not the end of a slow write check', async () => {
+    const streamsThenHangs: ModelManagerModelConfig = {
+      id: 'partial',
+      maxRetries: 0,
+      model: new MockLanguageModelV2({
+        doStream: async () => ({
+          stream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'text-start', id: 'text-1' });
+              controller.enqueue({ type: 'text-delta', id: 'text-1', delta: 'Partial answer.' });
+            },
+          }),
+        }),
+      }),
+    };
+    let deadlineAt = 0;
+    const replies: { text: string; createdAt: Date }[] = [];
+    const probe: Processor = {
+      id: 'probe',
+      processOutputResult: async ({ messages }) => {
+        for (const message of messages.filter(message => message.role === 'assistant')) {
+          const text = (message.content.parts ?? [])
+            .flatMap(part => (part.type === 'text' ? [part.text] : []))
+            .join('');
+          replies.push({ text, createdAt: new Date(message.createdAt) });
+        }
+        return messages;
+      },
+    };
+
+    await runLoop({
+      models: [streamsThenHangs],
+      totalMs: 100,
+      outputProcessors: [probe],
+      beforeDeadlineSave: async () => {
+        deadlineAt = Date.now();
+        vi.setSystemTime(deadlineAt + 60_000);
+      },
+    });
+
+    const reply = replies.find(reply => reply.text.includes('Partial answer.'));
+    expect(reply).toBeDefined();
+    expect(reply!.createdAt.getTime()).toBeLessThan(deadlineAt + 60_000);
+  });
+});

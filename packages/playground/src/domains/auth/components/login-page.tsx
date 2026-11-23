@@ -1,11 +1,15 @@
-import { Button, Input, LogoWithoutText } from '@mastra/playground-ui';
-import { Lock } from 'lucide-react';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { Field, FieldError, FieldLabel } from '@mastra/playground-ui/components/Field';
+import { Form } from '@mastra/playground-ui/components/Form';
+import { Input } from '@mastra/playground-ui/components/Input';
+import { Notice } from '@mastra/playground-ui/components/Notice';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { IconArrowBoxRight } from '@mastra/playground-ui/icons/central/IconArrowBoxRight';
+import { IconLock } from '@mastra/playground-ui/icons/central/IconLock';
+import { useSSOLogin, useAuthCapabilities, useCredentialsLogin, useCredentialsSignUp } from '@mastra/react/hooks/auth';
 import { useState } from 'react';
-import { useSSOLogin } from '../hooks/use-auth-actions';
-import { useAuthCapabilities } from '../hooks/use-auth-capabilities';
-import { useCredentialsLogin } from '../hooks/use-credentials-login';
-import { useCredentialsSignUp } from '../hooks/use-credentials-signup';
-import type { SSOConfig } from '../types';
+import { LoginLayout } from './login-layout';
+import { withStudioBasePath } from '@/lib/studio-base-path';
 
 export type LoginPageProps = {
   /** URL to redirect to after successful login */
@@ -52,25 +56,17 @@ export function LoginPage({ redirectUri, onSuccess, initialMode = 'signin', erro
   const [password, setPassword] = useState('');
 
   if (isLoadingCapabilities) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-surface1">
-        <div className="text-neutral3">Loading...</div>
-      </div>
-    );
+    return <div className="text-muted-foreground">Loading...</div>;
   }
 
   if (!capabilities?.enabled || !capabilities?.login) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-surface1">
-        <div className="text-neutral3">Authentication is not configured</div>
-      </div>
-    );
+    return <div className="text-muted-foreground">Authentication is not configured</div>;
   }
 
   const { login } = capabilities;
   const hasSSO = login.type === 'sso' || login.type === 'both';
   const hasCredentials = login.type === 'credentials' || login.type === 'both';
-  const sso = login.sso as SSOConfig | undefined;
+  const sso = login.sso;
   const signUpEnabled = login.signUpEnabled !== false; // defaults to true
 
   const isSignIn = mode === 'signin' || !signUpEnabled; // force signin mode if signup disabled
@@ -83,7 +79,7 @@ export function LoginPage({ redirectUri, onSuccess, initialMode = 'signin', erro
     } else if (redirectUri) {
       window.location.href = redirectUri;
     } else {
-      window.location.href = '/';
+      window.location.href = withStudioBasePath('/');
     }
   };
 
@@ -112,119 +108,119 @@ export function LoginPage({ redirectUri, onSuccess, initialMode = 'signin', erro
     // Clear any errors when switching modes
   };
 
-  return (
-    <div className="flex min-h-screen items-center justify-center bg-surface1">
-      <div className="w-full max-w-sm space-y-6 rounded-lg border border-border1 bg-surface2 p-8">
-        <div className="flex flex-col items-center space-y-2">
-          <LogoWithoutText className="h-10 w-10" />
-          <h1 className="text-xl font-semibold text-neutral6">
-            {isSignIn ? 'Sign in to Mastra Studio' : 'Create your account'}
-          </h1>
-        </div>
-
-        {login.description && (
-          <div className="flex items-start gap-2.5 rounded-md border border-border1 bg-surface1 p-3">
-            <Lock className="mt-0.5 h-4 w-4 shrink-0 text-neutral4" />
-            <p className="text-sm text-neutral3">{login.description}</p>
-          </div>
-        )}
-
-        {errorMessage && <div className="rounded-md bg-red-500/10 p-3 text-sm text-red-400">{errorMessage}</div>}
-
-        {hasCredentials && (
-          <form onSubmit={handleCredentialsSubmit} className="space-y-4">
-            {!isSignIn && (
-              <div className="space-y-2">
-                <label htmlFor="name" className="block text-sm text-neutral4">
-                  Name
-                </label>
-                <Input
-                  id="name"
-                  type="text"
-                  value={name}
-                  onChange={e => setName(e.target.value)}
-                  placeholder="Your name"
-                  variant="default"
-                  size="lg"
-                />
-              </div>
-            )}
-
-            <div className="space-y-2">
-              <label htmlFor="email" className="block text-sm text-neutral4">
-                Email
-              </label>
-              <Input
-                id="email"
-                type="email"
-                value={email}
-                onChange={e => setEmail(e.target.value)}
-                placeholder="you@example.com"
-                required
-                variant="default"
-                size="lg"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label htmlFor="password" className="block text-sm text-neutral4">
-                Password
-              </label>
-              <Input
-                id="password"
-                type="password"
-                value={password}
-                onChange={e => setPassword(e.target.value)}
-                placeholder={isSignIn ? 'Enter your password' : 'Create a password'}
-                required
-                variant="default"
-                size="lg"
-              />
-            </div>
-
-            {error && <div className="rounded-md bg-red-500/10 p-3 text-sm text-red-400">{error.message}</div>}
-
-            <Button type="submit" disabled={isPending} className="w-full" size="lg">
-              {isPending
-                ? isSignIn
-                  ? 'Signing in...'
-                  : 'Creating account...'
-                : isSignIn
-                  ? 'Sign in'
-                  : 'Create account'}
-            </Button>
-
-            {signUpEnabled && (
-              <div className="text-center text-sm">
-                <span className="text-neutral3">
-                  {isSignIn ? "Don't have an account? " : 'Already have an account? '}
-                </span>
-                <button type="button" onClick={toggleMode} className="text-neutral6 hover:underline">
-                  {isSignIn ? 'Sign up' : 'Sign in'}
-                </button>
-              </div>
-            )}
-          </form>
-        )}
-
-        {hasSSO && hasCredentials && (
-          <div className="relative">
-            <div className="absolute inset-0 flex items-center">
-              <div className="w-full border-t border-border1" />
-            </div>
-            <div className="relative flex justify-center text-sm">
-              <span className="bg-surface2 px-2 text-neutral3">or continue with</span>
-            </div>
-          </div>
-        )}
-
-        {hasSSO && sso && (
-          <Button onClick={handleSSOLogin} disabled={isSSOPending} className="w-full" size="lg" variant="outline">
-            {sso.icon && <span className="mr-2">{sso.icon}</span>}
-            {isSSOPending ? 'Redirecting...' : sso.text || 'Sign in'}
-          </Button>
-        )}
-      </div>
+  const description = login.description ? (
+    <div className="flex items-start gap-2.5 rounded-md border border-border bg-sidebar p-3">
+      <IconLock className="mt-0.5 size-icon-md shrink-0 text-muted-foreground" />
+      <Txt tone="muted">{login.description}</Txt>
     </div>
+  ) : null;
+
+  const errorBanner = errorMessage ? (
+    <div role="alert">
+      <Notice variant="destructive">{errorMessage}</Notice>
+    </div>
+  ) : null;
+
+  return (
+    <LoginLayout
+      title={isSignIn ? 'Sign in to Mastra Studio' : 'Create your account'}
+      description={description}
+      errorBanner={errorBanner}
+    >
+      {hasCredentials && (
+        <Form onSubmit={handleCredentialsSubmit}>
+          {!isSignIn && (
+            <Field>
+              <FieldLabel>Name</FieldLabel>
+              <Input
+                name="name"
+                type="text"
+                autoComplete="name"
+                value={name}
+                onChange={e => setName(e.target.value)}
+                placeholder="Your name"
+                variant="default"
+                size="lg"
+              />
+            </Field>
+          )}
+
+          <Field>
+            <FieldLabel required>Email</FieldLabel>
+            <Input
+              name="email"
+              type="email"
+              autoComplete="email"
+              value={email}
+              onChange={e => setEmail(e.target.value)}
+              placeholder="you@example.com"
+              required
+              variant="default"
+              size="lg"
+            />
+            <FieldError />
+          </Field>
+
+          <Field>
+            <FieldLabel required>Password</FieldLabel>
+            <Input
+              name="password"
+              type="password"
+              autoComplete={isSignIn ? 'current-password' : 'new-password'}
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              placeholder={isSignIn ? 'Enter your password' : 'Create a password'}
+              required
+              variant="default"
+              size="lg"
+            />
+            <FieldError />
+          </Field>
+
+          {error ? (
+            <div role="alert">
+              <Notice variant="destructive">{error.message}</Notice>
+            </div>
+          ) : null}
+
+          <Button icon={<IconArrowBoxRight />} type="submit" disabled={isPending} className="w-full" size="lg">
+            {isPending ? (isSignIn ? 'Signing in...' : 'Creating account...') : isSignIn ? 'Sign in' : 'Create account'}
+          </Button>
+
+          {signUpEnabled && (
+            <div className="text-center">
+              <Txt as="span" variant="body" tone="muted">
+                {isSignIn ? "Don't have an account? " : 'Already have an account? '}
+              </Txt>
+              <button type="button" onClick={toggleMode} className="text-foreground hover:underline">
+                <Txt as="span" variant="body" className="block">
+                  {isSignIn ? 'Sign up' : 'Sign in'}
+                </Txt>
+              </button>
+            </div>
+          )}
+        </Form>
+      )}
+
+      {hasSSO && hasCredentials && (
+        <div className="relative">
+          <div className="absolute inset-0 flex items-center">
+            <div className="w-full border-t border-border" />
+          </div>
+          <div className="relative flex justify-center">
+            <Txt as="span" variant="body" tone="muted" className="bg-sidebar px-2">
+              or continue with
+            </Txt>
+          </div>
+        </div>
+      )}
+
+      {hasSSO && sso && (
+        <Button onClick={handleSSOLogin} disabled={isSSOPending} className="w-full" size="lg">
+          {sso.icon && <span className="mr-2">{sso.icon}</span>}
+          {isSSOPending ? 'Redirecting...' : sso.text || 'Sign in'}
+        </Button>
+      )}
+    </LoginLayout>
   );
 }

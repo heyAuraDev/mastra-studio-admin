@@ -1,9 +1,16 @@
 import type { MCPHttpTransportResult, MCPSseTransportResult } from '@mastra/server/handlers/mcp';
-import { redactStreamChunk } from '@mastra/server/server-adapter';
+import {
+  applyMcpRequestAuth,
+  cancelReaderOnResponseClose,
+  redactStreamChunk,
+  serializeStreamChunk,
+  writeWithBackpressure,
+} from '@mastra/server/server-adapter';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import type { CallHandler, ExecutionContext, NestInterceptor } from '@nestjs/common';
 import type { Request, Response } from 'express';
-import { Observable, from, of, switchMap } from 'rxjs';
+import type { Observable } from 'rxjs';
+import { from, of, switchMap } from 'rxjs';
 
 import { MASTRA_OPTIONS } from '../constants';
 import type { MastraModuleOptions } from '../mastra.module';
@@ -43,6 +50,11 @@ export class StreamingInterceptor implements NestInterceptor {
     } else {
       this.heartbeatMs = configuredHeartbeat;
     }
+  }
+
+  /** Module `mcpOptions` win; otherwise use `server.mcpOptions` from the Mastra config. */
+  private resolveMcpOptions() {
+    return this.options.mcpOptions ?? this.options.mastra.getServer()?.mcpOptions;
   }
 
   intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
@@ -128,10 +140,15 @@ export class StreamingInterceptor implements NestInterceptor {
       response.setHeader('X-Accel-Buffering', 'no');
     }
 
+    if (streamFormat === 'sse' && result.sseFlushOnConnect) {
+      response.write(': connected\n\n');
+    }
+
     const data = result.data;
     const hasFullStream = data !== null && typeof data === 'object' && 'fullStream' in data;
     const stream = hasFullStream ? (data as { fullStream: ReadableStream }).fullStream : (data as ReadableStream);
     const reader = stream.getReader();
+    const readerCancel = cancelReaderOnResponseClose(reader, response);
     const unregisterSse = streamFormat === 'sse' ? this.shutdownService.registerSseClient(response) : null;
     let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -152,14 +169,28 @@ export class StreamingInterceptor implements NestInterceptor {
         }
 
         if (value) {
+          if (streamFormat === 'sse' && typeof value === 'string' && value.startsWith(':')) {
+            await writeWithBackpressure(response, value);
+            continue;
+          }
+
           // Optionally redact sensitive data
           const outputValue = shouldRedact ? redactStreamChunk(value) : value;
 
+          // A chunk that can't be serialized must not kill the stream — skip it and keep streaming
+          const serialized = serializeStreamChunk(outputValue);
+          if (!serialized.ok) {
+            this.logger.error(
+              `Failed to serialize stream chunk, skipping (path: ${response.req?.path}, type: ${(outputValue as { type?: string })?.type}, error: ${serialized.error.message})`,
+            );
+            continue;
+          }
+
           if (streamFormat === 'sse') {
-            response.write(`data: ${JSON.stringify(outputValue)}\n\n`);
+            await writeWithBackpressure(response, `data: ${serialized.json}\n\n`);
           } else {
             // Use record separator (\x1E) for stream format
-            response.write(JSON.stringify(outputValue) + '\x1E');
+            await writeWithBackpressure(response, serialized.json + '\x1E');
           }
         }
       }
@@ -169,6 +200,7 @@ export class StreamingInterceptor implements NestInterceptor {
         this.logger.error('Stream error:', error);
       }
     } finally {
+      readerCancel.dispose();
       if (heartbeatInterval) {
         clearInterval(heartbeatInterval);
       }
@@ -203,14 +235,16 @@ export class StreamingInterceptor implements NestInterceptor {
 
     if (fetchResponse.body) {
       const reader = fetchResponse.body.getReader();
+      const readerCancel = cancelReaderOnResponseClose(reader, response);
 
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          response.write(value);
+          await writeWithBackpressure(response, value);
         }
       } finally {
+        readerCancel.dispose();
         response.end();
       }
     } else {
@@ -229,8 +263,13 @@ export class StreamingInterceptor implements NestInterceptor {
 
     try {
       // Merge module-level mcpOptions with route-specific options (route takes precedence)
-      const options = { ...this.options.mcpOptions, ...routeMcpOptions };
+      const { setRequestAuth, ...options } = { ...this.resolveMcpOptions(), ...routeMcpOptions };
       const requestUrl = (request as Request & { originalUrl?: string }).originalUrl ?? request.url;
+      await applyMcpRequestAuth({
+        req: request,
+        requestContext: result.requestContext,
+        setRequestAuth,
+      });
 
       await server.startHTTP({
         url: new URL(requestUrl, `http://${request.headers.host}`),
@@ -271,6 +310,11 @@ export class StreamingInterceptor implements NestInterceptor {
 
     try {
       const requestUrl = (request as Request & { originalUrl?: string }).originalUrl ?? request.url;
+      await applyMcpRequestAuth({
+        req: request,
+        requestContext: result.requestContext,
+        setRequestAuth: this.resolveMcpOptions()?.setRequestAuth,
+      });
 
       await server.startSSE({
         url: new URL(requestUrl, `http://${request.headers.host}`),

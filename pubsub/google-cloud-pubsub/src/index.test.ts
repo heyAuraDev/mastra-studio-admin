@@ -18,8 +18,9 @@ const testStorage = new MockStore();
 
 let testRunIdCounter = 0;
 
-describe.sequential(
+describe(
   'Workflow',
+  { concurrent: false },
   () => {
     beforeEach(async () => {
       vi.resetAllMocks();
@@ -29,7 +30,7 @@ describe.sequential(
       }
     });
 
-    describe.sequential('Streaming', () => {
+    describe('Streaming', { concurrent: false }, () => {
       it('should generate a stream', async () => {
         const step1Action = vi.fn<any>().mockResolvedValue({ result: 'success1' });
         const step2Action = vi.fn<any>().mockResolvedValue({ result: 'success2' });
@@ -796,7 +797,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('Basic Workflow Execution', () => {
+    describe('Basic Workflow Execution', { concurrent: false }, () => {
       it('should be able to bail workflow execution', async () => {
         const step1 = createStep({
           id: 'step1',
@@ -1122,7 +1123,7 @@ describe.sequential(
         await mastra.stopEventEngine();
       });
 
-      describe.sequential('Variable Resolution', () => {
+      describe('Variable Resolution', { concurrent: false }, () => {
         it('should resolve trigger data', async () => {
           const execute = vi.fn<any>().mockResolvedValue({ result: 'success' });
 
@@ -1990,7 +1991,7 @@ describe.sequential(
         });
       });
 
-      describe.sequential('Simple Conditions', () => {
+      describe('Simple Conditions', { concurrent: false }, () => {
         it('should follow conditional chains', async () => {
           const step1Action = vi.fn().mockImplementation(() => {
             return Promise.resolve({ status: 'success' });
@@ -2441,7 +2442,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('abort', () => {
+    describe('abort', { concurrent: false }, () => {
       it('should be able to abort workflow execution in between steps', async () => {
         const step1 = createStep({
           id: 'step1',
@@ -2644,7 +2645,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('Error Handling', () => {
+    describe('Error Handling', { concurrent: false }, () => {
       it('should handle step execution errors', async () => {
         const error = new Error('Step execution failed');
         const failingAction = vi.fn<any>().mockImplementation(() => {
@@ -2913,7 +2914,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('Complex Conditions', () => {
+    describe('Complex Conditions', { concurrent: false }, () => {
       it('should handle nested AND/OR conditions', async () => {
         const step1Action = vi.fn<any>().mockResolvedValue({
           status: 'partial',
@@ -3024,7 +3025,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('Loops', () => {
+    describe('Loops', { concurrent: false }, () => {
       it('should run an until loop', async () => {
         const increment = vi.fn().mockImplementation(async ({ inputData }) => {
           // Get the current value (either from trigger or previous increment)
@@ -3182,7 +3183,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('foreach', () => {
+    describe('foreach', { concurrent: false }, () => {
       it('should run a single item concurrency (default) for loop', async () => {
         const startTime = Date.now();
         const map = vi.fn().mockImplementation(async ({ inputData }) => {
@@ -3262,7 +3263,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('if-else branching', () => {
+    describe('if-else branching', { concurrent: false }, () => {
       it('should run the if-then branch', async () => {
         const start = vi.fn().mockImplementation(async ({ inputData }) => {
           // Get the current value (either from trigger or previous increment)
@@ -3511,7 +3512,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('multiple chains', () => {
+    describe('multiple chains', { concurrent: false }, () => {
       it('should run multiple chains in parallel', async () => {
         const step1 = createStep({
           id: 'step1',
@@ -3606,7 +3607,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('Retry', () => {
+    describe('Retry', { concurrent: false }, () => {
       it('should retry a step default 0 times', async () => {
         let err: Error | undefined;
         const step1 = createStep({
@@ -3735,7 +3736,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('Interoperability (Actions)', () => {
+    describe('Interoperability (Actions)', { concurrent: false }, () => {
       it('should be able to use all action types in a workflow', async () => {
         const step1Action = vi.fn<any>().mockResolvedValue({ name: 'step1' });
 
@@ -3801,7 +3802,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('Suspend and Resume', () => {
+    describe('Suspend and Resume', { concurrent: false }, () => {
       afterAll(async () => {
         const pathToDb = path.join(process.cwd(), 'mastra.db');
 
@@ -4339,7 +4340,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('Workflow Runs', () => {
+    describe('Workflow Runs', { concurrent: false }, () => {
       let testStorage;
 
       beforeEach(async () => {
@@ -4452,7 +4453,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('Agent as step', () => {
+    describe('Agent as step', { concurrent: false }, () => {
       it('should be able to use an agent as a step', async () => {
         const workflow = createWorkflow({
           id: 'test-workflow',
@@ -5007,7 +5008,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('Nested workflows', () => {
+    describe('Nested workflows', { concurrent: false }, () => {
       it('should be able to nest workflows', async () => {
         const start = vi.fn().mockImplementation(async ({ inputData }) => {
           // Get the current value (either from trigger or previous increment)
@@ -5500,7 +5501,7 @@ describe.sequential(
         await mastra.stopEventEngine();
       });
 
-      describe.sequential('new if else branching syntax with nested workflows', () => {
+      describe('new if else branching syntax with nested workflows', { concurrent: false }, () => {
         it('should execute if-branch', async () => {
           const start = vi.fn().mockImplementation(async ({ inputData }) => {
             // Get the current value (either from trigger or previous increment)
@@ -5976,7 +5977,7 @@ describe.sequential(
         });
       });
 
-      describe.sequential('suspending and resuming nested workflows', () => {
+      describe('suspending and resuming nested workflows', { concurrent: false }, () => {
         it('should be able to suspend nested workflow step', async () => {
           const start = vi.fn().mockImplementation(async ({ inputData }) => {
             // Get the current value (either from trigger or previous increment)
@@ -6108,7 +6109,7 @@ describe.sequential(
         });
       });
 
-      describe.sequential('Workflow results', () => {
+      describe('Workflow results', { concurrent: false }, () => {
         it('should be able to spec out workflow result via variables', async () => {
           const start = vi.fn().mockImplementation(async ({ inputData }) => {
             // Get the current value (either from trigger or previous increment)
@@ -6402,7 +6403,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('Dependency Injection', () => {
+    describe('Dependency Injection', { concurrent: false }, () => {
       it('should inject requestContext dependencies into steps during run', async () => {
         const requestContext = new RequestContext();
         const testValue = 'test-dependency';
@@ -6496,7 +6497,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('consecutive parallel executions', () => {
+    describe('consecutive parallel executions', { concurrent: false }, () => {
       it('should support consecutive parallel calls with proper type inference', async () => {
         // First parallel stage steps
         const step1 = createStep({
@@ -6629,7 +6630,7 @@ describe.sequential(
       });
     });
 
-    describe.sequential('Run count', () => {
+    describe('Run count', { concurrent: false }, () => {
       it('retryCount property should increment the run count when a step is executed multiple times', async () => {
         const repeatingStep = createStep({
           id: 'repeatingStep',

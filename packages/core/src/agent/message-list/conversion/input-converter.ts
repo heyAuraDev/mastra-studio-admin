@@ -1,14 +1,8 @@
-import type { CoreMessage as CoreMessageV4, UIMessage as UIMessageV4 } from '@internal/ai-sdk-v4';
+import type { CoreMessage as CoreMessageV4 } from '@internal/ai-sdk-v4';
 
 import { AIV4Adapter, AIV5Adapter, AIV6Adapter } from '../adapters';
 import { TypeDetector } from '../detection/TypeDetector';
-import type {
-  MastraDBMessage,
-  MastraMessageV1,
-  MessageSource,
-  MemoryInfo,
-  UIMessageWithMetadata,
-} from '../state/types';
+import type { MastraDBMessage, MastraMessageV1, MessageSource, MemoryInfo } from '../state/types';
 import type { MessageInput } from '../types';
 import { stampMessageParts } from '../utils/stamp-part';
 
@@ -46,8 +40,10 @@ export function inputToMastraDBMessage(
     );
   }
 
-  // Validate resourceId matches
+  // Validate resourceId matches (except for memory messages, which can carry a
+  // system resourceId — e.g. observational-memory continuation messages)
   if (
+    messageSource !== `memory` &&
     `resourceId` in message &&
     message.resourceId &&
     context.memoryInfo?.resourceId &&
@@ -62,16 +58,13 @@ export function inputToMastraDBMessage(
     return stampMessageParts(mastraMessageV1ToMastraDBMessage(message, messageSource, context), messageSource);
   }
   if (TypeDetector.isMastraDBMessage(message)) {
-    return stampMessageParts(hydrateMastraDBMessageFields(message, context), messageSource);
+    return stampMessageParts(hydrateMastraDBMessageFields(message, context, messageSource), messageSource);
   }
   if (TypeDetector.isAIV4CoreMessage(message)) {
     return stampMessageParts(AIV4Adapter.fromCoreMessage(message, context, messageSource), messageSource);
   }
   if (TypeDetector.isAIV4UIMessage(message)) {
-    return stampMessageParts(
-      AIV4Adapter.fromUIMessage(message as UIMessageV4 | UIMessageWithMetadata, context, messageSource),
-      messageSource,
-    );
+    return stampMessageParts(AIV4Adapter.fromUIMessage(message, context, messageSource), messageSource);
   }
 
   // Use custom ID generator if message doesn't have an ID, otherwise keep the original
@@ -108,7 +101,7 @@ export function inputToMastraDBMessage(
   }
 
   if (TypeDetector.isAIV5CoreMessage(message)) {
-    const dbMsg = AIV5Adapter.fromModelMessage(message, messageSource);
+    const dbMsg = AIV5Adapter.fromModelMessage(message, messageSource, context);
     // Only use the original createdAt from input message metadata, not the generated one from the static method
     // This fixes issue #10683 where messages without createdAt would get shuffled
     const rawCreatedAt =
@@ -183,13 +176,20 @@ export function mastraMessageV1ToMastraDBMessage(
 export function hydrateMastraDBMessageFields(
   message: MastraDBMessage,
   context: InputConversionContext,
+  messageSource: MessageSource,
 ): MastraDBMessage {
+  message.content.parts = Array.isArray(message.content.parts)
+    ? message.content.parts.filter(part => part !== null && typeof part === 'object')
+    : [];
+
   // Generate ID if missing
   if (!message.id) {
     message.id = context.newMessageId();
   }
 
-  if (!(message.createdAt instanceof Date)) {
+  if (message.createdAt === undefined || message.createdAt === null) {
+    message.createdAt = context.generateCreatedAt(messageSource);
+  } else if (!(message.createdAt instanceof Date)) {
     message.createdAt = new Date(message.createdAt);
   }
 
@@ -217,10 +217,10 @@ export function hydrateMastraDBMessageFields(
 
   if (!message.threadId && context.memoryInfo?.threadId) {
     message.threadId = context.memoryInfo.threadId;
+  }
 
-    if (!message.resourceId && context.memoryInfo?.resourceId) {
-      message.resourceId = context.memoryInfo.resourceId;
-    }
+  if (!message.resourceId && context.memoryInfo?.resourceId) {
+    message.resourceId = context.memoryInfo.resourceId;
   }
 
   return message;

@@ -1,6 +1,105 @@
 import type { Meta, StoryObj } from '@storybook/react-vite';
-import { Label } from '../Label';
+import type { ReactNode } from 'react';
+import { useState } from 'react';
+import { Field, FieldContent, FieldDescription, FieldLabel } from '../Field';
+import type { SwitchProps } from './switch';
 import { Switch } from './switch';
+import { IconGlobe } from '@/ds/icons/central/IconGlobe';
+import { IconLock } from '@/ds/icons/central/IconLock';
+import { IconZap } from '@/ds/icons/central/IconZap';
+
+const SURFACES: { token: string; label: string; className: string }[] = [
+  { token: 'sidebar', label: 'sidebar · the recessed shell', className: 'bg-sidebar' },
+  { token: 'background', label: 'background · the page canvas', className: 'bg-background' },
+  { token: 'card', label: 'card · a raised surface', className: 'bg-card' },
+  { token: 'muted', label: 'muted · the quiet step above the canvas', className: 'bg-muted' },
+];
+
+type SwitchIconProps = Pick<SwitchProps, 'checkedIcon' | 'icon' | 'uncheckedIcon'>;
+
+const visibilityIcons: SwitchIconProps = {
+  checkedIcon: <IconLock />,
+  uncheckedIcon: <IconGlobe />,
+};
+
+const withIconSource = `import { Switch } from '@mastra/playground-ui/components/Switch';
+import { ZapIcon } from 'lucide-react';
+
+<Switch aria-label="Enable boost" icon={<ZapIcon />} />;`;
+
+const withStateIconsSource = `import { Field, FieldLabel } from '@mastra/playground-ui/components/Field';
+import { Switch } from '@mastra/playground-ui/components/Switch';
+import { GlobeIcon, LockKeyhole } from 'lucide-react';
+import { useState } from 'react';
+
+function RepositoryVisibilitySwitch() {
+  const [isPrivate, setIsPrivate] = useState(true);
+
+  return (
+ <Field orientation="horizontal" className="gap-4">
+ <FieldLabel>Repository visibility</FieldLabel>
+ <span className="inline-flex items-center gap-2">
+ <span>{isPrivate ? 'Private' : 'Public'}</span>
+ <Switch
+ checked={isPrivate}
+ onCheckedChange={setIsPrivate}
+ aria-label="Private repository"
+ checkedIcon={<LockKeyhole />}
+ uncheckedIcon={<GlobeIcon />}
+ />
+ </span>
+ </Field>
+  );
+}`;
+
+function SurfaceFrame({ className, label, children }: { className: string; label: string; children: ReactNode }) {
+  return (
+    <div className={`rounded-2xl border border-surface-rim p-5 ${className}`}>
+      <p className="mb-4 text-meta tracking-wide text-muted-foreground uppercase">{label}</p>
+      {children}
+    </div>
+  );
+}
+
+function SwitchStateGrid({ idPrefix, icons }: { idPrefix: string; icons?: SwitchIconProps }) {
+  return (
+    <div className="grid grid-cols-[5rem_repeat(4,minmax(0,1fr))] items-center gap-x-4 gap-y-3 text-caption text-muted-foreground">
+      <span />
+      <span>Default</span>
+      <span>On</span>
+      <span>Disabled</span>
+      <span>Disabled on</span>
+
+      <span className="text-foreground">State</span>
+      <Switch aria-label={`${idPrefix} default`} {...icons} />
+      <Switch aria-label={`${idPrefix} on`} checked onCheckedChange={() => {}} {...icons} />
+      <Switch aria-label={`${idPrefix} disabled`} disabled {...icons} />
+      <Switch aria-label={`${idPrefix} disabled on`} checked disabled onCheckedChange={() => {}} {...icons} />
+    </div>
+  );
+}
+
+function RepositoryVisibilitySwitch() {
+  const [isPrivate, setIsPrivate] = useState(true);
+
+  return (
+    <div className="grid gap-4 rounded-lg bg-background p-4">
+      <Field orientation="horizontal" className="gap-4">
+        <FieldLabel>Repository visibility</FieldLabel>
+        <span className="inline-flex items-center gap-2">
+          <span className="text-column text-foreground">{isPrivate ? 'Private' : 'Public'}</span>
+          <Switch
+            checked={isPrivate}
+            onCheckedChange={setIsPrivate}
+            aria-label="Private repository"
+            {...visibilityIcons}
+          />
+        </span>
+      </Field>
+      <SwitchStateGrid idPrefix="visibility icon" icons={visibilityIcons} />
+    </div>
+  );
+}
 
 const meta: Meta<typeof Switch> = {
   title: 'Elements/Switch',
@@ -14,6 +113,18 @@ const meta: Meta<typeof Switch> = {
     },
     checked: {
       control: { type: 'boolean' },
+    },
+    icon: {
+      control: false,
+      description: 'Any React node rendered inside the thumb for both checked and unchecked states.',
+    },
+    checkedIcon: {
+      control: false,
+      description: 'Any React node rendered inside the thumb when the switch is checked.',
+    },
+    uncheckedIcon: {
+      control: false,
+      description: 'Any React node rendered inside the thumb when the switch is unchecked.',
     },
   },
 };
@@ -44,42 +155,118 @@ export const DisabledChecked: Story = {
   },
 };
 
+export const WithIcon: Story = {
+  args: {
+    icon: <IconZap />,
+  },
+  parameters: {
+    docs: {
+      source: {
+        code: withIconSource,
+      },
+    },
+  },
+};
+
+export const WithStateIcons: Story = {
+  render: () => <RepositoryVisibilitySwitch />,
+  parameters: {
+    docs: {
+      source: {
+        code: withStateIconsSource,
+      },
+    },
+  },
+};
+
+export const AllStates: Story = {
+  parameters: {
+    layout: 'centered',
+  },
+  render: () => (
+    <div className="grid min-w-108 gap-4 rounded-lg bg-background p-4">
+      <div className="grid grid-cols-[9rem_repeat(3,minmax(0,1fr))] items-center gap-x-5 gap-y-3 text-caption text-muted-foreground">
+        <span />
+        <span>Default</span>
+        <span>On</span>
+        <span>Focus</span>
+
+        <span className="text-foreground">Enabled</span>
+        <Switch aria-label="enabled off" />
+        <Switch aria-label="enabled on" checked onCheckedChange={() => {}} />
+        <Switch
+          aria-label="focused on"
+          checked
+          onCheckedChange={() => {}}
+          className="outline-1 outline-offset-2 outline-border-focus outline-solid"
+        />
+
+        <span className="text-foreground">Disabled</span>
+        <Switch aria-label="disabled off" disabled />
+        <Switch aria-label="disabled on" checked disabled onCheckedChange={() => {}} />
+        <Switch
+          aria-label="disabled focus preview"
+          checked
+          disabled
+          onCheckedChange={() => {}}
+          className="outline-1 outline-offset-2 outline-border-focus outline-solid"
+        />
+      </div>
+    </div>
+  ),
+};
+
+export const OnSurfaces: Story = {
+  parameters: {
+    layout: 'padded',
+  },
+  render: () => (
+    <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+      {SURFACES.map(({ token, label, className }) => (
+        <SurfaceFrame key={token} className={className} label={label}>
+          <SwitchStateGrid idPrefix={token} />
+        </SurfaceFrame>
+      ))}
+    </div>
+  ),
+};
+
 export const WithLabel: Story = {
   render: args => (
-    <div className="flex items-center gap-2">
-      <Switch id="notifications" {...args} />
-      <Label htmlFor="notifications">Enable notifications</Label>
-    </div>
+    <Field orientation="horizontal">
+      <Switch {...args} />
+      <FieldLabel>Enable notifications</FieldLabel>
+    </Field>
   ),
 };
 
 export const SettingsList: Story = {
   render: () => (
-    <div className="flex flex-col gap-4 w-dropdown-max-height">
-      <div className="flex items-center justify-between">
-        <Label htmlFor="email">Email notifications</Label>
-        <Switch id="email" defaultChecked />
-      </div>
-      <div className="flex items-center justify-between">
-        <Label htmlFor="push">Push notifications</Label>
-        <Switch id="push" />
-      </div>
-      <div className="flex items-center justify-between">
-        <Label htmlFor="sms">SMS notifications</Label>
-        <Switch id="sms" disabled />
-      </div>
+    <div className="flex w-75 flex-col gap-4">
+      <Field orientation="horizontal">
+        <FieldLabel>Email notifications</FieldLabel>
+        <Switch defaultChecked />
+      </Field>
+      <Field orientation="horizontal">
+        <FieldLabel>Push notifications</FieldLabel>
+        <Switch />
+      </Field>
+      <Field orientation="horizontal" disabled>
+        <FieldLabel>SMS notifications</FieldLabel>
+        <Switch />
+      </Field>
     </div>
   ),
 };
 
 export const WithDescription: Story = {
   render: () => (
-    <div className="flex items-start justify-between gap-4 w-[350px]">
-      <div className="flex flex-col gap-1">
-        <Label htmlFor="dark-mode">Dark mode</Label>
-        <span className="text-xs text-neutral3">Switch to a darker color scheme</span>
-      </div>
-      <Switch id="dark-mode" />
-    </div>
+    <Field orientation="horizontal" className="w-[350px] items-start gap-4">
+      <FieldContent className="gap-1">
+        <FieldLabel>Dark mode</FieldLabel>
+        <FieldDescription className="mt-0">Switch to a darker color scheme</FieldDescription>
+      </FieldContent>
+      <Switch />
+    </Field>
   ),
 };

@@ -1,11 +1,33 @@
-import { ScrollArea, Txt, cn } from '@mastra/playground-ui';
-import { Check } from 'lucide-react';
+import { ScrollArea } from '@mastra/playground-ui/components/ScrollArea';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { IconCheckmark2Medium } from '@mastra/playground-ui/icons/central/IconCheckmark2Medium';
+import { useLinkComponent } from '@mastra/playground-ui/lib/framework';
+import { controlStateColorTransition } from '@mastra/playground-ui/primitives/transitions';
+import { quietTextHover } from '@mastra/playground-ui/primitives/typography';
 
+import { cn } from '@mastra/playground-ui/utils/cn';
+import { useMemo } from 'react';
 import { useAgentEditFormContext } from '../../context/agent-edit-form-context';
 import { isActive } from './agent-cms-is-active';
-import { AGENT_CMS_SECTIONS, CODE_AGENT_OVERRIDE_SECTIONS } from './agent-cms-sections';
+import { AGENT_CMS_SECTIONS, getCodeAgentOverrideSections } from './agent-cms-sections';
+import type { AgentCmsSection } from './agent-cms-sections';
 import { useSidebarDescriptions } from './use-sidebar-descriptions';
-import { useLinkComponent } from '@/lib/framework';
+import { useBuilderAgentFeatures } from '@/domains/agent-builder/hooks/use-builder-agent-features';
+
+/** Maps section names to builder feature keys. Sections without a mapping are always shown. */
+const SECTION_FEATURE_GATE: Record<string, keyof ReturnType<typeof useBuilderAgentFeatures>> = {
+  Skills: 'skills',
+};
+
+function filterByFeatures(
+  sections: AgentCmsSection[],
+  features: ReturnType<typeof useBuilderAgentFeatures>,
+): AgentCmsSection[] {
+  return sections.filter(s => {
+    const featureKey = SECTION_FEATURE_GATE[s.name];
+    return featureKey == null || features[featureKey];
+  });
+}
 
 interface AgentCmsSidebarProps {
   basePath: string;
@@ -14,13 +36,17 @@ interface AgentCmsSidebarProps {
 }
 
 export function AgentCmsSidebar({ basePath, currentPath, versionId }: AgentCmsSidebarProps) {
-  const { form, isCodeAgentOverride } = useAgentEditFormContext();
+  const { form, isCodeAgentOverride, editorConfig } = useAgentEditFormContext();
   const descriptions = useSidebarDescriptions(form.control);
-  const sections = isCodeAgentOverride ? CODE_AGENT_OVERRIDE_SECTIONS : AGENT_CMS_SECTIONS;
+  const features = useBuilderAgentFeatures();
+  const sections = useMemo(() => {
+    const base = isCodeAgentOverride ? getCodeAgentOverrideSections(editorConfig) : AGENT_CMS_SECTIONS;
+    return filterByFeatures(base, features);
+  }, [isCodeAgentOverride, editorConfig, features]);
 
   return (
-    <div className="h-full flex flex-col">
-      <ScrollArea className="flex-1 min-h-0">
+    <div className="flex h-full flex-col">
+      <ScrollArea className="min-h-0 flex-1">
         <nav className="py-4">
           <ul className="flex flex-col gap-0">
             {sections.map((section, index) => (
@@ -75,35 +101,39 @@ const SidebarLink = ({
       <Link
         href={href}
         className={cn(
-          'flex items-center gap-2.5 px-3 py-2 text-sm transition-colors border-r-2 border-transparent',
-          active ? 'bg-surface2 text-neutral5 border-accent1' : 'text-neutral3 hover:bg-surface3 hover:text-neutral5',
+          active ? 'text-foreground' : '',
+          'flex items-center gap-2.5 border-r-2 border-transparent px-3 py-2',
+          controlStateColorTransition,
+          active ? 'border-border-strong bg-fill-hover' : `hover:bg-fill-subtle ${quietTextHover}`,
         )}
       >
         {done ? (
-          <div className="size-6 rounded-full bg-accent1 flex items-center justify-center shrink-0">
-            <Check className="size-3.5 text-white" />
+          <div className="flex size-6 shrink-0 items-center justify-center rounded-full bg-success-subtle text-success-subtle-foreground">
+            <IconCheckmark2Medium className="size-icon-sm" />
           </div>
         ) : (
           <Txt
-            className="size-6 rounded-full border border-neutral2 flex items-center justify-center text-neutral2 font-mono shrink-0"
-            variant="ui-sm"
+            font="mono"
+            className="flex size-6 shrink-0 items-center justify-center rounded-full border border-placeholder"
+            variant="caption"
+            tone="faint"
           >
             {index + 1}
           </Txt>
         )}
 
         <div>
-          <Txt variant="ui-sm" className="text-neutral5">
+          <Txt variant="caption" tone="ink">
             {name}
           </Txt>
 
-          <Txt variant="ui-xs" className="text-neutral2">
+          <Txt variant="meta" tone="faint">
             {description}
           </Txt>
         </div>
       </Link>
 
-      {!isLast && <div className="bg-surface3 w-0.5 h-2 inline-block ml-6" />}
+      {!isLast && <div className="ml-6 inline-block h-2 w-0.5 bg-card" />}
     </li>
   );
 };

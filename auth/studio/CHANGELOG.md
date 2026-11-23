@@ -1,5 +1,337 @@
 # @mastra/auth-studio
 
+## 1.4.1
+
+### Patch Changes
+
+- Fixed connecting the Mastra Gateway from a local Factory, which failed with "Your Mastra role cannot create gateway keys for this organization" even for organization admins. Requests made to Mastra platform on behalf of the signed-in user now include the origin of the browser request. ([#30742](https://github.com/mastra-ai/mastra/pull/30742))
+
+## 1.4.1-alpha.0
+
+### Patch Changes
+
+- Fixed connecting the Mastra Gateway from a local Factory, which failed with "Your Mastra role cannot create gateway keys for this organization" even for organization admins. Requests made to Mastra platform on behalf of the signed-in user now include the origin of the browser request. ([#30742](https://github.com/mastra-ai/mastra/pull/30742))
+
+## 1.4.0
+
+### Minor Changes
+
+- Added `fetchAsRequestUser(request, path, init)` to `MastraAuthStudio`. It calls the Mastra platform API as the signed-in user of an incoming request, so your server can act on the organization that user's session is on without its own platform token. It resolves to `null` when the request has no Mastra session, and gives up after 15 seconds unless you pass your own `signal`. ([#29183](https://github.com/mastra-ai/mastra/pull/29183))
+
+  ```ts
+  import { MastraAuthStudio } from '@mastra/auth-studio';
+
+  const auth = new MastraAuthStudio();
+
+  const response = await auth.fetchAsRequestUser(request, '/auth/me');
+  if (!response) {
+    // The request has no Mastra session: ask the user to sign in.
+  }
+  ```
+
+  When a call renews the user's session, later calls for the same request send the renewed session, so several platform calls can run in one request. Add the headers from `consumePendingResponseHeaders(request)` to your response so the browser keeps the renewed session.
+
+### Patch Changes
+
+- Fixed sign-outs and extra platform calls when a page sends several requests at once. Requests that arrive together with the same session cookie now share one check with the Mastra platform. Before, each request checked the cookie on its own. When the session had expired, each one also tried to renew it with the same refresh token. The platform accepts a refresh token only once, so the other requests failed and could sign the user out. ([#29434](https://github.com/mastra-ai/mastra/pull/29434))
+
+## 1.4.0-alpha.1
+
+### Minor Changes
+
+- Added `fetchAsRequestUser(request, path, init)` to `MastraAuthStudio`. It calls the Mastra platform API as the signed-in user of an incoming request, so your server can act on the organization that user's session is on without its own platform token. It resolves to `null` when the request has no Mastra session, and gives up after 15 seconds unless you pass your own `signal`. ([#29183](https://github.com/mastra-ai/mastra/pull/29183))
+
+  ```ts
+  import { MastraAuthStudio } from '@mastra/auth-studio';
+
+  const auth = new MastraAuthStudio();
+
+  const response = await auth.fetchAsRequestUser(request, '/auth/me');
+  if (!response) {
+    // The request has no Mastra session: ask the user to sign in.
+  }
+  ```
+
+  When a call renews the user's session, later calls for the same request send the renewed session, so several platform calls can run in one request. Add the headers from `consumePendingResponseHeaders(request)` to your response so the browser keeps the renewed session.
+
+## 1.3.12-alpha.0
+
+### Patch Changes
+
+- Fixed sign-outs and extra platform calls when a page sends several requests at once. Requests that arrive together with the same session cookie now share one check with the Mastra platform. Before, each request checked the cookie on its own. When the session had expired, each one also tried to renew it with the same refresh token. The platform accepts a refresh token only once, so the other requests failed and could sign the user out. ([#29434](https://github.com/mastra-ai/mastra/pull/29434))
+
+## 1.3.11
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+- Studio session cookies are now host-only, so a session is never sent to other deployments on a shared domain. ([#28168](https://github.com/mastra-ai/mastra/pull/28168))
+
+  `@mastra/auth-studio`: on secure deployments `MastraAuthStudio` issues `__Host-wos-session` (`Secure`, `Path=/`, no `Domain`). `MASTRA_COOKIE_DOMAIN` is no longer used as the cookie `Domain`. A legacy `wos-session` cookie is still accepted on read, but only so it can be re-issued as `__Host-wos-session`. The new `getLegacySessionClearCookies()` expires the legacy `wos-session` on the current host, on `MASTRA_COOKIE_DOMAIN`, and on each domain in `MASTRA_LEGACY_COOKIE_DOMAINS` (or the `legacyCookieDomains` option). Plain-http `localhost` dev keeps an unprefixed host-only cookie; use `secureCookies` to override. An explicit `cookieDomain` option still issues a `wos-session` cookie with that `Domain`.
+
+  `@mastra/server`: the SSO callback, `POST /auth/refresh` and `POST /auth/logout` responses now also send the provider's `getLegacySessionClearCookies()`.
+
+  `@mastra/factory`: the default Studio provider no longer derives `Domain=.mastra.cloud` from `publicUrl`. Its sign-in and sign-out responses also expire legacy session cookies.
+
+  `@mastra/core`: `ISessionProvider` gains the optional `getLegacySessionClearCookies()`.
+
+## 1.3.11-alpha.1
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+## 1.3.11-alpha.0
+
+### Patch Changes
+
+- Studio session cookies are now host-only, so a session is never sent to other deployments on a shared domain. ([#28168](https://github.com/mastra-ai/mastra/pull/28168))
+
+  `@mastra/auth-studio`: on secure deployments `MastraAuthStudio` issues `__Host-wos-session` (`Secure`, `Path=/`, no `Domain`). `MASTRA_COOKIE_DOMAIN` is no longer used as the cookie `Domain`. A legacy `wos-session` cookie is still accepted on read, but only so it can be re-issued as `__Host-wos-session`. The new `getLegacySessionClearCookies()` expires the legacy `wos-session` on the current host, on `MASTRA_COOKIE_DOMAIN`, and on each domain in `MASTRA_LEGACY_COOKIE_DOMAINS` (or the `legacyCookieDomains` option). Plain-http `localhost` dev keeps an unprefixed host-only cookie; use `secureCookies` to override. An explicit `cookieDomain` option still issues a `wos-session` cookie with that `Domain`.
+
+  `@mastra/server`: the SSO callback, `POST /auth/refresh` and `POST /auth/logout` responses now also send the provider's `getLegacySessionClearCookies()`.
+
+  `@mastra/factory`: the default Studio provider no longer derives `Domain=.mastra.cloud` from `publicUrl`. Its sign-in and sign-out responses also expire legacy session cookies.
+
+  `@mastra/core`: `ISessionProvider` gains the optional `getLegacySessionClearCookies()`.
+
+## 1.3.10
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 1.3.10-alpha.0
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 1.3.9
+
+### Patch Changes
+
+- Keep Studio and Factory sessions alive for the identity provider's full session length. ([#26447](https://github.com/mastra-ai/mastra/pull/26447))
+
+  - `MastraAuthStudio` session cookies now last 14 days by default (was a hardcoded 24 hours), configurable via the new `sessionMaxAgeSeconds` option or the `MASTRA_SESSION_MAX_AGE` environment variable.
+  - When the shared API renews the session during verification, `MastraAuthStudio` re-issues the renewed cookie under the deployment's own cookie domain and exposes it through a new optional `consumePendingResponseHeaders` provider hook.
+  - `@mastra/server`'s auth middleware, `CompositeAuth`, the Factory auth gate, and Factory's per-route `ensureFactoryAuthUser` (used by routes declared `requiresAuth: false`, which skip the gate) forward those headers to the browser, as does the public `GET /auth/me` route. Forwarding is best-effort and never fails a request.
+
+  ```ts
+  import { MastraAuthStudio } from '@mastra/auth-studio';
+
+  // Defaults to 14 days. Override per deployment, or set MASTRA_SESSION_MAX_AGE (seconds).
+  const auth = new MastraAuthStudio({ sessionMaxAgeSeconds: 7 * 24 * 60 * 60 });
+  ```
+
+## 1.3.9-alpha.0
+
+### Patch Changes
+
+- Keep Studio and Factory sessions alive for the identity provider's full session length. ([#26447](https://github.com/mastra-ai/mastra/pull/26447))
+
+  - `MastraAuthStudio` session cookies now last 14 days by default (was a hardcoded 24 hours), configurable via the new `sessionMaxAgeSeconds` option or the `MASTRA_SESSION_MAX_AGE` environment variable.
+  - When the shared API renews the session during verification, `MastraAuthStudio` re-issues the renewed cookie under the deployment's own cookie domain and exposes it through a new optional `consumePendingResponseHeaders` provider hook.
+  - `@mastra/server`'s auth middleware, `CompositeAuth`, the Factory auth gate, and Factory's per-route `ensureFactoryAuthUser` (used by routes declared `requiresAuth: false`, which skip the gate) forward those headers to the browser, as does the public `GET /auth/me` route. Forwarding is best-effort and never fails a request.
+
+  ```ts
+  import { MastraAuthStudio } from '@mastra/auth-studio';
+
+  // Defaults to 14 days. Override per deployment, or set MASTRA_SESSION_MAX_AGE (seconds).
+  const auth = new MastraAuthStudio({ sessionMaxAgeSeconds: 7 * 24 * 60 * 60 });
+  ```
+
+## 1.3.8
+
+### Patch Changes
+
+- Fixed local dev auth: MastraAuthStudio now falls back to organizationId in .mastra-project.json when neither the constructor option nor MASTRA_ORGANIZATION_ID env var is set. Running pnpm mastra dev in a project linked to a platform organization now pins AuthKit to that org and skips the WorkOS org picker for multi-org users, without requiring the env var to be exported locally. ([#25583](https://github.com/mastra-ai/mastra/pull/25583))
+
+## 1.3.8-alpha.0
+
+### Patch Changes
+
+- Fixed local dev auth: MastraAuthStudio now falls back to organizationId in .mastra-project.json when neither the constructor option nor MASTRA_ORGANIZATION_ID env var is set. Running pnpm mastra dev in a project linked to a platform organization now pins AuthKit to that org and skips the WorkOS org picker for multi-org users, without requiring the env var to be exported locally. ([#25583](https://github.com/mastra-ai/mastra/pull/25583))
+
+## 1.3.7
+
+### Patch Changes
+
+- Improved Studio authentication portability by hashing credential cache keys with Web Crypto. ([#24583](https://github.com/mastra-ai/mastra/pull/24583))
+
+## 1.3.7-alpha.0
+
+### Patch Changes
+
+- Improved Studio authentication portability by hashing credential cache keys with Web Crypto. ([#24583](https://github.com/mastra-ai/mastra/pull/24583))
+
+## 1.3.6
+
+### Patch Changes
+
+- Fixed deployments pinned to an organization (`MASTRA_ORGANIZATION_ID`) serving members under whatever organization their shared Mastra session cookie happened to be on. A member is now served in the pinned organization with their role in that organization, and bearer tokens are verified against it. Signing in to one deployment no longer changes which organization another deployment treats you as. ([#23427](https://github.com/mastra-ai/mastra/pull/23427))
+
+## 1.3.6-alpha.0
+
+### Patch Changes
+
+- Fixed deployments pinned to an organization (`MASTRA_ORGANIZATION_ID`) serving members under whatever organization their shared Mastra session cookie happened to be on. A member is now served in the pinned organization with their role in that organization, and bearer tokens are verified against it. Signing in to one deployment no longer changes which organization another deployment treats you as. ([#23427](https://github.com/mastra-ai/mastra/pull/23427))
+
+## 1.3.5
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.3.5-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+## 1.3.5-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.3.4
+
+### Patch Changes
+
+- Fixed reading request headers from Express-style plain header objects so cookie-based auth providers no longer throw and fail with a misleading 401. ([#21261](https://github.com/mastra-ai/mastra/pull/21261))
+
+  Related to https://github.com/mastra-ai/mastra/issues/21253
+
+## 1.3.4-alpha.0
+
+### Patch Changes
+
+- Fixed reading request headers from Express-style plain header objects so cookie-based auth providers no longer throw and fail with a misleading 401. ([#21261](https://github.com/mastra-ai/mastra/pull/21261))
+
+  Related to https://github.com/mastra-ai/mastra/issues/21253
+
+## 1.3.3
+
+### Patch Changes
+
+- Speed up Factory hot paths: ([#20261](https://github.com/mastra-ai/mastra/pull/20261))
+
+  - Much lower latency on authenticated requests — successful auth verifications are cached briefly instead of hitting the platform on every request, and credential verification requests time out after 15 seconds instead of hanging
+  - Faster GitHub repository listing and connecting
+  - Opening the same session concurrently no longer provisions duplicate sandboxes, and stuck sandbox commands now fail with a clear error instead of hanging
+  - Factory run dispatching stays fast as work-item history grows
+
+## 1.3.3-alpha.0
+
+### Patch Changes
+
+- Speed up Factory hot paths: ([#20261](https://github.com/mastra-ai/mastra/pull/20261))
+
+  - Much lower latency on authenticated requests — successful auth verifications are cached briefly instead of hitting the platform on every request, and credential verification requests time out after 15 seconds instead of hanging
+  - Faster GitHub repository listing and connecting
+  - Opening the same session concurrently no longer provisions duplicate sandboxes, and stuck sandbox commands now fail with a clear error instead of hanging
+  - Factory run dispatching stays fast as work-item history grows
+
+## 1.3.2
+
+### Patch Changes
+
+- `MastraAuthStudio` now automatically creates a personal organization for users who don't belong to one yet, and can check whether a user is an organization admin — matching the behavior already available in `MastraAuthWorkos` and `MastraAuthBetterAuth`. This lets hosts like a self-hosted MastraCode deployment authorize organization-level actions without users needing to manually set up an organization first. ([#19858](https://github.com/mastra-ai/mastra/pull/19858))
+
+- `MastraAuthStudio.ensureOrganization` now dedupes concurrent bootstraps for the same user, so parallel tabs or requests for a brand-new sign-in no longer end up creating duplicate personal organizations. ([#19858](https://github.com/mastra-ai/mastra/pull/19858))
+
+- Changed the default shared API URL for Studio auth from http://localhost:3010/v1 to https://platform.mastra.ai/v1, so deployed instances work against the production platform without extra configuration. Set MASTRA_SHARED_API_URL or the sharedApiUrl option to point at a different environment. Production cookie settings (Secure + Domain=.mastra.ai) are now only auto-enabled when the shared API URL is explicitly configured on .mastra.ai, keeping local development cookies host-only. ([#19958](https://github.com/mastra-ai/mastra/pull/19958))
+
+## 1.3.2-alpha.1
+
+### Patch Changes
+
+- Changed the default shared API URL for Studio auth from http://localhost:3010/v1 to https://platform.mastra.ai/v1, so deployed instances work against the production platform without extra configuration. Set MASTRA_SHARED_API_URL or the sharedApiUrl option to point at a different environment. Production cookie settings (Secure + Domain=.mastra.ai) are now only auto-enabled when the shared API URL is explicitly configured on .mastra.ai, keeping local development cookies host-only. ([#19958](https://github.com/mastra-ai/mastra/pull/19958))
+
+## 1.3.2-alpha.0
+
+### Patch Changes
+
+- `MastraAuthStudio` now automatically creates a personal organization for users who don't belong to one yet, and can check whether a user is an organization admin — matching the behavior already available in `MastraAuthWorkos` and `MastraAuthBetterAuth`. This lets hosts like a self-hosted MastraCode deployment authorize organization-level actions without users needing to manually set up an organization first. ([#19858](https://github.com/mastra-ai/mastra/pull/19858))
+
+- `MastraAuthStudio.ensureOrganization` now dedupes concurrent bootstraps for the same user, so parallel tabs or requests for a brand-new sign-in no longer end up creating duplicate personal organizations. ([#19858](https://github.com/mastra-ai/mastra/pull/19858))
+
+## 1.3.1
+
+### Patch Changes
+
+- Improved auth package builds by removing the direct core dependency from auth providers while preserving the existing public auth APIs. ([#17142](https://github.com/mastra-ai/mastra/pull/17142))
+
+## 1.3.1-alpha.0
+
+### Patch Changes
+
+- Improved auth package builds by removing the direct core dependency from auth providers while preserving the existing public auth APIs. ([#17142](https://github.com/mastra-ai/mastra/pull/17142))
+
+## 1.3.0
+
+### Minor Changes
+
+- Random bump ([#18178](https://github.com/mastra-ai/mastra/pull/18178))
+
+### Patch Changes
+
+- Updated dependencies [[`7c0d868`](https://github.com/mastra-ai/mastra/commit/7c0d868d97d0fdbc04c14d0166dbf44d4c5a4a62), [`d9d2273`](https://github.com/mastra-ai/mastra/commit/d9d2273c702690c9a26eab2aebea879701d4355a), [`b04369d`](https://github.com/mastra-ai/mastra/commit/b04369d6b167c698ef103981171a8bf92808e756), [`8f3c262`](https://github.com/mastra-ai/mastra/commit/8f3c262587b335588a02d96b17fd6aca34c885b3)]:
+  - @mastra/core@1.45.0
+
+## 1.3.0-alpha.0
+
+### Minor Changes
+
+- Random bump ([#18178](https://github.com/mastra-ai/mastra/pull/18178))
+
+### Patch Changes
+
+- Updated dependencies [[`7c0d868`](https://github.com/mastra-ai/mastra/commit/7c0d868d97d0fdbc04c14d0166dbf44d4c5a4a62), [`d9d2273`](https://github.com/mastra-ai/mastra/commit/d9d2273c702690c9a26eab2aebea879701d4355a), [`b04369d`](https://github.com/mastra-ai/mastra/commit/b04369d6b167c698ef103981171a8bf92808e756), [`8f3c262`](https://github.com/mastra-ai/mastra/commit/8f3c262587b335588a02d96b17fd6aca34c885b3)]:
+  - @mastra/core@1.45.0-alpha.0
+
+## 1.2.6
+
+### Patch Changes
+
+- Security remediation for the 2026-06-17 "easy-day-js" supply-chain incident. Patch bump to publish clean versions and move the `latest` dist-tag forward, superseding the compromised versions that declared the malicious `easy-day-js` dependency. ([#18056](https://github.com/mastra-ai/mastra/pull/18056))
+
+- Updated dependencies [[`339c57c`](https://github.com/mastra-ai/mastra/commit/339c57c5b2c6dbe75a125e138228e0556528976f), [`1dd4117`](https://github.com/mastra-ai/mastra/commit/1dd4117dcbd8e031ede9f0489436bfbc6f0315b8), [`2b11d1f`](https://github.com/mastra-ai/mastra/commit/2b11d1f6ac7024c5dd2b2dd12a48a956ac9d63bd), [`77a2351`](https://github.com/mastra-ai/mastra/commit/77a2351ee79296e360bce822cb3391f7cfd6489d), [`b7dff0a`](https://github.com/mastra-ai/mastra/commit/b7dff0a3d1022eb6868f48dc40a2b1febd5c277f), [`02087e1`](https://github.com/mastra-ai/mastra/commit/02087e1fbc54aa07f3071f7a200df1bf5be601a8), [`49af8df`](https://github.com/mastra-ai/mastra/commit/49af8df589c4ff71a5015a4553b377b32704b691), [`30ce559`](https://github.com/mastra-ai/mastra/commit/30ce55902ecf819b8ab8697398dd68b108228063), [`c241b92`](https://github.com/mastra-ai/mastra/commit/c241b929dc8c8d6a7b7219c99ed13ac1f3124a77), [`7d6ff70`](https://github.com/mastra-ai/mastra/commit/7d6ff708727297a0526ca0e26e93eeb5bbaaa187), [`ab975d4`](https://github.com/mastra-ai/mastra/commit/ab975d4dd9488752f05bda7afa03166d207e3e2a), [`9d6aa1b`](https://github.com/mastra-ai/mastra/commit/9d6aa1bae407e2afa6a089abc2a6accbbcb287b8)]:
+  - @mastra/core@1.44.0
+
+## 1.2.6-alpha.0
+
+### Patch Changes
+
+- Security remediation for the 2026-06-17 "easy-day-js" supply-chain incident. Patch bump to publish clean versions and move the `latest` dist-tag forward, superseding the compromised versions that declared the malicious `easy-day-js` dependency. ([#18056](https://github.com/mastra-ai/mastra/pull/18056))
+
+- Updated dependencies [[`77a2351`](https://github.com/mastra-ai/mastra/commit/77a2351ee79296e360bce822cb3391f7cfd6489d)]:
+  - @mastra/core@1.43.1-alpha.0
+
+## 1.2.3
+
+### Patch Changes
+
+- Removed Hono from @mastra/core and auth package runtime dependencies. Auth providers now receive framework-agnostic request types that support standard Request objects and Hono-compatible request shapes. MCP and deployer avoid relying on core-bundled Hono context types at package boundaries. ([#17410](https://github.com/mastra-ai/mastra/pull/17410))
+
+- Updated dependencies [[`c973db4`](https://github.com/mastra-ai/mastra/commit/c973db428df1b564ff0c35d4b2a90e8f4f1e13fd), [`552285e`](https://github.com/mastra-ai/mastra/commit/552285e5af43cfc680a0972032cab8de8776c6a0), [`77e686c`](https://github.com/mastra-ai/mastra/commit/77e686c264e493e99ae5024e4dfe3ea5d5a09718), [`ece8dba`](https://github.com/mastra-ai/mastra/commit/ece8dba7ec1a5089eee8c33167cd762bfa91e509), [`e751af2`](https://github.com/mastra-ai/mastra/commit/e751af219433fbf4c7035b2d771b4c9ec8813b05), [`e2a8380`](https://github.com/mastra-ai/mastra/commit/e2a838017a7657850404c1e94c70d79ffdc6f14a), [`be3f1cd`](https://github.com/mastra-ai/mastra/commit/be3f1cd81f0e2a649e8eac15a024d542d814aef8), [`a34d9db`](https://github.com/mastra-ai/mastra/commit/a34d9dbc39fedb722f271318e9355ecee70489ab)]:
+  - @mastra/core@1.39.0
+
+## 1.2.3-alpha.0
+
+### Patch Changes
+
+- Removed Hono from @mastra/core and auth package runtime dependencies. Auth providers now receive framework-agnostic request types that support standard Request objects and Hono-compatible request shapes. MCP and deployer avoid relying on core-bundled Hono context types at package boundaries. ([#17410](https://github.com/mastra-ai/mastra/pull/17410))
+
+- Updated dependencies [[`c973db4`](https://github.com/mastra-ai/mastra/commit/c973db428df1b564ff0c35d4b2a90e8f4f1e13fd), [`552285e`](https://github.com/mastra-ai/mastra/commit/552285e5af43cfc680a0972032cab8de8776c6a0), [`77e686c`](https://github.com/mastra-ai/mastra/commit/77e686c264e493e99ae5024e4dfe3ea5d5a09718), [`ece8dba`](https://github.com/mastra-ai/mastra/commit/ece8dba7ec1a5089eee8c33167cd762bfa91e509), [`e751af2`](https://github.com/mastra-ai/mastra/commit/e751af219433fbf4c7035b2d771b4c9ec8813b05), [`e2a8380`](https://github.com/mastra-ai/mastra/commit/e2a838017a7657850404c1e94c70d79ffdc6f14a), [`be3f1cd`](https://github.com/mastra-ai/mastra/commit/be3f1cd81f0e2a649e8eac15a024d542d814aef8), [`a34d9db`](https://github.com/mastra-ai/mastra/commit/a34d9dbc39fedb722f271318e9355ecee70489ab)]:
+  - @mastra/core@1.39.0-alpha.0
+
 ## 1.2.2
 
 ### Patch Changes

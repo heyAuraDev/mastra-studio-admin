@@ -1,12 +1,20 @@
-import { Button, Spinner, Textarea, toast } from '@mastra/playground-ui';
-import { ArrowUpIcon } from 'lucide-react';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { Form } from '@mastra/playground-ui/components/Form';
+import { Spinner } from '@mastra/playground-ui/components/Spinner';
+import { Textarea } from '@mastra/playground-ui/components/Textarea';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { IconArrowUp } from '@mastra/playground-ui/icons/central/IconArrowUp';
+import { toast } from '@mastra/playground-ui/utils/toast';
+import { useStoredAgentMutations } from '@mastra/react/hooks/agents';
+import { useAuthCapabilities } from '@mastra/react/hooks/auth';
 import { nanoid } from 'nanoid';
 import { useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
+import { DEFAULT_BUILDER_REQUEST_CONTEXT_SCHEMA } from '../../constants/default-request-context-schema';
 import { useAgentBuilderAllowedModels } from '../../hooks/use-agent-builder-allowed-models';
+import { useBuilderModelPolicy, useBuilderSettings } from '../../hooks/use-builder-settings';
 import { ExampleList } from './example-list';
 import { resolveStarterModel, truncateName } from './utils';
-import { useStoredAgentMutations } from '@/domains/agents/hooks/use-stored-agents';
 import { useDefaultVisibility } from '@/domains/auth/hooks/use-default-visibility';
 
 export const AgentBuilderStarter = () => {
@@ -15,14 +23,21 @@ export const AgentBuilderStarter = () => {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { createStoredAgent } = useStoredAgentMutations(undefined);
   const defaultVisibility = useDefaultVisibility();
+  const { data: authCapabilities } = useAuthCapabilities();
   const { models: allowedModels } = useAgentBuilderAllowedModels();
+  const modelPolicy = useBuilderModelPolicy();
+  // While builder settings are still loading, useBuilderModelPolicy falls back
+  // to an inactive policy — submitting in that window would skip the admin
+  // default model. Block submit until the settings query has resolved.
+  const { isLoading: isBuilderSettingsLoading } = useBuilderSettings();
 
   const trimmed = message.trim();
   const isCreating = createStoredAgent.isPending;
+  const isSubmitBlocked = trimmed.length === 0 || isCreating || isBuilderSettingsLoading;
 
   const handleSubmit = async (e: React.SubmitEvent<HTMLFormElement>) => {
     e.preventDefault();
-    if (trimmed.length === 0 || isCreating) return;
+    if (isSubmitBlocked) return;
 
     const id = nanoid();
 
@@ -36,7 +51,8 @@ export const AgentBuilderStarter = () => {
         workflows: {},
         skills: {},
         visibility: defaultVisibility,
-        model: resolveStarterModel(allowedModels),
+        model: resolveStarterModel(allowedModels, modelPolicy),
+        ...(authCapabilities?.enabled ? { requestContextSchema: DEFAULT_BUILDER_REQUEST_CONTEXT_SCHEMA } : {}),
       });
 
       void navigate(`/agent-builder/agents/${id}/edit`, {
@@ -45,7 +61,6 @@ export const AgentBuilderStarter = () => {
       });
     } catch {
       toast.error('Failed to start a new agent');
-      return;
     }
   };
 
@@ -64,31 +79,28 @@ export const AgentBuilderStarter = () => {
   };
 
   return (
-    <div className="starter-aurora flex min-h-full flex-col items-center justify-center bg-surface1 px-6 py-24">
-      <div className="relative z-10 flex w-full max-w-3xl flex-col gap-12">
-        <h1
-          className="starter-heading text-center font-serif text-neutral6"
-          style={{ fontSize: 'clamp(1.875rem, 3.5vw, 2.5rem)', lineHeight: 1.1, letterSpacing: '-0.015em' }}
-        >
+    <div className="starter-aurora flex min-h-full flex-col items-center justify-center bg-sidebar px-4 py-16">
+      <div className="relative z-10 flex w-full max-w-3xl flex-col gap-6">
+        <Txt font="display" as="h1" variant="title" tone="ink" className="starter-heading text-center">
           What should we build today?
-        </h1>
+        </Txt>
 
-        <form
+        <Form
           onSubmit={handleSubmit}
-          className="starter-prompt rounded-2xl border border-border1 bg-surface2 transition-colors duration-normal ease-out-custom focus-within:border-neutral3"
+          className="starter-prompt gap-0 rounded-2xl border border-border bg-background transition-colors duration-normal ease-out-custom focus-within:border-muted-foreground"
           style={{ viewTransitionName: 'chat-composer' }}
         >
           <Textarea
             ref={textareaRef}
             testId="agent-builder-starter-input"
-            size="default"
+            size="md"
             variant="unstyled"
-            placeholder="Describe the agent you want to build…"
+            placeholder="Describe the agent you want to build"
             value={message}
             onChange={e => setMessage(e.target.value)}
             onKeyDown={handleKeyDown}
             disabled={isCreating}
-            className="min-h-[112px] resize-none px-5 py-4 text-ui-md outline-none placeholder:text-neutral3 focus:outline-none focus-visible:outline-none"
+            className="min-h-[112px] resize-none px-5 py-4 text-body outline-none placeholder:text-muted-foreground focus:outline-none focus-visible:outline-none"
             rows={3}
           />
 
@@ -98,20 +110,19 @@ export const AgentBuilderStarter = () => {
               variant="default"
               size="icon-md"
               tooltip="Start building"
-              disabled={trimmed.length === 0 || isCreating}
+              disabled={isSubmitBlocked}
               data-testid="agent-builder-starter-submit"
-              className="rounded-full"
             >
               {isCreating ? (
                 <span data-testid="agent-builder-starter-submit-spinner">
                   <Spinner />
                 </span>
               ) : (
-                <ArrowUpIcon />
+                <IconArrowUp />
               )}
             </Button>
           </div>
-        </form>
+        </Form>
 
         <ExampleList onExampleClick={handleExampleClick} />
       </div>

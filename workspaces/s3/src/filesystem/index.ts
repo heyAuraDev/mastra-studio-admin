@@ -30,6 +30,17 @@ import type {
 import { MastraFilesystem, FileNotFoundError, FileExistsError } from '@mastra/core/workspace';
 
 /**
+ * Owner of the files inside a FUSE mount, as numeric uid/gid.
+ *
+ * Set this when commands run as a different OS user than the one the sandbox
+ * mounts as, so that user can read and write the mounted files.
+ */
+export interface MountOwner {
+  uid: number;
+  gid: number;
+}
+
+/**
  * S3 mount configuration.
  * Returned by S3Filesystem.getMountConfig() for FUSE mounting in sandboxes.
  */
@@ -55,6 +66,11 @@ export interface S3MountConfig extends FilesystemMountConfig {
   prefix?: string;
   /** Mount as read-only */
   readOnly?: boolean;
+  /**
+   * Owner of the files inside the mount, as numeric uid/gid.
+   * When unset, the sandbox probes the default user's uid/gid.
+   */
+  owner?: MountOwner;
 }
 
 /**
@@ -168,6 +184,7 @@ export interface S3FilesystemOptions extends MastraFilesystemOptions {
    * - Cloudflare R2: 'https://{accountId}.r2.cloudflarestorage.com'
    * - MinIO: 'http://localhost:9000'
    * - DigitalOcean Spaces: 'https://{region}.digitaloceanspaces.com'
+   * - Neon Object Storage: 'https://{branchId}.storage.{cell}.{region}.aws.neon.tech'
    */
   endpoint?: string;
   /** Force path-style URLs (required for some S3-compatible services) */
@@ -176,6 +193,13 @@ export interface S3FilesystemOptions extends MastraFilesystemOptions {
   prefix?: string;
   /** Mount as read-only (blocks write operations, mounts read-only in sandboxes) */
   readOnly?: boolean;
+  /**
+   * Owner of the files inside the FUSE mount, as numeric uid/gid.
+   * Use this when sandbox commands run as a different OS user than the one
+   * performing the mount, so that user can read and write the mounted files.
+   * When unset, the sandbox probes the default user's uid/gid.
+   */
+  owner?: MountOwner;
 }
 
 /**
@@ -209,6 +233,20 @@ export interface S3FilesystemOptions extends MastraFilesystemOptions {
  * });
  * ```
  *
+ * @example Neon Object Storage
+ * ```typescript
+ * import { S3Filesystem } from '@mastra/s3';
+ *
+ * // Values come from `neon env pull` (branch-scoped credentials)
+ * const fs = new S3Filesystem({
+ *   bucket: 'my-bucket',
+ *   region: process.env.AWS_REGION!,
+ *   accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+ *   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+ *   endpoint: process.env.AWS_ENDPOINT_URL_S3!,
+ * });
+ * ```
+ *
  * @example MinIO (local)
  * ```typescript
  * import { S3Filesystem } from '@mastra/s3';
@@ -238,6 +276,7 @@ export class S3Filesystem extends MastraFilesystem {
   readonly name = 'S3Filesystem';
   readonly provider = 's3';
   readonly readOnly?: boolean;
+  readonly owner?: MountOwner;
 
   status: ProviderStatus = 'pending';
 
@@ -278,6 +317,7 @@ export class S3Filesystem extends MastraFilesystem {
     this.displayName = options.displayName ?? this.getDefaultDisplayName(this.icon);
     this.description = options.description;
     this.readOnly = options.readOnly;
+    this.owner = options.owner;
   }
 
   /**
@@ -335,6 +375,13 @@ export class S3Filesystem extends MastraFilesystem {
 
     if (this.readOnly) {
       config.readOnly = true;
+    }
+
+    if (this.owner) {
+      // Copy the ids: the mount marker hashes this config, so a caller that mutates
+      // the object it passed in must not change the ownership that was mounted.
+      // Reading the fields also keeps an accessor-backed owner, which a spread would drop.
+      config.owner = { uid: this.owner.uid, gid: this.owner.gid };
     }
 
     return config;
@@ -432,6 +479,10 @@ export class S3Filesystem extends MastraFilesystem {
       return 'azure';
     }
 
+    if (hostname.endsWith('.neon.tech') && hostname.includes('.storage.')) {
+      return 'neon';
+    }
+
     if (hostname.includes('minio')) {
       return 'minio';
     }
@@ -460,6 +511,8 @@ export class S3Filesystem extends MastraFilesystem {
         return 'Azure Blob';
       case 'minio':
         return 'MinIO';
+      case 'neon':
+        return 'Neon Object Storage';
       case 's3':
         return 'S3';
       default:
@@ -515,6 +568,11 @@ export class S3Filesystem extends MastraFilesystem {
   // ---------------------------------------------------------------------------
 
   async readFile(path: string, options?: ReadOptions): Promise<string | Buffer> {
+    // A trailing slash means a directory: never return the empty body of a directory marker
+    if (path.endsWith('/')) {
+      throw new FileNotFoundError(path);
+    }
+
     const client = await this.getReadyClient();
 
     try {
@@ -605,6 +663,11 @@ export class S3Filesystem extends MastraFilesystem {
   }
 
   async copyFile(src: string, dest: string, options?: CopyOptions): Promise<void> {
+    // A trailing slash means a directory: never copy a directory marker as a file
+    if (src.endsWith('/')) {
+      throw new FileNotFoundError(src);
+    }
+
     const client = await this.getReadyClient();
 
     if (options?.overwrite === false && (await this.exists(dest))) {
@@ -636,17 +699,53 @@ export class S3Filesystem extends MastraFilesystem {
   // Directory Operations
   // ---------------------------------------------------------------------------
 
-  async mkdir(_path: string, _options?: { recursive?: boolean }): Promise<void> {
-    // S3 doesn't have real directories - they're just key prefixes
-    // No-op, directories are created implicitly when files are written
+  async mkdir(path: string, _options?: { recursive?: boolean }): Promise<void> {
+    // S3 doesn't have real directories - they're just key prefixes.
+    // Write a zero-byte marker object at "<key>/" (the convention the S3 console uses)
+    // so an empty directory is visible to readdir(), exists() and stat().
+    // Parent directories need no marker of their own: the marker key already
+    // matches every parent prefix, so nested paths work without `recursive`.
+    const key = trimSlashes(this.toKey(path));
+    if (!key || key + '/' === this.prefix) return; // Root always exists
+
+    const client = await this.getReadyClient();
+
+    // A file already occupies this path. A credential that can write but not read
+    // cannot probe, so treat a failed probe as "no file there" and let the write below
+    // report a real problem.
+    try {
+      await client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: key }));
+      throw new FileExistsError(path);
+    } catch (error: unknown) {
+      if (error instanceof FileExistsError) throw error;
+    }
+
+    await client.send(
+      new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: key + '/',
+        Body: new Uint8Array(0),
+      }),
+    );
   }
 
   async rmdir(path: string, options?: RemoveOptions): Promise<void> {
     if (!options?.recursive) {
-      // Check if directory is empty
+      // Check if directory is empty (the directory marker is not listed as an entry)
       const entries = await this.readdir(path);
       if (entries.length > 0) {
         throw new Error(`Directory not empty: ${path}`);
+      }
+      // Remove the directory marker so the empty directory disappears
+      const key = trimSlashes(this.toKey(path));
+      if (key && key + '/' !== this.prefix) {
+        const client = await this.getReadyClient();
+        await client.send(
+          new DeleteObjectCommand({
+            Bucket: this.bucket,
+            Key: key + '/',
+          }),
+        );
       }
       return;
     }
@@ -717,7 +816,13 @@ export class S3Filesystem extends MastraFilesystem {
 
           // Skip if this looks like a directory marker
           if (relativePath.endsWith('/')) {
-            const dirName = relativePath.slice(0, -1);
+            // A directory is not a file, so an extension filter must exclude it. Only a
+            // recursive listing reaches this branch for a nested marker.
+            if (options?.recursive && options.extension) continue;
+            // A nested marker such as "a/b/" belongs to the directory "a" in a
+            // non-recursive listing; only a recursive listing reports the full path.
+            const dirName = options?.recursive ? relativePath.slice(0, -1) : relativePath.split('/')[0]!;
+            if (!dirName) continue;
             if (!seenDirs.has(dirName)) {
               seenDirs.add(dirName);
               entries.push({ name: dirName, type: 'directory' });
@@ -801,7 +906,10 @@ export class S3Filesystem extends MastraFilesystem {
   }
 
   async stat(path: string): Promise<FileStat> {
-    const key = this.toKey(path);
+    // The key never keeps a trailing slash, so a lookup never matches a directory marker
+    const key = trimSlashes(this.toKey(path));
+    // A trailing slash always means a directory, so never look for a file
+    const directoryOnly = path.endsWith('/');
 
     // Root is always a directory
     if (!key) {
@@ -815,46 +923,54 @@ export class S3Filesystem extends MastraFilesystem {
       };
     }
 
-    const client = await this.getReadyClient();
+    const name = key.split('/').pop() ?? '';
 
-    try {
-      const response: { ContentLength?: number; LastModified?: Date } = await client.send(
-        new HeadObjectCommand({
-          Bucket: this.bucket,
-          Key: key,
-        }),
-      );
+    if (!directoryOnly) {
+      const client = await this.getReadyClient();
 
-      const name = path.split('/').pop() ?? '';
-      return {
-        name,
-        path,
-        type: 'file',
-        size: response.ContentLength ?? 0,
-        createdAt: response.LastModified ?? new Date(),
-        modifiedAt: response.LastModified ?? new Date(),
-      };
-    } catch (error: unknown) {
-      if (!isNotFoundError(error)) throw this.handleError(error);
-      // Check if it's a directory
-      const isDir = await this.isDirectory(path);
-      if (isDir) {
-        const name = path.split('/').filter(Boolean).pop() ?? '';
+      try {
+        const response: { ContentLength?: number; ContentType?: string; LastModified?: Date } = await client.send(
+          new HeadObjectCommand({
+            Bucket: this.bucket,
+            Key: key,
+          }),
+        );
+
         return {
           name,
           path,
-          type: 'directory',
-          size: 0,
-          createdAt: new Date(),
-          modifiedAt: new Date(),
+          type: 'file',
+          size: response.ContentLength ?? 0,
+          mimeType: response.ContentType ?? getMimeType(path),
+          createdAt: response.LastModified ?? new Date(),
+          modifiedAt: response.LastModified ?? new Date(),
         };
+      } catch (error: unknown) {
+        if (!isNotFoundError(error)) throw this.handleError(error);
       }
-      throw new FileNotFoundError(path);
     }
+
+    // Check if it's a directory
+    const isDir = await this.isDirectory(path);
+    if (isDir) {
+      return {
+        name,
+        path,
+        type: 'directory',
+        size: 0,
+        createdAt: new Date(),
+        modifiedAt: new Date(),
+      };
+    }
+    throw new FileNotFoundError(path);
   }
 
   async isFile(path: string): Promise<boolean> {
-    const key = this.toKey(path);
+    // A trailing slash always means a directory
+    if (path.endsWith('/')) return false;
+
+    // The key never keeps a trailing slash, so a lookup never matches a directory marker
+    const key = trimSlashes(this.toKey(path));
     if (!key) return false; // Root is a directory, not a file
 
     const client = await this.getReadyClient();
@@ -899,10 +1015,14 @@ export class S3Filesystem extends MastraFilesystem {
    * Status management is handled by the base class.
    */
   async init(): Promise<void> {
-    // Verify we can access the bucket
+    // Prefix-scoped credentials may not authorize a bucket-wide access check.
     const client = this.getClient();
     try {
-      await client.send(new HeadBucketCommand({ Bucket: this.bucket }));
+      if (this.prefix) {
+        await client.send(new ListObjectsV2Command({ Bucket: this.bucket, Prefix: this.prefix, MaxKeys: 1 }));
+      } else {
+        await client.send(new HeadBucketCommand({ Bucket: this.bucket }));
+      }
     } catch (error) {
       // Extract httpStatusCode if available
       const statusCode = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;

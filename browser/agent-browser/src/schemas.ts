@@ -49,6 +49,11 @@ export const clickInputSchema = z.object({
     .array(z.enum(['Alt', 'Control', 'Meta', 'Shift']))
     .optional()
     .describe('Modifier keys to hold'),
+  waitUntil: z
+    .enum(['load', 'domcontentloaded', 'networkidle'])
+    .optional()
+    .describe('If the click triggers a navigation, wait for this page load state before returning'),
+  timeout: z.number().nonnegative().optional().describe('Timeout in milliseconds for the click and optional waitUntil'),
 });
 export type ClickInput = z.output<typeof clickInputSchema>;
 
@@ -72,6 +77,11 @@ export const pressInputSchema = z.object({
     .array(z.enum(['Alt', 'Control', 'Meta', 'Shift']))
     .optional()
     .describe('Modifier keys to hold'),
+  waitUntil: z
+    .enum(['load', 'domcontentloaded', 'networkidle'])
+    .optional()
+    .describe('If the key press triggers a navigation, wait for this page load state before returning'),
+  timeout: z.number().nonnegative().optional().describe('Timeout in milliseconds for the optional waitUntil'),
 });
 export type PressInput = z.output<typeof pressInputSchema>;
 
@@ -84,6 +94,15 @@ export const selectInputSchema = z
     value: z.string().optional().describe('Option value to select'),
     label: z.string().optional().describe('Option label to select'),
     index: z.number().int().min(0).optional().describe('Option index to select (0-based)'),
+    waitUntil: z
+      .enum(['load', 'domcontentloaded', 'networkidle'])
+      .optional()
+      .describe('If the selection triggers a navigation, wait for this page load state before returning'),
+    timeout: z
+      .number()
+      .nonnegative()
+      .optional()
+      .describe('Timeout in milliseconds for the selection and optional waitUntil'),
   })
   .superRefine((data, ctx) => {
     if (data.value === undefined && data.label === undefined && data.index === undefined) {
@@ -212,6 +231,13 @@ export const screenshotInputSchema = z.object({
     .boolean()
     .optional()
     .describe('Capture the full scrollable page instead of just the viewport (default: false)'),
+  path: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Also save the PNG to this path in your workspace, so you can treat it as a normal file (attach, commit, view). Missing folders are created.',
+    ),
 });
 export type ScreenshotInput = z.output<typeof screenshotInputSchema>;
 

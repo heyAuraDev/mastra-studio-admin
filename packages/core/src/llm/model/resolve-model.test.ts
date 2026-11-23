@@ -3,7 +3,8 @@ import { describe, it, expect } from 'vitest';
 import { RequestContext } from '../../request-context';
 import { AISDKV4LegacyLanguageModel } from './aisdk/v4/model';
 import { AISDKV5LanguageModel } from './aisdk/v5/model';
-import { resolveModelConfig } from './resolve-model';
+import { AISDKV7LanguageModel } from './aisdk/v7/model';
+import { isOpenAICompatibleObjectConfig, resolveModelConfig } from './resolve-model';
 import { ModelRouterLanguageModel } from './router';
 
 describe('resolveModelConfig', () => {
@@ -69,14 +70,106 @@ describe('resolveModelConfig', () => {
     expect(result.provider).toBe(`anthropic`);
   });
 
+  describe('labeled { model, id } configs', () => {
+    it('exposes the label on a model built by a dynamic function', async () => {
+      const result = await resolveModelConfig(() => ({ model: openai('gpt-4o'), id: 'mastra/openai/gpt-4o' }));
+
+      expect(result).toBeInstanceOf(AISDKV5LanguageModel);
+      expect(result.provider).toBe('openai.responses');
+      expect(result.modelId).toBe('gpt-4o');
+      expect((result as { id?: string }).id).toBe('mastra/openai/gpt-4o');
+    });
+
+    it('resolves a labeled model ID string through the router', async () => {
+      const result = await resolveModelConfig({ model: 'openai/gpt-4o', id: 'custom/openai/gpt-4o' });
+
+      expect(result).toBeInstanceOf(ModelRouterLanguageModel);
+      expect((result as { id?: string }).id).toBe('custom/openai/gpt-4o');
+    });
+
+    it('is not mistaken for an OpenAI-compatible config', () => {
+      expect(isOpenAICompatibleObjectConfig({ model: 'openai/gpt-4o', id: 'openai/gpt-4o' } as never)).toBe(false);
+    });
+
+    it('leaves unlabeled model instances without an id', async () => {
+      const result = await resolveModelConfig(openai('gpt-4o'));
+      expect((result as { id?: string }).id).toBeUndefined();
+    });
+
+    it('exposes the router ID only when the ID alone resolves the same route', async () => {
+      const plain = await resolveModelConfig('mastra/openai/gpt-4o');
+      const configured = await resolveModelConfig({ id: 'openai/gpt-4o', apiKey: 'test-key' });
+
+      expect((plain as { id?: string }).id).toBe('mastra/openai/gpt-4o');
+      expect((configured as { id?: string }).id).toBeUndefined();
+    });
+  });
+
   it('should throw error for invalid config', async () => {
     await expect(resolveModelConfig({} as any)).rejects.toThrow('Invalid model configuration');
+  });
+
+  it('should return false when checking a null OpenAI-compatible config', () => {
+    expect(isOpenAICompatibleObjectConfig(null as any)).toBe(false);
+  });
+
+  it('should throw an invalid configuration error for null', async () => {
+    await expect(resolveModelConfig(null as any)).rejects.toThrow('Invalid model configuration provided');
+  });
+
+  describe('routing field validation', () => {
+    it('should reject a config whose id is not a string', async () => {
+      const config = { id: 123 } as any;
+      expect(isOpenAICompatibleObjectConfig(config)).toBe(false);
+      await expect(resolveModelConfig(config)).rejects.toThrow('Invalid model configuration provided');
+    });
+
+    it('should reject a config whose providerId is not a string', async () => {
+      const config = { providerId: 123, modelId: 'model' } as any;
+      expect(isOpenAICompatibleObjectConfig(config)).toBe(false);
+      await expect(resolveModelConfig(config)).rejects.toThrow('Invalid model configuration provided');
+    });
+
+    it('should reject a config whose modelId is not a string', async () => {
+      const config = { providerId: 'provider', modelId: 123 } as any;
+      expect(isOpenAICompatibleObjectConfig(config)).toBe(false);
+      await expect(resolveModelConfig(config)).rejects.toThrow('Invalid model configuration provided');
+    });
+
+    it('should reject a malformed providerId/modelId pair even when a valid id is present', async () => {
+      const config = { id: 'openai/gpt-4o', providerId: 123, modelId: 'model' } as any;
+      expect(isOpenAICompatibleObjectConfig(config)).toBe(false);
+      await expect(resolveModelConfig(config)).rejects.toThrow('Invalid model configuration provided');
+    });
+
+    it('should still accept valid string routing fields', () => {
+      expect(isOpenAICompatibleObjectConfig({ id: 'openai/gpt-4o' } as any)).toBe(true);
+      expect(isOpenAICompatibleObjectConfig({ providerId: 'openai', modelId: 'gpt-4o' } as any)).toBe(true);
+    });
+  });
+
+  describe('v4 (LanguageModelV4 / AI SDK v7) handling', () => {
+    it('should wrap a v4 model in AISDKV7LanguageModel', async () => {
+      const model = {
+        specificationVersion: 'v4',
+        provider: 'openai.responses',
+        modelId: 'gpt-5',
+        supportedUrls: {},
+        doGenerate: async () => ({}),
+        doStream: async () => ({}),
+      };
+      const result = await resolveModelConfig(model as any);
+      expect(result).toBeInstanceOf(AISDKV7LanguageModel);
+      expect(result.specificationVersion).toBe('v4');
+      expect(result.modelId).toBe('gpt-5');
+      expect(result.provider).toBe('openai.responses');
+    });
   });
 
   describe('unknown specificationVersion handling', () => {
     it('should wrap a model with unknown specificationVersion as AISDKV5LanguageModel when it has doStream/doGenerate', async () => {
       const model = {
-        specificationVersion: 'v4',
+        specificationVersion: 'v99',
         provider: 'ollama.responses',
         modelId: 'llama3.2',
         supportedUrls: {},
@@ -92,7 +185,7 @@ describe('resolveModelConfig', () => {
 
     it('should pass through a model with unknown specificationVersion when it lacks doStream/doGenerate', async () => {
       const model = {
-        specificationVersion: 'v4',
+        specificationVersion: 'v99',
         provider: 'test',
         modelId: 'test-model',
       };

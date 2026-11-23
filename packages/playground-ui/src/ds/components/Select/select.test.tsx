@@ -7,8 +7,8 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 // Base UI's Select synthesizes PointerEvents on interaction, which jsdom does
 // not implement. Polyfill it with the available MouseEvent constructor.
 beforeAll(() => {
-  if (typeof window.PointerEvent === 'undefined') {
-    window.PointerEvent = window.MouseEvent as unknown as typeof PointerEvent;
+  if (window.PointerEvent === undefined) {
+    Object.defineProperty(window, 'PointerEvent', { value: window.MouseEvent, configurable: true });
   }
 });
 
@@ -98,20 +98,5 @@ describe('Select', () => {
     );
 
     expect(screen.getByRole('combobox').classList.contains('custom-trigger')).toBe(true);
-  });
-
-  it('accepts the legacy size and variant props on the trigger without throwing', () => {
-    expect(() =>
-      render(
-        <Select>
-          <SelectTrigger size="sm" variant="ghost">
-            <SelectValue placeholder="Pick one" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="apple">Apple</SelectItem>
-          </SelectContent>
-        </Select>,
-      ),
-    ).not.toThrow();
   });
 });

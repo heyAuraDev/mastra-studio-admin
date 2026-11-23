@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createWorkflow } from '../../../../workflows/create';
 import { globalRunRegistry } from '../../run-registry';
 import { createDurableBackgroundTaskCheckStep } from './background-task-check';
 
@@ -49,7 +50,7 @@ function setupRegistry({
     model: {} as any,
   } as any);
 
-  const getInitData = () => ({
+  const getInitData = () => () => ({
     runId,
     agentId,
     options: skipBgTaskWait ? { skipBgTaskWait } : undefined,
@@ -80,6 +81,42 @@ describe('createDurableBackgroundTaskCheckStep', () => {
     globalRunRegistry.delete(runId);
   });
 
+  it.each(['error', 'other'])(
+    'does not revive terminal %s signal-discard state when a background task completes',
+    async reason => {
+      const { listTasks, waitForNextTask } = setupRegistry({});
+      let complete!: () => void;
+      const completion = new Promise<void>(resolve => {
+        complete = resolve;
+      });
+      waitForNextTask.mockImplementationOnce(async () => {
+        queueMicrotask(complete);
+        await completion;
+        return makeRunningTask('t1');
+      });
+      const step = createDurableBackgroundTaskCheckStep();
+      const workflow = createWorkflow({
+        id: 'terminal-background-check',
+        inputSchema: step.inputSchema,
+        outputSchema: step.outputSchema,
+      })
+        .then(step)
+        .commit();
+      const run = await workflow.createRun();
+      const input = {
+        ...baseInput(),
+        runId: 'run-1',
+        agentId: 'a1',
+        stepResult: { reason, isContinued: false, signalPreempted: true },
+      };
+      const result = await run.start({ inputData: input });
+      if (result.status !== 'success') throw new Error(`Background check failed: ${result.status}`);
+      expect(result.result).toEqual(input);
+      expect(listTasks).not.toHaveBeenCalled();
+      expect(waitForNextTask).not.toHaveBeenCalled();
+    },
+  );
+
   it('passes through unchanged when there are no running tasks', async () => {
     const { waitForNextTask, getInitData } = setupRegistry({ runningTasks: [] });
     const step = createDurableBackgroundTaskCheckStep();
@@ -88,7 +125,7 @@ describe('createDurableBackgroundTaskCheckStep', () => {
     const result = await (step as any).execute({
       inputData: input,
       retryCount: 0,
-      getInitData,
+      getInitData: getInitData(),
     });
 
     expect(result).toBe(input);
@@ -104,39 +141,60 @@ describe('createDurableBackgroundTaskCheckStep', () => {
 
     const result = await (step as any).execute({
       inputData: baseInput(),
-      retryCount: 1,
-      getInitData,
+      retryCount: 0,
+      getInitData: getInitData(),
     });
 
     expect(waitForNextTask).not.toHaveBeenCalled();
     expect(result.backgroundTaskPending).toBe(true);
   });
 
-  it('flags pending without waiting on first invocation (retryCount=0)', async () => {
+  it('returns immediately on retryCount=0 when waitTimeoutMs IS configured', async () => {
     const { waitForNextTask, getInitData } = setupRegistry({ waitTimeoutMs: 60_000 });
     const step = createDurableBackgroundTaskCheckStep();
 
     const result = await (step as any).execute({
       inputData: baseInput(),
       retryCount: 0,
-      getInitData,
+      getInitData: getInitData(),
     });
 
+    // When waitTimeoutMs is explicitly configured, the caller drives
+    // continuation externally — match the regular agent's retryCount=0 skip.
     expect(waitForNextTask).not.toHaveBeenCalled();
     expect(result.backgroundTaskPending).toBe(true);
   });
 
-  it('waits for next task when retryCount > 0 and a wait timeout is configured', async () => {
+  it('waits with 1s default when no waitTimeoutMs is configured (retryCount=0)', async () => {
+    const { waitForNextTask, getInitData } = setupRegistry({});
+    const step = createDurableBackgroundTaskCheckStep();
+
+    const result = await (step as any).execute({
+      inputData: baseInput(),
+      retryCount: 0,
+      getInitData: getInitData(),
+    });
+
+    // No explicit waitTimeoutMs — durable agent must wait with a default
+    // to keep the workflow and pubsub subscription alive.
+    expect(waitForNextTask).toHaveBeenCalledTimes(1);
+    expect(waitForNextTask).toHaveBeenCalledWith(['t1'], expect.objectContaining({ timeoutMs: 1000 }));
+    expect(result.backgroundTaskPending).toBe(true);
+    expect(result.stepResult.isContinued).toBe(true);
+  });
+
+  it('waits with configured timeout on subsequent invocations (retryCount>0)', async () => {
     const { waitForNextTask, getInitData } = setupRegistry({ waitTimeoutMs: 60_000 });
     const step = createDurableBackgroundTaskCheckStep();
 
     const result = await (step as any).execute({
       inputData: baseInput(),
       retryCount: 1,
-      getInitData,
+      getInitData: getInitData(),
     });
 
     expect(waitForNextTask).toHaveBeenCalledTimes(1);
+    expect(waitForNextTask).toHaveBeenCalledWith(['t1'], expect.objectContaining({ timeoutMs: 60_000 }));
     expect(result.backgroundTaskPending).toBe(true);
     expect(result.stepResult.isContinued).toBe(true);
   });

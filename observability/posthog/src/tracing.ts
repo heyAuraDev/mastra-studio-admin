@@ -1,9 +1,17 @@
-import type { AnyExportedSpan, ModelGenerationAttributes, SpanErrorInfo, UsageStats } from '@mastra/core/observability';
+import type {
+  AnyExportedSpan,
+  ExportedFeedback,
+  FeedbackEvent,
+  ModelGenerationAttributes,
+  SpanErrorInfo,
+  UsageStats,
+} from '@mastra/core/observability';
 import { SpanType } from '@mastra/core/observability';
 import type { TraceData, TrackingExporterConfig } from '@mastra/observability';
 import { TrackingExporter } from '@mastra/observability';
 import { PostHog } from 'posthog-node';
 import type { EventMessage } from 'posthog-node';
+import { isModelInferenceEnabled } from './features';
 
 /**
  * Token usage format compatible with PostHog.
@@ -14,6 +22,8 @@ export interface PostHogUsageMetrics {
   $ai_output_tokens?: number;
   $ai_cache_read_input_tokens?: number;
   $ai_cache_creation_input_tokens?: number;
+  $ai_cache_creation_5m_input_tokens?: number;
+  $ai_cache_creation_1h_input_tokens?: number;
 }
 
 /**
@@ -41,6 +51,12 @@ export function formatUsageMetrics(usage?: UsageStats): PostHogUsageMetrics {
 
   if (usage.inputDetails?.cacheWrite !== undefined) {
     props.$ai_cache_creation_input_tokens = usage.inputDetails.cacheWrite;
+  }
+  if (usage.inputDetails?.cacheWrite5m !== undefined) {
+    props.$ai_cache_creation_5m_input_tokens = usage.inputDetails.cacheWrite5m;
+  }
+  if (usage.inputDetails?.cacheWrite1h !== undefined) {
+    props.$ai_cache_creation_1h_input_tokens = usage.inputDetails.cacheWrite1h;
   }
 
   if (usage.outputTokens !== undefined) {
@@ -75,6 +91,16 @@ interface MastraContent {
 type SpanData = string | MastraMessage[] | Record<string, unknown> | unknown;
 
 const DISTINCT_ID = 'distinctId';
+/** Per-trace key prefix for the provider calls and tool results recorded under one MODEL_GENERATION. */
+const CONVERSATION = 'conversation:';
+
+/** Ended spans under one MODEL_GENERATION, used to rebuild each provider call's `$ai_input`. */
+interface Conversation {
+  /** Ended MODEL_INFERENCE spans, in the order they ended. */
+  calls: AnyExportedSpan[];
+  /** Ended TOOL_CALL / MCP_TOOL_CALL spans and PROVIDER_TOOL_CALL spans with a result, keyed by toolCallId. */
+  toolResults: Map<string, AnyExportedSpan>;
+}
 
 export interface PosthogExporterConfig extends TrackingExporterConfig {
   /** PostHog API key. Defaults to POSTHOG_API_KEY environment variable. */
@@ -170,16 +196,20 @@ export class PosthogExporter extends TrackingExporter<
   }): Promise<PosthogEvent> {
     const { span, traceData } = args;
 
-    const eventName = this.mapToPostHogEvent(span.type);
+    const isModelCall = this.isModelCall(span);
     const distinctId = this.getDistinctId(span, traceData);
-    const properties = this.buildEventProperties(span, 0);
+    const properties = this.buildEventProperties(span, 0, false, isModelCall);
 
-    this.#client?.capture({
-      distinctId,
-      event: eventName,
-      properties,
-      timestamp: span.endTime ? new Date(span.endTime) : new Date(),
-    });
+    // captureAi() targets PostHog's dedicated AI endpoint (8 MiB per event, oversized events
+    // dropped individually). Plain capture() uses /batch/, which returns 413 for large spans.
+    this.#client?.captureAi(
+      this.withGroups({
+        distinctId,
+        event: isModelCall ? '$ai_generation' : '$ai_span',
+        properties,
+        timestamp: span.endTime ? new Date(span.endTime) : new Date(),
+      }),
+    );
 
     return true;
   }
@@ -212,8 +242,10 @@ export class PosthogExporter extends TrackingExporter<
     const cachedSpan = traceData.getSpan({ spanId: span.id });
     const mergedSpan = !span.input && cachedSpan?.input ? { ...span, input: cachedSpan.input } : span;
 
-    const eventMessage = this.buildEventMessage({ span: mergedSpan, traceData });
-    this.#client?.capture(eventMessage);
+    const eventMessage = this.buildEventMessage({ span: this.withCallInput(mergedSpan, traceData), traceData });
+    this.#client?.captureAi(this.withGroups(eventMessage));
+
+    this.recordForConversation(span, traceData);
   }
 
   protected override async _abortSpan(args: {
@@ -226,8 +258,82 @@ export class PosthogExporter extends TrackingExporter<
     // update span with the abort reason
     span.errorInfo = reason;
 
-    const eventMessage = this.buildEventMessage({ span, traceData });
-    this.#client?.capture(eventMessage);
+    const eventMessage = this.buildEventMessage({ span: this.withCallInput(span, traceData), traceData });
+    this.#client?.captureAi(this.withGroups(eventMessage));
+  }
+
+  /**
+   * Forward feedback recorded via `addFeedback()` to PostHog as a native
+   * `$ai_feedback` event, shown as "User feedback" on the linked trace in
+   * PostHog's AI observability UI.
+   */
+  async onFeedbackEvent(event: FeedbackEvent): Promise<void> {
+    if (!this.#client) return;
+
+    const { feedback } = event;
+    if (!feedback.traceId) {
+      this.logger.debug('PostHog exporter: dropping feedback with no traceId; PostHog requires $ai_trace_id', {
+        feedbackId: feedback.feedbackId,
+      });
+      return;
+    }
+
+    const properties: Record<string, any> = {
+      // Custom metadata goes first so it cannot overwrite the natively mapped fields below
+      ...this.extractCustomMetadata(feedback.metadata),
+      $ai_trace_id: feedback.traceId,
+      // PostHog's trace UI only displays feedback events that carry $ai_feedback_text
+      $ai_feedback_text: feedback.comment ?? String(feedback.value),
+      feedback_id: feedback.feedbackId,
+      feedback_type: feedback.feedbackType,
+      feedback_value: feedback.value,
+    };
+
+    const feedbackSource = feedback.feedbackSource ?? feedback.source;
+    if (feedbackSource) properties.feedback_source = feedbackSource;
+    if (feedback.spanId) properties.span_id = feedback.spanId;
+    if (feedback.sourceId) properties.source_id = feedback.sourceId;
+    if (feedback.metadata?.sessionId) properties.$ai_session_id = feedback.metadata.sessionId;
+
+    try {
+      this.#client.captureAi(
+        this.withGroups({
+          distinctId: this.getFeedbackDistinctId(feedback),
+          event: '$ai_feedback',
+          properties,
+          timestamp: new Date(feedback.timestamp),
+        }),
+      );
+    } catch (err) {
+      this.logger.error('PostHog exporter: failed to submit feedback', {
+        error: err,
+        traceId: feedback.traceId,
+        feedbackId: feedback.feedbackId,
+      });
+    }
+  }
+
+  private getFeedbackDistinctId(feedback: ExportedFeedback): string {
+    const userId =
+      feedback.feedbackUserId !== undefined ? feedback.feedbackUserId : (feedback.userId ?? feedback.metadata?.userId);
+    if (userId) {
+      return String(userId);
+    }
+    return this.config.defaultDistinctId ?? 'anonymous';
+  }
+
+  /**
+   * PostHog group analytics are keyed off the top-level `groups` field on the
+   * capture call. The Node SDK derives the event's `$groups` from that field and
+   * overwrites any property-level `$groups`, so group metadata carried in
+   * properties is dropped unless it is mirrored here.
+   */
+  private withGroups(message: EventMessage): EventMessage {
+    const groups = message.properties?.$groups;
+    if (groups && typeof groups === 'object' && !Array.isArray(groups)) {
+      return { ...message, groups };
+    }
+    return message;
   }
 
   private buildEventMessage(args: { span: AnyExportedSpan; traceData: PosthogTraceData }): EventMessage {
@@ -239,9 +345,8 @@ export class PosthogExporter extends TrackingExporter<
 
     if (span.isRootSpan) {
       return this.buildRootEventMessage({ span, distinctId, endTime });
-    } else {
-      return this.buildChildEventMessage({ span, distinctId, endTime, traceData });
     }
+    return this.buildChildEventMessage({ span, distinctId, endTime, traceData });
   }
 
   /**
@@ -291,6 +396,17 @@ export class PosthogExporter extends TrackingExporter<
     const { userId, sessionId, ...customMetadata } = span.metadata ?? {};
     Object.assign(traceProperties, customMetadata);
 
+    // A served MCP request is always a root span. Keep the caller's W3C context
+    // on the trace, since PostHog has no span links to point at the caller.
+    if (span.type === SpanType.MCP_SERVER_REQUEST) {
+      const { callerTraceparent, callerTracestate } = (span.attributes ?? {}) as {
+        callerTraceparent?: string;
+        callerTracestate?: string;
+      };
+      if (callerTraceparent) traceProperties.callerTraceparent = callerTraceparent;
+      if (callerTracestate) traceProperties.callerTracestate = callerTracestate;
+    }
+
     return {
       distinctId,
       event: '$ai_trace',
@@ -307,18 +423,18 @@ export class PosthogExporter extends TrackingExporter<
   }): EventMessage {
     const { span, distinctId, endTime, traceData } = args;
 
-    const eventName = this.mapToPostHogEvent(span.type);
+    const isModelCall = this.isModelCall(span);
     const startTime = span.startTime.getTime();
     const latency = (endTime - startTime) / 1000;
 
     // Check if parent is the root span - if so, use traceId as parent_id
     // since we don't create an $ai_span for root spans
     const parentIsRootSpan = this.isParentRootSpan(span, traceData);
-    const properties = this.buildEventProperties(span, latency, parentIsRootSpan);
+    const properties = this.buildEventProperties(span, latency, parentIsRootSpan, isModelCall);
 
     return {
       distinctId,
-      event: eventName,
+      event: isModelCall ? '$ai_generation' : '$ai_span',
       properties,
       timestamp: new Date(endTime),
     };
@@ -328,11 +444,116 @@ export class PosthogExporter extends TrackingExporter<
     return timestamp instanceof Date ? timestamp : new Date(timestamp);
   }
 
-  private mapToPostHogEvent(spanType: SpanType): string {
-    if (spanType == SpanType.MODEL_GENERATION) {
-      return '$ai_generation';
+  /**
+   * Whether this span is exported as `$ai_generation`. PostHog expects one per
+   * provider call and sums tokens and cost across them, so exactly one span
+   * per call may carry usage. With paired packages that emit MODEL_INFERENCE,
+   * that is the call and MODEL_GENERATION is the loop around it, exported as
+   * `$ai_span`. Older pairings only emit MODEL_GENERATION, which keeps the
+   * `$ai_generation` role.
+   */
+  private isModelCall(span: AnyExportedSpan): boolean {
+    return span.type === (isModelInferenceEnabled() ? SpanType.MODEL_INFERENCE : SpanType.MODEL_GENERATION);
+  }
+
+  /**
+   * Give a MODEL_INFERENCE exported as `$ai_generation` the conversation that
+   * call received. The span has no input of its own, so it is rebuilt from the
+   * generation's input plus, for each earlier call in the same generation, its
+   * output and the results of the tools it called (as Braintrust's Thread view
+   * does). Earlier calls and their tools end before this call does, so they are
+   * already recorded.
+   */
+  private withCallInput(span: AnyExportedSpan, traceData: PosthogTraceData): AnyExportedSpan {
+    if (span.type !== SpanType.MODEL_INFERENCE || !this.isModelCall(span)) return span;
+
+    const generation = this.findGeneration(span, traceData);
+    if (!generation?.input) return span;
+
+    const messages = this.formatMessages(generation.input, 'user');
+    const conversation = traceData.getExtraValue(CONVERSATION + generation.id) as Conversation | undefined;
+    for (const call of conversation?.calls ?? []) {
+      const output = call.output as
+        | { text?: string; toolCalls?: Array<{ toolCallId: string; toolName: string }> }
+        | undefined;
+      if (!output?.text && !output?.toolCalls?.length) continue;
+      messages.push(...this.formatMessages(output, 'assistant'));
+
+      // Parallel tool calls are ordered by when each tool started.
+      const results = (output.toolCalls ?? [])
+        .map(toolCall => ({ toolCall, toolSpan: conversation!.toolResults.get(toolCall.toolCallId) }))
+        .filter(
+          (result): result is { toolCall: typeof result.toolCall; toolSpan: AnyExportedSpan } => !!result.toolSpan,
+        )
+        .sort((a, b) => this.toDate(a.toolSpan.startTime).getTime() - this.toDate(b.toolSpan.startTime).getTime());
+      for (const { toolCall, toolSpan } of results) {
+        // Provider-executed tools report failure through `success`, not `errorInfo`.
+        const isError =
+          !!toolSpan.errorInfo ||
+          (toolSpan.type === SpanType.PROVIDER_TOOL_CALL &&
+            (toolSpan.attributes as { success?: boolean } | undefined)?.success === false);
+        // Same `tool-result` part shape PostHog's own AI SDK integrations send.
+        messages.push({
+          role: 'tool',
+          content: [
+            {
+              type: 'tool-result',
+              toolCallId: toolCall.toolCallId,
+              toolName: toolCall.toolName,
+              output: toolSpan.errorInfo ? toolSpan.errorInfo.message : toolSpan.output,
+              ...(isError ? { isError: true } : {}),
+            },
+          ],
+        });
+      }
     }
-    return '$ai_span';
+
+    return { ...span, input: messages };
+  }
+
+  /** Record ended calls and tool results so later calls in the same generation can rebuild their input. */
+  private recordForConversation(span: AnyExportedSpan, traceData: PosthogTraceData): void {
+    const isCall = span.type === SpanType.MODEL_INFERENCE && !span.errorInfo;
+    // A PROVIDER_TOOL_CALL span ended without a result (e.g. the run stopped first)
+    // has no `success`, and recording it would add an empty result.
+    const isProviderToolWithResult =
+      span.type === SpanType.PROVIDER_TOOL_CALL &&
+      typeof (span.attributes as { success?: unknown } | undefined)?.success === 'boolean';
+    const isTool = span.type === SpanType.TOOL_CALL || span.type === SpanType.MCP_TOOL_CALL || isProviderToolWithResult;
+    if (!isModelInferenceEnabled() || (!isCall && !isTool)) return;
+
+    const generation = this.findGeneration(span, traceData);
+    if (!generation) return;
+
+    const key = CONVERSATION + generation.id;
+    let conversation = traceData.getExtraValue(key) as Conversation | undefined;
+    if (!conversation) {
+      conversation = { calls: [], toolResults: new Map() };
+      traceData.setExtraValue(key, conversation);
+    }
+    if (isCall) {
+      conversation.calls.push(span);
+    } else {
+      const toolCallId = this.resolveToolCallId(span);
+      if (toolCallId) conversation.toolResults.set(toolCallId, span);
+    }
+  }
+
+  private findGeneration(span: AnyExportedSpan, traceData: PosthogTraceData): AnyExportedSpan | undefined {
+    let ancestor = span.parentSpanId ? traceData.getSpan({ spanId: span.parentSpanId }) : undefined;
+    while (ancestor && ancestor.type !== SpanType.MODEL_GENERATION) {
+      ancestor = ancestor.parentSpanId ? traceData.getSpan({ spanId: ancestor.parentSpanId }) : undefined;
+    }
+    return ancestor;
+  }
+
+  private resolveToolCallId(span: AnyExportedSpan): string | undefined {
+    const attrs = span.attributes as { toolCallId?: string } | undefined;
+    return (
+      attrs?.toolCallId ??
+      (span.metadata?.toolCallId as string | undefined) ??
+      (span.input as { toolCallId?: string } | undefined)?.toolCallId
+    );
   }
 
   private getDistinctId(span: AnyExportedSpan, traceData?: PosthogTraceData): string {
@@ -375,6 +596,7 @@ export class PosthogExporter extends TrackingExporter<
     span: AnyExportedSpan,
     latency: number,
     parentIsRootSpan: boolean = false,
+    isModelCall: boolean = this.isModelCall(span),
   ): Record<string, any> {
     const baseProperties: Record<string, any> = {
       $ai_trace_id: span.traceId,
@@ -401,14 +623,13 @@ export class PosthogExporter extends TrackingExporter<
       }
     }
 
-    if (span.type === SpanType.MODEL_GENERATION) {
+    if (isModelCall) {
       baseProperties.$ai_generation_id = span.id;
       return { ...baseProperties, ...this.buildGenerationProperties(span) };
-    } else {
-      baseProperties.$ai_span_id = span.id;
-      baseProperties.$ai_span_name = span.name;
-      return { ...baseProperties, ...this.buildSpanProperties(span) };
     }
+    baseProperties.$ai_span_id = span.id;
+    baseProperties.$ai_span_name = span.name;
+    return { ...baseProperties, ...this.buildSpanProperties(span) };
   }
 
   private extractErrorProperties(errorInfo?: SpanErrorInfo): Record<string, any> {
@@ -431,8 +652,8 @@ export class PosthogExporter extends TrackingExporter<
     return props;
   }
 
-  private extractCustomMetadata(span: AnyExportedSpan): Record<string, any> {
-    const { userId, sessionId, ...customMetadata } = span.metadata ?? {};
+  private extractCustomMetadata(metadata?: Record<string, unknown>): Record<string, any> {
+    const { userId, sessionId, ...customMetadata } = metadata ?? {};
     return customMetadata;
   }
 
@@ -454,8 +675,20 @@ export class PosthogExporter extends TrackingExporter<
       if (attrs.parameters.maxOutputTokens !== undefined) props.$ai_max_tokens = attrs.parameters.maxOutputTokens;
     }
     if (attrs.streaming !== undefined) props.$ai_stream = attrs.streaming;
+    if (attrs.tools?.length) {
+      // OpenAI-style shape — the format PostHog's own AI SDKs send and its
+      // trace view renders. Provider-defined tools pass through as-is.
+      props.$ai_tools = attrs.tools.map(tool =>
+        tool.type === 'function'
+          ? {
+              type: 'function',
+              function: { name: tool.name, description: tool.description, parameters: tool.parameters },
+            }
+          : tool,
+      );
+    }
 
-    return { ...props, ...this.extractErrorProperties(span.errorInfo), ...this.extractCustomMetadata(span) };
+    return { ...props, ...this.extractErrorProperties(span.errorInfo), ...this.extractCustomMetadata(span.metadata) };
   }
 
   private buildSpanProperties(span: AnyExportedSpan): Record<string, any> {
@@ -474,7 +707,7 @@ export class PosthogExporter extends TrackingExporter<
       Object.assign(props, span.attributes);
     }
 
-    return { ...props, ...this.extractErrorProperties(span.errorInfo), ...this.extractCustomMetadata(span) };
+    return { ...props, ...this.extractErrorProperties(span.errorInfo), ...this.extractCustomMetadata(span.metadata) };
   }
 
   private formatMessages(data: SpanData, defaultRole: 'user' | 'assistant' = 'user'): PostHogMessage[] {

@@ -1,10 +1,12 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { MessageList } from '../../agent';
 import type { MastraDBMessage } from '../../agent';
+import { createSignal } from '../../agent/signals';
+import { messageVectorId } from '../../memory/message-embeddings';
 import { RequestContext } from '../../request-context';
 import type { MemoryStorage } from '../../storage';
-import type { MastraEmbeddingModel, MastraVector } from '../../vector';
 
+import type { MastraEmbeddingModel, MastraVector } from '../../vector';
 import { globalEmbeddingCache } from './embedding-cache';
 import { SemanticRecall } from './semantic-recall';
 
@@ -40,6 +42,7 @@ describe('SemanticRecall', () => {
     // Mock storage
     mockStorage = {
       listMessages: vi.fn(),
+      getThreadById: vi.fn().mockResolvedValue(null),
     } as any;
 
     // Mock vector store
@@ -882,6 +885,69 @@ describe('SemanticRecall', () => {
       expect(msg2Content).toContain(inputMessages[0]!.content.content);
     });
 
+    it('should render each cross-thread message on its own line', async () => {
+      const processor = new SemanticRecall({
+        storage: mockStorage,
+        vector: mockVector,
+        embedder: mockEmbedder,
+        scope: 'resource',
+      });
+
+      const crossThread = (id: string, role: 'user' | 'assistant', text: string, createdAt: string) =>
+        ({ ...createTestMessage(id, role, text, createdAt), threadId: 'other-thread' }) as MastraDBMessage;
+
+      const recalled = [
+        crossThread('msg-a', 'user', 'first', '2024-01-15T10:30:00.000Z'),
+        crossThread('msg-b', 'assistant', 'ok', '2024-01-15T10:31:00.000Z'),
+        crossThread('msg-c', 'user', 'hi', '2024-01-15T10:32:00.000Z'),
+        crossThread('msg-d', 'user', 'next day', '2024-01-16T09:00:00.000Z'),
+      ];
+
+      vi.mocked(mockEmbedder.doEmbed).mockResolvedValue({ embeddings: [[0.1, 0.2, 0.3]] });
+      vi.mocked(mockVector.listIndexes).mockResolvedValue(['mastra-memory']);
+      vi.mocked(mockVector.query).mockResolvedValue(
+        recalled.map(m => ({ id: m.id, score: 0.9, metadata: { message_id: m.id, thread_id: 'other-thread' } })),
+      );
+      vi.mocked(mockStorage.listMessages).mockResolvedValue({
+        messages: recalled,
+        total: recalled.length,
+        page: 1,
+        perPage: false,
+        hasMore: false,
+      });
+
+      const inputMessages = [createTestMessage('msg-new', 'user', 'What did we discuss?', '2024-01-17T12:00:00.000Z')];
+      const messageList = new MessageList();
+      messageList.add(inputMessages, 'input');
+
+      const result = await processor.processInput({
+        messages: inputMessages,
+        messageList,
+        abort: vi.fn() as any,
+        requestContext,
+      });
+
+      const [systemMessage] = (result as MessageList).get.all.aiV4.prompt();
+      const month = new Date('2024-01-15T10:30:00.000Z').toLocaleString('default', { month: 'short' });
+
+      expect(systemMessage!.role).toBe('system');
+      expect(systemMessage!.content).toBe(
+        [
+          'The following messages were remembered from a different conversation:',
+          '<remembered_from_other_conversation>',
+          '',
+          `the following messages are from 2024, ${month}, 15`,
+          'Message from previous conversation at 10:30 AM: User: first',
+          'Message from previous conversation at 10:31 AM: Assistant: ok',
+          'Message from previous conversation at 10:32 AM: User: hi',
+          '',
+          `the following messages are from 2024, ${month}, 16`,
+          'Message from previous conversation at 9:00 AM: User: next day',
+          '<end_remembered_from_other_conversation>',
+        ].join('\n'),
+      );
+    });
+
     it('should not add cross-thread messages when scope is thread', async () => {
       const processor = new SemanticRecall({
         storage: mockStorage,
@@ -953,6 +1019,7 @@ describe('SemanticRecall', () => {
     it('should create embeddings for both user and assistant messages', async () => {
       const mockStorage = {
         listMessages: vi.fn(),
+        getThreadById: vi.fn().mockResolvedValue(null),
         saveMessages: vi.fn(),
       };
 
@@ -1032,7 +1099,7 @@ describe('SemanticRecall', () => {
           [0.1, 0.2, 0.3],
           [0.4, 0.5, 0.6],
         ],
-        ids: ['msg-user-1', 'msg-assistant-1'],
+        ids: [await messageVectorId('msg-user-1', 0), await messageVectorId('msg-assistant-1', 0)],
         metadata: [
           {
             message_id: 'msg-user-1',
@@ -1055,9 +1122,42 @@ describe('SemanticRecall', () => {
       });
     });
 
+    it('embeds the chunks of a long message in one request, and still writes other messages when one fails', async () => {
+      const doEmbed = vi.fn(async ({ values }: { values: string[] }) => {
+        if (values.includes('broken')) throw new Error('rate limited');
+        return { embeddings: values.map(() => [0.1, 0.2, 0.3]) };
+      });
+      const upsert = vi.fn().mockResolvedValue(undefined);
+      const processor = new SemanticRecall({
+        storage: { listMessages: vi.fn(), getThreadById: vi.fn().mockResolvedValue(null) } as any,
+        embedder: { modelId: 'test-model', doEmbed } as any,
+        vector: { upsert, query: vi.fn(), createIndex: vi.fn() } as any,
+        maxChunkChars: 20,
+      });
+      const longText = 'zebra stripes '.repeat(10).trim();
+      const messages: MastraDBMessage[] = [
+        createTestMessage('msg-long', 'user', longText),
+        createTestMessage('msg-broken', 'assistant', 'broken'),
+      ];
+      const requestContext = new RequestContext();
+      requestContext.set('MastraMemory', { thread: { id: 'thread-1' }, resourceId: 'resource-1' });
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+
+      await processor.processOutputResult({ messages, messageList, abort: vi.fn() as any, requestContext });
+
+      const longCalls = doEmbed.mock.calls.filter(([args]) => !args.values.includes('broken'));
+      expect(longCalls).toHaveLength(1);
+      expect(longCalls[0]![0].values.length).toBeGreaterThan(1);
+      const { ids } = upsert.mock.calls[0]![0];
+      expect(ids[0]).toBe(await messageVectorId('msg-long', 0));
+      expect(ids).not.toContain(await messageVectorId('msg-broken', 0));
+    });
+
     it('should skip system messages when creating embeddings', async () => {
       const mockStorage = {
         listMessages: vi.fn(),
+        getThreadById: vi.fn().mockResolvedValue(null),
         saveMessages: vi.fn(),
       };
 
@@ -1131,7 +1231,7 @@ describe('SemanticRecall', () => {
 
       expect(mockVector.upsert).toHaveBeenCalledWith({
         vectors: [[0.1, 0.2, 0.3]],
-        ids: ['msg-user-1'],
+        ids: [await messageVectorId('msg-user-1', 0)],
         metadata: [
           {
             message_id: 'msg-user-1',
@@ -1149,6 +1249,7 @@ describe('SemanticRecall', () => {
     it('should handle messages with no text content', async () => {
       const mockStorage = {
         listMessages: vi.fn(),
+        getThreadById: vi.fn().mockResolvedValue(null),
         saveMessages: vi.fn(),
       };
 
@@ -1217,7 +1318,7 @@ describe('SemanticRecall', () => {
 
       expect(mockVector.upsert).toHaveBeenCalledWith({
         vectors: [[0.1, 0.2, 0.3]],
-        ids: ['msg-valid-1'],
+        ids: [await messageVectorId('msg-valid-1', 0)],
         metadata: expect.arrayContaining([
           expect.objectContaining({
             message_id: 'msg-valid-1',
@@ -1230,6 +1331,7 @@ describe('SemanticRecall', () => {
     it('should create vector index if it does not exist', async () => {
       const mockStorage = {
         listMessages: vi.fn(),
+        getThreadById: vi.fn().mockResolvedValue(null),
         saveMessages: vi.fn(),
       };
 
@@ -1291,6 +1393,7 @@ describe('SemanticRecall', () => {
     it('should use custom index name if provided', async () => {
       const mockStorage = {
         listMessages: vi.fn(),
+        getThreadById: vi.fn().mockResolvedValue(null),
         saveMessages: vi.fn(),
       };
 
@@ -1359,6 +1462,7 @@ describe('SemanticRecall', () => {
     it('should return original messages when no threadId', async () => {
       const mockStorage = {
         listMessages: vi.fn(),
+        getThreadById: vi.fn().mockResolvedValue(null),
         saveMessages: vi.fn(),
       };
 
@@ -1415,6 +1519,7 @@ describe('SemanticRecall', () => {
     it('should skip embedding messages when memoryConfig.readOnly is true', async () => {
       const mockStorage = {
         listMessages: vi.fn(),
+        getThreadById: vi.fn().mockResolvedValue(null),
         saveMessages: vi.fn(),
       };
 
@@ -1473,6 +1578,7 @@ describe('SemanticRecall', () => {
     it('should handle embedding errors gracefully', async () => {
       const mockStorage = {
         listMessages: vi.fn(),
+        getThreadById: vi.fn().mockResolvedValue(null),
         saveMessages: vi.fn(),
       };
 
@@ -1533,6 +1639,7 @@ describe('SemanticRecall', () => {
       // (as is the case in runOutputProcessors), it still embeds user messages from the messageList
       const mockStorage = {
         listMessages: vi.fn(),
+        getThreadById: vi.fn().mockResolvedValue(null),
         saveMessages: vi.fn(),
       };
 
@@ -1615,7 +1722,7 @@ describe('SemanticRecall', () => {
           [0.1, 0.2, 0.3],
           [0.4, 0.5, 0.6],
         ],
-        ids: ['msg-assistant-1', 'msg-user-1'],
+        ids: [await messageVectorId('msg-assistant-1', 0), await messageVectorId('msg-user-1', 0)],
         metadata: expect.arrayContaining([
           expect.objectContaining({
             message_id: 'msg-assistant-1',
@@ -1633,6 +1740,7 @@ describe('SemanticRecall', () => {
     it('should handle vector store errors gracefully', async () => {
       const mockStorage = {
         listMessages: vi.fn(),
+        getThreadById: vi.fn().mockResolvedValue(null),
         saveMessages: vi.fn(),
       };
 
@@ -1925,6 +2033,7 @@ describe('SemanticRecall', () => {
 
       const localMockStorage = {
         listMessages: vi.fn(),
+        getThreadById: vi.fn().mockResolvedValue(null),
         saveMessages: vi.fn(),
       };
 
@@ -2124,6 +2233,7 @@ describe('SemanticRecall', () => {
     it('should handle embedding errors gracefully when embedderOptions are configured', async () => {
       const localMockStorage = {
         listMessages: vi.fn(),
+        getThreadById: vi.fn().mockResolvedValue(null),
         saveMessages: vi.fn(),
       };
 
@@ -2262,6 +2372,7 @@ describe('SemanticRecall', () => {
           perPage: false,
           hasMore: false,
         }),
+        getThreadById: vi.fn().mockResolvedValue(null),
       } as any;
 
       const requestContext = new RequestContext();
@@ -2403,6 +2514,7 @@ describe('SemanticRecall', () => {
           perPage: false,
           hasMore: false,
         }),
+        getThreadById: vi.fn().mockResolvedValue(null),
       } as any;
 
       const embedder = {
@@ -2470,6 +2582,135 @@ describe('SemanticRecall', () => {
       ).resolves.not.toThrow();
 
       expect(mockVector.createIndex).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('Signal-Delivered User Messages', () => {
+    // Regression for https://github.com/mastra-ai/mastra/issues/17797:
+    // user turns sent through the agent signal pipeline (agent.sendMessage,
+    // used by the Studio playground) are stored as role 'signal' rows and only
+    // projected to role 'user' at prompt time — after input processors run —
+    // so recall must extract its query from user-type signals too.
+    const USER_TEXT = 'What was my secret code word?';
+    const OTHER_THREAD = 'thread-OTHER';
+
+    let processor: SemanticRecall;
+
+    beforeEach(() => {
+      // The planted message lives in a different thread (cross-thread recall
+      // with scope: 'resource').
+      const plantedMessage: MastraDBMessage = {
+        id: 'msg-planted',
+        role: 'user',
+        threadId: OTHER_THREAD,
+        resourceId: 'resource-1',
+        content: {
+          format: 2,
+          content: 'Remember: my secret code word is Orchid-7.',
+          parts: [{ type: 'text', text: 'Remember: my secret code word is Orchid-7.' }],
+        },
+        createdAt: new Date(Date.now() - 60_000),
+      };
+
+      vi.mocked(mockEmbedder.doEmbed).mockResolvedValue({ embeddings: [[0.1, 0.2, 0.3]] });
+      vi.mocked(mockVector.listIndexes).mockResolvedValue(['mastra_memory_text_embedding_3_small']);
+      vi.mocked(mockVector.query).mockResolvedValue([
+        { id: 'vec-1', score: 0.95, metadata: { message_id: 'msg-planted', thread_id: OTHER_THREAD } },
+      ]);
+      vi.mocked(mockStorage.listMessages).mockResolvedValue({
+        messages: [plantedMessage],
+        total: 1,
+        page: 1,
+        perPage: false,
+        hasMore: false,
+      });
+
+      processor = new SemanticRecall({
+        storage: mockStorage,
+        vector: mockVector,
+        embedder: mockEmbedder,
+        topK: 3,
+        scope: 'resource',
+      });
+    });
+
+    async function runProcessor(messageList: MessageList) {
+      // Mirrors ProcessorRunner.runInputProcessors: processors receive
+      // messageList.get.input.db() as `messages`.
+      return processor.processInput({
+        messages: messageList.get.input.db(),
+        messageList,
+        abort: vi.fn() as any,
+        requestContext,
+      });
+    }
+
+    function recalledBlock(messageList: MessageList): string | undefined {
+      return messageList
+        .getSystemMessages('memory')
+        .map(m => (typeof m.content === 'string' ? m.content : ''))
+        .find(c => c.includes('<remembered_from_other_conversation>'));
+    }
+
+    it('should inject recalled context for a plain user message', async () => {
+      const messageList = new MessageList({ threadId: 'thread-1', resourceId: 'resource-1' });
+      messageList.add(
+        {
+          id: 'msg-new',
+          role: 'user',
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          content: { format: 2, content: USER_TEXT, parts: [] },
+          createdAt: new Date(),
+        },
+        'input',
+      );
+
+      await runProcessor(messageList);
+
+      expect(mockEmbedder.doEmbed).toHaveBeenCalledWith({ values: [USER_TEXT] });
+      expect(mockVector.query).toHaveBeenCalledTimes(1);
+
+      const block = recalledBlock(messageList);
+      expect(block).toBeDefined();
+      expect(block).toContain('Orchid-7');
+    });
+
+    it('should inject recalled context for a user-message signal (Studio sendMessage path)', async () => {
+      // This is how a playground turn reaches input processors: useChat →
+      // agent.sendMessage → thread-stream-runtime wakes the idle thread with
+      // agent.stream(signal, ...) → the signal is added to the MessageList as
+      // a role: 'signal' DB row.
+      const signal = createSignal({ type: 'user-message', contents: USER_TEXT });
+
+      const messageList = new MessageList({ threadId: 'thread-1', resourceId: 'resource-1' });
+      messageList.addSignal(signal, { source: 'input' });
+
+      const inputMessages = messageList.get.input.db();
+      expect(inputMessages).toHaveLength(1);
+      expect(inputMessages[0]!.role).toBe('signal');
+
+      await runProcessor(messageList);
+
+      expect(mockEmbedder.doEmbed).toHaveBeenCalledWith({ values: [USER_TEXT] });
+      expect(mockVector.query).toHaveBeenCalledTimes(1);
+
+      const block = recalledBlock(messageList);
+      expect(block).toBeDefined();
+      expect(block).toContain('Orchid-7');
+    });
+
+    it('should not run recall for non-user signals', async () => {
+      const signal = createSignal({ type: 'system-reminder', contents: 'The deploy finished.' });
+
+      const messageList = new MessageList({ threadId: 'thread-1', resourceId: 'resource-1' });
+      messageList.addSignal(signal, { source: 'input' });
+
+      await runProcessor(messageList);
+
+      expect(mockEmbedder.doEmbed).not.toHaveBeenCalled();
+      expect(mockVector.query).not.toHaveBeenCalled();
+      expect(recalledBlock(messageList)).toBeUndefined();
     });
   });
 });

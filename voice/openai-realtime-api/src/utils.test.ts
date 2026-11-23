@@ -1,4 +1,4 @@
-import { createTool } from '@mastra/core/tools';
+import { createTool } from '@internal/voice';
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { transformTools } from './utils';
@@ -114,6 +114,24 @@ describe('transformTools', () => {
 
       // Verify the adapter correctly passes the context
       expect(result).toBe('Processed: Hello');
+    });
+
+    it('passes args directly as the first execute argument for inputSchema tools', async () => {
+      let received: unknown;
+      const tool = {
+        id: 'directTool',
+        description: 'records its first execute argument',
+        inputSchema: z.object({ city: z.string() }),
+        execute: async (inputData: { city: string }) => {
+          received = inputData;
+          return inputData;
+        },
+      };
+
+      const transformed = transformTools({ directTool: tool });
+      await transformed[0].execute({ city: 'Tokyo' });
+
+      expect(received).toEqual({ city: 'Tokyo' });
     });
   });
 });

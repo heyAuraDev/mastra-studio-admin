@@ -1,24 +1,18 @@
 import type { Mastra } from '@mastra/core/mastra';
 import type { RequestContext } from '@mastra/core/request-context';
-import { SERVER_ROUTES } from '@mastra/server/server-adapter';
-import type { ServerRoute, ServerContext } from '@mastra/server/server-adapter';
-import { BadRequestException, Inject, Injectable, Logger } from '@nestjs/common';
-import { ZodError } from 'zod';
+import { formatZodError } from '@mastra/server/handlers/error';
+import {
+  checkRouteFGA,
+  checkRouteRBAC,
+  isZodError,
+  resolveServerRoute,
+  SERVER_ROUTES,
+} from '@mastra/server/server-adapter';
+import type { ServerRoute, ServerContext, ZodErrorLike } from '@mastra/server/server-adapter';
+import { BadRequestException, ForbiddenException, HttpException, Inject, Injectable, Logger } from '@nestjs/common';
 
 import { MASTRA, MASTRA_OPTIONS } from '../constants';
 import type { MastraModuleOptions } from '../mastra.module';
-
-function isZodErrorLike(error: unknown): error is ZodError {
-  return (
-    error instanceof ZodError ||
-    (typeof error === 'object' &&
-      error !== null &&
-      'name' in error &&
-      (error as { name?: unknown }).name === 'ZodError' &&
-      'issues' in error &&
-      Array.isArray((error as { issues?: unknown }).issues))
-  );
-}
 
 export interface RouteMatch {
   route: ServerRoute;
@@ -36,6 +30,8 @@ export interface RouteHandlerParams {
   requestContext: RequestContext;
   /** Abort signal for request cancellation */
   abortSignal: AbortSignal;
+  /** The web-standard Request object for accessing headers, cookies, etc. */
+  request?: Request;
 }
 
 export interface RouteHandlerResult {
@@ -45,6 +41,48 @@ export interface RouteHandlerResult {
   responseType: 'json' | 'stream' | 'datastream-response' | 'mcp-http' | 'mcp-sse';
   /** Stream format (only for 'stream' responseType) */
   streamFormat?: 'sse' | 'stream';
+  /** Whether to flush an SSE comment on connect before stream data arrives */
+  sseFlushOnConnect?: boolean;
+  /** The request context the route ran with; MCP transports hand it to their tools */
+  requestContext?: RequestContext;
+}
+
+type ValidationErrorContext = 'query' | 'body' | 'path';
+
+const VALIDATION_CONTEXT_LABELS: Record<ValidationErrorContext, string> = {
+  query: 'query parameters',
+  body: 'request body',
+  path: 'path parameters',
+};
+
+function getSchemaTypeName(schema: unknown): string | undefined {
+  if (!schema || typeof schema !== 'object') {
+    return undefined;
+  }
+
+  const definition = (schema as any)._def ?? (schema as any).def;
+  return definition?.typeName ?? definition?.type;
+}
+
+function unwrapOptionalNullable(schema: any): any {
+  let inner = schema;
+  let typeName = getSchemaTypeName(inner);
+
+  while (
+    typeName === 'ZodOptional' ||
+    typeName === 'optional' ||
+    typeName === 'ZodNullable' ||
+    typeName === 'nullable'
+  ) {
+    const definition = inner?._def ?? inner?.def;
+    if (!definition?.innerType) {
+      return inner;
+    }
+    inner = definition.innerType;
+    typeName = getSchemaTypeName(inner);
+  }
+
+  return inner;
 }
 
 /**
@@ -71,9 +109,16 @@ export class RouteHandlerService {
     // Build a map of path+method to route for fast lookup
     this.routeMap = new Map();
     for (const route of SERVER_ROUTES) {
-      const key = this.getRouteKey(route.method, route.path);
-      this.routeMap.set(key, route);
+      this.registerRoute(resolveServerRoute(route, mastra, SERVER_ROUTES));
     }
+  }
+
+  /**
+   * Register a route with the catch-all NestJS controller.
+   */
+  registerRoute(route: ServerRoute): void {
+    const key = this.getRouteKey(route.method, route.path);
+    this.routeMap.set(key, route);
   }
 
   /**
@@ -106,7 +151,7 @@ export class RouteHandlerService {
       }
 
       // Then check parameterized routes
-      for (const route of SERVER_ROUTES) {
+      for (const route of this.routeMap.values()) {
         if (route.method.toUpperCase() !== checkMethod) {
           continue;
         }
@@ -125,7 +170,7 @@ export class RouteHandlerService {
    * Get all routes (for dynamic controller generation).
    */
   getAllRoutes(): readonly ServerRoute[] {
-    return SERVER_ROUTES;
+    return Array.from(this.routeMap.values());
   }
 
   /**
@@ -179,8 +224,8 @@ export class RouteHandlerService {
       try {
         validatedPathParams = (await route.pathParamSchema.parseAsync(params.pathParams)) as Record<string, string>;
       } catch (error) {
-        if (isZodErrorLike(error)) {
-          throw new ValidationError('Invalid path parameters', error);
+        if (isZodError(error)) {
+          throw this.createValidationError(route, error, 'path');
         }
         throw error;
       }
@@ -191,24 +236,30 @@ export class RouteHandlerService {
       try {
         validatedQueryParams = (await route.queryParamSchema.parseAsync(params.queryParams)) as Record<string, unknown>;
       } catch (error) {
-        if (isZodErrorLike(error)) {
-          throw new ValidationError('Invalid query parameters', error);
+        if (isZodError(error)) {
+          throw this.createValidationError(route, error, 'query');
         }
         throw error;
       }
     }
 
     let validatedBody = params.body;
-    if (route.bodySchema && params.body !== undefined) {
+    if (route.bodySchema) {
       try {
-        validatedBody = await route.bodySchema.parseAsync(params.body);
+        validatedBody = await this.parseBody(route, params.body);
       } catch (error) {
-        if (isZodErrorLike(error)) {
-          throw new ValidationError('Invalid request body', error);
+        if (isZodError(error)) {
+          throw this.createValidationError(route, error, 'body');
         }
         throw error;
       }
     }
+
+    await this.authorizeRoute(route, params.requestContext, {
+      ...validatedPathParams,
+      ...validatedQueryParams,
+      ...(typeof validatedBody === 'object' && validatedBody !== null ? validatedBody : {}),
+    });
 
     const context: ServerContext = {
       mastra: this.mastra,
@@ -217,6 +268,7 @@ export class RouteHandlerService {
       taskStore: this.options.taskStore,
       abortSignal: params.abortSignal,
       routePrefix: this.options.prefix,
+      request: params.request,
     };
 
     const handlerParams = {
@@ -228,11 +280,116 @@ export class RouteHandlerService {
 
     const data = await route.handler(handlerParams);
 
-    return {
+    const result: RouteHandlerResult = {
       data,
       responseType: route.responseType,
       streamFormat: route.streamFormat,
+      sseFlushOnConnect: route.sseFlushOnConnect,
     };
+    // Non-enumerable so the caller's token, user and permissions never end up in
+    // a response if this result is ever serialized.
+    Object.defineProperty(result, 'requestContext', { value: params.requestContext, enumerable: false });
+    return result;
+  }
+
+  /**
+   * Enforce the route's RBAC permission and FGA check, matching the other server adapters.
+   * Relies on the auth guard having stored the user, permissions, and auth mode in the request context.
+   */
+  private async authorizeRoute(
+    route: ServerRoute,
+    requestContext: RequestContext,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    await this.enforceRoutePermission(route, requestContext);
+    await this.enforceRouteFGA(route, requestContext, params);
+  }
+
+  /**
+   * Throws 403 when the user lacks the route's effective RBAC permission.
+   * Skipped when Mastra auth is explicitly disabled (`auth.enabled: false`), since no Mastra user is resolved.
+   */
+  async enforceRoutePermission(route: ServerRoute, requestContext: RequestContext): Promise<void> {
+    if (this.options.auth?.enabled === false) return;
+
+    const permissionError = checkRouteRBAC(this.mastra, route, requestContext);
+    if (permissionError) {
+      throw new ForbiddenException(permissionError.message);
+    }
+  }
+
+  /**
+   * Throws when the FGA provider denies the route's resource.
+   * Skipped when Mastra auth is explicitly disabled (`auth.enabled: false`), since no Mastra user is resolved.
+   */
+  async enforceRouteFGA(
+    route: ServerRoute,
+    requestContext: RequestContext,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    if (this.options.auth?.enabled === false) return;
+
+    const fgaError = await checkRouteFGA(this.mastra, route, requestContext, params);
+    if (fgaError) {
+      throw new HttpException(fgaError.message, fgaError.status);
+    }
+  }
+
+  private async parseBody(route: ServerRoute, body: unknown): Promise<unknown> {
+    const bodySchema = route.bodySchema;
+    if (!bodySchema) {
+      return body;
+    }
+
+    if (body === undefined) {
+      const omitted = await bodySchema.safeParseAsync(undefined);
+      if (omitted.success) {
+        return omitted.data;
+      }
+
+      const schemaType = getSchemaTypeName(unwrapOptionalNullable(bodySchema));
+      if (schemaType === 'object' || schemaType === 'ZodObject') {
+        const emptyObject = await bodySchema.safeParseAsync({});
+        if (emptyObject.success) {
+          return emptyObject.data;
+        }
+      }
+
+      throw omitted.error;
+    }
+
+    return bodySchema.parseAsync(body);
+  }
+
+  private createValidationError(
+    route: ServerRoute,
+    error: ZodErrorLike,
+    context: ValidationErrorContext,
+  ): ValidationError {
+    const hook = route.onValidationError ?? this.mastra.getServer()?.onValidationError;
+
+    if (hook) {
+      try {
+        const result = hook(error as any, context);
+        if (result) {
+          return new ValidationError(
+            `Invalid ${VALIDATION_CONTEXT_LABELS[context]}`,
+            error,
+            result.status,
+            result.body,
+          );
+        }
+      } catch (hookError) {
+        this.logger.error('Error in custom onValidationError hook', hookError);
+      }
+    }
+
+    return new ValidationError(
+      `Invalid ${VALIDATION_CONTEXT_LABELS[context]}`,
+      error,
+      400,
+      formatZodError(error, VALIDATION_CONTEXT_LABELS[context]),
+    );
   }
 
   private getRouteKey(method: string, path: string): string {
@@ -259,11 +416,19 @@ export class RouteHandlerService {
 
 /**
  * Error class for validation failures with Zod error details.
+ *
+ * `zodError` is typed as `ZodErrorLike` (a structural subset of `ZodError`
+ * exposing `issues[]`) so that consumers pinning a different `zod` major than
+ * the one bundled with this adapter still type-check. The runtime value is
+ * the actual `ZodError` thrown by the route schema and supports all of its
+ * methods at runtime — cast to your installed `ZodError` if you need them.
  */
 export class ValidationError extends Error {
   constructor(
     message: string,
-    public readonly zodError: ZodError,
+    public readonly zodError: ZodErrorLike,
+    public readonly status = 400,
+    public readonly body: unknown = formatZodError(zodError, 'request'),
   ) {
     super(message);
     this.name = 'ValidationError';

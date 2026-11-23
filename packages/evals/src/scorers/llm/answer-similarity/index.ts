@@ -1,6 +1,7 @@
+import { compileSchema } from '@internal/types-builder/compile-zod';
 import { createScorer } from '@mastra/core/evals';
 import type { MastraModelConfig } from '@mastra/core/llm';
-import { z } from 'zod';
+import { z } from 'zod/v4';
 import { roundToTwoDecimals, getAssistantMessageFromRunOutput } from '../../utils';
 import type { ScorerRunInputForLLMJudge, ScorerRunOutputForLLMJudge } from '../../utils';
 import { createExtractPrompt, createAnalyzePrompt, createReasonPrompt } from './prompts';
@@ -37,29 +38,33 @@ Key Principles:
 6. Be strict but fair - partial credit for partial matches
 `;
 
-const extractOutputSchema = z.object({
-  outputUnits: z.array(z.string()),
-  groundTruthUnits: z.array(z.string()),
-});
+const extractOutputSchema = compileSchema(
+  z.object({
+    outputUnits: z.array(z.string()),
+    groundTruthUnits: z.array(z.string()),
+  }),
+);
 
-const analyzeOutputSchema = z.object({
-  matches: z.array(
-    z.object({
-      groundTruthUnit: z.string(),
-      outputUnit: z.string().nullable(),
-      matchType: z.enum(['exact', 'semantic', 'partial', 'missing']),
-      explanation: z.string(),
-    }),
-  ),
-  extraInOutput: z.array(z.string()),
-  contradictions: z.array(
-    z.object({
-      outputUnit: z.string(),
-      groundTruthUnit: z.string(),
-      explanation: z.string(),
-    }),
-  ),
-});
+const analyzeOutputSchema = compileSchema(
+  z.object({
+    matches: z.array(
+      z.object({
+        groundTruthUnit: z.string(),
+        outputUnit: z.string().nullable(),
+        matchType: z.enum(['exact', 'semantic', 'partial', 'missing']),
+        explanation: z.string(),
+      }),
+    ),
+    extraInOutput: z.array(z.string()),
+    contradictions: z.array(
+      z.object({
+        outputUnit: z.string(),
+        groundTruthUnit: z.string(),
+        explanation: z.string(),
+      }),
+    ),
+  }),
+);
 
 export function createAnswerSimilarityScorer({
   model,
@@ -157,7 +162,7 @@ export function createAnswerSimilarityScorer({
 
       // Normalize by total units (accounting for exact match bonus)
       const maxPossibleScore = totalUnits * (1.0 + mergedOptions.exactMatchBonus);
-      score = score / maxPossibleScore;
+      score /= maxPossibleScore;
 
       // Apply penalties for contradictions
       const contradictionPenalty = analysis.contradictions.length * mergedOptions.contradictionPenalty;

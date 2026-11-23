@@ -1,10 +1,10 @@
 import type { ClientScoreRowData } from '@mastra/client-js';
-import type { ScoreRowData } from '@mastra/core/evals';
-import { ScoresDataList, DataListSkeleton, cn } from '@mastra/playground-ui';
+import { ScoresDataList, DataListSkeleton, useDataListKeyboard } from '@mastra/playground-ui/components/DataList';
+import type { DataListSort } from '@mastra/playground-ui/components/DataList';
+import { ScoreDataPanel } from '@mastra/playground-ui/domains/scores';
+import type { ListSort } from '@mastra/playground-ui/sort/sort-by';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ScoreDataPanel } from '@/domains/traces/components/score-data-panel';
-
-const COLUMNS = 'auto auto 1fr auto auto';
+import type { ScoresColumnsState } from '@/domains/scores/hooks/use-scores-columns';
 
 type ScoresListProps = {
   selectedScoreId?: string;
@@ -15,15 +15,12 @@ type ScoresListProps = {
   hasNextPage?: boolean;
   setEndOfListElement?: (element: HTMLDivElement | null) => void;
   errorMsg?: string;
+  columnsState: ScoresColumnsState;
+  sort?: ListSort<ScoresSortKey>;
+  onSortChange?: (sort: DataListSort, key: string) => void;
 };
 
-function mapScore(score: ClientScoreRowData): ScoreRowData {
-  return {
-    ...score,
-    createdAt: new Date(score.createdAt),
-    updatedAt: new Date(score.updatedAt),
-  };
-}
+export type ScoresSortKey = 'date' | 'score';
 
 export function ScoresList({
   scores,
@@ -34,11 +31,14 @@ export function ScoresList({
   hasNextPage,
   setEndOfListElement,
   selectedScoreId: controlledSelectedId,
+  columnsState: { visibleColumns, columns },
+  sort,
+  onSortChange,
 }: ScoresListProps) {
   const [internalSelectedId, setInternalSelectedId] = useState<string | undefined>(controlledSelectedId);
   const selectedScoreId = controlledSelectedId ?? internalSelectedId;
 
-  // Sync internal selection when parent updates the controlled prop (e.g. browser back clearing ?scoreId)
+  // Sync internal selection when parent updates the controlled prop
   useEffect(() => {
     setInternalSelectedId(controlledSelectedId);
   }, [controlledSelectedId]);
@@ -77,13 +77,15 @@ export function ScoresList({
         }
       : undefined;
 
+  const { containerRef, getRowProps } = useDataListKeyboard({ count: scores?.length ?? 0 });
+
   const handleClose = useCallback(() => {
     setInternalSelectedId(undefined);
     onScoreClick?.('');
   }, [onScoreClick]);
 
   if (isLoading) {
-    return <DataListSkeleton columns={COLUMNS} />;
+    return <DataListSkeleton columns={columns} />;
   }
 
   if (!scores) {
@@ -92,17 +94,37 @@ export function ScoresList({
 
   const header = (
     <ScoresDataList.Top>
-      <ScoresDataList.TopCell>Date</ScoresDataList.TopCell>
+      {onSortChange ? (
+        <ScoresDataList.SortableTopCell
+          sortKey="date"
+          sort={sort?.key === 'date' ? sort.direction : undefined}
+          onSortChange={onSortChange}
+        >
+          Date
+        </ScoresDataList.SortableTopCell>
+      ) : (
+        <ScoresDataList.TopCell>Date</ScoresDataList.TopCell>
+      )}
       <ScoresDataList.TopCell>Time</ScoresDataList.TopCell>
-      <ScoresDataList.TopCell>Input</ScoresDataList.TopCell>
-      <ScoresDataList.TopCell>Entity</ScoresDataList.TopCell>
-      <ScoresDataList.TopCell>Score</ScoresDataList.TopCell>
+      {onSortChange ? (
+        <ScoresDataList.SortableTopCell
+          sortKey="score"
+          sort={sort?.key === 'score' ? sort.direction : undefined}
+          onSortChange={onSortChange}
+        >
+          Score
+        </ScoresDataList.SortableTopCell>
+      ) : (
+        <ScoresDataList.TopCell>Score</ScoresDataList.TopCell>
+      )}
+      {visibleColumns.has('entity') && <ScoresDataList.TopCell>Entity</ScoresDataList.TopCell>}
+      {visibleColumns.has('input') && <ScoresDataList.TopCell>Input</ScoresDataList.TopCell>}
     </ScoresDataList.Top>
   );
 
   if (errorMsg) {
     return (
-      <ScoresDataList columns={COLUMNS}>
+      <ScoresDataList columns={columns}>
         {header}
         <ScoresDataList.NoMatch message={errorMsg} />
       </ScoresDataList>
@@ -113,44 +135,36 @@ export function ScoresList({
     return null;
   }
 
-  const hasSidePanel = !!selectedScore;
-
   return (
-    <div
-      className={cn('grid h-full min-h-0 gap-4 items-start', hasSidePanel ? 'grid-cols-[1fr_1fr]' : 'grid-cols-[1fr]')}
-    >
-      <ScoresDataList columns={COLUMNS}>
-        {header}
+    <>
+      <div className="flex h-full min-h-0 min-w-0 flex-col">
+        <ScoresDataList columns={columns} className="min-h-0" scrollRef={containerRef}>
+          {header}
 
-        {scores.map(score => (
-          <ScoresDataList.RowButton
-            key={score.id}
-            onClick={() => handleScoreClick(score.id)}
-            className={selectedScoreId === score.id ? 'bg-surface4' : ''}
-          >
-            <ScoresDataList.DateCell timestamp={score.createdAt} />
-            <ScoresDataList.TimeCell timestamp={score.createdAt} />
-            <ScoresDataList.InputCell input={score.input} />
-            <ScoresDataList.EntityCell entityId={score.entityId} />
-            <ScoresDataList.ScoreCell score={score.score} />
-          </ScoresDataList.RowButton>
-        ))}
+          {scores.map((score, index) => (
+            <ScoresDataList.RowButton
+              key={score.id}
+              onClick={() => handleScoreClick(score.id)}
+              className={selectedScoreId === score.id ? 'bg-fill-hover' : ''}
+              {...getRowProps(index)}
+            >
+              <ScoresDataList.DateCell timestamp={score.createdAt} />
+              <ScoresDataList.TimeCell timestamp={score.createdAt} />
+              <ScoresDataList.ScoreCell score={score.score} />
+              {visibleColumns.has('entity') && <ScoresDataList.EntityCell entityId={score.entityId} />}
+              {visibleColumns.has('input') && <ScoresDataList.InputCell input={score.input} />}
+            </ScoresDataList.RowButton>
+          ))}
 
-        <ScoresDataList.NextPageLoading
-          isLoading={isFetchingNextPage}
-          hasMore={hasNextPage}
-          setEndOfListElement={setEndOfListElement}
-        />
-      </ScoresDataList>
+          <ScoresDataList.NextPageLoading
+            isLoading={isFetchingNextPage}
+            hasMore={hasNextPage}
+            setEndOfListElement={setEndOfListElement}
+          />
+        </ScoresDataList>
+      </div>
 
-      {selectedScore && (
-        <ScoreDataPanel
-          score={mapScore(selectedScore)}
-          onClose={handleClose}
-          onPrevious={handlePrevious}
-          onNext={handleNext}
-        />
-      )}
-    </div>
+      <ScoreDataPanel score={selectedScore} onClose={handleClose} onPrevious={handlePrevious} onNext={handleNext} />
+    </>
   );
 }

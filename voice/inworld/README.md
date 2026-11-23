@@ -1,77 +1,16 @@
 # @mastra/voice-inworld
 
-[Inworld AI](https://inworld.ai) voice provider for [Mastra](https://mastra.ai) — streaming TTS and batch STT.
+[Inworld AI](https://inworld.ai) voice provider for [Mastra](https://mastra.ai) — streaming TTS, batch STT, and realtime full-duplex voice.
 
 ## Installation
 
 ```bash
-npm install @mastra/voice-inworld @mastra/core
+npm install @mastra/voice-inworld
 ```
 
-## Quick Start
+## Usage
 
-```typescript
-import { InworldVoice } from '@mastra/voice-inworld';
-
-const voice = new InworldVoice({
-  speaker: 'Dennis', // 22 built-in voices available
-});
-
-// Text-to-Speech (streaming)
-const audioStream = await voice.speak('Hello from Inworld!');
-
-// Speech-to-Text
-const transcript = await voice.listen(audioStream);
-
-// List available voices
-const voices = await voice.getSpeakers();
-```
-
-## Configuration
-
-```typescript
-const voice = new InworldVoice({
-  speechModel: {
-    name: 'inworld-tts-2', // default; also 'inworld-tts-1.5-max' or 'inworld-tts-1.5-mini'
-    apiKey: 'your-key', // or set INWORLD_API_KEY env var
-  },
-  listeningModel: {
-    name: 'groq/whisper-large-v3',
-  },
-  speaker: 'Dennis', // default voice
-  audioEncoding: 'MP3', // MP3, WAV, OGG_OPUS, LINEAR16, PCM, ALAW, MULAW, FLAC
-  sampleRateHertz: 48000, // 8000-48000
-  language: 'en-US', // BCP-47 language code for STT
-});
-```
-
-## Speak Options
-
-```typescript
-const stream = await voice.speak('Hello', {
-  speaker: 'Olivia', // override voice
-  audioEncoding: 'WAV', // override format
-  sampleRateHertz: 24000, // override sample rate
-  speakingRate: 1.2, // 0.5 - 1.5
-  temperature: 0.8, // (0, 2] — ignored on inworld-tts-2
-  deliveryMode: 'CREATIVE', // STABLE | BALANCED | CREATIVE — only honored on inworld-tts-2
-  language: 'fr-FR', // BCP-47 per-call override; auto-detected when omitted
-});
-```
-
-## Listen Options
-
-```typescript
-const text = await voice.listen(audioStream, {
-  audioEncoding: 'AUTO_DETECT', // or 'MP3', 'LINEAR16', etc.
-  sampleRateHertz: 16000,
-  language: 'en-US',
-});
-```
-
-## CompositeVoice
-
-Mix Inworld with other providers:
+Set the API credentials required by your voice provider.
 
 ```typescript
 import { CompositeVoice } from '@mastra/core/voice';
@@ -84,28 +23,14 @@ const voice = new CompositeVoice({
 });
 ```
 
-## Available Voices
+## Documentation
 
-Alex, Ashley, Craig, Deborah, Dennis, Dominus, Edward, Elizabeth, Hades, Heitor, Julia, Maite, Mark, Olivia, Pixie, Priya, Ronald, Sarah, Shaun, Theodore, Timothy, Wendy.
+- [@mastra/voice-inworld documentation](https://mastra.ai/integrations/voice/inworld)
 
-## TTS Models
+## Changelog
 
-| Model                  | Quality | Latency       | Notes                                           |
-| ---------------------- | ------- | ------------- | ----------------------------------------------- |
-| `inworld-tts-2`        | Highest | ~200ms median | **Default.** Flagship; supports `deliveryMode`. |
-| `inworld-tts-1.5-max`  | High    | ~200ms median | Previous flagship. Supports `temperature`.      |
-| `inworld-tts-1.5-mini` | Good    | ~100ms median | Lower latency, reduced quality.                 |
+See the [package changelog](https://github.com/mastra-ai/mastra/blob/main/voice/inworld/CHANGELOG.md) for version history and release notes.
 
-## STT Models
+## Support
 
-| Model                   | Languages | Notes                      |
-| ----------------------- | --------- | -------------------------- |
-| `groq/whisper-large-v3` | 99+       | Best multilingual coverage |
-
-## Streaming
-
-The `speak()` method uses Inworld's streaming TTS endpoint (`/tts/v1/voice:stream`), returning audio chunks progressively as they are generated. This is ideal for agentic workflows where low time-to-first-audio matters.
-
-## Authentication
-
-Set your API key via the `INWORLD_API_KEY` environment variable or pass it in the config. Get your key from [platform.inworld.ai](https://platform.inworld.ai) → Settings → API Keys.
+We have an [open community Discord](https://discord.gg/mastra-ai). Come and say hello and let us know if you have any questions or need any help getting things running.

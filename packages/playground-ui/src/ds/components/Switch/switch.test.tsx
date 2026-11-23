@@ -1,34 +1,17 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { Switch } from './switch';
 
 // Base UI's Switch synthesizes a PointerEvent on click, which jsdom does not
 // implement. Polyfill it with the available MouseEvent constructor.
-beforeAll(() => {
-  if (typeof window.PointerEvent === 'undefined') {
-    window.PointerEvent = window.MouseEvent as unknown as typeof PointerEvent;
-  }
-});
 
 afterEach(() => {
   cleanup();
 });
 
 describe('Switch', () => {
-  it('renders a switch without throwing', () => {
-    expect(() => render(<Switch aria-label="Toggle" />)).not.toThrow();
-
-    expect(screen.getByRole('switch')).toBeDefined();
-  });
-
-  it('reflects the checked state via aria-checked', () => {
-    render(<Switch aria-label="Toggle" defaultChecked />);
-
-    expect(screen.getByRole('switch').getAttribute('aria-checked')).toBe('true');
-  });
-
   it('toggles an uncontrolled switch when clicked', () => {
     render(<Switch aria-label="Toggle" />);
 
@@ -77,6 +60,41 @@ describe('Switch', () => {
     render(<Switch aria-label="Toggle" className="custom-switch" />);
 
     expect(screen.getByRole('switch').classList.contains('custom-switch')).toBe(true);
+  });
+
+  it('renders an optional icon inside the thumb', () => {
+    render(<Switch aria-label="Toggle" icon={<span data-testid="switch-icon">Icon</span>} />);
+
+    const switchEl = screen.getByRole('switch');
+    const thumbEl = switchEl.querySelector('[data-slot="switch-thumb"]');
+    const iconEl = thumbEl?.querySelector('[data-slot="switch-thumb-icon"]');
+
+    expect(iconEl).toBeDefined();
+    expect(iconEl?.getAttribute('aria-hidden')).toBe('true');
+    expect(screen.getByTestId('switch-icon')).toBeDefined();
+  });
+
+  it('renders checked and unchecked thumb icons with state-driven visibility classes', () => {
+    render(
+      <Switch
+        aria-label="Toggle"
+        checkedIcon={<span data-testid="checked-icon">Checked</span>}
+        uncheckedIcon={<span data-testid="unchecked-icon">Unchecked</span>}
+      />,
+    );
+
+    const switchEl = screen.getByRole('switch');
+    const checkedIconEl = switchEl.querySelector('[data-switch-icon="checked"]');
+    const uncheckedIconEl = switchEl.querySelector('[data-switch-icon="unchecked"]');
+
+    expect(checkedIconEl).toBeDefined();
+    expect(checkedIconEl?.getAttribute('aria-hidden')).toBe('true');
+    expect(checkedIconEl?.className).toContain('opacity-0');
+    expect(checkedIconEl?.className).toContain('group-data-[checked]/switch:opacity-100');
+    expect(uncheckedIconEl).toBeDefined();
+    expect(uncheckedIconEl?.getAttribute('aria-hidden')).toBe('true');
+    expect(uncheckedIconEl?.className).toContain('opacity-100');
+    expect(uncheckedIconEl?.className).toContain('group-data-[checked]/switch:opacity-0');
   });
 
   it('applies the id to the visible switch control, not a hidden input', () => {

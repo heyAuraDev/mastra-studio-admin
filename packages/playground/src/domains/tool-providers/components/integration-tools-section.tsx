@@ -1,17 +1,12 @@
-import {
-  Badge,
-  Entity,
-  EntityContent,
-  EntityName,
-  EntityDescription,
-  Section,
-  SubSectionRoot,
-  stringToColor,
-} from '@mastra/playground-ui';
-import { Plug } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { Badge } from '@mastra/playground-ui/components/Badge';
+import { Entity, EntityContent, EntityName, EntityDescription } from '@mastra/playground-ui/components/Entity';
+import { Section, SubSectionRoot } from '@mastra/playground-ui/components/Section';
+import { IconPlugin1 } from '@mastra/playground-ui/icons/central/IconPlugin1';
+import { cn } from '@mastra/playground-ui/utils/cn';
+import { hueFillClass, hueForName } from '@mastra/playground-ui/utils/colors';
+import { useToolProviders } from '@mastra/react/hooks/tool-providers';
 
-import { useToolProviders } from '../hooks/use-tool-providers';
+import { useMemo, useState } from 'react';
 import { ToolProviderDialog } from './tool-provider-dialog';
 import { SubSectionHeader } from '@/domains/cms/components/section/section-header';
 
@@ -51,20 +46,20 @@ export function IntegrationToolsSection({ selectedToolIds, onSubmitTools }: Inte
     <>
       <SubSectionRoot>
         <Section.Header>
-          <SubSectionHeader title="Integration Tools" icon={<Plug />} />
+          <SubSectionHeader title="Integration Tools" icon={<IconPlugin1 />} />
         </Section.Header>
 
         <div className="flex flex-col gap-1">
           {providers.map(provider => {
-            const bg = stringToColor(provider.name);
-            const text = stringToColor(provider.name, 25);
             const count = toolCountsByProvider[provider.id] ?? 0;
 
             return (
-              <Entity key={provider.id} onClick={() => setSelectedProvider(provider)} className="bg-surface2">
+              <Entity key={provider.id} onClick={() => setSelectedProvider(provider)} className="bg-background">
                 <div
-                  className="size-11 rounded-lg flex items-center justify-center uppercase shrink-0"
-                  style={{ backgroundColor: bg, color: text }}
+                  className={cn(
+                    'flex size-11 shrink-0 items-center justify-center rounded-lg uppercase shadow-inset',
+                    hueFillClass(hueForName(provider.name)),
+                  )}
                 >
                   {provider.name[0]}
                 </div>
@@ -76,7 +71,7 @@ export function IntegrationToolsSection({ selectedToolIds, onSubmitTools }: Inte
 
                 <div className="flex items-center gap-2">
                   {count > 0 && (
-                    <Badge variant="default">
+                    <Badge>
                       {count} {count === 1 ? 'tool' : 'tools'}
                     </Badge>
                   )}

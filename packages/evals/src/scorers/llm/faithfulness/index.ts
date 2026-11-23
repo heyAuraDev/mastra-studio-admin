@@ -1,6 +1,7 @@
+import { compileSchema } from '@internal/types-builder/compile-zod';
 import { createScorer } from '@mastra/core/evals';
 import type { MastraModelConfig } from '@mastra/core/llm';
-import { z } from 'zod';
+import { z } from 'zod/v4';
 import { roundToTwoDecimals, getAssistantMessageFromRunOutput, getUserMessageFromRunInput } from '../../utils';
 import type { ScorerRunInputForLLMJudge, ScorerRunOutputForLLMJudge } from '../../utils';
 import {
@@ -44,9 +45,11 @@ export function createFaithfulnessScorer({
   })
     .preprocess({
       description: 'Extract relevant statements from the LLM output',
-      outputSchema: z.object({
-        claims: z.array(z.string()),
-      }),
+      outputSchema: compileSchema(
+        z.object({
+          claims: z.array(z.string()),
+        }),
+      ),
       createPrompt: ({ run }) => {
         const prompt = createFaithfulnessExtractPrompt({ output: getAssistantMessageFromRunOutput(run.output) ?? '' });
         return prompt;
@@ -54,7 +57,9 @@ export function createFaithfulnessScorer({
     })
     .analyze({
       description: 'Score the relevance of the statements to the input',
-      outputSchema: z.object({ verdicts: z.array(z.object({ verdict: z.string(), reason: z.string() })) }),
+      outputSchema: compileSchema(
+        z.object({ verdicts: z.array(z.object({ verdict: z.string(), reason: z.string() })) }),
+      ),
       createPrompt: ({ results, run }) => {
         // Use the context provided by the user, or the context from the tool invocations
         const context = options?.context ?? getToolInvocationContext(run.output);
@@ -66,14 +71,16 @@ export function createFaithfulnessScorer({
       },
     })
     .generateScore(({ results }) => {
-      const totalClaims = results.analyzeStepResult.verdicts.length;
-      const supportedClaims = results.analyzeStepResult.verdicts.filter(v => v.verdict === 'yes').length;
+      const verdicts = results.analyzeStepResult.verdicts;
+      // Score against the extracted claims so verdicts the judge omitted are not dropped from the denominator
+      const totalClaims = results.preprocessStepResult?.claims?.length || verdicts.length;
+      const supportedClaims = verdicts.filter(v => v.verdict.toLowerCase().trim() === 'yes').length;
 
       if (totalClaims === 0) {
         return 0;
       }
 
-      const score = (supportedClaims / totalClaims) * (options?.scale || 1);
+      const score = Math.min(1, supportedClaims / totalClaims) * (options?.scale || 1);
 
       return roundToTwoDecimals(score);
     })

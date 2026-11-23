@@ -1,9 +1,9 @@
-import { randomUUID } from 'node:crypto';
 import { ReadableStream } from 'node:stream/web';
 import type { MastraLanguageModel } from '../llm/model/shared.types';
 import type { ObservabilityContext } from '../observability';
 import { resolveObservabilityContext } from '../observability';
-import { ChunkFrom, MastraModelOutput } from '../stream';
+import { MastraModelOutput } from '../stream/base/output';
+import { ChunkFrom } from '../stream/types';
 import type { ChunkType } from '../stream/types';
 import type { InnerAgentExecutionOptions } from './agent.types';
 import type { MessageList } from './message-list';
@@ -38,6 +38,7 @@ export class TripWire<TMetadata = unknown> extends Error {
 
   constructor(reason: string, options: TripWireOptions<TMetadata> = {}, processorId?: string) {
     super(reason);
+    this.name = 'TripWire';
     this.options = options;
     this.processorId = processorId;
     Object.setPrototypeOf(this, new.target.prototype);
@@ -103,7 +104,7 @@ export const getModelOutputForTripwire = async <OUTPUT = undefined, TMetadata = 
       returnScorerData: options.returnScorerData,
       requestContext: options.requestContext,
     },
-    messageId: randomUUID(),
+    messageId: globalThis.crypto.randomUUID(),
   });
 
   return modelOutput;

@@ -5,7 +5,14 @@
 
 import { getLLMTestMode, hasLLMRecording, listLLMRecordings, getLLMRecordingsDir } from '@internal/llm-recorder';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { getModelRecordingName, isV5PlusModel, setupDummyApiKeys, hasApiKey } from './llm-helpers';
+import {
+  getModelRecordingName,
+  isV5PlusModel,
+  setupDummyApiKeys,
+  hasApiKey,
+  canonicalizeJsonSchemaNullability,
+  canonicalizeRequestJsonSchema,
+} from './llm-helpers';
 
 /**
  * Restore process.env to a snapshot without replacing the native proxy object.
@@ -160,6 +167,7 @@ describe('getModelRecordingName', () => {
   it('handles model with specificationVersion', () => {
     expect(getModelRecordingName({ specificationVersion: 'v2' })).toBe('sdk-v2');
     expect(getModelRecordingName({ specificationVersion: 'v3' })).toBe('sdk-v3');
+    expect(getModelRecordingName({ specificationVersion: 'v4' })).toBe('sdk-v4');
   });
 
   it('returns unknown-model for unrecognized config', () => {
@@ -178,6 +186,10 @@ describe('isV5PlusModel', () => {
 
   it('returns true for v3 specificationVersion', () => {
     expect(isV5PlusModel({ specificationVersion: 'v3' })).toBe(true);
+  });
+
+  it('returns true for v4 specificationVersion', () => {
+    expect(isV5PlusModel({ specificationVersion: 'v4' })).toBe(true);
   });
 
   it('returns false for v1 specificationVersion', () => {
@@ -272,5 +284,103 @@ describe('hasApiKey', () => {
     process.env.ANTHROPIC_API_KEY = 'sk-ant-test';
     expect(hasApiKey('anthropic')).toBe(true);
     expect(hasApiKey('openai')).toBe(false);
+  });
+});
+
+describe('canonicalizeJsonSchemaNullability', () => {
+  it('rewrites primitive type unions into anyOf', () => {
+    expect(
+      canonicalizeJsonSchemaNullability({
+        description: 'sample text or number',
+        type: ['string', 'number'],
+      }),
+    ).toEqual({
+      description: 'sample text or number',
+      anyOf: [{ type: 'string' }, { type: 'number' }],
+    });
+  });
+
+  it('rewrites type arrays that include null into anyOf', () => {
+    expect(
+      canonicalizeJsonSchemaNullability({
+        description: 'leave this field empty as an example of a nullable field',
+        type: ['string', 'null'],
+      }),
+    ).toEqual({
+      description: 'leave this field empty as an example of a nullable field',
+      anyOf: [{ type: 'string' }, { type: 'null' }],
+    });
+  });
+
+  it('flattens nested anyOf used for union + null', () => {
+    expect(
+      canonicalizeJsonSchemaNullability({
+        description: 'Maximum number of execution steps',
+        anyOf: [{ anyOf: [{ type: 'number' }, { type: 'string' }] }, { type: 'null' }],
+      }),
+    ).toEqual({
+      description: 'Maximum number of execution steps',
+      anyOf: [{ type: 'number' }, { type: 'string' }, { type: 'null' }],
+    });
+  });
+
+  it('canonicalizes nested tool parameters in a request body', () => {
+    const result = canonicalizeRequestJsonSchema({
+      url: 'https://api.openai.com/v1/responses',
+      body: {
+        tools: [
+          {
+            parameters: {
+              properties: {
+                nullable: { type: ['string', 'null'] },
+                maxSteps: { anyOf: [{ anyOf: [{ type: 'number' }, { type: 'string' }] }, { type: 'null' }] },
+              },
+            },
+          },
+        ],
+      },
+    });
+
+    expect(result.body).toEqual({
+      tools: [
+        {
+          parameters: {
+            properties: {
+              nullable: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+              maxSteps: { anyOf: [{ type: 'number' }, { type: 'string' }, { type: 'null' }] },
+            },
+          },
+        },
+      ],
+    });
+  });
+
+  it('leaves non-schema type arrays unchanged so request hashes still match', () => {
+    const metadata = { type: ['string', 'number'] };
+    const result = canonicalizeRequestJsonSchema({
+      url: 'https://api.openai.com/v1/responses',
+      body: {
+        metadata,
+        tools: [
+          {
+            parameters: {
+              type: ['object', 'null'],
+            },
+          },
+        ],
+      },
+    });
+
+    expect(result.body).toEqual({
+      metadata: { type: ['string', 'number'] },
+      tools: [
+        {
+          parameters: {
+            anyOf: [{ type: 'object' }, { type: 'null' }],
+          },
+        },
+      ],
+    });
+    expect((result.body as { metadata: { type: string[] } }).metadata).toBe(metadata);
   });
 });

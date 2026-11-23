@@ -310,7 +310,7 @@ describe('MastraLLM', () => {
       expect(result.text).toEqual('Custom text response');
     });
 
-    it('should handle tool conversion', async () => {
+    it('should pass core tools to the provider as function definitions', async () => {
       const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
 
       await aisdkText.__text({
@@ -322,50 +322,19 @@ describe('MastraLLM', () => {
         tracingContext,
       });
 
-      expect(generateSpy).toHaveBeenCalled();
-    });
-
-    it('should handle pre-converted tools', async () => {
-      const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
-
-      await aisdkText.__text({
-        messages,
-        tools: mockTools,
-        temperature: 0.7,
-        maxSteps: 5,
-        requestContext,
-        tracingContext,
-      });
-
-      expect(generateSpy).toHaveBeenCalled();
+      expect(generateSpy.mock.lastCall?.[0].mode.tools).toEqual([
+        expect.objectContaining({
+          type: 'function',
+          name: 'testTool',
+          description: 'Test tool description',
+          parameters: expect.objectContaining({ properties: { test: { type: 'string' } } }),
+        }),
+      ]);
     });
 
     it('should handle onStepFinish callback', async () => {
       const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
       const onStepFinish = vi.fn();
-
-      await aisdkText.__text({
-        messages,
-        onStepFinish,
-        temperature: 0.7,
-        maxSteps: 5,
-        requestContext,
-        tracingContext,
-      });
-
-      expect(generateSpy).toHaveBeenCalled();
-    });
-
-    it('should handle rate limiting', async () => {
-      const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
-      const onStepFinish = vi.fn();
-      // const mockResponse = {
-      //   response: {
-      //     headers: {
-      //       'x-ratelimit-remaining-tokens': '1500',
-      //     },
-      //   },
-      // };
 
       await aisdkText.__text({
         messages,
@@ -394,36 +363,13 @@ describe('MastraLLM', () => {
 
       expect(generateSpy).toHaveBeenCalled();
     });
-
-    it('should handle step change logging', async () => {
-      const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
-      const runId = 'test-run';
-      // const mockStepData = {
-      //   text: 'Custom text response',
-      //   toolCalls: [],
-      //   toolResults: [],
-      //   finishReason: 'stop',
-      //   usage: { promptTokens: 10, completionTokens: 20 },
-      // };
-
-      await aisdkText.__text({
-        messages,
-        runId,
-        temperature: 0.7,
-        maxSteps: 5,
-        requestContext,
-        tracingContext,
-      });
-
-      expect(generateSpy).toHaveBeenCalled();
-    });
   });
 
   describe('__stream', () => {
     it('should stream text with correct parameters', async () => {
       const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
 
-      await aisdkText.__stream({
+      const result = await aisdkText.__stream({
         messages,
         tools: mockTools,
         temperature: 0.7,
@@ -431,14 +377,15 @@ describe('MastraLLM', () => {
         requestContext,
         tracingContext,
       });
+      await result.consumeStream();
 
       expect(streamSpy).toHaveBeenCalled();
     });
 
-    it('should handle tool conversion', async () => {
+    it('should pass core tools to the provider as function definitions', async () => {
       const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
 
-      await aisdkText.__stream({
+      const result = await aisdkText.__stream({
         messages,
         tools: mockTools,
         temperature: 0.7,
@@ -446,23 +393,16 @@ describe('MastraLLM', () => {
         requestContext,
         tracingContext,
       });
+      await result.consumeStream();
 
-      expect(streamSpy).toHaveBeenCalled();
-    });
-
-    it('should handle pre-converted tools', async () => {
-      const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
-
-      await aisdkText.__stream({
-        messages,
-        tools: mockTools,
-        temperature: 0.7,
-        maxSteps: 5,
-        requestContext,
-        tracingContext,
-      });
-
-      expect(streamSpy).toHaveBeenCalled();
+      expect(streamSpy.mock.lastCall?.[0].mode.tools).toEqual([
+        expect.objectContaining({
+          type: 'function',
+          name: 'testTool',
+          description: 'Test tool description',
+          parameters: expect.objectContaining({ properties: { test: { type: 'string' } } }),
+        }),
+      ]);
     });
 
     it('should handle callbacks', async () => {
@@ -470,7 +410,7 @@ describe('MastraLLM', () => {
       const onStepFinish = vi.fn();
       const onFinish = vi.fn();
 
-      await aisdkText.__stream({
+      const result = await aisdkText.__stream({
         messages,
         onStepFinish,
         onFinish,
@@ -479,6 +419,7 @@ describe('MastraLLM', () => {
         requestContext,
         tracingContext,
       });
+      await result.consumeStream();
 
       expect(streamSpy).toHaveBeenCalled();
     });
@@ -487,7 +428,7 @@ describe('MastraLLM', () => {
       const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
       const runId = 'test-run';
 
-      await aisdkText.__stream({
+      const result = await aisdkText.__stream({
         messages,
         runId,
         temperature: 0.7,
@@ -495,6 +436,7 @@ describe('MastraLLM', () => {
         requestContext,
         tracingContext,
       });
+      await result.consumeStream();
 
       expect(streamSpy).toHaveBeenCalled();
 
@@ -512,7 +454,7 @@ describe('MastraLLM', () => {
       //   usage: { promptTokens: 10, completionTokens: 20 },
       // };
 
-      await aisdkText.__stream({
+      const result = await aisdkText.__stream({
         messages,
         runId,
         temperature: 0.7,
@@ -520,6 +462,7 @@ describe('MastraLLM', () => {
         requestContext,
         tracingContext,
       });
+      await result.consumeStream();
 
       expect(streamSpy).toHaveBeenCalled();
     });
@@ -718,27 +661,6 @@ describe('MastraLLM', () => {
 
       expect(streamSpy).toHaveBeenCalled();
     });
-
-    it('should handle rate limiting', async () => {
-      const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
-      const schema = z.object({
-        content: z.string(),
-      }) as z.ZodType<any>;
-
-      const runId = 'test-run';
-
-      await aisdkObject.__streamObject({
-        messages,
-        structuredOutput: schema,
-        runId,
-        temperature: 0.7,
-        maxSteps: 5,
-        requestContext,
-        tracingContext,
-      });
-
-      expect(streamSpy).toHaveBeenCalled();
-    });
   });
 
   // Regression tests for https://github.com/mastra-ai/mastra/issues/12184
@@ -875,6 +797,80 @@ describe('MastraLLM', () => {
       }
 
       expect(errorMastra.logger.error).toHaveBeenCalled();
+    });
+  });
+
+  describe('rate-limit span instrumentation', () => {
+    it('should create a rate-limit-sleep span when remaining tokens are below threshold in __text', async () => {
+      const rateLimitMastra = {
+        logger: {
+          debug: vi.fn(),
+          warn: vi.fn(),
+          info: vi.fn(),
+          error: vi.fn(),
+          trackException: vi.fn(),
+        } as any,
+      };
+
+      const rateLimitModel = new MockLanguageModelV1({
+        doGenerate: async () => ({
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop' as const,
+          usage: { promptTokens: 10, completionTokens: 20 },
+          text: 'hello',
+          rawResponse: { headers: { 'x-ratelimit-remaining-tokens': '1500' } },
+        }),
+        doStream: async () => {
+          throw new Error('not used');
+        },
+      });
+
+      const llm = new MastraLLMV1({ model: rateLimitModel });
+      llm.__registerPrimitives(rateLimitMastra);
+
+      const mockRateLimitSpan = { end: vi.fn() };
+      const mockLlmSpan = {
+        createChildSpan: vi.fn().mockReturnValue(mockRateLimitSpan),
+        end: vi.fn(),
+        error: vi.fn(),
+        update: vi.fn(),
+        executeInContext: vi.fn(async (fn: any) => fn()),
+        executeInContextSync: vi.fn((fn: any) => fn()),
+      };
+      const mockCurrentSpan = {
+        createChildSpan: vi.fn().mockReturnValue(mockLlmSpan),
+      };
+
+      const tracingCtx = {
+        tracingContext: { currentSpan: mockCurrentSpan },
+      };
+
+      // Use fake timers so the 10s delay completes instantly
+      vi.useFakeTimers();
+
+      const textPromise = llm.__text({
+        messages: [{ role: 'user', content: 'test' }],
+        requestContext: new RequestContext(),
+        ...tracingCtx,
+      });
+
+      // Advance past the 10s delay
+      await vi.advanceTimersByTimeAsync(11_000);
+      await textPromise;
+
+      vi.useRealTimers();
+
+      expect(rateLimitMastra.logger.warn).toHaveBeenCalledWith(
+        'Rate limit approaching, waiting 10 seconds',
+        expect.objectContaining({ remainingTokens: 1500 }),
+      );
+      expect(mockLlmSpan.createChildSpan).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'rate-limit-sleep',
+          metadata: { remainingTokens: 1500, delayMs: 10_000 },
+        }),
+      );
+      expect(mockRateLimitSpan.end).toHaveBeenCalled();
     });
   });
 });

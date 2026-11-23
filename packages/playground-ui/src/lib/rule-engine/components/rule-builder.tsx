@@ -1,4 +1,3 @@
-import { Plus, X, Component } from 'lucide-react';
 import * as React from 'react';
 
 import type { Rule, RuleGroup, RuleGroupDepth1 } from '../types';
@@ -7,7 +6,13 @@ import { isRule, createDefaultRule, createDefaultRuleGroup } from '../utils';
 import { RuleRow } from './rule-row';
 import type { RuleBuilderProps, RuleGroupViewProps } from './types';
 import { Button } from '@/ds/components/Button';
+import { Txt } from '@/ds/components/Txt';
 import { Icon } from '@/ds/icons';
+import { IconComponents } from '@/ds/icons/central/IconComponents';
+import { IconCrossMedium } from '@/ds/icons/central/IconCrossMedium';
+import { IconPlusMedium } from '@/ds/icons/central/IconPlusMedium';
+import { controlStateColorTransition } from '@/ds/primitives/transitions';
+import { quietTextHover } from '@/ds/primitives/typography';
 import { cn } from '@/lib/utils';
 
 const DEFAULT_MAX_DEPTH = 3;
@@ -25,6 +30,7 @@ const RuleGroupView: React.FC<RuleGroupViewProps> = ({ schema, group, onChange, 
   const handleConditionChange = (index: number, condition: Rule | RuleGroup) => {
     onChange({
       ...group,
+      // oxlint-disable-next-line typescript/no-unnecessary-type-assertion -- Built core declarations distinguish the recursive group's depth from its children.
       conditions: group.conditions.map((c, i) => (i === index ? (condition as Rule | RuleGroupDepth1) : c)),
     });
   };
@@ -53,34 +59,38 @@ const RuleGroupView: React.FC<RuleGroupViewProps> = ({ schema, group, onChange, 
   };
 
   return (
-    <div className={cn(isRoot ? 'bg-surface2' : 'pl-6 bg-surface3')}>
+    <div className={cn(isRoot ? 'bg-background' : 'bg-card pl-6')}>
       {/* Non-root group header */}
       {!isRoot && (
-        <div className="flex items-center justify-between pl-3 pr-4 py-1.5 border-b border-border1 border-dashed">
-          <span className="text-ui-xs text-neutral3">Group</span>
+        <div className="flex items-center justify-between border-b border-dashed border-border py-1.5 pr-4 pl-3">
+          <Txt as="span" variant="meta" tone="muted">
+            Group
+          </Txt>
           {onRemove && (
             <Button type="button" onClick={onRemove} tooltip="Remove group" size="icon-sm" variant="ghost">
-              <X />
+              <IconCrossMedium />
             </Button>
           )}
         </div>
       )}
 
       {group.conditions.map((condition, index) => (
-        <div key={index} className="border-b border-border1 border-dashed last:border-b-0">
-          <div className={cn('relative', isRule(condition) && 'p-4 border-l-4 border-border1')}>
+        <div key={index} className="border-b border-dashed border-border last:border-b-0">
+          <div className={cn('relative', isRule(condition) && 'border-l-4 border-border p-4')}>
             {index > 0 && (
               <button
                 type="button"
                 onClick={handleToggleOperator}
                 className={cn(
-                  'absolute left-1/2 -translate-x-1/2 z-10 -translate-y-1/2 top-0 text-ui-xs px-3 py-0.5 rounded-full cursor-pointer',
+                  'absolute top-0 left-1/2 z-10 -translate-1/2 cursor-pointer rounded-full px-3 py-0.5',
                   group.operator === 'OR'
-                    ? 'bg-accent6Dark text-accent6 hover:bg-accent6Dark/70'
-                    : 'bg-accent3Dark text-accent3 hover:bg-accent3Dark/70',
+                    ? 'bg-badge-amber-subtle text-badge-amber-foreground hover:bg-badge-amber-strong'
+                    : 'bg-badge-blue-subtle text-badge-blue-foreground hover:bg-badge-blue-strong',
                 )}
               >
-                {group.operator.toLowerCase()}
+                <Txt as="span" variant="meta" className="block">
+                  {group.operator.toLowerCase()}
+                </Txt>
               </button>
             )}
 
@@ -105,18 +115,12 @@ const RuleGroupView: React.FC<RuleGroupViewProps> = ({ schema, group, onChange, 
         </div>
       ))}
 
-      <div className="p-2 flex gap-1">
-        <Button type="button" onClick={handleAddRule} variant="ghost" size="sm">
-          <Icon>
-            <Plus />
-          </Icon>
+      <div className="flex gap-1 p-2">
+        <Button type="button" onClick={handleAddRule} variant="ghost" size="sm" icon={<IconPlusMedium />}>
           Add rule
         </Button>
         {depth < maxDepth - 1 && (
-          <Button type="button" onClick={handleAddGroup} variant="ghost" size="sm">
-            <Icon>
-              <Component />
-            </Icon>
+          <Button type="button" onClick={handleAddGroup} variant="ghost" size="sm" icon={<IconComponents />}>
             Add group
           </Button>
         )}
@@ -154,12 +158,18 @@ export const RuleBuilder: React.FC<RuleBuilderProps> = ({
       <button
         type="button"
         onClick={handleAddFirstRule}
-        className="flex items-center justify-center gap-2 text-ui-sm text-neutral3 hover:text-neutral6 w-full border border-dashed border-border1 p-2 rounded-md"
+        className={cn(
+          quietTextHover,
+          controlStateColorTransition,
+          'flex w-full items-center justify-center gap-2 rounded-md border border-dashed border-border p-2',
+        )}
       >
         <Icon>
-          <Plus />
+          <IconPlusMedium />
         </Icon>
-        Add conditional rule
+        <Txt as="span" variant="caption" className="block">
+          Add conditional rule
+        </Txt>
       </button>
     );
   }

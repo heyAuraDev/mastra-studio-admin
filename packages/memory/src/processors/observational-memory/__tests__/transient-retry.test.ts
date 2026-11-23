@@ -6,13 +6,16 @@
  * agent still produces output normally.
  */
 
+import type { MastraDBMessage } from '@mastra/core/agent';
 import { Agent } from '@mastra/core/agent';
 import { InMemoryStore } from '@mastra/core/storage';
 import { createTool } from '@mastra/core/tools';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import { Memory } from '../../../index';
+import { OmModelExecutionError } from '../error';
+import { ObserverRunner } from '../observer-runner';
 import { RETRY_CONFIG } from '../retry';
 
 type StreamPart =
@@ -122,8 +125,18 @@ function createMockActorModel(responseText: string) {
  * the AI SDK's built-in pRetry budget (default 2 retries → 3 attempts), the
  * call only succeeds if OM's withRetry wrapper layers additional retries on
  * top.
+ *
+ * With `failureMode: 'stream-error'` the model instead emits an
+ * OpenRouter-style mid-stream error part ({ code: 502, message, metadata })
+ * — the shape OpenRouter injects into the SSE stream when an upstream
+ * provider is unavailable. Mid-stream errors bypass the AI SDK's pRetry
+ * entirely, so OM's withRetry is the only retry layer.
  */
-function createFlakyObserverModel(observationsText: string, failuresBeforeSuccess: number) {
+function createFlakyObserverModel(
+  observationsText: string,
+  failuresBeforeSuccess: number,
+  failureMode: 'throw' | 'stream-error' = 'throw',
+) {
   let callCount = 0;
   let observerCallCount = 0;
 
@@ -152,6 +165,12 @@ function createFlakyObserverModel(observationsText: string, failuresBeforeSucces
     async doGenerate() {
       observerCallCount = ++callCount;
       if (callCount <= failuresBeforeSuccess) {
+        if (failureMode === 'stream-error') {
+          throw Object.assign(new Error('JSON error injected into SSE stream'), {
+            code: 502,
+            metadata: { error_type: 'provider_unavailable' },
+          });
+        }
         throw new TypeError('terminated');
       }
       return buildSuccessGenerate();
@@ -160,6 +179,37 @@ function createFlakyObserverModel(observationsText: string, failuresBeforeSucces
     async doStream() {
       observerCallCount = ++callCount;
       if (callCount <= failuresBeforeSuccess) {
+        if (failureMode === 'stream-error') {
+          // OpenRouter mid-stream error: HTTP 200 established, then the raw
+          // error object is injected into the SSE stream as an error part.
+          const errorParts: unknown[] = [
+            { type: 'stream-start', warnings: [] },
+            {
+              type: 'response-metadata',
+              id: 'obs-err',
+              modelId: 'mock-flaky-observer-model',
+              timestamp: new Date(),
+            },
+            {
+              type: 'error',
+              error: {
+                code: 502,
+                message: 'JSON error injected into SSE stream',
+                metadata: { error_type: 'provider_unavailable' },
+              },
+            },
+          ];
+          return {
+            stream: new ReadableStream({
+              start(controller) {
+                for (const p of errorParts) controller.enqueue(p);
+                controller.close();
+              },
+            }),
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+          };
+        }
         throw new TypeError('terminated');
       }
 
@@ -210,6 +260,33 @@ const observationsText = `<observations>
 - 🟢 User greeted and asked for help
 </observations>`;
 
+function createObserverRunner(maxRetries?: number) {
+  return new ObserverRunner({
+    observationConfig: {
+      model: 'mock/model',
+      messageTokens: 1000,
+      bufferTokens: false,
+      previousObserverTokens: 1000,
+      observeAttachments: false,
+      ...(maxRetries === undefined ? {} : { maxRetries }),
+    } as any,
+    observedMessageIds: new Set(),
+    resolveModel: () => ({ model: 'mock/model' as any }),
+    tokenCounter: { countMessages: () => 1 } as any,
+  });
+}
+
+function createMessage(): MastraDBMessage {
+  return {
+    id: 'message-1',
+    threadId: 'thread-1',
+    resourceId: 'resource-1',
+    role: 'user',
+    content: { format: 2, parts: [{ type: 'text', text: 'hello' }] },
+    createdAt: new Date(),
+  } as MastraDBMessage;
+}
+
 describe('OM transient-error retry', { timeout: 30_000 }, () => {
   const originalConfig = { ...RETRY_CONFIG };
 
@@ -224,11 +301,47 @@ describe('OM transient-error retry', { timeout: 30_000 }, () => {
     Object.assign(RETRY_CONFIG, originalConfig);
   });
 
-  it('retries sync observation past the AI SDK retry budget on transient "terminated" errors', async () => {
-    // AI SDK's pRetry retries 2 times by default → 3 total attempts. Force more
-    // failures than that so the call only succeeds if OM's withRetry layers
-    // additional retries on top.
-    const failuresBeforeSuccess = 5;
+  it.each([
+    { maxRetries: 0, expectedCalls: 1 },
+    { maxRetries: 1, expectedCalls: 2 },
+    { maxRetries: undefined, expectedCalls: 9 },
+  ])('uses $maxRetries retries as $expectedCalls total observer calls', async ({ maxRetries, expectedCalls }) => {
+    const observer = createObserverRunner(maxRetries);
+    const stream = vi.fn().mockRejectedValue(new TypeError('terminated'));
+    vi.spyOn(observer as any, 'createAgent').mockReturnValue({
+      id: 'observational-memory-observer',
+      stream,
+    });
+
+    await expect(observer.call(undefined, [createMessage()])).rejects.toBeInstanceOf(OmModelExecutionError);
+
+    expect(stream).toHaveBeenCalledTimes(expectedCalls);
+  });
+
+  it('succeeds on the configured observer retry', async () => {
+    const observer = createObserverRunner(1);
+    const stream = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError('terminated'))
+      .mockResolvedValueOnce({
+        getFullOutput: async () => ({
+          text: observationsText,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        }),
+      });
+    vi.spyOn(observer as any, 'createAgent').mockReturnValue({
+      id: 'observational-memory-observer',
+      stream,
+    });
+
+    const result = await observer.call(undefined, [createMessage()]);
+
+    expect(result.observations).toContain('User greeted');
+    expect(stream).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses the observation retry budget for a transient "terminated" failure', async () => {
+    const failuresBeforeSuccess = 1;
     const store = new InMemoryStore();
     const observerModel = createFlakyObserverModel(observationsText, failuresBeforeSuccess);
 
@@ -240,6 +353,7 @@ describe('OM transient-error retry', { timeout: 30_000 }, () => {
           observation: {
             model: observerModel as any,
             messageTokens: 20,
+            maxRetries: 1,
             // Disable async buffering — test the synchronous observation path
             // (the path that previously killed the actor on `terminated`).
             bufferTokens: false,
@@ -271,7 +385,56 @@ describe('OM transient-error retry', { timeout: 30_000 }, () => {
     expect(result.tripwire).toBeFalsy();
     expect(result.text).toBe(longResponseText);
 
-    // We were called more times than the AI SDK retry budget allows on its own.
+    expect(observerModel.__observerCallCount).toBeGreaterThan(failuresBeforeSuccess);
+  });
+
+  it('retries observation on OpenRouter-style mid-stream SSE errors (numeric code 502)', async () => {
+    // Mid-stream errors never hit the AI SDK's pRetry (the HTTP request
+    // succeeded), so OM's withRetry is the only retry layer. Previously these
+    // errors were classified as non-transient and killed the actor turn with
+    // "Observational memory observation buffering failed: JSON error injected
+    // into SSE stream".
+    const failuresBeforeSuccess = 2;
+    const store = new InMemoryStore();
+    const observerModel = createFlakyObserverModel(observationsText, failuresBeforeSuccess, 'stream-error');
+
+    const memory = new Memory({
+      storage: store,
+      options: {
+        observationalMemory: {
+          enabled: true,
+          observation: {
+            model: observerModel as any,
+            messageTokens: 20,
+            bufferTokens: false,
+            maxRetries: 2,
+          },
+          reflection: {
+            observationTokens: 50_000,
+          },
+        },
+      },
+    });
+
+    const agent = new Agent({
+      id: 'sse-error-retry-test-agent',
+      name: 'SSE Error Retry Test Agent',
+      instructions: 'You are a helpful assistant. Always use the test tool first.',
+      model: createMockActorModel(longResponseText) as any,
+      tools: { test: omTriggerTool },
+      memory,
+    });
+
+    const result = await agent.generate('Hello, I need help.', {
+      memory: {
+        thread: 'sse-error-retry-thread',
+        resource: 'sse-error-retry-resource',
+      },
+    });
+
+    // The actor turn completed normally despite mid-stream provider errors.
+    expect(result.tripwire).toBeFalsy();
+    expect(result.text).toBe(longResponseText);
     expect(observerModel.__observerCallCount).toBeGreaterThan(failuresBeforeSuccess);
   });
 });

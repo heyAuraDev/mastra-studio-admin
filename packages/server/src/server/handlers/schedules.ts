@@ -1,18 +1,25 @@
 import type { Mastra } from '@mastra/core';
+import type { RequestContext } from '@mastra/core/request-context';
+import type { AgentSchedule, AnySchedule, WorkflowSchedule } from '@mastra/core/schedules';
 import type { WorkflowRunState } from '@mastra/core/workflows';
-// `computeNextFireAt` is new in @mastra/core@1.32.0; route it through a shim
-// that tolerates older cores (see ./schedules-workflows-shim.ts).
+import { MASTRA_USER_KEY } from '../constants';
 import { HTTPException } from '../http-exception';
 import {
+  createScheduleBodySchema,
+  deleteScheduleResponseSchema,
   listSchedulesQuerySchema,
   listSchedulesResponseSchema,
-  scheduleIdPathParams,
-  scheduleResponseSchema,
   listScheduleTriggersQuerySchema,
   listScheduleTriggersResponseSchema,
+  runScheduleResponseSchema,
+  scheduleIdPathParams,
+  scheduleSchema,
+  updateScheduleBodySchema,
 } from '../schemas/schedules';
 import { createRoute } from '../server-adapter/routes/route-builder';
-import { computeNextFireAt } from './schedules-workflows-shim';
+import { assertStoredAgentAccess } from './agent-access';
+import { assertExecuteAccess, assertReadAccess, getCallerAuthorId, hasAdminBypass } from './authorship';
+import { getPublicWorkflowById } from './utils';
 
 type RunSummary = {
   status: WorkflowRunState['status'];
@@ -58,15 +65,77 @@ async function fetchRunSummary(mastra: Mastra, workflowName: string, runId: stri
   }
 }
 
-async function hydrateScheduleResponse<T extends { lastRunId?: string; target: { type: string; workflowId?: string } }>(
+/**
+ * Attach a `lastRun` summary to workflow schedules. Agent schedules pass
+ * through unchanged — their `lastRunId` is an agent run, not a workflow run.
+ */
+async function hydrateScheduleResponse(
   mastra: Mastra,
-  schedule: T,
-): Promise<T & { lastRun?: RunSummary }> {
-  if (!schedule.lastRunId || schedule.target.type !== 'workflow' || !schedule.target.workflowId) {
+  schedule: AnySchedule,
+): Promise<AgentSchedule | (WorkflowSchedule & { lastRun?: RunSummary })> {
+  if (!schedule.workflowId || !schedule.lastRunId) {
     return schedule;
   }
-  const lastRun = await fetchRunSummary(mastra, schedule.target.workflowId, schedule.lastRunId);
+  const lastRun = await fetchRunSummary(mastra, schedule.workflowId, schedule.lastRunId);
   return lastRun ? { ...schedule, lastRun } : schedule;
+}
+
+/**
+ * Resolve a schedule by id via `mastra.schedules`. Returns 404 for missing
+ * rows so handlers surface a clean HTTP error instead of a service error.
+ */
+async function loadSchedule(
+  mastra: Mastra,
+  scheduleId: string,
+  requestContext: RequestContext,
+  access: 'read' | 'execute',
+): Promise<AnySchedule> {
+  const schedule = await mastra.schedules.get(scheduleId);
+  if (!schedule || !(await canAccessScheduleAgent(mastra, schedule, requestContext, access))) {
+    throw new HTTPException(404, { message: 'Schedule not found' });
+  }
+  return schedule;
+}
+
+/**
+ * Schedules have no owner of their own: an agent schedule follows the visibility of the agent it runs, so a caller
+ * who can't see a private stored agent can't see, change or fire its schedules either. Reading needs read access to
+ * the agent; anything that changes or fires the schedule needs execute access, as creating it does.
+ */
+async function canAccessScheduleAgent(
+  mastra: Mastra,
+  schedule: AnySchedule,
+  requestContext: RequestContext,
+  access: 'read' | 'execute',
+): Promise<boolean> {
+  const agentId = schedule.agentId;
+  if (!agentId) return true;
+  try {
+    let agent;
+    try {
+      agent = mastra.getAgentById(agentId);
+    } catch {
+      agent = undefined;
+    }
+    if (agent) {
+      assertStoredAgentAccess({ agent, agentId, requestContext, access });
+      return true;
+    }
+    // Editing a stored agent unregisters it until its next load, so check its stored record instead.
+    const record = await (await mastra.getStorage()?.getStore('agents'))?.getById(agentId);
+    if (record) {
+      const check = access === 'read' ? assertReadAccess : assertExecuteAccess;
+      check({ requestContext, resource: 'stored-agents', resourceId: agentId, record });
+      return true;
+    }
+    // Neither registered nor stored: the agent was deleted, and nothing says who could see it. Only admins and
+    // setups without auth keep seeing its schedules.
+    const authenticated = getCallerAuthorId(requestContext) !== null || !!requestContext.get(MASTRA_USER_KEY);
+    return !authenticated || hasAdminBypass(requestContext, 'stored-agents');
+  } catch (error) {
+    if (error instanceof HTTPException && error.status === 404) return false;
+    throw error;
+  }
 }
 
 export const LIST_SCHEDULES_ROUTE = createRoute({
@@ -75,31 +144,23 @@ export const LIST_SCHEDULES_ROUTE = createRoute({
   responseType: 'json' as const,
   queryParamSchema: listSchedulesQuerySchema,
   responseSchema: listSchedulesResponseSchema,
-  summary: 'List workflow schedules',
-  description: 'Returns the configured schedules, optionally filtered by workflowId or status.',
+  summary: 'List schedules',
+  description:
+    'Returns all schedules — agent schedules and workflow schedules — optionally filtered by agentId, workflowId, or status. Completed schedules are excluded unless requested with a status filter. Agent schedules can additionally be filtered by threadId, resourceId, or name.',
   tags: ['Schedules'],
   requiresAuth: true,
-  handler: async ({ mastra, workflowId, status, ownerType, ownerId }) => {
+  handler: async ({ mastra, requestContext, agentId, workflowId, status, threadId, resourceId, name }) => {
     const schedulesStore = await mastra.getStorage()?.getStore('schedules');
     if (!schedulesStore) {
       // Schedules domain not configured — there are no schedules to return.
       return { schedules: [] };
     }
-    const schedules = await schedulesStore.listSchedules({ workflowId, status, ownerType, ownerId });
-    // Filter out owned schedules (e.g. heartbeats) unless caller explicitly
-    // asks for them via ownerType/ownerId. The /schedules surface is for
-    // workflow schedules; owned schedules have dedicated UIs.
-    const visible =
-      ownerType !== undefined || ownerId !== undefined ? schedules : schedules.filter(s => s.ownerType == null);
-    const hydrated = await Promise.all(
-      visible.map(async schedule => {
-        if (!schedule.lastRunId || schedule.target.type !== 'workflow') {
-          return schedule;
-        }
-        const lastRun = await fetchRunSummary(mastra, schedule.target.workflowId, schedule.lastRunId);
-        return lastRun ? { ...schedule, lastRun } : schedule;
-      }),
-    );
+    const schedules = await mastra.schedules.list({ agentId, workflowId, status, threadId, resourceId, name });
+    const visible = [];
+    for (const schedule of schedules) {
+      if (await canAccessScheduleAgent(mastra, schedule, requestContext, 'read')) visible.push(schedule);
+    }
+    const hydrated = await Promise.all(visible.map(schedule => hydrateScheduleResponse(mastra, schedule)));
     return { schedules: hydrated };
   },
 });
@@ -109,21 +170,202 @@ export const GET_SCHEDULE_ROUTE = createRoute({
   path: '/schedules/:scheduleId',
   responseType: 'json' as const,
   pathParamSchema: scheduleIdPathParams,
-  responseSchema: scheduleResponseSchema,
-  summary: 'Get a workflow schedule by ID',
-  description: 'Returns a single schedule row by its storage id.',
+  responseSchema: scheduleSchema,
+  summary: 'Get a schedule by ID',
+  description: 'Returns a single schedule by its id.',
   tags: ['Schedules'],
   requiresAuth: true,
-  handler: async ({ mastra, scheduleId }) => {
-    const schedulesStore = await mastra.getStorage()?.getStore('schedules');
-    if (!schedulesStore) {
-      throw new HTTPException(404, { message: 'Schedule not found' });
-    }
-    const schedule = await schedulesStore.getSchedule(scheduleId);
-    if (!schedule) {
-      throw new HTTPException(404, { message: 'Schedule not found' });
-    }
+  handler: async ({ mastra, requestContext, scheduleId }) => {
+    const schedule = await loadSchedule(mastra, scheduleId, requestContext, 'read');
     return hydrateScheduleResponse(mastra, schedule);
+  },
+});
+
+export const CREATE_SCHEDULE_ROUTE = createRoute({
+  method: 'POST',
+  path: '/schedules',
+  responseType: 'json' as const,
+  bodySchema: createScheduleBodySchema,
+  responseSchema: scheduleSchema,
+  summary: 'Create a schedule',
+  description:
+    'Creates a new schedule. Pass `agentId` (plus `prompt`) to schedule an agent, or `workflowId` (plus optional `inputData`) to schedule a workflow. Agent schedules get a random `agent_<uuid>` id, workflow schedules a random `schedule_<uuid>` id; pass `id` for a stable slug instead.',
+  tags: ['Schedules'],
+  requiresAuth: true,
+  handler: async params => {
+    const { mastra, ...body } = params;
+    // getAgentById throws a MastraError (status 404) when the target is
+    // unknown; translate that into a clean HTTP 404 instead of letting it
+    // surface as 500. Hidden internal workflows are treated as unknown.
+    if ('workflowId' in body && body.workflowId) {
+      // The scheduler later resolves the stored id through core, which also
+      // sees hidden workflows. Reject ids where that lookup would pick a
+      // different workflow than the public one validated here.
+      const workflow = getPublicWorkflowById(mastra, body.workflowId);
+      let resolved: unknown;
+      try {
+        resolved = mastra.getWorkflowById(body.workflowId);
+      } catch {
+        resolved = undefined;
+      }
+      if (!workflow || resolved !== workflow) {
+        throw new HTTPException(404, { message: `Workflow "${body.workflowId}" not found` });
+      }
+      return await mastra.schedules.create({
+        workflowId: body.workflowId,
+        ...(body.cron ? { cron: body.cron } : {}),
+        ...(body.runAt !== undefined ? { runAt: body.runAt } : {}),
+        ...(body.endAt !== undefined ? { endAt: body.endAt } : {}),
+        ...(body.id ? { id: body.id } : {}),
+        ...(body.timezone ? { timezone: body.timezone } : {}),
+        ...(body.inputData !== undefined ? { inputData: body.inputData } : {}),
+        ...(body.initialState !== undefined ? { initialState: body.initialState } : {}),
+        ...(body.requestContext ? { requestContext: body.requestContext } : {}),
+        ...(body.resourceId ? { resourceId: body.resourceId } : {}),
+        ...(body.metadata ? { metadata: body.metadata } : {}),
+      });
+    }
+    const agentBody = body as Extract<typeof body, { agentId: string }>;
+    let agent;
+    try {
+      agent = mastra.getAgentById(agentBody.agentId);
+    } catch {
+      throw new HTTPException(404, { message: `Agent "${agentBody.agentId}" not found` });
+    }
+    // The scheduler will run the agent, so the caller needs execute access to it.
+    assertStoredAgentAccess({
+      agent,
+      agentId: agentBody.agentId,
+      requestContext: params.requestContext,
+      access: 'execute',
+    });
+    return await mastra.schedules.create({
+      agentId: agentBody.agentId,
+      ...(agentBody.cron ? { cron: agentBody.cron } : {}),
+      ...(agentBody.runAt !== undefined ? { runAt: agentBody.runAt } : {}),
+      ...(agentBody.endAt !== undefined ? { endAt: agentBody.endAt } : {}),
+      prompt: agentBody.prompt,
+      ...(agentBody.id ? { id: agentBody.id } : {}),
+      ...(agentBody.name ? { name: agentBody.name } : {}),
+      ...(agentBody.timezone ? { timezone: agentBody.timezone } : {}),
+      ...(agentBody.threadId ? { threadId: agentBody.threadId } : {}),
+      ...(agentBody.resourceId ? { resourceId: agentBody.resourceId } : {}),
+      ...(agentBody.signalType ? { signalType: agentBody.signalType } : {}),
+      ...(agentBody.tagName ? { tagName: agentBody.tagName } : {}),
+      ...(agentBody.attributes ? { attributes: agentBody.attributes } : {}),
+      ...(agentBody.ifActive ? { ifActive: agentBody.ifActive } : {}),
+      ...(agentBody.ifIdle ? { ifIdle: agentBody.ifIdle } : {}),
+      ...(agentBody.providerOptions ? { providerOptions: agentBody.providerOptions } : {}),
+      ...(agentBody.metadata ? { metadata: agentBody.metadata } : {}),
+    });
+  },
+});
+
+export const UPDATE_SCHEDULE_ROUTE = createRoute({
+  method: 'PATCH',
+  path: '/schedules/:scheduleId',
+  responseType: 'json' as const,
+  pathParamSchema: scheduleIdPathParams,
+  bodySchema: updateScheduleBodySchema,
+  responseSchema: scheduleSchema,
+  summary: 'Update a schedule',
+  description:
+    "Partial update of a schedule. Fields apply to the matching target type; agent-only fields on a workflow schedule are rejected. An agent schedule's `threadId` and `resourceId` are part of its identity and cannot be changed — to re-target, delete and recreate. A workflow schedule's `resourceId` is run-attribution metadata and may be updated. Editing `cron` (or `timezone`) recomputes `nextFireAt`. One-off schedules accept `runAt`; cron schedules accept `endAt` (`null` removes the bound). A recomputed cadence that can still fire reactivates a `completed` schedule, while a cadence with no future occurrence leaves the schedule `completed`.",
+  tags: ['Schedules'],
+  requiresAuth: true,
+  handler: async params => {
+    const { mastra, scheduleId, ...body } = params;
+    await loadSchedule(mastra, scheduleId, params.requestContext, 'execute');
+    return await mastra.schedules.update(scheduleId, {
+      ...(body.cron !== undefined ? { cron: body.cron } : {}),
+      ...(body.runAt !== undefined ? { runAt: body.runAt } : {}),
+      ...(body.endAt !== undefined ? { endAt: body.endAt } : {}),
+      ...(body.timezone !== undefined ? { timezone: body.timezone } : {}),
+      ...(body.status !== undefined ? { status: body.status } : {}),
+      ...(body.metadata !== undefined ? { metadata: body.metadata } : {}),
+      ...(body.prompt !== undefined ? { prompt: body.prompt } : {}),
+      ...(body.name !== undefined ? { name: body.name } : {}),
+      ...(body.signalType !== undefined ? { signalType: body.signalType } : {}),
+      ...(body.tagName !== undefined ? { tagName: body.tagName } : {}),
+      ...(body.attributes !== undefined ? { attributes: body.attributes } : {}),
+      ...(body.ifActive !== undefined ? { ifActive: body.ifActive } : {}),
+      ...(body.ifIdle !== undefined ? { ifIdle: body.ifIdle } : {}),
+      ...(body.providerOptions !== undefined ? { providerOptions: body.providerOptions } : {}),
+      ...(body.inputData !== undefined ? { inputData: body.inputData } : {}),
+      ...(body.initialState !== undefined ? { initialState: body.initialState } : {}),
+      ...(body.requestContext !== undefined ? { requestContext: body.requestContext } : {}),
+      ...(body.resourceId !== undefined ? { resourceId: body.resourceId } : {}),
+    });
+  },
+});
+
+export const DELETE_SCHEDULE_ROUTE = createRoute({
+  method: 'DELETE',
+  path: '/schedules/:scheduleId',
+  responseType: 'json' as const,
+  pathParamSchema: scheduleIdPathParams,
+  responseSchema: deleteScheduleResponseSchema,
+  summary: 'Delete a schedule',
+  description: 'Permanently deletes the schedule. 404 when the schedule does not exist.',
+  tags: ['Schedules'],
+  requiresAuth: true,
+  handler: async ({ mastra, requestContext, scheduleId }) => {
+    await loadSchedule(mastra, scheduleId, requestContext, 'execute');
+    await mastra.schedules.delete(scheduleId);
+    return { message: 'Schedule deleted' };
+  },
+});
+
+export const PAUSE_SCHEDULE_ROUTE = createRoute({
+  method: 'POST',
+  path: '/schedules/:scheduleId/pause',
+  responseType: 'json' as const,
+  pathParamSchema: scheduleIdPathParams,
+  responseSchema: scheduleSchema,
+  summary: 'Pause a schedule',
+  description:
+    'Marks the schedule as paused. The scheduler tick loop will skip paused schedules. Idempotent — pausing an already-paused schedule returns the current state unchanged. Pause status survives redeploys.',
+  tags: ['Schedules'],
+  requiresAuth: true,
+  handler: async ({ mastra, requestContext, scheduleId }) => {
+    await loadSchedule(mastra, scheduleId, requestContext, 'execute');
+    const updated = await mastra.schedules.pause(scheduleId);
+    return hydrateScheduleResponse(mastra, updated);
+  },
+});
+
+export const RESUME_SCHEDULE_ROUTE = createRoute({
+  method: 'POST',
+  path: '/schedules/:scheduleId/resume',
+  responseType: 'json' as const,
+  pathParamSchema: scheduleIdPathParams,
+  responseSchema: scheduleSchema,
+  summary: 'Resume a paused schedule',
+  description:
+    'Marks the schedule as active and recomputes nextFireAt from "now" so a long-paused schedule does not fire a backlog. Idempotent — resuming an already-active schedule returns the current state unchanged.',
+  tags: ['Schedules'],
+  requiresAuth: true,
+  handler: async ({ mastra, requestContext, scheduleId }) => {
+    await loadSchedule(mastra, scheduleId, requestContext, 'execute');
+    const updated = await mastra.schedules.resume(scheduleId);
+    return hydrateScheduleResponse(mastra, updated);
+  },
+});
+
+export const RUN_SCHEDULE_ROUTE = createRoute({
+  method: 'POST',
+  path: '/schedules/:scheduleId/run',
+  responseType: 'json' as const,
+  pathParamSchema: scheduleIdPathParams,
+  responseSchema: runScheduleResponseSchema,
+  summary: 'Fire a schedule now',
+  description:
+    'Manually triggers a single schedule fire out-of-band from the cron schedule. Records a trigger row with `triggerKind: "manual"`. Does not advance `nextFireAt`.',
+  tags: ['Schedules'],
+  requiresAuth: true,
+  handler: async ({ mastra, requestContext, scheduleId }) => {
+    await loadSchedule(mastra, scheduleId, requestContext, 'execute');
+    return await mastra.schedules.run(scheduleId);
   },
 });
 
@@ -138,17 +380,24 @@ export const LIST_SCHEDULE_TRIGGERS_ROUTE = createRoute({
   description: 'Returns the audit trail of trigger attempts for a schedule, ordered by actualFireAt descending.',
   tags: ['Schedules'],
   requiresAuth: true,
-  handler: async ({ mastra, scheduleId, limit, fromActualFireAt, toActualFireAt }) => {
+  handler: async ({ mastra, requestContext, scheduleId, limit, fromActualFireAt, toActualFireAt }) => {
     const schedulesStore = await mastra.getStorage()?.getStore('schedules');
     if (!schedulesStore) {
       return { triggers: [] };
     }
-    const schedule = await schedulesStore.getSchedule(scheduleId);
-    const triggers = await schedulesStore.listTriggers(scheduleId, { limit, fromActualFireAt, toActualFireAt });
-    if (!schedule || schedule.target.type !== 'workflow') {
+    const schedule = await mastra.schedules.get(scheduleId);
+    if (schedule && !(await canAccessScheduleAgent(mastra, schedule, requestContext, 'read'))) {
+      throw new HTTPException(404, { message: 'Schedule not found' });
+    }
+    const triggers = await schedulesStore.listTriggers(schedule?.id ?? scheduleId, {
+      limit,
+      fromActualFireAt,
+      toActualFireAt,
+    });
+    if (!schedule?.workflowId) {
       return { triggers };
     }
-    const workflowName = schedule.target.workflowId;
+    const workflowName = schedule.workflowId;
     const hydrated = await Promise.all(
       triggers.map(async trigger => {
         if (trigger.outcome !== 'published' || !trigger.runId) return trigger;
@@ -157,65 +406,5 @@ export const LIST_SCHEDULE_TRIGGERS_ROUTE = createRoute({
       }),
     );
     return { triggers: hydrated };
-  },
-});
-
-export const PAUSE_SCHEDULE_ROUTE = createRoute({
-  method: 'POST',
-  path: '/schedules/:scheduleId/pause',
-  responseType: 'json' as const,
-  pathParamSchema: scheduleIdPathParams,
-  responseSchema: scheduleResponseSchema,
-  summary: 'Pause a workflow schedule',
-  description:
-    'Marks the schedule as paused. The scheduler tick loop will skip paused schedules. Idempotent — pausing an already-paused schedule returns the current state unchanged. Pause status survives redeploys.',
-  tags: ['Schedules'],
-  requiresAuth: true,
-  handler: async ({ mastra, scheduleId }) => {
-    const schedulesStore = await mastra.getStorage()?.getStore('schedules');
-    if (!schedulesStore) {
-      throw new HTTPException(404, { message: 'Schedule not found' });
-    }
-    const existing = await schedulesStore.getSchedule(scheduleId);
-    if (!existing) {
-      throw new HTTPException(404, { message: 'Schedule not found' });
-    }
-    if (existing.status === 'paused') {
-      return hydrateScheduleResponse(mastra, existing);
-    }
-    const updated = await schedulesStore.updateSchedule(scheduleId, { status: 'paused' });
-    return hydrateScheduleResponse(mastra, updated);
-  },
-});
-
-export const RESUME_SCHEDULE_ROUTE = createRoute({
-  method: 'POST',
-  path: '/schedules/:scheduleId/resume',
-  responseType: 'json' as const,
-  pathParamSchema: scheduleIdPathParams,
-  responseSchema: scheduleResponseSchema,
-  summary: 'Resume a paused workflow schedule',
-  description:
-    'Marks the schedule as active and recomputes nextFireAt from "now" so a long-paused schedule does not fire a backlog. Idempotent — resuming an already-active schedule returns the current state unchanged.',
-  tags: ['Schedules'],
-  requiresAuth: true,
-  handler: async ({ mastra, scheduleId }) => {
-    const schedulesStore = await mastra.getStorage()?.getStore('schedules');
-    if (!schedulesStore) {
-      throw new HTTPException(404, { message: 'Schedule not found' });
-    }
-    const existing = await schedulesStore.getSchedule(scheduleId);
-    if (!existing) {
-      throw new HTTPException(404, { message: 'Schedule not found' });
-    }
-    if (existing.status === 'active') {
-      return hydrateScheduleResponse(mastra, existing);
-    }
-    const nextFireAt = computeNextFireAt(existing.cron, {
-      timezone: existing.timezone,
-      after: Date.now(),
-    });
-    const updated = await schedulesStore.updateSchedule(scheduleId, { status: 'active', nextFireAt });
-    return hydrateScheduleResponse(mastra, updated);
   },
 });

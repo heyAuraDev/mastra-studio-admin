@@ -1,8 +1,8 @@
-import fs from 'fs/promises';
-import path from 'path';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { Extractor, ExtractorConfig } from '@microsoft/api-extractor';
 import { Project } from 'ts-morph';
-import { createReadStream } from 'fs';
+import { createReadStream } from 'node:fs';
 import { Writable } from 'node:stream';
 
 export async function embedTypes(file, rootDir, bundledPackages) {
@@ -108,10 +108,9 @@ export async function embedTypes(file, rootDir, bundledPackages) {
 
   if (extractorResult.succeeded) {
     return true;
-  } else {
-    throw new Error(
-      `API Extractor completed with ${extractorResult.errorCount} errors` +
-        ` and ${extractorResult.warningCount} warnings`,
-    );
   }
+  throw new Error(
+    `API Extractor completed with ${extractorResult.errorCount} errors` +
+      ` and ${extractorResult.warningCount} warnings`,
+  );
 }

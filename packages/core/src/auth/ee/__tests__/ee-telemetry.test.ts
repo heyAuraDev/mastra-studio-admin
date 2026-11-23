@@ -1,4 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import { RequestContext } from '../../../request-context';
 import type * as PosthogTelemetry from '../../../telemetry/posthog';
 
 const { captureEEEvent } = vi.hoisted(() => ({
@@ -72,118 +73,62 @@ describe('EE telemetry', () => {
     clearLicenseCache();
   });
 
-  it('emits a safe license check event from capabilities', async () => {
-    await buildCapabilities(
-      createMockAuth({ id: 'user-1', email: 'user@test.com', name: 'User' }) as any,
-      new Request('http://localhost', {
-        headers: {
-          'x-forwarded-for': '203.0.113.1, 10.0.0.1',
-          'user-agent': 'test-agent',
-        },
-      }),
-      { fga: createMockFGAProvider() },
-    );
+  it('emits FGA feature usage for trusted actor bypasses', async () => {
+    const fgaProvider = createMockFGAProvider();
+    const requestContext = new RequestContext();
+    requestContext.set('organizationId', 'org-1');
 
-    expect(captureEEEvent).toHaveBeenCalledWith(
-      'ee_license_check',
-      'user-1',
-      expect.objectContaining({
-        license_valid: true,
-        license_hash: expect.any(String),
-        $ip: '203.0.113.1',
-        user_id: 'user-1',
-        capabilities: expect.objectContaining({ fga: true }),
-      }),
-    );
-    expect(JSON.stringify(captureEEEvent.mock.calls)).not.toContain('license-key-that-is-long-enough-for-tests');
-    expect(JSON.stringify(captureEEEvent.mock.calls)).not.toContain('user@test.com');
-    expect(JSON.stringify(captureEEEvent.mock.calls)).not.toContain('test-agent');
-    expect(captureEEEvent.mock.calls[0]?.[2]).not.toHaveProperty('ip');
-    expect(captureEEEvent.mock.calls[0]?.[2]).not.toHaveProperty('user_agent');
-  });
-
-  it('falls back to x-real-ip for license check events', async () => {
-    await buildCapabilities(
-      createMockAuth({ id: 'user-1', email: 'user@test.com', name: 'User' }) as any,
-      new Request('http://localhost', {
-        headers: {
-          'x-real-ip': '198.51.100.2',
-        },
-      }),
-    );
-
-    expect(captureEEEvent).toHaveBeenCalledWith(
-      'ee_license_check',
-      'user-1',
-      expect.objectContaining({
-        $ip: '198.51.100.2',
-      }),
-    );
-    expect(captureEEEvent.mock.calls[0]?.[2]).not.toHaveProperty('ip');
-  });
-
-  it('emits RBAC feature usage when access is resolved', async () => {
-    await buildCapabilities(
-      createMockAuth({
-        id: 'user-1',
-        email: 'user@test.com',
-        name: 'User',
-        metadata: { organizationMembershipId: 'om-1' },
-      }) as any,
-      new Request('http://localhost'),
-      { rbac: createMockRBACProvider() },
-    );
-
-    expect(captureEEEvent).toHaveBeenCalledWith(
-      'ee_feature_used',
-      'user-1',
-      expect.objectContaining({
-        feature: 'rbac',
-        role_count: 1,
-        permission_count: 1,
-        organization_membership_id: 'om-1',
-      }),
-    );
-    expect(JSON.stringify(captureEEEvent.mock.calls)).not.toContain('license-key-that-is-long-enough-for-tests');
-    expect(JSON.stringify(captureEEEvent.mock.calls)).not.toContain('user@test.com');
-    expect(JSON.stringify(captureEEEvent.mock.calls)).not.toContain('agents:*');
-  });
-
-  it('emits FGA feature usage after successful checks', async () => {
     await checkFGA({
-      fgaProvider: createMockFGAProvider(),
-      user: { id: 'user-2', email: 'user2@test.com', organizationMembershipId: 'om-2' },
-      resource: { type: 'agent', id: 'agent-1' },
-      permission: MastraFGAPermissions.AGENTS_EXECUTE,
+      fgaProvider,
+      user: undefined,
+      resource: { type: 'workflow', id: 'nightly-workflow' },
+      permission: MastraFGAPermissions.WORKFLOWS_EXECUTE,
+      requestContext,
+      actor: { actorKind: 'system', sourceWorkflow: 'nightly-workflow' },
     });
 
+    expect(fgaProvider.require).not.toHaveBeenCalled();
     expect(captureEEEvent).toHaveBeenCalledWith(
       'ee_feature_used',
-      'user-2',
+      expect.any(String),
       expect.objectContaining({
         feature: 'fga',
-        resource_type: 'agent',
-        resource_id: 'agent-1',
-        permission: MastraFGAPermissions.AGENTS_EXECUTE,
-        organization_membership_id: 'om-2',
+        actor_kind: 'system',
+        resource_type: 'workflow',
+        resource_id: 'nightly-workflow',
+        permission: MastraFGAPermissions.WORKFLOWS_EXECUTE,
+        user_id: null,
+        organization_membership_id: null,
+        source_workflow: 'nightly-workflow',
       }),
     );
-    expect(JSON.stringify(captureEEEvent.mock.calls)).not.toContain('license-key-that-is-long-enough-for-tests');
-    expect(JSON.stringify(captureEEEvent.mock.calls)).not.toContain('user2@test.com');
   });
 
-  it('does not let telemetry failures break FGA checks', async () => {
-    captureEEEvent.mockImplementationOnce(() => {
-      throw new Error('posthog unavailable');
+  it('uses metadata sourceWorkflow when a trusted actor omits one', async () => {
+    const requestContext = new RequestContext();
+    requestContext.set('organizationId', 'org-1');
+
+    await checkFGA({
+      fgaProvider: createMockFGAProvider(),
+      user: undefined,
+      resource: { type: 'workflow', id: 'nightly-workflow' },
+      permission: MastraFGAPermissions.WORKFLOWS_EXECUTE,
+      requestContext,
+      actor: { actorKind: 'system' },
+      context: {
+        metadata: {
+          sourceWorkflow: 'metadata-workflow',
+        },
+      },
     });
 
-    await expect(
-      checkFGA({
-        fgaProvider: createMockFGAProvider(),
-        user: { id: 'user-2' },
-        resource: { type: 'agent', id: 'agent-1' },
-        permission: MastraFGAPermissions.AGENTS_EXECUTE,
+    expect(captureEEEvent).toHaveBeenCalledWith(
+      'ee_feature_used',
+      expect.any(String),
+      expect.objectContaining({
+        actor_kind: 'system',
+        source_workflow: 'metadata-workflow',
       }),
-    ).resolves.toBeUndefined();
+    );
   });
 });

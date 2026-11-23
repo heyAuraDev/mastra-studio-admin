@@ -17,7 +17,8 @@ describe('Workflow start', () => {
       inputData: { name: 'John', age: 30 },
     });
 
-    expectTypeOf(result).toExtend<Promise<WorkflowRunResult>>();
+    // start() only acknowledges the run; startAsync() returns the result
+    expectTypeOf(result).toEqualTypeOf<Promise<{ message: string }>>();
   });
 
   it('should accept resourceId and runId', async () => {
@@ -71,5 +72,18 @@ describe('Workflow resume', () => {
     });
 
     expectTypeOf(result).toEqualTypeOf<WorkflowRunResult>();
+  });
+
+  it('resumeNoWait should return runId', async () => {
+    const workflow = client.getWorkflow('my-workflow');
+    const run = await workflow.createRun({
+      runId: 'run-123',
+    });
+    const result = await run.resumeNoWait({
+      step: 'approval-step',
+      resumeData: { approved: true },
+    });
+
+    expectTypeOf(result).toEqualTypeOf<{ runId: string }>();
   });
 });

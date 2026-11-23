@@ -1,16 +1,55 @@
 import { useMemo, useState } from 'react';
 import type { PropertyFilterField, PropertyFilterToken } from './types';
-import { Checkbox } from '@/ds/components/Checkbox';
-import { Input } from '@/ds/components/Input';
-import { RadioGroup, RadioGroupItem } from '@/ds/components/RadioGroup';
 import { Spinner } from '@/ds/components/Spinner/spinner';
+import { IconCheckmark2Medium } from '@/ds/icons/central/IconCheckmark2Medium';
+import { IconMagnifyingGlass } from '@/ds/icons/central/IconMagnifyingGlass';
+import { menuEmptyClass, menuItemButtonClass, menuItemCheckClass, menuSearchClasses } from '@/ds/primitives/menu-item';
+import { passwordManagerOptOutProps } from '@/ds/primitives/password-manager-autofill';
+import { cn } from '@/lib/utils';
+
+// Same rendering as Combobox items: no visible control, a trailing check when selected.
+// Focus is on the item itself (roving via [data-pick-multi-item]).
+const pickMultiItemClass = cn(menuItemButtonClass, 'min-w-0');
+
+function PickMultiItem({
+  role,
+  checked,
+  label,
+  onClick,
+}: {
+  role: 'checkbox' | 'radio';
+  checked: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role={role}
+      aria-checked={checked}
+      data-selected={checked || undefined}
+      data-pick-multi-item=""
+      title={label}
+      className={pickMultiItemClass}
+      onClick={onClick}
+    >
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      {checked && (
+        <span className={menuItemCheckClass}>
+          <IconCheckmark2Medium />
+        </span>
+      )}
+    </button>
+  );
+}
 
 type PickMultiField = Extract<PropertyFilterField, { kind: 'pick-multi' }>;
 
 export type PickMultiPanelProps = {
   field: PickMultiField;
   tokens: PropertyFilterToken[];
-  onChange: (fieldId: string, value: string | string[] | undefined) => void;
+  /** Always carries a value: an empty list is how the panel says "nothing selected". */
+  onChange: (fieldId: string, value: string | string[]) => void;
 };
 
 /**
@@ -21,6 +60,7 @@ export type PickMultiPanelProps = {
  */
 export function PickMultiPanel({ field, tokens, onChange }: PickMultiPanelProps) {
   const [query, setQuery] = useState('');
+  const listClassName = 'max-h-[80dvh] overflow-auto p-1';
 
   const filteredOptions = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -33,94 +73,88 @@ export function PickMultiPanel({ field, tokens, onChange }: PickMultiPanelProps)
   // show their default option pre-selected before the user explicitly picks one.
   const selectedValue = typeof token?.value === 'string' ? token.value : !field.multi ? field.defaultValue : undefined;
   const selectedValues = useMemo<string[]>(() => {
-    if (Array.isArray(token?.value)) return token!.value as string[];
-    if (typeof token?.value === 'string') return [token.value];
+    const value = token?.value;
+    if (Array.isArray(value)) return value;
+    if (typeof value === 'string') return [value];
     return [];
   }, [token]);
 
   return (
     <>
       {field.searchable !== false && (
-        <Input
-          size="sm"
-          value={query}
-          onChange={e => setQuery(e.target.value)}
-          placeholder={`Search ${field.label.toLowerCase()}...`}
-          className="mb-2"
-          onKeyDown={e => {
-            if (e.key !== 'ArrowDown') return;
-            const panel = e.currentTarget.closest<HTMLElement>('[data-pick-multi-panel]');
-            const first = panel?.querySelector<HTMLElement>('[data-pick-multi-item]:not([disabled])');
-            if (!first) return;
-            e.preventDefault();
-            e.stopPropagation();
-            first.focus();
-          }}
-        />
+        <div className={menuSearchClasses.container}>
+          <IconMagnifyingGlass className={menuSearchClasses.icon} />
+          <input
+            type="text"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            placeholder={`Search ${field.label.toLowerCase()}`}
+            className={menuSearchClasses.input}
+            {...passwordManagerOptOutProps}
+            onKeyDown={e => {
+              if (e.key !== 'ArrowDown') return;
+              const panel = e.currentTarget.closest<HTMLElement>('[data-pick-multi-panel]');
+              const first = panel?.querySelector<HTMLElement>('[data-pick-multi-item]:not([disabled])');
+              if (!first) return;
+              e.preventDefault();
+              e.stopPropagation();
+              first.focus();
+            }}
+          />
+        </div>
       )}
 
       {field.isLoading ? (
-        <div className="flex items-center gap-2 px-2 py-1.5 text-ui-sm text-neutral3">
-          <Spinner size="sm" className="w-3 h-3" color="var(--neutral3)" />
+        <div className={cn(menuEmptyClass, 'm-1')}>
+          <Spinner size="sm" className="size-3 text-muted-foreground" />
           Loading options…
         </div>
       ) : filteredOptions.length === 0 ? (
-        <div className="px-2 py-1.5 text-ui-sm text-neutral3">{field.emptyText ?? 'No option found.'}</div>
+        <div className={cn(menuEmptyClass, 'm-1')}>{field.emptyText ?? 'No option found.'}</div>
       ) : field.multi ? (
-        <div className="max-h-[80dvh] overflow-auto">
-          {filteredOptions.map(option => {
-            const checked = selectedValues.includes(option.value);
-            return (
-              <label
-                key={option.value}
-                title={option.label}
-                className="flex items-center gap-2 rounded-md px-2 py-1.5 text-ui-md text-neutral4 hover:bg-surface4 hover:text-neutral6 cursor-pointer focus-within:bg-surface4 focus-within:text-neutral6 min-w-0"
-              >
-                <Checkbox
-                  data-pick-multi-item=""
+        <div className={listClassName}>
+          <>
+            {filteredOptions.map(option => {
+              const checked = selectedValues.includes(option.value);
+              return (
+                <PickMultiItem
+                  key={option.value}
+                  role="checkbox"
                   checked={checked}
-                  onCheckedChange={next => {
-                    const isChecked = next === true;
-                    const nextValues = isChecked
-                      ? selectedValues.includes(option.value)
-                        ? selectedValues
-                        : [...selectedValues, option.value]
-                      : selectedValues.filter(v => v !== option.value);
-                    onChange(field.id, nextValues);
-                  }}
-                  className="shrink-0"
+                  label={option.label}
+                  onClick={() =>
+                    onChange(
+                      field.id,
+                      checked ? selectedValues.filter(v => v !== option.value) : [...selectedValues, option.value],
+                    )
+                  }
                 />
-                <span className="truncate min-w-0 flex-1">{option.label}</span>
-              </label>
-            );
-          })}
+              );
+            })}
+          </>
         </div>
       ) : (
-        <RadioGroup
-          value={selectedValue ?? ''}
-          onValueChange={value => onChange(field.id, value)}
-          className="max-h-[80dvh] gap-0 overflow-auto"
-        >
-          {filteredOptions.map(option => (
-            <label
-              key={option.value}
-              title={option.label}
-              className="flex items-center gap-2 rounded-md px-2 py-1.5 text-ui-md text-neutral4 hover:bg-surface4 hover:text-neutral6 cursor-pointer focus-within:bg-surface4 focus-within:text-neutral6 min-w-0"
-            >
-              <RadioGroupItem data-pick-multi-item="" value={option.value} className="shrink-0" />
-              <span className="truncate min-w-0 flex-1">{option.label}</span>
-            </label>
-          ))}
-          {!field.omitAnyOption && (
-            <label
-              title="Any"
-              className="flex items-center gap-2 rounded-md px-2 py-1.5 text-ui-md text-neutral4 hover:bg-surface4 hover:text-neutral6 cursor-pointer focus-within:bg-surface4 focus-within:text-neutral6 min-w-0"
-            >
-              <RadioGroupItem data-pick-multi-item="" value="Any" className="shrink-0" />
-              <span className="truncate min-w-0 flex-1">Any</span>
-            </label>
-          )}
-        </RadioGroup>
+        <div role="radiogroup" className={listClassName}>
+          <>
+            {filteredOptions.map(option => (
+              <PickMultiItem
+                key={option.value}
+                role="radio"
+                checked={selectedValue === option.value}
+                label={option.label}
+                onClick={() => onChange(field.id, option.value)}
+              />
+            ))}
+            {!field.omitAnyOption && (
+              <PickMultiItem
+                role="radio"
+                checked={selectedValue === 'Any'}
+                label="Any"
+                onClick={() => onChange(field.id, 'Any')}
+              />
+            )}
+          </>
+        </div>
       )}
     </>
   );

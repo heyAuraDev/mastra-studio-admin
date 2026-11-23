@@ -1,9 +1,8 @@
-import { MastraBundler } from '../bundler';
-import type { IBundler } from '../bundler';
+import type { IDeployer } from '@internal/deployer';
 
-export interface IDeployer extends IBundler {
-  deploy(outputDirectory: string): Promise<void>;
-}
+import { MastraBundler } from '../bundler';
+
+export type { IDeployer } from '@internal/deployer';
 
 export abstract class MastraDeployer extends MastraBundler implements IDeployer {
   constructor({ name }: { name: string }) {
@@ -11,4 +10,7 @@ export abstract class MastraDeployer extends MastraBundler implements IDeployer 
   }
 
   abstract deploy(outputDirectory: string): Promise<void>;
+
+  /** See {@link IDeployer.deployOnBuild}. */
+  readonly deployOnBuild?: boolean;
 }

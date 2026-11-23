@@ -1,12 +1,9 @@
 ---
 title: "Reference: voice.speak() | Voice"
-description: "Documentation for the speak() method available in all Mastra voice providers, which converts text to speech."
+description: "The speak() method is a core function available in all Mastra voice providers that converts text to speech."
 packages:
   - "@mastra/core"
   - "@mastra/node-speaker"
-  - "@mastra/voice-openai"
-  - "@mastra/voice-openai-realtime"
-  - "@mastra/voice-playai"
 ---
 
 # voice.speak()
@@ -245,7 +242,7 @@ const voice = new CompositeVoice({
 const audioStream = await voice.speak('Hello, world!')
 ```
 
-### Using AI SDK Model Providers
+### Using AI SDK model providers
 
 You can also use AI SDK speech models directly with `CompositeVoice`:
 

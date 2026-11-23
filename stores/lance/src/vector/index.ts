@@ -1,5 +1,12 @@
 import { connect, Index } from '@lancedb/lancedb';
-import type { Connection, ConnectionOptions, CreateTableOptions, Table, TableLike } from '@lancedb/lancedb';
+import type {
+  Connection,
+  ConnectionOptions,
+  CreateTableOptions,
+  OptimizeStats,
+  Table,
+  TableLike,
+} from '@lancedb/lancedb';
 
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import { createVectorErrorId } from '@mastra/core/storage';
@@ -21,6 +28,9 @@ import type { LanceVectorFilter } from './filter';
 import { LanceFilterTranslator } from './filter';
 import type { IndexConfig } from './types';
 
+type MastraMetric = NonNullable<CreateIndexParams['metric']>;
+type LanceDistanceType = 'cosine' | 'l2' | 'dot';
+
 interface LanceCreateIndexParams extends CreateIndexParams {
   indexConfig?: LanceIndexConfig;
   tableName?: string;
@@ -39,10 +49,41 @@ interface LanceQueryVectorParams extends QueryVectorParams<LanceVectorFilter> {
   tableName?: string;
   columns?: string[];
   includeAllColumns?: boolean;
+  /**
+   * Distance metric used to compute `_distance` and convert it into a similarity `score`.
+   * Defaults to the table's vector index metric when one exists, otherwise 'cosine'
+   * (matching `createIndex`'s default and `@mastra/memory`'s usage).
+   */
+  metric?: 'cosine' | 'euclidean' | 'dotproduct';
+}
+
+const LANCE_INDEX_FINGERPRINT_KEY = 'mastra.index.fingerprint';
+const LANCE_INDEX_UUID_KEY = 'mastra.index.uuid';
+
+export interface LanceTableTargetParams {
+  tableName?: string;
+  /** Used as the table name when `tableName` is omitted, matching `upsert` and `query`. */
+  indexName?: string;
+}
+
+export interface LanceOptimizeParams extends LanceTableTargetParams {
+  /** Remove table versions older than this date. Defaults to LanceDB's retention (7 days). */
+  cleanupOlderThan?: Date;
+  /** Also delete unverified files newer than 7 days. Only safe when no other writer is active. Defaults to `false`. */
+  deleteUnverified?: boolean;
+}
+
+export interface LanceIndexCoverage {
+  indexName: string;
+  indexType: string;
+  columns: string[];
+  numIndexedRows: number;
+  numUnindexedRows: number;
 }
 
 export class LanceVectorStore extends MastraVector<LanceVectorFilter> {
   private lanceClient!: Connection;
+  private optimizeInFlight = new Map<string, Promise<OptimizeStats>>();
 
   /**
    * Creates a new instance of LanceVectorStore
@@ -66,7 +107,7 @@ export class LanceVectorStore extends MastraVector<LanceVectorFilter> {
    * const store = await LanceVectorStore.create('s3://bucket/db', { storageOptions: { timeout: '60s' } });
    * ```
    */
-  public static async create(uri: string, options?: ConnectionOptions & { id: string }): Promise<LanceVectorStore> {
+  public static async create(uri: string, options?: ConnectionOptions & { id?: string }): Promise<LanceVectorStore> {
     const instance = new LanceVectorStore(options?.id || crypto.randomUUID());
     try {
       instance.lanceClient = await connect(uri, options);
@@ -107,6 +148,7 @@ export class LanceVectorStore extends MastraVector<LanceVectorFilter> {
     topK = 10,
     columns = [],
     includeAllColumns = false,
+    metric,
   }: LanceQueryVectorParams): Promise<QueryResult[]> {
     // Default tableName to indexName for compatibility with the standard QueryVectorParams interface.
     // This allows Memory and other consumers to call query without explicitly providing tableName.
@@ -154,8 +196,18 @@ export class LanceVectorStore extends MastraVector<LanceVectorFilter> {
       // Open the table
       const table = await this.lanceClient.openTable(resolvedTableName);
 
-      // Create the query builder
-      let query = table.search(queryVector);
+      // Resolve the distance metric so `_distance` is computed consistently and can be
+      // converted into a similarity score. LanceDB defaults brute-force search to L2;
+      // setting the distance type explicitly keeps non-indexed tables consistent with the
+      // index metric and with how every other Mastra vector store reports scores.
+      const resolvedMetric = await this.resolveQueryMetric(table, {
+        columnName: tableName ? indexName : 'vector',
+        explicitMetric: metric,
+      });
+
+      // Create the query builder. `vectorSearch` returns a typed VectorQuery so the distance
+      // type can be set explicitly (unlike `search`, which may also return a full-text Query).
+      let query = table.vectorSearch(queryVector).distanceType(this.mastraMetricToLance(resolvedMetric));
 
       // Add filter if provided
       if (filter && Object.keys(filter).length > 0) {
@@ -186,6 +238,9 @@ export class LanceVectorStore extends MastraVector<LanceVectorFilter> {
         const selectColumns = [...columns];
         if (!selectColumns.includes('id')) {
           selectColumns.push('id');
+        }
+        if (!selectColumns.includes('_distance')) {
+          selectColumns.push('_distance');
         }
         query = query.select(selectColumns);
       }
@@ -219,7 +274,7 @@ export class LanceVectorStore extends MastraVector<LanceVectorFilter> {
                 : Array.from(result.vector as any[])
               : undefined,
           document: result.document,
-          score: result._distance,
+          score: this.distanceToScore(result._distance, resolvedMetric),
         };
       });
     } catch (error: any) {
@@ -232,6 +287,96 @@ export class LanceVectorStore extends MastraVector<LanceVectorFilter> {
         },
         error,
       );
+    }
+  }
+
+  /**
+   * Maps a Mastra distance metric to the LanceDB distance type.
+   */
+  private mastraMetricToLance(metric: MastraMetric): LanceDistanceType {
+    switch (metric) {
+      case 'euclidean':
+        return 'l2';
+      case 'dotproduct':
+        return 'dot';
+      case 'cosine':
+      default:
+        return 'cosine';
+    }
+  }
+
+  /**
+   * Determines the distance metric to use for a query.
+   *
+   * Precedence: the table's vector index metric wins when an index exists because
+   * LanceDB requires indexed searches to use the same distance type the index was
+   * trained with; otherwise an explicitly provided metric is used; otherwise it
+   * defaults to 'cosine'.
+   */
+  private async resolveQueryMetric(
+    table: Table,
+    {
+      columnName,
+      explicitMetric,
+    }: {
+      columnName: string;
+      explicitMetric?: MastraMetric;
+    },
+  ): Promise<MastraMetric> {
+    try {
+      const indices = await table.listIndices();
+      const matchingIndices = indices.filter(index => index.columns?.includes(columnName));
+      for (const index of matchingIndices.length > 0 ? matchingIndices : indices) {
+        const stats = await table.indexStats(index.name);
+        const resolved = this.lanceMetricToMastra(stats?.distanceType);
+        if (resolved) {
+          if (explicitMetric && explicitMetric !== resolved) {
+            this.logger.warn(
+              `Ignoring query metric "${explicitMetric}" because Lance index "${index.name}" uses "${resolved}".`,
+            );
+          }
+          return resolved;
+        }
+      }
+    } catch (error) {
+      this.logger.debug('Failed to resolve metric from Lance index stats.', error);
+    }
+
+    return explicitMetric ?? 'cosine';
+  }
+
+  private lanceMetricToMastra(metric?: string | null): MastraMetric | undefined {
+    switch (metric) {
+      case 'l2':
+        return 'euclidean';
+      case 'dot':
+        return 'dotproduct';
+      case 'cosine':
+        return 'cosine';
+      default:
+        return undefined;
+    }
+  }
+
+  /**
+   * Converts a LanceDB `_distance` (smaller = more similar) into a Mastra similarity
+   * `score` (larger = more similar), consistent with every other Mastra vector store.
+   *
+   * - cosine: LanceDB returns cosine distance (`1 - cosine_similarity`), so `1 - distance`
+   *   recovers the cosine similarity.
+   * - dotproduct: LanceDB's dot distance is `1 - dot_product`, so `1 - distance` recovers
+   *   the dot product (matching `@mastra/pg`).
+   * - euclidean: LanceDB returns squared L2 distance for `l2`, so use its square root
+   *   before mapping into (0, 1] (matching `@mastra/pg`).
+   */
+  private distanceToScore(distance: number, metric: MastraMetric): number {
+    switch (metric) {
+      case 'euclidean':
+        return 1 / (1 + Math.sqrt(distance));
+      case 'dotproduct':
+      case 'cosine':
+      default:
+        return 1 - distance;
     }
   }
 
@@ -577,6 +722,12 @@ export class LanceVectorStore extends MastraVector<LanceVectorFilter> {
       );
     }
 
+    if (indexConfig.type === 'ivfflat' && indexConfig.numSubVectors !== undefined) {
+      this.logger.warn(
+        `numSubVectors is ignored for 'ivfflat' indexes. Use type 'ivfpq' for product-quantized IVF indexes.`,
+      );
+    }
+
     try {
       const tables = await this.lanceClient.tableNames();
       let table: Table;
@@ -608,20 +759,10 @@ export class LanceVectorStore extends MastraVector<LanceVectorFilter> {
         // Table is now empty; index will be created when data is upserted and row count >= 256
         this.logger.debug(`Table ${resolvedTableName} created. Index creation deferred until data is available.`);
         return;
-      } else {
-        table = await this.lanceClient.openTable(resolvedTableName);
       }
+      table = await this.lanceClient.openTable(resolvedTableName);
 
-      // Convert metric to LanceDB metric
-      type LanceMetric = 'cosine' | 'l2' | 'dot';
-      let metricType: LanceMetric | undefined;
-      if (metric === 'euclidean') {
-        metricType = 'l2';
-      } else if (metric === 'dotproduct') {
-        metricType = 'dot';
-      } else if (metric === 'cosine') {
-        metricType = 'cosine';
-      }
+      const metricType = this.mastraMetricToLance(metric);
 
       // Check row count - LanceDB requires at least 256 rows for IVF_HNSW_PQ index
       const rowCount = await table.countRows();
@@ -632,24 +773,58 @@ export class LanceVectorStore extends MastraVector<LanceVectorFilter> {
         return;
       }
 
+      const numPartitions = indexConfig.numPartitions || 128;
+      const buildParams =
+        indexConfig.type === 'ivfflat'
+          ? { numPartitions }
+          : indexConfig.type === 'ivfpq'
+            ? { numPartitions, numSubVectors: indexConfig.numSubVectors || 16 }
+            : { m: indexConfig?.hnsw?.m || 16, efConstruction: indexConfig?.hnsw?.efConstruction || 100 };
+      const fingerprintType =
+        indexConfig.type === 'ivfflat' ? 'ivf_flat' : indexConfig.type === 'ivfpq' ? 'ivf_pq' : 'hnsw_pq';
+      const fingerprint = JSON.stringify({ type: fingerprintType, metric: metricType, ...buildParams });
+
+      // Skip the rebuild when the index on this column is the one we last built with identical settings.
+      // LanceDB index stats don't expose build params, so the fingerprint and index UUID are persisted on
+      // the column's field metadata. Missing, mismatched, or externally replaced indexes are rebuilt.
+      const existingIndex = (await table.listIndices()).find(index => index.columns.includes(columnToIndex));
+      if (existingIndex?.indexUuid) {
+        const field = (await table.schema()).fields.find(f => f.name === columnToIndex);
+        if (
+          field?.metadata.get(LANCE_INDEX_FINGERPRINT_KEY) === fingerprint &&
+          field.metadata.get(LANCE_INDEX_UUID_KEY) === existingIndex.indexUuid
+        ) {
+          this.logger.debug(`Index ${existingIndex.name} on ${resolvedTableName} is unchanged. Skipping rebuild.`);
+          return;
+        }
+      }
+
       if (indexConfig.type === 'ivfflat') {
         await table.createIndex(columnToIndex, {
-          config: Index.ivfPq({
-            numPartitions: indexConfig.numPartitions || 128,
-            numSubVectors: indexConfig.numSubVectors || 16,
-            distanceType: metricType,
-          }),
+          config: Index.ivfFlat({ numPartitions, distanceType: metricType }),
+        });
+      } else if (indexConfig.type === 'ivfpq') {
+        await table.createIndex(columnToIndex, {
+          config: Index.ivfPq({ ...buildParams, distanceType: metricType }),
         });
       } else {
         // Default to HNSW PQ index
         this.logger.debug('Creating HNSW PQ index with config:', indexConfig);
         await table.createIndex(columnToIndex, {
-          config: Index.hnswPq({
-            m: indexConfig?.hnsw?.m || 16,
-            efConstruction: indexConfig?.hnsw?.efConstruction || 100,
-            distanceType: metricType,
-          }),
+          config: Index.hnswPq({ ...buildParams, distanceType: metricType }),
         });
+      }
+
+      // Only record the fingerprint for an index this call actually produced. If the index is replaced after
+      // this write, the UUID check above no longer matches and the next call rebuilds.
+      const builtUuid = (await table.listIndices()).find(index => index.columns.includes(columnToIndex))?.indexUuid;
+      if (builtUuid && builtUuid !== existingIndex?.indexUuid) {
+        await table.updateFieldMetadata([
+          {
+            path: columnToIndex,
+            metadata: { [LANCE_INDEX_FINGERPRINT_KEY]: fingerprint, [LANCE_INDEX_UUID_KEY]: builtUuid },
+          },
+        ]);
       }
     } catch (error: any) {
       throw new MastraError(
@@ -744,7 +919,7 @@ export class LanceVectorStore extends MastraVector<LanceVectorFilter> {
 
           return {
             dimension: dimension,
-            metric: stats.distanceType as 'cosine' | 'euclidean' | 'dotproduct' | undefined,
+            metric: this.lanceMetricToMastra(stats.distanceType),
             count: stats.numIndexedRows,
           };
         }
@@ -806,6 +981,154 @@ export class LanceVectorStore extends MastraVector<LanceVectorFilter> {
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
           details: { indexName },
+        },
+        error,
+      );
+    }
+  }
+
+  private async openExistingTable(
+    { tableName, indexName }: LanceTableTargetParams,
+    operation: string,
+  ): Promise<{ table: Table; resolvedTableName: string }> {
+    const resolvedTableName = tableName ?? indexName;
+    let validationError: string | undefined;
+    if (!this.lanceClient) {
+      validationError = 'LanceDB client not initialized. Use LanceVectorStore.create() to create an instance';
+    } else if (!resolvedTableName) {
+      validationError = 'tableName or indexName is required';
+    }
+    if (validationError || !resolvedTableName || !this.lanceClient) {
+      throw new MastraError({
+        id: createVectorErrorId('LANCE', operation, 'INVALID_ARGS'),
+        text: validationError,
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.USER,
+        details: { tableName: resolvedTableName ?? '' },
+      });
+    }
+
+    let tableExists: boolean;
+    try {
+      tableExists = (await this.lanceClient.tableNames()).includes(resolvedTableName);
+      if (tableExists) {
+        return { table: await this.lanceClient.openTable(resolvedTableName), resolvedTableName };
+      }
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createVectorErrorId('LANCE', operation, 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { tableName: resolvedTableName },
+        },
+        error,
+      );
+    }
+    throw new MastraError({
+      id: createVectorErrorId('LANCE', operation, 'INVALID_ARGS'),
+      text: `Table ${resolvedTableName} does not exist`,
+      domain: ErrorDomain.STORAGE,
+      category: ErrorCategory.USER,
+      details: { tableName: resolvedTableName },
+    });
+  }
+
+  /**
+   * Runs LanceDB table maintenance: compacts fragments, adds unindexed rows to existing indexes
+   * (without retraining them), and prunes old table versions.
+   *
+   * Never runs implicitly. Concurrent calls for the same table share a single in-flight run.
+   */
+  async optimize(params: LanceOptimizeParams): Promise<OptimizeStats> {
+    const key = params.tableName ?? params.indexName;
+    const inFlight = key ? this.optimizeInFlight.get(key) : undefined;
+    if (inFlight) {
+      return inFlight;
+    }
+
+    // Registered before the async table lookup so concurrent callers always share one run.
+    const run = (async () => {
+      try {
+        const { table, resolvedTableName } = await this.openExistingTable(params, 'OPTIMIZE');
+        try {
+          // Indexes whose UUID matches the one createIndex() recorded; optimize may assign new UUIDs
+          // without retraining, so carry the record forward instead of forcing a rebuild later.
+          const schema = await table.schema();
+          const tracked = (await table.listIndices()).filter(index =>
+            index.columns.some(
+              column =>
+                schema.fields.find(f => f.name === column)?.metadata.get(LANCE_INDEX_UUID_KEY) === index.indexUuid,
+            ),
+          );
+
+          const stats = await table.optimize({
+            ...(params.cleanupOlderThan ? { cleanupOlderThan: params.cleanupOlderThan } : {}),
+            deleteUnverified: params.deleteUnverified ?? false,
+          });
+
+          if (tracked.length) {
+            const after = await table.listIndices();
+            const updates = tracked.flatMap(before => {
+              const current = after.find(index => index.name === before.name);
+              return current?.indexUuid && current.indexUuid !== before.indexUuid
+                ? before.columns.map(path => ({ path, metadata: { [LANCE_INDEX_UUID_KEY]: current.indexUuid! } }))
+                : [];
+            });
+            if (updates.length) await table.updateFieldMetadata(updates);
+          }
+
+          return stats;
+        } catch (error) {
+          throw new MastraError(
+            {
+              id: createVectorErrorId('LANCE', 'OPTIMIZE', 'FAILED'),
+              domain: ErrorDomain.STORAGE,
+              category: ErrorCategory.THIRD_PARTY,
+              details: { tableName: resolvedTableName },
+            },
+            error,
+          );
+        }
+      } finally {
+        if (key) this.optimizeInFlight.delete(key);
+      }
+    })();
+
+    if (key) this.optimizeInFlight.set(key, run);
+    return run;
+  }
+
+  /**
+   * Reports how many rows each index on a table covers. Rows written after an index was built
+   * stay unindexed until `optimize()` runs; use this to decide when to optimize.
+   */
+  async getIndexCoverage(params: LanceTableTargetParams): Promise<LanceIndexCoverage[]> {
+    const { table, resolvedTableName } = await this.openExistingTable(params, 'GET_INDEX_COVERAGE');
+
+    try {
+      const indices = await table.listIndices();
+      const coverage: LanceIndexCoverage[] = [];
+      for (const index of indices) {
+        const stats = await table.indexStats(index.name);
+        // Undefined means the index was dropped after listIndices(); reporting zeros would hide real coverage.
+        if (!stats) continue;
+        coverage.push({
+          indexName: index.name,
+          indexType: stats.indexType,
+          columns: index.columns,
+          numIndexedRows: stats.numIndexedRows,
+          numUnindexedRows: stats.numUnindexedRows,
+        });
+      }
+      return coverage;
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createVectorErrorId('LANCE', 'GET_INDEX_COVERAGE', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { tableName: resolvedTableName },
         },
         error,
       );
@@ -990,16 +1313,15 @@ export class LanceVectorStore extends MastraVector<LanceVectorFilter> {
                     // If we're about to update this vector anyway, use the new value
                     if (update.vector) {
                       rowData[key] = update.vector;
-                    } else {
+                    } else if (Array.isArray(value)) {
                       // Ensure vector is a plain array
-                      if (Array.isArray(value)) {
-                        rowData[key] = [...value];
-                      } else if (typeof value === 'object' && value !== null) {
-                        // Handle vector objects by converting to array if needed
-                        rowData[key] = Array.from(value as any[]);
-                      } else {
-                        rowData[key] = value;
-                      }
+
+                      rowData[key] = [...value];
+                    } else if (typeof value === 'object' && value !== null) {
+                      // Handle vector objects by converting to array if needed
+                      rowData[key] = Array.from(value as any[]);
+                    } else {
+                      rowData[key] = value;
                     }
                   } else {
                     rowData[key] = value;

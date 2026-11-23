@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import type { UIMessage, CoreMessage, Message } from '@internal/ai-sdk-v4';
 import { appendClientMessage, appendResponseMessages } from '@internal/ai-sdk-v4';
 import { describe, expect, it } from 'vitest';
@@ -775,7 +774,7 @@ describe('MessageList', () => {
       // msg2
       messages = appendResponseMessages({
         messages,
-        responseMessages: [{ ...msg2, id: randomUUID() }],
+        responseMessages: [{ ...msg2, id: globalThis.crypto.randomUUID() }],
       });
       // Filter out tool invocations with state="call" from expected UI messages
       const expectedUIMessages = messages.map(m => {
@@ -794,7 +793,10 @@ describe('MessageList', () => {
       expect(list.get.all.ui()).toEqual(expectedUIMessages);
 
       // msg3
-      messages = appendResponseMessages({ messages, responseMessages: [{ id: randomUUID(), ...msg3 }] });
+      messages = appendResponseMessages({
+        messages,
+        responseMessages: [{ id: globalThis.crypto.randomUUID(), ...msg3 }],
+      });
       expect(new MessageList().add(messages, 'response').get.all.ui()).toMatchObject([
         expect.objectContaining({
           role: 'user',
@@ -931,7 +933,7 @@ describe('MessageList', () => {
               expect.objectContaining({
                 type: 'reasoning',
                 createdAt: expect.any(Number),
-                reasoning: '',
+                reasoning: 'Step 1: Analyze',
                 details: [{ type: 'text', text: 'Step 1: Analyze', signature: 'sig-a' }],
               }),
               expect.objectContaining({
@@ -1011,7 +1013,7 @@ describe('MessageList', () => {
               expect.objectContaining({
                 type: 'reasoning',
                 createdAt: expect.any(Number),
-                reasoning: '',
+                reasoning: 'Analyzing data...',
                 details: [{ type: 'text', text: 'Analyzing data...', signature: 'sig-b' }],
               }),
               expect.objectContaining({
@@ -1225,7 +1227,7 @@ describe('MessageList', () => {
               expect.objectContaining({
                 type: 'reasoning',
                 createdAt: expect.any(Number),
-                reasoning: '',
+                reasoning: 'First, I need to gather some data.',
                 details: [{ type: 'text', text: 'First, I need to gather some data.', signature: 'sig-gather' }],
               }),
               expect.objectContaining({ type: 'text', text: 'Calling data tool...', createdAt: expect.any(Number) }),
@@ -1244,7 +1246,7 @@ describe('MessageList', () => {
               expect.objectContaining({
                 type: 'reasoning',
                 createdAt: expect.any(Number),
-                reasoning: '',
+                reasoning: 'Data gathered, now processing.',
                 details: [{ type: 'text', text: 'Data gathered, now processing.', signature: 'sig-process' }],
               }),
               expect.objectContaining({
@@ -1269,6 +1271,80 @@ describe('MessageList', () => {
         } satisfies MastraDBMessage,
       ]);
     });
+
+    describe('steps that open with a tool call', () => {
+      const call = (toolCallId: string, toolName: string) =>
+        ({ type: 'tool-call', toolCallId, toolName, input: {} }) as const;
+      const result = (toolCallId: string, toolName: string) =>
+        ({ type: 'tool-result', toolCallId, toolName, output: { type: 'json', value: {} } }) as const;
+      const describePrompt = (list: MessageList) =>
+        list.get.all.aiV5
+          .model()
+          .map(
+            m =>
+              `${m.role}[${typeof m.content === 'string' ? 'text' : m.content.map(p => ('toolName' in p ? p.toolName : p.type))}]`,
+          );
+
+      it('keeps a step that opens with a tool call separate from the previous step', () => {
+        const list = new MessageList({ threadId, resourceId });
+        list.add({ role: 'user', content: 'list my items, then check the first one' }, 'input');
+        list.add({ role: 'assistant', content: [call('A', 'list_items')] } satisfies AIV5Type.ModelMessage, 'response');
+        list.add({ role: 'tool', content: [result('A', 'list_items')] } satisfies AIV5Type.ModelMessage, 'response');
+        list.add({ role: 'assistant', content: [call('B', 'get_item')] } satisfies AIV5Type.ModelMessage, 'response');
+        list.add({ role: 'tool', content: [result('B', 'get_item')] } satisfies AIV5Type.ModelMessage, 'response');
+
+        expect(describePrompt(list)).toEqual([
+          'user[text]',
+          'assistant[list_items]',
+          'tool[list_items]',
+          'assistant[get_item]',
+          'tool[get_item]',
+        ]);
+      });
+
+      it('keeps parallel tool calls from one step together', () => {
+        const list = new MessageList({ threadId, resourceId });
+        list.add({ role: 'user', content: 'check both items' }, 'input');
+        list.add(
+          {
+            role: 'assistant',
+            content: [call('A', 'get_item'), call('B', 'get_status')],
+          } satisfies AIV5Type.ModelMessage,
+          'response',
+        );
+        list.add(
+          {
+            role: 'tool',
+            content: [result('A', 'get_item'), result('B', 'get_status')],
+          } satisfies AIV5Type.ModelMessage,
+          'response',
+        );
+
+        expect(describePrompt(list)).toEqual([
+          'user[text]',
+          'assistant[get_item,get_status]',
+          'tool[get_item,get_status]',
+        ]);
+      });
+    });
+
+    it.each(['https://example.com/leads.csv', 'data:text/csv;base64,bmFtZQpBY21l', 'bmFtZQpBY21l'])(
+      'preserves attachment filenames in UI messages after storage round-trip: %s',
+      data => {
+        const list = new MessageList({ threadId, resourceId }).add(
+          {
+            role: 'user',
+            content: [{ type: 'file', mimeType: 'text/csv', data, filename: 'leads.csv' }],
+          } satisfies VercelCoreMessage,
+          'input',
+        );
+        const restored = new MessageList({ threadId, resourceId }).add(list.get.all.db(), 'memory');
+
+        expect(restored.get.all.aiV5.ui()[0]?.parts).toEqual([
+          expect.objectContaining({ type: 'file', filename: 'leads.csv', mediaType: 'text/csv' }),
+        ]);
+      },
+    );
 
     it('should correctly convert a Mastra V1 MessageType with a file part containing a non-data URL', () => {
       const inputV1Message = {
@@ -1716,7 +1792,7 @@ describe('MessageList', () => {
             parts: [
               {
                 type: 'reasoning',
-                reasoning: '',
+                reasoning: 'First, I need to gather some data.',
                 details: [{ type: 'text', text: 'First, I need to gather some data.', signature: 'sig-gather' }],
               },
               { type: 'text', text: 'Gathering data...' },
@@ -1731,7 +1807,7 @@ describe('MessageList', () => {
               },
               {
                 type: 'reasoning',
-                reasoning: '',
+                reasoning: 'Data gathered, now I will process it.',
                 details: [{ type: 'text', text: 'Data gathered, now I will process it.', signature: 'sig-process' }],
               },
             ],
@@ -1893,13 +1969,13 @@ describe('MessageList', () => {
             parts: [
               {
                 type: 'reasoning',
-                reasoning: '',
+                reasoning: 'Thinking step 1...',
                 details: [{ type: 'text', text: 'Thinking step 1...', signature: 'sig-1' }],
               },
               { type: 'reasoning', reasoning: '', details: [{ type: 'redacted', data: 'some hidden data' }] },
               {
                 type: 'reasoning',
-                reasoning: '',
+                reasoning: 'Final thought.',
                 details: [{ type: 'text', text: 'Final thought.', signature: 'sig-2' }],
               },
             ],
@@ -2188,7 +2264,7 @@ describe('MessageList', () => {
       ];
       expect(uiMessages).toEqual(expectedMessages);
 
-      let newId = randomUUID();
+      let newId = globalThis.crypto.randomUUID();
       const responseMessages = [
         {
           id: newId,
@@ -2223,7 +2299,7 @@ describe('MessageList', () => {
       ]);
 
       const newClientMessage = {
-        id: randomUUID(),
+        id: globalThis.crypto.randomUUID(),
         role: 'user',
         createdAt: new Date(),
         content: 'Do it anyway please',
@@ -2243,14 +2319,14 @@ describe('MessageList', () => {
       );
 
       const responseMessages2 = [
-        { id: randomUUID(), role: 'assistant', content: "Ok fine I'll call a tool then" },
+        { id: globalThis.crypto.randomUUID(), role: 'assistant', content: "Ok fine I'll call a tool then" },
         {
-          id: randomUUID(),
+          id: globalThis.crypto.randomUUID(),
           role: 'assistant',
           content: [{ type: 'tool-call', args: { ok: 'fine' }, toolCallId: 'ok-fine-1', toolName: 'okFineTool' }],
         },
         {
-          id: randomUUID(),
+          id: globalThis.crypto.randomUUID(),
           role: 'tool',
           content: [{ type: 'tool-result', toolName: 'okFineTool', toolCallId: 'ok-fine-1', result: { lets: 'go' } }],
         },
@@ -2538,6 +2614,7 @@ describe('MessageList', () => {
             result: 123,
             step: undefined,
           },
+          updatedAt: expect.any(Number),
         },
       ]);
     });
@@ -2591,6 +2668,7 @@ describe('MessageList', () => {
             result: 42,
             step: undefined,
           },
+          updatedAt: expect.any(Number),
         },
       ]);
     });
@@ -2691,6 +2769,7 @@ describe('MessageList', () => {
             result: 100,
             step: undefined,
           },
+          updatedAt: expect.any(Number),
         },
       ]);
     });
@@ -2736,6 +2815,7 @@ describe('MessageList', () => {
         {
           type: 'tool-invocation',
           toolInvocation: { state: 'result', toolCallId: 'B', toolName: 'bar', args: {}, result: 7 },
+          updatedAt: expect.any(Number),
         },
       ]);
     });
@@ -2783,6 +2863,7 @@ describe('MessageList', () => {
         {
           type: 'tool-invocation',
           toolInvocation: { state: 'result', toolCallId: 'call-4', toolName: 'baz', args: {}, result: 5 },
+          updatedAt: expect.any(Number),
         },
       ]);
     });
@@ -2849,6 +2930,7 @@ describe('MessageList', () => {
         {
           type: 'tool-invocation',
           toolInvocation: { state: 'result', toolCallId: 'call-5', toolName: 'foo', args: {}, result: 123 },
+          updatedAt: expect.any(Number),
         },
       ]);
     });
@@ -4281,10 +4363,10 @@ describe('MessageList', () => {
   });
 
   describe('replaceAllSystemMessages', () => {
-    it('should replace all system messages with new ones', () => {
+    it('should replace untagged system messages and preserve tagged ones', () => {
       const list = new MessageList();
       list.addSystem('Original instruction 1');
-      list.addSystem('Original instruction 2', 'memory');
+      list.addSystem('Memory context', 'memory');
 
       const newSystemMessages: AIV4Type.CoreSystemMessage[] = [
         { role: 'system', content: 'New instruction 1' },
@@ -4293,13 +4375,11 @@ describe('MessageList', () => {
 
       list.replaceAllSystemMessages(newSystemMessages);
 
-      const systemMessages = list.getAllSystemMessages();
-      expect(systemMessages).toHaveLength(2);
-      expect(systemMessages[0].content).toBe('New instruction 1');
-      expect(systemMessages[1].content).toBe('New instruction 2');
+      expect(list.getSystemMessages().map(m => m.content)).toEqual(['New instruction 1', 'New instruction 2']);
+      expect(list.getSystemMessages('memory').map(m => m.content)).toEqual(['Memory context']);
     });
 
-    it('should clear all existing system messages including tagged ones', () => {
+    it('should preserve tagged system messages when called with an empty array', () => {
       const list = new MessageList();
       list.addSystem('Instruction');
       list.addSystem('Memory context', 'memory');
@@ -4307,8 +4387,9 @@ describe('MessageList', () => {
 
       list.replaceAllSystemMessages([]);
 
-      const systemMessages = list.getAllSystemMessages();
-      expect(systemMessages).toHaveLength(0);
+      expect(list.getSystemMessages()).toHaveLength(0);
+      expect(list.getSystemMessages('memory').map(m => m.content)).toEqual(['Memory context']);
+      expect(list.getSystemMessages('user-provided').map(m => m.content)).toEqual(['User provided']);
     });
 
     it('should not affect non-system messages', () => {
@@ -4406,6 +4487,76 @@ describe('MessageList', () => {
       const uiMessages = list.get.all.ui();
       expect(uiMessages).toHaveLength(1);
       expect(uiMessages[0].content).toBe('Content with empty parts');
+    });
+  });
+
+  describe('response iteration splitting', () => {
+    const createSplitList = () => {
+      const list = new MessageList({ generateMessageId: () => 'current-response' });
+      list.add(
+        {
+          id: 'response',
+          role: 'assistant',
+          createdAt: new Date(),
+          content: {
+            format: 2,
+            parts: [
+              { type: 'reasoning', reasoning: 'thinking' },
+              { type: 'text', text: 'answer' },
+            ],
+          },
+        },
+        'response',
+      );
+      return list;
+    };
+
+    it('keeps the original id on persisted parts while the processor split is live', () => {
+      const list = createSplitList();
+
+      expect(list.splitResponseMessageAtPartOffset('response', 1)).toEqual({
+        earlierMessageId: 'response',
+        currentMessageId: 'current-response',
+      });
+      expect(list.get.response.db().map(message => message.id)).toEqual(['response', 'current-response']);
+
+      const persistenceList = list.cloneForPersistence();
+      expect(persistenceList.get.response.db()).toMatchObject([
+        {
+          id: 'response',
+          content: {
+            parts: [
+              { type: 'reasoning', reasoning: 'thinking' },
+              { type: 'text', text: 'answer' },
+            ],
+          },
+        },
+      ]);
+    });
+
+    it('keeps the original id when the current iteration is removed', () => {
+      const list = createSplitList();
+      const split = list.splitResponseMessageAtPartOffset('response', 1)!;
+
+      list.removeByIds([split.currentMessageId]);
+      list.coalesceSplitResponseMessages(split.earlierMessageId, split.currentMessageId);
+
+      expect(list.get.response.db().map(message => message.id)).toEqual(['response']);
+    });
+
+    it('hands the original id to the current iteration when earlier parts are removed', () => {
+      const list = createSplitList();
+      const split = list.splitResponseMessageAtPartOffset('response', 1)!;
+
+      list.removeByIds([split.earlierMessageId]);
+      list.coalesceSplitResponseMessages(split.earlierMessageId, split.currentMessageId);
+
+      expect(list.get.response.db()).toMatchObject([
+        {
+          id: 'response',
+          content: { parts: [{ type: 'text', text: 'answer' }] },
+        },
+      ]);
     });
   });
 });

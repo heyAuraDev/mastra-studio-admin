@@ -12,11 +12,6 @@ describe('VARIABLE_PATTERN', () => {
     return matches;
   };
 
-  it('should match simple variable names', () => {
-    const text = '{{userName}}';
-    expect(matchAll(text)).toEqual(['{{userName}}']);
-  });
-
   it('should match variables starting with underscore', () => {
     const text = '{{_privateVar}}';
     expect(matchAll(text)).toEqual(['{{_privateVar}}']);
@@ -57,15 +52,24 @@ describe('VARIABLE_PATTERN', () => {
     expect(matchAll(text)).toEqual([]);
   });
 
-  it('should match in markdown context', () => {
-    const text = `# Instructions
+  it('should match a dotted path', () => {
+    expect(matchAll('{{user.name}}')).toEqual(['{{user.name}}']);
+  });
 
-You are helping {{userName}} at {{companyName}}.
+  it('should match a deeply dotted path', () => {
+    expect(matchAll('{{context.user.profile.name}}')).toEqual(['{{context.user.profile.name}}']);
+  });
 
-## Context
-- Role: {{userRole}}
-- Language: {{preferredLanguage}}`;
+  it('should not match a path segment starting with a digit', () => {
+    expect(matchAll('{{user.1name}}')).toEqual([]);
+  });
 
-    expect(matchAll(text)).toEqual(['{{userName}}', '{{companyName}}', '{{userRole}}', '{{preferredLanguage}}']);
+  it('should not match a path segment with special characters', () => {
+    expect(matchAll('{{user.n--}}')).toEqual([]);
+    expect(matchAll('{{user.first-name}}')).toEqual([]);
+  });
+
+  it('should not match a trailing dot', () => {
+    expect(matchAll('{{user.}}')).toEqual([]);
   });
 });

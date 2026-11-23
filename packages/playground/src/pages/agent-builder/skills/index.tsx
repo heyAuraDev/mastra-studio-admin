@@ -1,0 +1,193 @@
+import type { StoredSkillResponse } from '@mastra/client-js';
+import { ActionRow } from '@mastra/playground-ui/components/ActionRow';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { EmptyState } from '@mastra/playground-ui/components/EmptyState';
+import { PageHeader } from '@mastra/playground-ui/components/PageHeader';
+import { PageLayout } from '@mastra/playground-ui/components/PageLayout';
+import { SearchInput, listSearchProps } from '@mastra/playground-ui/components/SearchInput';
+import { PermissionDenied } from '@mastra/playground-ui/domains/auth/components/permission-denied';
+import { SessionExpired } from '@mastra/playground-ui/domains/auth/components/session-expired';
+import { IconArrowInbox } from '@mastra/playground-ui/icons/central/IconArrowInbox';
+import { IconPlusMedium } from '@mastra/playground-ui/icons/central/IconPlusMedium';
+import { IconSparklesTwo } from '@mastra/playground-ui/icons/central/IconSparklesTwo';
+import { is401UnauthorizedError, is403ForbiddenError } from '@mastra/playground-ui/utils/errors';
+import { useStoredSkills } from '@mastra/react/hooks/agents';
+import { useCurrentUser } from '@mastra/react/hooks/auth';
+import { useMemo, useState } from 'react';
+import { useNavigate } from 'react-router';
+import { toast } from 'sonner';
+import { BuilderAddSkillDialog } from '@/domains/agent-builder/components/skill-list/builder-add-skill-dialog';
+import {
+  SkillBuilderList,
+  SkillBuilderListSkeleton,
+} from '@/domains/agent-builder/components/skill-list/skill-builder-list';
+import { useBuilderRegistries } from '@/domains/agent-builder/hooks/use-builder-registries';
+import { usePermissions } from '@/domains/auth/hooks/use-permissions';
+
+export default function AgentBuilderSkillsPage() {
+  const navigate = useNavigate();
+  const { isLoading: isCurrentUserLoading } = useCurrentUser();
+  const { hasPermission, rbacEnabled } = usePermissions();
+  const canWriteSkills = !rbacEnabled || hasPermission('stored-skills:write');
+  const canReadSkills = !rbacEnabled || hasPermission('stored-skills:read');
+  const [registryDialog, setRegistryDialog] = useState<{ id: string; label: string } | null>(null);
+
+  const goToCreate = () => navigate('/agent-builder/skills/create', { viewTransition: true });
+  const goToEdit = (skillId: string) => navigate(`/agent-builder/skills/${skillId}/edit`, { viewTransition: true });
+
+  const { data, isLoading, error } = useStoredSkills({ queryOptions: { enabled: !isCurrentUserLoading } });
+  const [search, setSearch] = useState('');
+
+  const skills = useMemo(() => data?.skills ?? [], [data?.skills]);
+  const installedSkillIds = useMemo(() => skills.map(s => s.id), [skills]);
+
+  // Surface registry browse only for users who can read AND write skills, and
+  // only when at least one registry is actually enabled. This is the gate
+  // requested in COR-832: invisible when there's nothing useful to do.
+  const { data: registriesData } = useBuilderRegistries({ enabled: canReadSkills && canWriteSkills });
+  const enabledRegistry = useMemo(() => registriesData?.registries.find(r => r.enabled) ?? null, [registriesData]);
+
+  const handleSkillClick = (skill: StoredSkillResponse) => {
+    void goToEdit(skill.id);
+  };
+
+  const body = (() => {
+    if (isCurrentUserLoading || isLoading) {
+      return <SkillBuilderListSkeleton />;
+    }
+
+    if (error) {
+      if (is401UnauthorizedError(error)) {
+        return (
+          <div className="flex items-center justify-center pt-10">
+            <SessionExpired />
+          </div>
+        );
+      }
+      if (is403ForbiddenError(error)) {
+        return (
+          <div className="flex items-center justify-center pt-10">
+            <PermissionDenied resource="skills" />
+          </div>
+        );
+      }
+      return (
+        <div className="flex items-center justify-center pt-10">
+          <EmptyState tone="error" titleSlot="Failed to load skills" descriptionSlot={error.message} />
+        </div>
+      );
+    }
+
+    if (skills.length === 0) {
+      return (
+        <div className="flex items-center-safe justify-center-safe">
+          <EmptyState
+            titleSlot="No skills yet"
+            descriptionSlot="Create your first skill to give agents new capabilities."
+            actionSlot={
+              canWriteSkills ? (
+                <div className="flex items-center gap-2">
+                  <Button variant="primary" onClick={goToCreate} icon={<IconPlusMedium />}>
+                    New skill
+                  </Button>
+                  {enabledRegistry && (
+                    <Button
+                      variant="default"
+                      onClick={() => setRegistryDialog({ id: enabledRegistry.id, label: enabledRegistry.label })}
+                      icon={<IconArrowInbox />}
+                    >
+                      Browse registry
+                    </Button>
+                  )}
+                </div>
+              ) : undefined
+            }
+          />
+        </div>
+      );
+    }
+
+    return <SkillBuilderList skills={skills} search={search} onSkillClick={handleSkillClick} />;
+  })();
+
+  return (
+    <>
+      <PageLayout
+        variant="page"
+        actionRow={
+          <>
+            <ActionRow className="items-start">
+              <ActionRow.Start>
+                <PageHeader>
+                  <PageHeader.Title>
+                    <IconSparklesTwo /> My skills
+                  </PageHeader.Title>
+                  <PageHeader.Description>Skills you've created.</PageHeader.Description>
+                </PageHeader>
+              </ActionRow.Start>
+              {skills.length > 0 && canWriteSkills && (
+                <ActionRow.End>
+                  {enabledRegistry && (
+                    <Button
+                      variant="default"
+                      onClick={() => setRegistryDialog({ id: enabledRegistry.id, label: enabledRegistry.label })}
+                      icon={<IconArrowInbox />}
+                    >
+                      Browse registry
+                    </Button>
+                  )}
+                  <Button variant="primary" onClick={goToCreate} icon={<IconPlusMedium />}>
+                    New skill
+                  </Button>
+                </ActionRow.End>
+              )}
+            </ActionRow>
+            <ActionRow>
+              <ActionRow.Start>
+                <div className="max-w-120 flex-1">
+                  <SearchInput
+                    {...listSearchProps}
+                    onValueChange={setSearch}
+                    label="Search skills"
+                    placeholder="Search by name or description"
+                  />
+                </div>
+              </ActionRow.Start>
+            </ActionRow>
+          </>
+        }
+      >
+        {body}
+      </PageLayout>
+
+      {registryDialog && (
+        <BuilderAddSkillDialog
+          open={!!registryDialog}
+          onOpenChange={open => {
+            if (!open) setRegistryDialog(null);
+          }}
+          registryId={registryDialog.id}
+          registryLabel={registryDialog.label}
+          installedSkillIds={installedSkillIds}
+          onInstalled={storedSkillId => {
+            const installed = skills.find(s => s.id === storedSkillId);
+            toast.success(installed ? `Imported "${installed.name}"` : 'Skill imported');
+          }}
+          onCollision={skillName => {
+            const existing = skills.find(s => s.id === skillName || s.name === skillName);
+            if (existing) {
+              toast.error(`"${existing.name}" is already in your library`, {
+                action: {
+                  label: 'Open existing',
+                  onClick: () => goToEdit(existing.id),
+                },
+              });
+            } else {
+              toast.error(`A skill named "${skillName}" already exists.`);
+            }
+          }}
+        />
+      )}
+    </>
+  );
+}

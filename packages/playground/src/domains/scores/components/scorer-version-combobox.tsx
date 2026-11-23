@@ -1,17 +1,8 @@
-import { Badge, Combobox } from '@mastra/playground-ui';
-import type { ComboboxProps } from '@mastra/playground-ui';
-import { useScorerVersions } from '../hooks/use-scorer-versions';
-
-function formatTimestamp(isoString: string): string {
-  const date = new Date(isoString);
-  return date.toLocaleDateString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
-}
+import { Badge } from '@mastra/playground-ui/components/Badge';
+import { Combobox } from '@mastra/playground-ui/components/Combobox';
+import type { ComboboxProps } from '@mastra/playground-ui/components/Combobox';
+import { formatDate } from '@mastra/playground-ui/utils/date-format';
+import { useScorerVersions } from '@mastra/react/hooks/scores';
 
 export interface ScorerVersionComboboxProps {
   scorerId: string;
@@ -29,12 +20,13 @@ export function ScorerVersionCombobox({
   onValueChange,
   className,
   disabled = false,
-  variant = 'default',
+  variant,
   activeVersionId,
 }: ScorerVersionComboboxProps) {
   const { data, isLoading } = useScorerVersions({
     scorerId,
     params: { orderBy: { direction: 'DESC' } },
+    queryOptions: { enabled: !!scorerId },
   });
 
   const versions = data?.versions ?? [];
@@ -51,7 +43,7 @@ export function ScorerVersionCombobox({
       return {
         label: `v${version.versionNumber}`,
         value: version.id,
-        description: formatTimestamp(version.createdAt),
+        description: formatDate(version.createdAt, 'date-time') ?? '',
         end: isPublished ? (
           <Badge variant="success">Published</Badge>
         ) : isDraft ? (
@@ -67,7 +59,7 @@ export function ScorerVersionCombobox({
       value={value}
       onValueChange={onValueChange}
       placeholder={isLoading ? 'Loading versions...' : 'Versions'}
-      searchPlaceholder="Search versions..."
+      searchPlaceholder="Search versions"
       emptyText="No versions found."
       className={className}
       disabled={disabled || isLoading}

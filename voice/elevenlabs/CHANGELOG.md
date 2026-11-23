@@ -1,5 +1,121 @@
 # @mastra/voice-elevenlabs
 
+## 0.13.3
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+## 0.13.3-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+## 0.13.2
+
+### Patch Changes
+
+- Fixed `ElevenLabsVoice.listen()` to use `listeningModel.apiKey` (falling back to `ELEVENLABS_API_KEY`) instead of the speech key. A voice configured with only a listening key no longer throws on construction, and `getListener()` now reports `enabled: false` when no listening key is available. ([#27225](https://github.com/mastra-ai/mastra/pull/27225))
+
+  If you previously relied on `speechModel.apiKey` for transcription without setting `ELEVENLABS_API_KEY`, `listen()` now throws. Pass the key to the listening model as well:
+
+  ```ts
+  // Before
+  const voice = new ElevenLabsVoice({ speechModel: { apiKey: 'sk-...' } });
+
+  // After
+  const voice = new ElevenLabsVoice({
+    speechModel: { apiKey: 'sk-...' },
+    listeningModel: { apiKey: 'sk-...' },
+  });
+  ```
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 0.13.2-alpha.0
+
+### Patch Changes
+
+- Fixed `ElevenLabsVoice.listen()` to use `listeningModel.apiKey` (falling back to `ELEVENLABS_API_KEY`) instead of the speech key. A voice configured with only a listening key no longer throws on construction, and `getListener()` now reports `enabled: false` when no listening key is available. ([#27225](https://github.com/mastra-ai/mastra/pull/27225))
+
+  If you previously relied on `speechModel.apiKey` for transcription without setting `ELEVENLABS_API_KEY`, `listen()` now throws. Pass the key to the listening model as well:
+
+  ```ts
+  // Before
+  const voice = new ElevenLabsVoice({ speechModel: { apiKey: 'sk-...' } });
+
+  // After
+  const voice = new ElevenLabsVoice({
+    speechModel: { apiKey: 'sk-...' },
+    listeningModel: { apiKey: 'sk-...' },
+  });
+  ```
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 0.13.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 0.13.1-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+## 0.13.1-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 0.13.0
+
+### Minor Changes
+
+- Random bump ([#18178](https://github.com/mastra-ai/mastra/pull/18178))
+
+## 0.13.0-alpha.0
+
+### Minor Changes
+
+- Random bump ([#18178](https://github.com/mastra-ai/mastra/pull/18178))
+
+## 0.12.2
+
+### Patch Changes
+
+- Security remediation for the 2026-06-17 "easy-day-js" supply-chain incident. Patch bump to publish clean versions and move the `latest` dist-tag forward, superseding the compromised versions that declared the malicious `easy-day-js` dependency. ([#18056](https://github.com/mastra-ai/mastra/pull/18056))
+
+## 0.12.2-alpha.0
+
+### Patch Changes
+
+- Security remediation for the 2026-06-17 "easy-day-js" supply-chain incident. Patch bump to publish clean versions and move the `latest` dist-tag forward, superseding the compromised versions that declared the malicious `easy-day-js` dependency. ([#18056](https://github.com/mastra-ai/mastra/pull/18056))
+
+## 0.12.1
+
+### Patch Changes
+
+- Moved shared voice primitives and route metadata into the new `@internal/voice` package so voice providers no longer depend on `@mastra/core` and server voice routes share the same route definitions. ([#16725](https://github.com/mastra-ai/mastra/pull/16725))
+
+  `@mastra/core/voice` continues to re-export the voice APIs for backwards compatibility.
+
+## 0.12.1-alpha.0
+
+### Patch Changes
+
+- Moved shared voice primitives and route metadata into the new `@internal/voice` package so voice providers no longer depend on `@mastra/core` and server voice routes share the same route definitions. ([#16725](https://github.com/mastra-ai/mastra/pull/16725))
+
+  `@mastra/core/voice` continues to re-export the voice APIs for backwards compatibility.
+
 ## 0.12.0
 
 ### Minor Changes

@@ -1,4 +1,6 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { connect } from '@lancedb/lancedb';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
+import type { MockInstance } from 'vitest';
 import { LanceVectorStore } from './index';
 
 describe('Lance vector store tests', () => {
@@ -75,7 +77,7 @@ describe('Lance vector store tests', () => {
 
         const stats = await vectorDB.describeIndex({ indexName: indexOnColumn + '_idx' });
 
-        expect(stats?.metric).toBe('l2');
+        expect(stats?.metric).toBe('euclidean');
       });
 
       it('should default tableName to indexName when tableName is not provided', async () => {
@@ -192,7 +194,7 @@ describe('Lance vector store tests', () => {
         expect(stats).toBeDefined();
         expect(stats?.dimension).toBe(3);
         expect(stats?.count).toBe(300);
-        expect(stats?.metric).toBe('l2');
+        expect(stats?.metric).toBe('euclidean');
       });
 
       it('should throw error for non-existent index', async () => {
@@ -246,6 +248,85 @@ describe('Lance vector store tests', () => {
 
         await expect(vectorDB.deleteIndex({ indexName: nonExistentIndex })).rejects.toThrow('not found');
       });
+    });
+  });
+
+  describe('createIndex idempotency', () => {
+    const tableName = 'idempotent-index-' + Date.now();
+    let createIndexSpy: MockInstance;
+
+    beforeAll(async () => {
+      await vectorDB.createTable(
+        tableName,
+        Array.from({ length: 300 }, (_, i) => ({
+          id: String(i + 1),
+          vector: Array.from({ length: 16 }, () => Math.random()),
+        })),
+      );
+      const db = await connect(connectionString);
+      const table = await db.openTable(tableName);
+      createIndexSpy = vi.spyOn(Object.getPrototypeOf(table), 'createIndex');
+      table.close();
+    });
+
+    afterEach(() => {
+      createIndexSpy.mockClear();
+    });
+
+    afterAll(() => {
+      createIndexSpy.mockRestore();
+    });
+
+    const create = (metric: 'cosine' | 'euclidean', numPartitions?: number, numSubVectors?: number) =>
+      vectorDB.createIndex({
+        tableName,
+        indexName: 'vector',
+        dimension: 16,
+        metric,
+        indexConfig: { type: 'ivfflat', numPartitions, numSubVectors },
+      });
+
+    it('does not rebuild an unchanged index', async () => {
+      await create('cosine', 2, 4);
+      await create('cosine', 2, 4);
+      expect(createIndexSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('rebuilds once when a build parameter changes', async () => {
+      await create('cosine', 2, 4);
+      createIndexSpy.mockClear();
+      await create('cosine', 4, 4);
+      await create('cosine', 4, 4);
+      expect(createIndexSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('rebuilds once when the metric changes', async () => {
+      await create('cosine', 4, 4);
+      createIndexSpy.mockClear();
+      await create('euclidean', 4, 4);
+      await create('euclidean', 4, 4);
+      expect(createIndexSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('treats omitted params and explicit defaults as the same config', async () => {
+      await create('cosine');
+      await create('cosine', 128, 16);
+      expect(createIndexSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('rebuilds an index that was replaced outside of createIndex, then reuses it', async () => {
+      const db = await connect(connectionString);
+      const table = await db.openTable(tableName);
+      await table.createIndex('vector');
+      table.close();
+      createIndexSpy.mockClear();
+
+      await create('cosine');
+      await create('cosine');
+      expect(createIndexSpy).toHaveBeenCalledTimes(1);
+
+      const stats = await vectorDB.describeIndex({ indexName: 'vector_idx' });
+      expect(stats.count).toBe(300);
     });
   });
 
@@ -335,7 +416,7 @@ describe('Lance vector store tests', () => {
       });
 
       afterAll(async () => {
-        vectorDB.deleteTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should upsert vectors in an existing table', async () => {
@@ -498,7 +579,7 @@ describe('Lance vector store tests', () => {
       });
 
       afterAll(async () => {
-        vectorDB.deleteTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should query vectors from an existing table', async () => {
@@ -609,7 +690,7 @@ describe('Lance vector store tests', () => {
       });
 
       afterAll(async () => {
-        vectorDB.deleteTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should update vector and metadata by id', async () => {
@@ -839,7 +920,7 @@ describe('Lance vector store tests', () => {
       });
 
       afterAll(async () => {
-        vectorDB.deleteTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should delete vector and metadata by id', async () => {
@@ -921,7 +1002,7 @@ describe('Lance vector store tests', () => {
     });
 
     afterAll(async () => {
-      vectorDB.deleteTable(testTableName);
+      await vectorDB.deleteTable(testTableName);
     });
 
     it('should query vectors with metadata', async () => {
@@ -1121,7 +1202,7 @@ describe('Lance vector store tests', () => {
     });
 
     afterAll(async () => {
-      vectorDB.deleteTable(testTableName);
+      await vectorDB.deleteTable(testTableName);
     });
 
     describe('Simple queries', () => {
@@ -1203,7 +1284,7 @@ describe('Lance vector store tests', () => {
       });
 
       afterAll(async () => {
-        vectorDB.deleteTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should filter with negated equality (equivalent to $not)', async () => {
@@ -1291,7 +1372,7 @@ describe('Lance vector store tests', () => {
       });
 
       afterAll(async () => {
-        vectorDB.deleteTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should query with logical $or operator for metadata filtering', async () => {
@@ -1357,7 +1438,7 @@ describe('Lance vector store tests', () => {
       });
 
       afterAll(async () => {
-        vectorDB.deleteTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should query with $and operator using comparison operators', async () => {
@@ -1428,7 +1509,7 @@ describe('Lance vector store tests', () => {
       });
 
       afterAll(async () => {
-        vectorDB.deleteTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should query with array $in operator', async () => {
@@ -1510,7 +1591,7 @@ describe('Lance vector store tests', () => {
       });
 
       afterAll(async () => {
-        vectorDB.deleteTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should query with nested comparison and pattern matching', async () => {
@@ -1595,7 +1676,7 @@ describe('Lance vector store tests', () => {
       });
 
       afterAll(async () => {
-        vectorDB.deleteTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should query with regex pattern matching', async () => {
@@ -1701,7 +1782,7 @@ describe('Lance vector store tests', () => {
       });
 
       afterAll(async () => {
-        vectorDB.deleteTable(testTableName);
+        await vectorDB.deleteTable(testTableName);
       });
 
       it('should find documents with null fields using direct null comparison', async () => {
@@ -1837,6 +1918,39 @@ describe('Lance vector store tests', () => {
 
         // Cleanup
         await vectorDB.deleteTable(tableName);
+      });
+    });
+
+    describe('native index types', () => {
+      const createAndListIndexType = async (type: 'ivfflat' | 'ivfpq') => {
+        const tableName = `native_index_${type}_${Date.now()}`;
+        await vectorDB.createTable(
+          tableName,
+          Array.from({ length: 300 }, (_, i) => ({
+            id: String(i + 1),
+            vector: Array.from({ length: 16 }, () => Math.random()),
+          })),
+        );
+        await vectorDB.createIndex({
+          tableName,
+          indexName: 'vector',
+          dimension: 16,
+          metric: 'cosine',
+          indexConfig: { type, numPartitions: 1, numSubVectors: 2 },
+        });
+        const db = await connect(connectionString);
+        const indices = await (await db.openTable(tableName)).listIndices();
+        db.close();
+        await vectorDB.deleteTable(tableName);
+        return indices.find(index => index.columns.includes('vector'))?.indexType;
+      };
+
+      it("creates an IVF Flat index for type 'ivfflat'", async () => {
+        expect(await createAndListIndexType('ivfflat')).toBe('IvfFlat');
+      });
+
+      it("creates an IVF PQ index for type 'ivfpq'", async () => {
+        expect(await createAndListIndexType('ivfpq')).toBe('IvfPq');
       });
     });
 
@@ -2235,6 +2349,203 @@ describe('Lance vector store tests', () => {
         // Cleanup
         await vectorDB.deleteTable(tableName);
       });
+    });
+  });
+
+  describe('score semantics (similarity, not raw distance)', () => {
+    it('returns a higher score for the closer vector (cosine default)', async () => {
+      const tableName = 'score_semantics_cosine_' + Date.now();
+      await vectorDB.createIndex({ indexName: tableName, dimension: 3, metric: 'cosine' });
+      await vectorDB.upsert({
+        indexName: tableName,
+        vectors: [
+          [1, 0, 0],
+          [0, 1, 0],
+        ],
+        ids: ['exact', 'far'],
+      });
+
+      const results = await vectorDB.query({ indexName: tableName, queryVector: [1, 0, 0], topK: 2 });
+
+      const exact = results.find(r => r.id === 'exact')!;
+      const far = results.find(r => r.id === 'far')!;
+      expect(exact).toBeDefined();
+      expect(far).toBeDefined();
+      // Higher score = more similar; the exact match must rank first and outscore the far one.
+      expect(results[0].id).toBe('exact');
+      expect(exact.score).toBeGreaterThan(far.score);
+      // cosine similarity: identical -> 1, orthogonal -> 0
+      expect(exact.score).toBeCloseTo(1, 5);
+      expect(far.score).toBeCloseTo(0, 5);
+
+      await vectorDB.deleteTable(tableName);
+    });
+
+    it('maps euclidean distance into a descending (0, 1] score', async () => {
+      const tableName = 'score_semantics_euclidean_' + Date.now();
+      await vectorDB.createIndex({ indexName: tableName, dimension: 3, metric: 'euclidean' });
+      await vectorDB.upsert({
+        indexName: tableName,
+        vectors: [
+          [1, 0, 0],
+          [0, 1, 0],
+        ],
+        ids: ['exact', 'far'],
+      });
+
+      const results = await vectorDB.query({
+        indexName: tableName,
+        queryVector: [1, 0, 0],
+        topK: 2,
+        metric: 'euclidean',
+      });
+
+      const exact = results.find(r => r.id === 'exact')!;
+      const far = results.find(r => r.id === 'far')!;
+      expect(results[0].id).toBe('exact');
+      expect(exact.score).toBeGreaterThan(far.score);
+      // Lance l2 returns squared L2; score uses sqrt(distance) to match Mastra euclidean semantics.
+      expect(exact.score).toBeCloseTo(1, 5);
+      expect(far.score).toBeGreaterThan(0.4);
+      expect(far.score).toBeLessThan(0.5);
+      expect(exact.score).toBeLessThanOrEqual(1);
+      expect(far.score).toBeGreaterThan(0);
+      expect(far.score).toBeLessThan(1);
+
+      await vectorDB.deleteTable(tableName);
+    });
+
+    // The two tests below need a real Lance index (256+ rows required), so they seed 300 rows:
+    // one exact match, a small cluster of orthogonal "far" rows, and near-identical filler.
+    //
+    // The far position is seeded ten times (ids 2-11) rather than once. The index built here is
+    // an HNSW approximation: it does not promise to return every row even when topK covers the
+    // whole table, and a lone orthogonal outlier is precisely what graph traversal drops. Seeding
+    // a small cluster of near-identical far rows, each with a slight offset so they are distinct
+    // graph nodes, keeps the euclidean-vs-cosine discriminator below without making the assertion
+    // depend on any one row surviving recall. Even so, HNSW graph construction is randomized and
+    // on rare runs the entire far cluster ends up unreachable from the graph entry point, so the
+    // seed/index/query cycle is retried with a freshly trained index before failing.
+    const queryIndexedScoreSemantics = async (namePrefix: string, queryMetric?: 'cosine') => {
+      const FAR_ROW_COUNT = 10;
+      const rows = Array.from({ length: 300 }, (_, i) => ({
+        id: String(i + 1),
+        vector:
+          i === 0
+            ? [1, 0, 0, 0, 0, 0, 0, 0]
+            : i <= FAR_ROW_COUNT
+              ? [0, 1, i / 1000, 0, 0, 0, 0, 0]
+              : [0.2, 0.2, 0.2 + i / 1000, 0, 0, 0, 0, 0],
+      }));
+      const farIds = new Set(Array.from({ length: FAR_ROW_COUNT }, (_, i) => String(i + 2)));
+
+      const MAX_ATTEMPTS = 3;
+      for (let attempt = 1; ; attempt++) {
+        const tableName = `${namePrefix}_${Date.now()}_${attempt}`;
+        await vectorDB.createTable(tableName, rows);
+        try {
+          await vectorDB.createIndex({ tableName, indexName: 'vector', dimension: 8, metric: 'euclidean' });
+
+          const results = await vectorDB.query({
+            indexName: 'vector',
+            tableName,
+            queryVector: [1, 0, 0, 0, 0, 0, 0, 0],
+            topK: 300,
+            ...(queryMetric ? { metric: queryMetric } : {}),
+          });
+
+          const exact = results.find(r => r.id === '1');
+          const far = results.find(r => farIds.has(r.id));
+          if ((exact && far) || attempt === MAX_ATTEMPTS) {
+            return { exact, far };
+          }
+        } finally {
+          await vectorDB.deleteTable(tableName);
+        }
+      }
+    };
+
+    it('resolves the metric from the table index when metric is omitted', async () => {
+      // No metric passed: resolveQueryMetric should read 'euclidean' from the index stats.
+      const { exact, far } = await queryIndexedScoreSemantics('score_semantics_index_metric');
+
+      expect(exact).toBeDefined();
+      expect(far).toBeDefined();
+      expect(exact!.score).toBeGreaterThan(far!.score);
+      // Euclidean: exact (distance ~0) scores ~1; far (distance ~sqrt(2)) scores ~0.414.
+      // Cosine would instead give far a score of ~0, so this confirms the euclidean
+      // metric was inferred from the index rather than the cosine default.
+      expect(exact!.score).toBeGreaterThan(0.9);
+      expect(far!.score).toBeGreaterThan(0.3);
+      expect(far!.score).toBeLessThan(0.5);
+    });
+
+    it('uses the Lance index metric when an explicit query metric conflicts', async () => {
+      const { exact, far } = await queryIndexedScoreSemantics('score_semantics_index_metric_conflict', 'cosine');
+
+      expect(exact).toBeDefined();
+      expect(far).toBeDefined();
+      expect(exact!.score).toBeGreaterThan(far!.score);
+      expect(exact!.score).toBeGreaterThan(0.9);
+      expect(far!.score).toBeGreaterThan(0.3);
+      expect(far!.score).toBeLessThan(0.5);
+    });
+
+    it('uses an explicit query metric for small tables without a Lance index', async () => {
+      const tableName = 'score_semantics_explicit_metric_' + Date.now();
+      await vectorDB.createIndex({ indexName: tableName, dimension: 3, metric: 'euclidean' });
+      await vectorDB.upsert({
+        indexName: tableName,
+        vectors: [
+          [1, 0, 0],
+          [0, 1, 0],
+        ],
+        ids: ['exact', 'far'],
+      });
+
+      const results = await vectorDB.query({
+        indexName: tableName,
+        queryVector: [1, 0, 0],
+        topK: 2,
+        metric: 'euclidean',
+      });
+
+      const exact = results.find(r => r.id === 'exact')!;
+      const far = results.find(r => r.id === 'far')!;
+      expect(results[0].id).toBe('exact');
+      expect(exact.score).toBeCloseTo(1, 5);
+      expect(far.score).toBeCloseTo(1 / (1 + Math.sqrt(2)), 5);
+
+      await vectorDB.deleteTable(tableName);
+    });
+
+    it('keeps _distance available when selecting columns', async () => {
+      const tableName = 'score_semantics_columns_' + Date.now();
+      await vectorDB.createIndex({ indexName: tableName, dimension: 3, metric: 'cosine' });
+      await vectorDB.upsert({
+        indexName: tableName,
+        vectors: [
+          [1, 0, 0],
+          [0, 1, 0],
+        ],
+        ids: ['exact', 'far'],
+        metadata: [{ text: 'exact' }, { text: 'far' }],
+      });
+
+      const results = await vectorDB.query({
+        indexName: tableName,
+        queryVector: [1, 0, 0],
+        topK: 2,
+        columns: ['metadata_text'],
+      });
+
+      const exact = results.find(r => r.id === 'exact')!;
+      const far = results.find(r => r.id === 'far')!;
+      expect(exact.score).toBeCloseTo(1, 5);
+      expect(far.score).toBeCloseTo(0, 5);
+      expect(exact.metadata?.text).toBe('exact');
+
+      await vectorDB.deleteTable(tableName);
     });
   });
 });

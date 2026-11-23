@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { convertArrayToReadableStream } from '@internal/ai-sdk-v5/test';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod/v4';
@@ -6,7 +5,8 @@ import { MastraLanguageModelV2Mock as MockLanguageModelV2 } from '../../loop/tes
 import { Mastra } from '../../mastra';
 import { MockMemory } from '../../memory/mock';
 import { RequestContext } from '../../request-context';
-import { createStep, createWorkflow } from '../../workflows/workflow';
+import { createWorkflow } from '../../workflows/create';
+import { createStep } from '../../workflows/workflow';
 import { Agent } from '../agent';
 
 function createWorkflowCallingModel(toolName: string) {
@@ -71,8 +71,8 @@ function createSimpleTextModel() {
 
 describe('Workflow tool MastraMemory isolation', () => {
   it('should restore MastraMemory on requestContext after workflow tool execution', async () => {
-    const parentThreadId = randomUUID();
-    const subAgentThreadId = randomUUID();
+    const parentThreadId = globalThis.crypto.randomUUID();
+    const subAgentThreadId = globalThis.crypto.randomUUID();
     const resourceId = 'test-user';
     const mockMemory = new MockMemory();
 
@@ -141,7 +141,7 @@ describe('Workflow tool MastraMemory isolation', () => {
   });
 
   it('should restore MastraMemory even when workflow tool execution fails', async () => {
-    const parentThreadId = randomUUID();
+    const parentThreadId = globalThis.crypto.randomUUID();
     const resourceId = 'test-user';
     const mockMemory = new MockMemory();
 

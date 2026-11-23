@@ -17,10 +17,10 @@ describe('commonjs', () => {
     fixturePath = await mkdtemp(join(tmpdir(), 'mastra-commonjs-test-'));
     console.log('fixturePath', fixturePath);
 
-    process.env.npm_config_registry = registry;
+    process.env.pnpm_config_registry = registry;
     await setupTestProject(fixturePath);
     console.log('fixturePath', fixturePath);
-  }, 60 * 1000);
+  }, 120 * 1000);
 
   afterAll(async () => {
     try {

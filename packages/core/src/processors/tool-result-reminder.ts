@@ -1,5 +1,5 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, normalize, resolve } from 'node:path';
+import { realpath, readFile, stat } from 'node:fs/promises';
+import { isAbsolute, normalize, posix, resolve, win32 } from 'node:path';
 import { estimateTokenCount } from 'tokenx';
 import type { MessageList, MastraDBMessage } from '../agent/message-list';
 import { signalToXmlMarkup } from '../agent/signals';
@@ -37,10 +37,58 @@ type ToolInvocationLike = {
 export interface ToolResultReminderOptions {
   reminderText?: string;
   maxTokens?: number;
-  pathExists?: (path: string) => boolean;
-  isDirectory?: (path: string) => boolean;
-  readFile?: (path: string) => string;
-  getIgnoredInstructionPaths?: (args: ProcessInputStepArgs) => string[];
+  pathExists?: (path: string) => boolean | Promise<boolean>;
+  isDirectory?: (path: string) => boolean | Promise<boolean>;
+  readFile?: (path: string) => string | Promise<string>;
+  getIgnoredInstructionPaths?: (args: ProcessInputStepArgs) => string[] | Promise<string[]>;
+  /**
+   * When provided and returning false for a request, no instruction-file
+   * reminders are injected at all. Lets hosts suppress ingestion of
+   * instruction files from untrusted checkouts (e.g. a PR branch under
+   * review), where AGENTS.md content is attacker-controlled.
+   */
+  isEnabled?: (args: ProcessInputStepArgs) => boolean;
+  /**
+   * Per-request override for how instruction files are located and read.
+   * When it returns a reader, that reader replaces the instance-level
+   * pathExists/isDirectory/readFile for this request — e.g. serving content
+   * from a trusted git ref instead of an untrusted working tree. Returning
+   * undefined keeps the instance defaults.
+   */
+  getReader?: (args: ProcessInputStepArgs) => ReminderFileReader | Promise<ReminderFileReader | undefined> | undefined;
+  /**
+   * Per-request project root. When it returns a path, relative tool paths are
+   * resolved against it instead of `process.cwd()`, and instruction files are
+   * only discovered inside it — paths outside the root and ancestor
+   * directories above it are never searched. Returning undefined keeps the
+   * default `process.cwd()` resolution with no boundary.
+   */
+  getBasePath?: (args: ProcessInputStepArgs) => string | undefined;
+}
+
+/** Filesystem-shaped read access used to locate and read instruction files. */
+export interface ReminderFileReader {
+  pathExists: (path: string) => boolean | Promise<boolean>;
+  isDirectory: (path: string) => boolean | Promise<boolean>;
+  readFile: (path: string) => string | Promise<string>;
+  /**
+   * Stable identity used only to deduplicate instruction paths. Read addresses
+   * and emitted paths remain unchanged. Omit to use lexical absolute paths;
+   * virtual readers must not resolve identities through the host filesystem.
+   */
+  getPathIdentity?: (path: string) => string | Promise<string>;
+}
+
+async function getPathIdentity(path: string, reader: ReminderFileReader): Promise<string> {
+  return (await reader.getPathIdentity?.(path)) ?? toAbsolutePath(path);
+}
+
+async function localPathIdentity(path: string): Promise<string> {
+  try {
+    return toPosixPath(await realpath(path));
+  } catch {
+    return toAbsolutePath(path);
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -51,38 +99,97 @@ function isInstructionFileName(name: string): boolean {
   return INSTRUCTION_FILE_NAMES.some(instructionFileName => instructionFileName.toLowerCase() === name.toLowerCase());
 }
 
-function toAbsolutePath(candidatePath: string): string {
-  return normalize(isAbsolute(candidatePath) ? candidatePath : resolve(process.cwd(), candidatePath));
+/**
+ * Normalize path separators to forward slashes.
+ *
+ * Instruction paths are embedded in prompt reminders and used as the dedup
+ * identity in metadata, so they must be stable across platforms. `node:path`
+ * produces `\` separators on Windows; converting to `/` keeps the reminder
+ * path (and the metadata used to avoid re-injection) identical on every OS.
+ * Windows filesystem APIs accept forward slashes, so real reads still work.
+ */
+function toPosixPath(candidatePath: string): string {
+  return candidatePath.replaceAll('\\', '/');
 }
 
-function findInstructionFileForPath(
+function usesWindowsPathSemantics(candidatePath: string): boolean {
+  const normalizedPath = toPosixPath(candidatePath);
+  return normalizedPath.startsWith('//') || (/^[a-zA-Z]:\//.test(normalizedPath) && win32.isAbsolute(normalizedPath));
+}
+
+function toAbsolutePath(candidatePath: string, basePath?: string): string {
+  if (usesWindowsPathSemantics(candidatePath)) {
+    return toPosixPath(win32.normalize(candidatePath));
+  }
+  if (basePath && !isAbsolute(candidatePath) && usesWindowsPathSemantics(basePath)) {
+    return toPosixPath(win32.resolve(basePath, candidatePath));
+  }
+
+  const absolutePath = normalize(
+    isAbsolute(candidatePath) ? candidatePath : resolve(basePath ?? process.cwd(), candidatePath),
+  );
+  return toPosixPath(absolutePath);
+}
+
+function dirnamePreservingWindowsRoot(candidatePath: string): string {
+  return usesWindowsPathSemantics(candidatePath)
+    ? toPosixPath(win32.dirname(candidatePath))
+    : posix.dirname(candidatePath);
+}
+
+function joinPreservingWindowsRoot(basePath: string, childPath: string): string {
+  return usesWindowsPathSemantics(basePath)
+    ? toPosixPath(win32.join(basePath, childPath))
+    : posix.join(basePath, childPath);
+}
+
+function isWithinRoot(candidatePath: string, rootPath: string): boolean {
+  const windows = usesWindowsPathSemantics(rootPath);
+  const normalize = (path: string) => (windows ? path.toLowerCase() : path).replace(/\/+$/, '');
+  const candidate = normalize(candidatePath);
+  const root = normalize(rootPath);
+  return candidate === root || candidate.startsWith(`${root}/`) || root === '';
+}
+
+async function findInstructionFileForPath(
   candidatePath: string,
-  pathExists: (path: string) => boolean,
-  isDirectory: (path: string) => boolean,
-): string | undefined {
-  const absoluteCandidatePath = toAbsolutePath(candidatePath);
-  const candidateName = basename(absoluteCandidatePath);
+  pathExists: (path: string) => boolean | Promise<boolean>,
+  isDirectory: (path: string) => boolean | Promise<boolean>,
+  basePath?: string,
+): Promise<string | undefined> {
+  const absoluteCandidatePath = toAbsolutePath(candidatePath, basePath);
+  const rootPath = basePath ? toAbsolutePath(basePath) : undefined;
+  if (rootPath && !isWithinRoot(absoluteCandidatePath, rootPath)) {
+    return undefined;
+  }
+  const candidateName = posix.basename(absoluteCandidatePath);
 
   if (isInstructionFileName(candidateName)) {
     return absoluteCandidatePath;
   }
 
+  // Ordinary paths use POSIX operations so the walk is deterministic on every
+  // platform. UNC and drive-rooted paths use win32 operations to preserve their
+  // roots, then convert the result back to forward slashes.
   let currentDir = absoluteCandidatePath;
-  if (!pathExists(currentDir) || !isDirectory(currentDir)) {
-    currentDir = dirname(currentDir);
+  if (!(await pathExists(currentDir)) || !(await isDirectory(currentDir))) {
+    currentDir = dirnamePreservingWindowsRoot(currentDir);
   }
 
   let previousDir: string | undefined;
   while (currentDir && currentDir !== previousDir) {
     for (const instructionFileName of INSTRUCTION_FILE_NAMES) {
-      const instructionFilePath = join(currentDir, instructionFileName);
-      if (pathExists(instructionFilePath)) {
+      const instructionFilePath = joinPreservingWindowsRoot(currentDir, instructionFileName);
+      if (await pathExists(instructionFilePath)) {
         return instructionFilePath;
       }
     }
 
+    if (rootPath && !isWithinRoot(dirnamePreservingWindowsRoot(currentDir), rootPath)) {
+      break;
+    }
     previousDir = currentDir;
-    currentDir = dirname(currentDir);
+    currentDir = dirnamePreservingWindowsRoot(currentDir);
   }
 
   return undefined;
@@ -152,7 +259,8 @@ function extractReminderPathFromMetadata(message: MastraDBMessage): string | und
 
 function getReminderMarkup(reminderText: string, instructionPath: string): string {
   return signalToXmlMarkup({
-    type: 'system-reminder',
+    type: 'reactive',
+    tagName: 'system-reminder',
     contents: reminderText,
     attributes: { type: REMINDER_TYPE, path: instructionPath },
   });
@@ -178,13 +286,13 @@ type CompletedToolCall = Pick<ToolCallInfo, 'toolCallId' | 'args'>;
 function getCompletedToolCalls(messages: MastraDBMessage[]): CompletedToolCall[] {
   const completed: CompletedToolCall[] = [];
 
-  for (const message of messages) {
+  for (const message of [...messages].reverse()) {
     const parts = isRecord(message.content) ? message.content.parts : undefined;
     if (!Array.isArray(parts)) {
       continue;
     }
 
-    for (const part of parts) {
+    for (const part of [...parts].reverse()) {
       if (!isRecord(part) || part.type !== 'tool-invocation') {
         continue;
       }
@@ -202,10 +310,6 @@ function getCompletedToolCalls(messages: MastraDBMessage[]): CompletedToolCall[]
   }
 
   return completed;
-}
-
-function getCurrentStepResponseMessages(messageList: MessageList): MastraDBMessage[] {
-  return messageList.get.response.db();
 }
 
 function parseInvocationArgs(args: unknown): Record<string, unknown> | undefined {
@@ -230,6 +334,8 @@ function parseInvocationArgs(args: unknown): Record<string, unknown> | undefined
  * a path whose directory ancestry contains an instruction file such as AGENTS.md.
  */
 export class AgentsMDInjector implements Processor<'agents-md-injector'> {
+  static readonly supportsAsyncInstructionReaders = true;
+
   id = 'agents-md-injector' as const;
   name = 'Agents.md Injector';
   description = 'Injects AGENTS.md reminders when instruction file operations are detected';
@@ -237,62 +343,123 @@ export class AgentsMDInjector implements Processor<'agents-md-injector'> {
 
   private readonly reminderText?: string;
   private readonly maxTokens: number;
-  private readonly pathExists: (path: string) => boolean;
-  private readonly isDirectory: (path: string) => boolean;
-  private readonly readFile: (path: string) => string;
-  private readonly getIgnoredInstructionPaths?: (args: ProcessInputStepArgs) => string[];
+  private readonly pathExists: (path: string) => boolean | Promise<boolean>;
+  private readonly isDirectory: (path: string) => boolean | Promise<boolean>;
+  private readonly readFile: (path: string) => string | Promise<string>;
+  private readonly getPathIdentity?: (path: string) => string | Promise<string>;
+  private readonly getIgnoredInstructionPaths?: (args: ProcessInputStepArgs) => string[] | Promise<string[]>;
+  private readonly isEnabled?: (args: ProcessInputStepArgs) => boolean;
+  private readonly getReader?: (
+    args: ProcessInputStepArgs,
+  ) => ReminderFileReader | Promise<ReminderFileReader | undefined> | undefined;
+  private readonly getBasePath?: (args: ProcessInputStepArgs) => string | undefined;
 
   constructor(options: ToolResultReminderOptions) {
     this.reminderText = options.reminderText;
     this.maxTokens = options.maxTokens ?? 1000;
-    this.pathExists = options.pathExists ?? existsSync;
-    this.isDirectory =
-      options.isDirectory ??
-      ((path: string) => {
+    this.pathExists =
+      options.pathExists ??
+      (async path => {
         try {
-          return statSync(path).isDirectory();
+          await stat(path);
+          return true;
         } catch {
           return false;
         }
       });
-    this.readFile = options.readFile ?? (path => readFileSync(path, 'utf-8'));
+    this.isDirectory =
+      options.isDirectory ??
+      (async (path: string) => {
+        try {
+          return (await stat(path)).isDirectory();
+        } catch {
+          return false;
+        }
+      });
+    this.readFile = options.readFile ?? (path => readFile(path, 'utf-8'));
+    this.getPathIdentity =
+      options.pathExists || options.isDirectory || options.readFile ? undefined : localPathIdentity;
     this.getIgnoredInstructionPaths = options.getIgnoredInstructionPaths;
+    this.isEnabled = options.isEnabled;
+    this.getReader = options.getReader;
+    this.getBasePath = options.getBasePath;
   }
 
   async processInputStep(args: ProcessInputStepArgs): Promise<MessageList | MastraDBMessage[]> {
     const { messageList } = args;
+    if (this.isEnabled && !this.isEnabled(args)) {
+      return messageList;
+    }
+    const reader: ReminderFileReader = (await this.getReader?.(args)) ?? {
+      pathExists: this.pathExists,
+      isDirectory: this.isDirectory,
+      readFile: this.readFile,
+      getPathIdentity: this.getPathIdentity,
+    };
+    const basePath = this.getBasePath?.(args);
+    const pathIdentities = new Map<string, Promise<string>>();
+    const resolvePathIdentity = (path: string) => {
+      const cached = pathIdentities.get(path);
+      if (cached !== undefined) {
+        return cached;
+      }
+      const identity = getPathIdentity(path, reader);
+      pathIdentities.set(path, identity);
+      return identity;
+    };
     const messages = messageList.get.all.db();
-    const responseMessages = getCurrentStepResponseMessages(messageList);
-    const completedToolCalls = getCompletedToolCalls(responseMessages);
-    const instructionPath = this.findReferencedInstructionPath(completedToolCalls);
+    // Memory processors can reclassify completed responses before this hook runs.
+    const completedToolCalls = getCompletedToolCalls(messages);
+    const checkedPaths = new Set<string>();
+    // Compare resolved identities so a symlinked instruction file cannot escape the base path.
+    const rootIdentity = basePath ? await resolvePathIdentity(toAbsolutePath(basePath)) : undefined;
+    let ignoredIdentities: Set<string> | undefined;
+    for (const toolCall of completedToolCalls) {
+      for await (const instructionPath of this.findInstructionPathsInInvocation(toolCall, reader, basePath)) {
+        const identity = await resolvePathIdentity(instructionPath);
+        if (checkedPaths.has(identity)) {
+          continue;
+        }
+        checkedPaths.add(identity);
 
-    if (!instructionPath || this.isIgnoredInstructionPath(args, instructionPath)) {
-      return messageList;
+        if (rootIdentity && !isWithinRoot(identity, rootIdentity)) {
+          continue;
+        }
+
+        ignoredIdentities ??= new Set(
+          await Promise.all(((await this.getIgnoredInstructionPaths?.(args)) ?? []).map(resolvePathIdentity)),
+        );
+        if (ignoredIdentities.has(identity)) {
+          continue;
+        }
+
+        const reminderText = await this.getReminderText(instructionPath, reader);
+        if (!reminderText) {
+          continue;
+        }
+
+        const reminderMarkup = getReminderMarkup(reminderText, instructionPath);
+        if (await this.hasReminderAlready(messages, reminderMarkup, resolvePathIdentity)) {
+          continue;
+        }
+
+        await args.sendSignal?.({
+          type: 'reactive',
+          tagName: 'system-reminder',
+          contents: reminderText,
+          attributes: { type: REMINDER_TYPE, path: instructionPath },
+          metadata: getReminderMetadata(instructionPath).systemReminder,
+        });
+        return messageList;
+      }
     }
-
-    const reminderText = this.getReminderText(instructionPath);
-    if (!reminderText) {
-      return messageList;
-    }
-
-    const reminderMarkup = getReminderMarkup(reminderText, instructionPath);
-    if (this.hasReminderAlready(messages, reminderMarkup)) {
-      return messageList;
-    }
-
-    await args.sendSignal?.({
-      type: 'system-reminder',
-      contents: reminderText,
-      attributes: { type: REMINDER_TYPE, path: instructionPath },
-      metadata: getReminderMetadata(instructionPath).systemReminder,
-    });
 
     return messageList;
   }
 
-  private getReminderText(instructionPath: string): string | undefined {
+  private async getReminderText(instructionPath: string, reader: ReminderFileReader): Promise<string | undefined> {
     try {
-      const content = this.readFile(instructionPath).trim();
+      const content = (await reader.readFile(instructionPath)).trim();
       if (content.length > 0) {
         return truncateToTokenLimit(content, this.maxTokens);
       }
@@ -303,35 +470,18 @@ export class AgentsMDInjector implements Processor<'agents-md-injector'> {
     return this.reminderText?.trim() || undefined;
   }
 
-  private isIgnoredInstructionPath(args: ProcessInputStepArgs, instructionPath: string): boolean {
-    const ignoredPaths = this.getIgnoredInstructionPaths?.(args) ?? [];
-    const normalizedInstructionPath = toAbsolutePath(instructionPath);
-    return ignoredPaths.some(path => toAbsolutePath(path) === normalizedInstructionPath);
-  }
-
-  private findReferencedInstructionPath(toolCalls?: CompletedToolCall[]): string | undefined {
-    if (!Array.isArray(toolCalls)) {
-      return undefined;
-    }
-
-    for (const toolCall of toolCalls) {
-      const path = this.findInstructionPathInInvocation(toolCall);
-      if (path) {
-        return path;
-      }
-    }
-
-    return undefined;
-  }
-
-  private findInstructionPathInInvocation(invocation: unknown): string | undefined {
+  private async *findInstructionPathsInInvocation(
+    invocation: unknown,
+    reader: ReminderFileReader,
+    basePath: string | undefined,
+  ): AsyncGenerator<string> {
     if (!isRecord(invocation)) {
-      return undefined;
+      return;
     }
 
     const args = parseInvocationArgs(invocation.args);
     if (!args) {
-      return undefined;
+      return;
     }
 
     for (const field of PATH_FIELDS) {
@@ -340,24 +490,28 @@ export class AgentsMDInjector implements Processor<'agents-md-injector'> {
         continue;
       }
 
-      const instructionPath = findInstructionFileForPath(value, this.pathExists, this.isDirectory);
+      const instructionPath = await findInstructionFileForPath(value, reader.pathExists, reader.isDirectory, basePath);
       if (instructionPath) {
-        return instructionPath;
+        yield instructionPath;
       }
     }
-
-    return undefined;
   }
 
-  private hasReminderAlready(messages: MastraDBMessage[], reminderMarkup: string): boolean {
+  private async hasReminderAlready(
+    messages: MastraDBMessage[],
+    reminderMarkup: string,
+    resolvePathIdentity: (path: string) => string | Promise<string>,
+  ): Promise<boolean> {
     const reminderPath = extractReminderPath(reminderMarkup);
+    const identity = reminderPath ? await resolvePathIdentity(reminderPath) : undefined;
 
-    return messages.some(message => {
+    for (const message of messages) {
       if (message.role !== 'user' && message.role !== 'signal') {
-        return false;
+        continue;
       }
 
-      if (reminderPath && extractReminderPathFromMetadata(message) === reminderPath) {
+      const metadataPath = extractReminderPathFromMetadata(message);
+      if (metadataPath && (await resolvePathIdentity(metadataPath)) === identity) {
         return true;
       }
 
@@ -367,10 +521,12 @@ export class AgentsMDInjector implements Processor<'agents-md-injector'> {
       }
 
       if (!reminderPath) {
-        return false;
+        continue;
       }
 
-      return extractReminderPath(messageText) === reminderPath;
-    });
+      const markupPath = extractReminderPath(messageText);
+      if (markupPath && (await resolvePathIdentity(markupPath)) === identity) return true;
+    }
+    return false;
   }
 }

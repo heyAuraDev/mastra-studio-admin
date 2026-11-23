@@ -25,6 +25,17 @@ import type {
 import { MastraFilesystem, FileNotFoundError, FileExistsError } from '@mastra/core/workspace';
 
 /**
+ * Owner of the files inside a FUSE mount, as numeric uid/gid.
+ *
+ * Set this when commands run as a different OS user than the one the sandbox
+ * mounts as, so that user can read and write the mounted files.
+ */
+export interface MountOwner {
+  uid: number;
+  gid: number;
+}
+
+/**
  * GCS mount configuration.
  * Returned by GCSFilesystem.getMountConfig() for FUSE mounting in sandboxes.
  */
@@ -34,6 +45,17 @@ export interface GCSMountConfig extends FilesystemMountConfig {
   bucket: string;
   /** Service account key JSON (optional - omit for public buckets or ADC) */
   serviceAccountKey?: string;
+  /**
+   * GCS key prefix to scope the mount (without trailing slash).
+   * When set, gcsfuse uses --only-dir to mount only this subdirectory, so
+   * sandbox paths map directly to prefixed GCS keys (matches S3/Azure mounts).
+   */
+  prefix?: string;
+  /**
+   * Owner of the files inside the mount, as numeric uid/gid.
+   * When unset, the sandbox probes the default user's uid/gid.
+   */
+  owner?: MountOwner;
 }
 
 /**
@@ -115,6 +137,13 @@ export interface GCSFilesystemOptions extends MastraFilesystemOptions {
   /** Mount as read-only (blocks write operations, mounts read-only in sandboxes) */
   readOnly?: boolean;
   /**
+   * Owner of the files inside the FUSE mount, as numeric uid/gid.
+   * Use this when sandbox commands run as a different OS user than the one
+   * performing the mount, so that user can read and write the mounted files.
+   * When unset, the sandbox probes the default user's uid/gid.
+   */
+  owner?: MountOwner;
+  /**
    * Custom API endpoint URL.
    * Used for local development with emulators like fake-gcs-server.
    */
@@ -182,6 +211,7 @@ export class GCSFilesystem extends MastraFilesystem {
   readonly name = 'GCSFilesystem';
   readonly provider = 'gcs';
   readonly readOnly?: boolean;
+  readonly owner?: MountOwner;
 
   status: ProviderStatus = 'pending';
 
@@ -214,6 +244,7 @@ export class GCSFilesystem extends MastraFilesystem {
     this.icon = options.icon ?? 'gcs';
     this.description = options.description;
     this.readOnly = options.readOnly;
+    this.owner = options.owner;
   }
 
   /**
@@ -264,6 +295,18 @@ export class GCSFilesystem extends MastraFilesystem {
     // Include service account key if credentials are an object
     if (this.credentials && typeof this.credentials === 'object') {
       config.serviceAccountKey = JSON.stringify(this.credentials);
+    }
+
+    // Include prefix so sandbox mounts can use gcsfuse --only-dir for path alignment
+    if (this.prefix) {
+      config.prefix = this.prefix.replace(/\/$/, ''); // Strip trailing slash for mount commands
+    }
+
+    if (this.owner) {
+      // Copy the ids: the mount marker hashes this config, so a caller that mutates
+      // the object it passed in must not change the ownership that was mounted.
+      // Reading the fields also keeps an accessor-backed owner, which a spread would drop.
+      config.owner = { uid: this.owner.uid, gid: this.owner.gid };
     }
 
     return config;
@@ -357,6 +400,11 @@ export class GCSFilesystem extends MastraFilesystem {
   // ---------------------------------------------------------------------------
 
   async readFile(path: string, options?: ReadOptions): Promise<string | Buffer> {
+    // A trailing slash means a directory: never return the empty body of a directory marker
+    if (path.endsWith('/')) {
+      throw new FileNotFoundError(path);
+    }
+
     const bucket = await this.getReadyBucket();
     const file = bucket.file(this.toKey(path));
 
@@ -433,6 +481,11 @@ export class GCSFilesystem extends MastraFilesystem {
   }
 
   async copyFile(src: string, dest: string, options?: CopyOptions): Promise<void> {
+    // A trailing slash means a directory: never copy a directory marker as a file
+    if (src.endsWith('/')) {
+      throw new FileNotFoundError(src);
+    }
+
     const bucket = await this.getReadyBucket();
     const srcFile = bucket.file(this.toKey(src));
     const destFile = bucket.file(this.toKey(dest));
@@ -460,19 +513,46 @@ export class GCSFilesystem extends MastraFilesystem {
   // Directory Operations
   // ---------------------------------------------------------------------------
 
-  async mkdir(_path: string, _options?: { recursive?: boolean }): Promise<void> {
-    // GCS doesn't have real directories - they're just key prefixes
-    // No-op, directories are created implicitly when files are written
+  async mkdir(path: string, _options?: { recursive?: boolean }): Promise<void> {
+    // GCS doesn't have real directories - they're just key prefixes.
+    // Write a zero-byte marker object at "<key>/" (the convention the GCS console uses)
+    // so an empty directory is visible to readdir(), exists() and stat().
+    // Parent directories need no marker of their own: the marker key already
+    // matches every parent prefix, so nested paths work without `recursive`.
+    const key = trimSlashes(this.toKey(path));
+    if (!key || key + '/' === this.prefix) return; // Root always exists
+
+    const bucket = await this.getReadyBucket();
+
+    // A file already occupies this path. A credential that can write but not read
+    // cannot probe, so treat a failed probe as "no file there" and let the write below
+    // report a real problem.
+    let fileExists = false;
+    try {
+      [fileExists] = await bucket.file(key).exists();
+    } catch {
+      fileExists = false;
+    }
+    if (fileExists) {
+      throw new FileExistsError(path);
+    }
+
+    await bucket.file(key + '/').save(Buffer.alloc(0), { resumable: false });
   }
 
   async rmdir(path: string, options?: RemoveOptions): Promise<void> {
     if (!options?.recursive) {
-      // Quick emptiness check — only fetch one object instead of full readdir
+      // Quick emptiness check — only the directory marker itself may remain
       const bucket = await this.getReadyBucket();
-      const prefix = this.toKey(path).replace(/\/$/, '') + '/';
-      const [files] = await bucket.getFiles({ prefix, maxResults: 1 });
-      if (files.length > 0) {
+      const key = trimSlashes(this.toKey(path));
+      const prefix = key + '/';
+      const [files] = await bucket.getFiles({ prefix, maxResults: 2 });
+      if (files.some(file => file.name !== prefix)) {
         throw new Error(`Directory not empty: ${path}`);
+      }
+      // Remove the directory marker so the empty directory disappears
+      if (key && prefix !== this.prefix) {
+        await bucket.file(prefix).delete({ ignoreNotFound: true });
       }
       return;
     }
@@ -507,7 +587,13 @@ export class GCSFilesystem extends MastraFilesystem {
 
       // Skip if this looks like a directory marker
       if (relativePath.endsWith('/')) {
-        const dirName = relativePath.slice(0, -1);
+        // A directory is not a file, so an extension filter must exclude it. Only a
+        // recursive listing reaches this branch for a nested marker.
+        if (options?.recursive && options.extension) continue;
+        // A nested marker such as "a/b/" belongs to the directory "a" in a
+        // non-recursive listing; only a recursive listing reports the full path.
+        const dirName = options?.recursive ? relativePath.slice(0, -1) : relativePath.split('/')[0]!;
+        if (!dirName) continue;
         if (!seenDirs.has(dirName)) {
           seenDirs.add(dirName);
           entries.push({ name: dirName, type: 'directory' });
@@ -574,7 +660,10 @@ export class GCSFilesystem extends MastraFilesystem {
   }
 
   async stat(path: string): Promise<FileStat> {
-    const key = this.toKey(path);
+    // The key never keeps a trailing slash, so a lookup never matches a directory marker
+    const key = trimSlashes(this.toKey(path));
+    // A trailing slash always means a directory, so never look for a file
+    const directoryOnly = path.endsWith('/');
 
     // Root path is always a directory
     if (!key) {
@@ -590,17 +679,19 @@ export class GCSFilesystem extends MastraFilesystem {
 
     const bucket = await this.getReadyBucket();
     const file = bucket.file(key);
+    const name = key.split('/').pop() ?? '';
 
-    const [exists] = await file.exists();
+    const [exists] = directoryOnly ? [false] : await file.exists();
     if (exists) {
       const [metadata] = await file.getMetadata();
-      const name = path.split('/').pop() ?? '';
 
       return {
         name,
         path,
         type: 'file',
         size: Number(metadata.size) || 0,
+        // read_file tool gates the native media-part path on `stat.mimeType`.
+        mimeType: typeof metadata.contentType === 'string' ? metadata.contentType : getMimeType(path),
         createdAt: metadata.timeCreated ? new Date(metadata.timeCreated) : new Date(),
         modifiedAt: metadata.updated ? new Date(metadata.updated) : new Date(),
       };
@@ -609,7 +700,6 @@ export class GCSFilesystem extends MastraFilesystem {
     // Check if it's a directory
     const isDir = await this.isDirectory(path);
     if (isDir) {
-      const name = path.split('/').filter(Boolean).pop() ?? '';
       return {
         name,
         path,
@@ -624,7 +714,11 @@ export class GCSFilesystem extends MastraFilesystem {
   }
 
   async isFile(path: string): Promise<boolean> {
-    const key = this.toKey(path);
+    // A trailing slash always means a directory
+    if (path.endsWith('/')) return false;
+
+    // The key never keeps a trailing slash, so a lookup never matches a directory marker
+    const key = trimSlashes(this.toKey(path));
     if (!key) return false; // Root is a directory, not a file
 
     const bucket = await this.getReadyBucket();

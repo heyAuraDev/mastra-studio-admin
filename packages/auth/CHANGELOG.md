@@ -1,5 +1,197 @@
 # @mastra/auth
 
+## 1.2.0
+
+### Minor Changes
+
+- Added `jwksUri` and `issuer` options to `MastraJwtAuth`, so it can verify tokens signed by an identity provider instead of only tokens signed with a shared secret. The issuer is advertised to MCP clients by the built-in MCP server, and tokens are checked against `server.mcp.oauth.resource` when it is set. ([#29930](https://github.com/mastra-ai/mastra/pull/29930))
+
+  ```ts
+  new MastraJwtAuth({
+    jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+    issuer: 'https://auth.example.com/',
+  });
+  ```
+
+### Patch Changes
+
+- The authenticated user now has `id` set to the token's `sub` claim when the token has no `id` claim. A token that already has an `id` claim keeps it. Standard OIDC access tokens identify the user only with `sub`, so before this change Mastra treated these users as having no id. ([#29930](https://github.com/mastra-ai/mastra/pull/29930))
+
+  This fixes RBAC: every protected route answered `403 Missing required permission` because the user's roles were never loaded.
+
+  It also changes which records these users see on existing HTTP routes, unless you set `mapUserToResourceId`:
+
+  - **Stored agents, skills, workspaces, and other owned records.** Lists were unfiltered before, so every user saw every record. Now each user sees their own records plus public ones, and another user's private records are no longer listed (users with an admin permission such as `agents:admin` keep the full list). Records these users create are owned by them and private by default. Records created before the upgrade have no owner and stay visible to everyone.
+  - **Tool-provider connections.** Per-author connections were stored under the shared `default` owner. They are now stored under the user's `sub`. Connections created before the upgrade stay under `default`, so users have to reconnect them. Shared connections are unaffected. To keep using the old connections instead, set `mapUserToResourceId: () => 'default'` on the auth provider. That puts every user back in one shared `default` resource, so it also shares memory and owned records between them; use it only if that matches how the app worked before.
+  - **Observability.** Feedback submitted by these users is recorded with their `sub` as the user id.
+
+- Added `toMastraUser()` support: the JWT auth provider normalizes the token payload through its `mapUser` option (or the default mapping), so dynamic agent configuration callbacks receive the mapped user as the `user` argument. The default mapping now also reads the token's `role` claim, so `/auth/me` and RBAC role resolution see it too. ([#28612](https://github.com/mastra-ai/mastra/pull/28612))
+
+## 1.2.0-alpha.0
+
+### Minor Changes
+
+- Added `jwksUri` and `issuer` options to `MastraJwtAuth`, so it can verify tokens signed by an identity provider instead of only tokens signed with a shared secret. The issuer is advertised to MCP clients by the built-in MCP server, and tokens are checked against `server.mcp.oauth.resource` when it is set. ([#29930](https://github.com/mastra-ai/mastra/pull/29930))
+
+  ```ts
+  new MastraJwtAuth({
+    jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+    issuer: 'https://auth.example.com/',
+  });
+  ```
+
+### Patch Changes
+
+- The authenticated user now has `id` set to the token's `sub` claim when the token has no `id` claim. A token that already has an `id` claim keeps it. Standard OIDC access tokens identify the user only with `sub`, so before this change Mastra treated these users as having no id. ([#29930](https://github.com/mastra-ai/mastra/pull/29930))
+
+  This fixes RBAC: every protected route answered `403 Missing required permission` because the user's roles were never loaded.
+
+  It also changes which records these users see on existing HTTP routes, unless you set `mapUserToResourceId`:
+
+  - **Stored agents, skills, workspaces, and other owned records.** Lists were unfiltered before, so every user saw every record. Now each user sees their own records plus public ones, and another user's private records are no longer listed (users with an admin permission such as `agents:admin` keep the full list). Records these users create are owned by them and private by default. Records created before the upgrade have no owner and stay visible to everyone.
+  - **Tool-provider connections.** Per-author connections were stored under the shared `default` owner. They are now stored under the user's `sub`. Connections created before the upgrade stay under `default`, so users have to reconnect them. Shared connections are unaffected. To keep using the old connections instead, set `mapUserToResourceId: () => 'default'` on the auth provider. That puts every user back in one shared `default` resource, so it also shares memory and owned records between them; use it only if that matches how the app worked before.
+  - **Observability.** Feedback submitted by these users is recorded with their `sub` as the user id.
+
+- Added `toMastraUser()` support: the JWT auth provider normalizes the token payload through its `mapUser` option (or the default mapping), so dynamic agent configuration callbacks receive the mapped user as the `user` argument. The default mapping now also reads the token's `role` claim, so `/auth/me` and RBAC role resolution see it too. ([#28612](https://github.com/mastra-ai/mastra/pull/28612))
+
+## 1.1.5
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+## 1.1.5-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+## 1.1.4
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 1.1.4-alpha.0
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 1.1.3
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.1.3-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+## 1.1.3-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.1.2
+
+### Patch Changes
+
+- Fixed a TypeScript error where auth provider instances (for example `new MastraAuthWorkos()`) could not be assigned to `server.auth` or `studio.auth`, failing with `Property '#private' is missing` (#18682). ([#18796](https://github.com/mastra-ai/mastra/pull/18796))
+
+  Auth providers are now typed with a new structural `IMastraAuthProvider` interface (exported from `@mastra/core/server` and `@mastra/auth`), so provider packages no longer need a shared class identity with `@mastra/core`. `CompositeAuth` also accepts any `IMastraAuthProvider` implementation. No code changes are required:
+
+  ```typescript
+  import { Mastra } from '@mastra/core';
+  import { MastraAuthWorkos } from '@mastra/auth-workos';
+
+  // Previously failed to compile with TS2322, now works without casts
+  export const mastra = new Mastra({
+    server: {
+      auth: new MastraAuthWorkos(),
+    },
+  });
+  ```
+
+## 1.1.2-alpha.0
+
+### Patch Changes
+
+- Fixed a TypeScript error where auth provider instances (for example `new MastraAuthWorkos()`) could not be assigned to `server.auth` or `studio.auth`, failing with `Property '#private' is missing` (#18682). ([#18796](https://github.com/mastra-ai/mastra/pull/18796))
+
+  Auth providers are now typed with a new structural `IMastraAuthProvider` interface (exported from `@mastra/core/server` and `@mastra/auth`), so provider packages no longer need a shared class identity with `@mastra/core`. `CompositeAuth` also accepts any `IMastraAuthProvider` implementation. No code changes are required:
+
+  ```typescript
+  import { Mastra } from '@mastra/core';
+  import { MastraAuthWorkos } from '@mastra/auth-workos';
+
+  // Previously failed to compile with TS2322, now works without casts
+  export const mastra = new Mastra({
+    server: {
+      auth: new MastraAuthWorkos(),
+    },
+  });
+  ```
+
+## 1.1.1
+
+### Patch Changes
+
+- Improved auth package builds by removing the direct core dependency from auth providers while preserving the existing public auth APIs. ([#17142](https://github.com/mastra-ai/mastra/pull/17142))
+
+## 1.1.1-alpha.0
+
+### Patch Changes
+
+- Improved auth package builds by removing the direct core dependency from auth providers while preserving the existing public auth APIs. ([#17142](https://github.com/mastra-ai/mastra/pull/17142))
+
+## 1.1.0
+
+### Minor Changes
+
+- Random bump ([#18178](https://github.com/mastra-ai/mastra/pull/18178))
+
+### Patch Changes
+
+- Updated dependencies [[`7c0d868`](https://github.com/mastra-ai/mastra/commit/7c0d868d97d0fdbc04c14d0166dbf44d4c5a4a62), [`d9d2273`](https://github.com/mastra-ai/mastra/commit/d9d2273c702690c9a26eab2aebea879701d4355a), [`b04369d`](https://github.com/mastra-ai/mastra/commit/b04369d6b167c698ef103981171a8bf92808e756), [`8f3c262`](https://github.com/mastra-ai/mastra/commit/8f3c262587b335588a02d96b17fd6aca34c885b3)]:
+  - @mastra/core@1.45.0
+
+## 1.1.0-alpha.0
+
+### Minor Changes
+
+- Random bump ([#18178](https://github.com/mastra-ai/mastra/pull/18178))
+
+### Patch Changes
+
+- Updated dependencies [[`7c0d868`](https://github.com/mastra-ai/mastra/commit/7c0d868d97d0fdbc04c14d0166dbf44d4c5a4a62), [`d9d2273`](https://github.com/mastra-ai/mastra/commit/d9d2273c702690c9a26eab2aebea879701d4355a), [`b04369d`](https://github.com/mastra-ai/mastra/commit/b04369d6b167c698ef103981171a8bf92808e756), [`8f3c262`](https://github.com/mastra-ai/mastra/commit/8f3c262587b335588a02d96b17fd6aca34c885b3)]:
+  - @mastra/core@1.45.0-alpha.0
+
+## 1.0.3
+
+### Patch Changes
+
+- Security remediation for the 2026-06-17 "easy-day-js" supply-chain incident. Patch bump to publish clean versions and move the `latest` dist-tag forward, superseding the compromised versions that declared the malicious `easy-day-js` dependency. ([#18056](https://github.com/mastra-ai/mastra/pull/18056))
+
+- Updated dependencies [[`339c57c`](https://github.com/mastra-ai/mastra/commit/339c57c5b2c6dbe75a125e138228e0556528976f), [`1dd4117`](https://github.com/mastra-ai/mastra/commit/1dd4117dcbd8e031ede9f0489436bfbc6f0315b8), [`2b11d1f`](https://github.com/mastra-ai/mastra/commit/2b11d1f6ac7024c5dd2b2dd12a48a956ac9d63bd), [`77a2351`](https://github.com/mastra-ai/mastra/commit/77a2351ee79296e360bce822cb3391f7cfd6489d), [`b7dff0a`](https://github.com/mastra-ai/mastra/commit/b7dff0a3d1022eb6868f48dc40a2b1febd5c277f), [`02087e1`](https://github.com/mastra-ai/mastra/commit/02087e1fbc54aa07f3071f7a200df1bf5be601a8), [`49af8df`](https://github.com/mastra-ai/mastra/commit/49af8df589c4ff71a5015a4553b377b32704b691), [`30ce559`](https://github.com/mastra-ai/mastra/commit/30ce55902ecf819b8ab8697398dd68b108228063), [`c241b92`](https://github.com/mastra-ai/mastra/commit/c241b929dc8c8d6a7b7219c99ed13ac1f3124a77), [`7d6ff70`](https://github.com/mastra-ai/mastra/commit/7d6ff708727297a0526ca0e26e93eeb5bbaaa187), [`ab975d4`](https://github.com/mastra-ai/mastra/commit/ab975d4dd9488752f05bda7afa03166d207e3e2a), [`9d6aa1b`](https://github.com/mastra-ai/mastra/commit/9d6aa1bae407e2afa6a089abc2a6accbbcb287b8)]:
+  - @mastra/core@1.44.0
+
+## 1.0.3-alpha.0
+
+### Patch Changes
+
+- Security remediation for the 2026-06-17 "easy-day-js" supply-chain incident. Patch bump to publish clean versions and move the `latest` dist-tag forward, superseding the compromised versions that declared the malicious `easy-day-js` dependency. ([#18056](https://github.com/mastra-ai/mastra/pull/18056))
+
+- Updated dependencies [[`77a2351`](https://github.com/mastra-ai/mastra/commit/77a2351ee79296e360bce822cb3391f7cfd6489d)]:
+  - @mastra/core@1.43.1-alpha.0
+
 ## 1.0.2
 
 ### Patch Changes

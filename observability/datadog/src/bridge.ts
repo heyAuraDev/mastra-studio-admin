@@ -23,6 +23,7 @@ import type {
   ModelStepAttributes,
   ObservabilityBridge,
   CreateSpanOptions,
+  ScoreEvent,
   SpanType,
   SpanIds,
 } from '@mastra/core/observability';
@@ -33,7 +34,7 @@ import type { BaseExporterConfig } from '@mastra/observability';
 import tracer from 'dd-trace';
 import { isModelInferenceEnabled } from './features';
 import { formatUsageMetrics } from './metrics';
-import { ensureTracer, formatInput, formatOutput, kindFor, toDate } from './utils';
+import { ensureTracer, formatInput, formatOutput, kindFor, toDate, toDatadogLinks } from './utils';
 import type { DatadogSpanKind } from './utils';
 
 // These types model dd-trace internals, not its public API surface.
@@ -152,6 +153,16 @@ export interface DatadogBridgeConfig extends BaseExporterConfig {
    * LLM Observability tags instead of being nested in annotations.metadata.
    */
   requestContextKeys?: string[];
+
+  /**
+   * How long `flush()` waits, in milliseconds, after handing data to dd-trace.
+   * dd-trace sends LLM Observability spans and evaluations from a background
+   * writer and offers no way to await that request, so the wait keeps a process
+   * that exits right after `flush()` from cutting the send off. The wait only
+   * happens when something was sent since the last flush. Set to 0 to disable.
+   * Defaults to 2000.
+   */
+  flushGraceMs?: number;
 }
 
 /**
@@ -166,11 +177,19 @@ export class DatadogBridge extends BaseExporter implements ObservabilityBridge {
 
   private config: Required<Pick<DatadogBridgeConfig, 'mlApp' | 'site'>> & DatadogBridgeConfig;
   private ddSpanMap = new Map<string, any>();
+  /** Keys of the links each dd span was started with, so links set later are added once at finish. */
+  private startLinkKeys = new WeakMap<object, Set<string>>();
   private traceContext = new Map<string, TraceContext>();
   private openSpanCounts = new Map<string, number>();
+  private flushGraceMs: number;
+  /** True when spans or evaluations were handed to dd-trace since the last flush() */
+  private pendingSend = false;
+  /** Grace wait in progress, shared by flush() calls that overlap it */
+  private graceWait: Promise<void> | null = null;
 
   constructor(config: DatadogBridgeConfig = {}) {
     super(config);
+    this.flushGraceMs = config.flushGraceMs ?? 2000;
 
     const mlApp = config.mlApp ?? process.env.DD_LLMOBS_ML_APP;
     const apiKey = config.apiKey ?? process.env.DD_API_KEY;
@@ -180,7 +199,7 @@ export class DatadogBridge extends BaseExporter implements ObservabilityBridge {
     // Default to false for the bridge — assume a local Datadog Agent is
     // present (required for the APM auto-instrumentation the bridge enables)
     const envAgentless = process.env.DD_LLMOBS_AGENTLESS_ENABLED?.toLowerCase();
-    const agentless = config.agentless ?? (envAgentless === 'true' || envAgentless === '1' ? true : false);
+    const agentless = config.agentless ?? (envAgentless === 'true' || envAgentless === '1');
     if (!mlApp) {
       this.setDisabled(`Missing required mlApp. Set DD_LLMOBS_ML_APP environment variable or pass mlApp in config.`);
       this.config = config as any;
@@ -195,7 +214,14 @@ export class DatadogBridge extends BaseExporter implements ObservabilityBridge {
       return;
     }
 
-    this.config = { ...config, mlApp, site, apiKey, agentless, env };
+    this.config = {
+      ...config,
+      mlApp,
+      site,
+      apiKey,
+      agentless,
+      env,
+    };
 
     ensureTracer({
       mlApp,
@@ -241,10 +267,15 @@ export class DatadogBridge extends BaseExporter implements ObservabilityBridge {
         llmobsParentDdSpan = apmParentDdSpan;
       }
 
+      const links = toDatadogLinks(options.links);
       const ddSpan = tracer.startSpan(options.name, {
         ...(apmParentDdSpan ? { childOf: apmParentDdSpan } : {}),
         ...(options.startTime ? { startTime: toDate(options.startTime).getTime() } : {}),
+        ...(links.length > 0 ? { links } : {}),
       });
+      if (options.links?.length) {
+        this.startLinkKeys.set(ddSpan, new Set(options.links.map(link => `${link.traceId}:${link.spanId}`)));
+      }
 
       const ddContext = ddSpan.context?.() as
         | {
@@ -259,6 +290,13 @@ export class DatadogBridge extends BaseExporter implements ObservabilityBridge {
       const parentContext = apmParentDdSpan?.context?.() as { toSpanId?: (hex?: boolean) => string } | undefined;
       const parentSpanId = parentContext?.toSpanId?.(true) ?? externalParentId;
 
+      // Declare which kind of parent was used. A parent resolved from the
+      // Mastra span chain is part of the Mastra trace; an active dd-trace scope
+      // span is a Mastra span only if this bridge created it, otherwise it
+      // belongs to Datadog (e.g. APM auto-instrumentation).
+      const parentIsMastraSpan =
+        parentSpanId !== undefined && (parentSource !== 'active-scope' || this.ddSpanMap.has(parentSpanId));
+
       this.captureTraceContext(traceId, options);
       this.openSpanCounts.set(traceId, (this.openSpanCounts.get(traceId) ?? 0) + 1);
       this.ddSpanMap.set(spanId, ddSpan);
@@ -270,7 +308,11 @@ export class DatadogBridge extends BaseExporter implements ObservabilityBridge {
           `[parentSource=${parentSource}] [externalParentId=${externalParentId ?? 'none'}]`,
       );
 
-      return { spanId, traceId, parentSpanId };
+      return {
+        spanId,
+        traceId,
+        ...(parentIsMastraSpan ? { parentSpanId } : { externalParentSpanId: parentSpanId }),
+      };
     } catch (error) {
       this.logger.error('[DatadogBridge] Failed to create span:', error);
       return undefined;
@@ -289,6 +331,41 @@ export class DatadogBridge extends BaseExporter implements ObservabilityBridge {
    */
   executeInContextSync<T>(spanId: string, fn: () => T): T {
     return this.executeWithSpanContext(spanId, fn);
+  }
+
+  async onScoreEvent(event: ScoreEvent): Promise<void> {
+    if (this.isDisabled || !(tracer as any).llmobs?.submitEvaluation) return;
+
+    const { score } = event;
+    if (!score.traceId || !score.spanId) {
+      this.logger.warn('Datadog bridge: dropping score with no traceId/spanId', {
+        scorerId: score.scorerId,
+      });
+      return;
+    }
+
+    try {
+      this.pendingSend = true;
+      tracer.llmobs.submitEvaluation(
+        { traceId: score.traceId, spanId: toDatadogSpanId(score.spanId) },
+        {
+          label: score.scorerName ?? score.scorerId,
+          value: score.score,
+          metricType: 'score',
+          mlApp: this.config.mlApp,
+          timestampMs: score.timestamp instanceof Date ? score.timestamp.getTime() : Date.now(),
+          ...(score.reason ? { reasoning: score.reason } : {}),
+          ...(score.metadata ? { metadata: score.metadata } : {}),
+        },
+      );
+    } catch (error) {
+      this.logger.error('Datadog bridge: Failed to submit evaluation', {
+        error,
+        traceId: score.traceId,
+        spanId: score.spanId,
+        scorerId: score.scorerId,
+      });
+    }
   }
 
   private executeWithSpanContext<T>(spanId: string, fn: () => T): T {
@@ -332,7 +409,7 @@ export class DatadogBridge extends BaseExporter implements ObservabilityBridge {
           return;
         case 'span_ended':
           this.annotateAndFinishSpan(span);
-          return;
+          break;
       }
     } catch (error) {
       this.logger.error('Datadog bridge error', {
@@ -440,7 +517,20 @@ export class DatadogBridge extends BaseExporter implements ObservabilityBridge {
     }
 
     try {
+      // Links set after the span started, such as an MCP tool call's link to the
+      // server span that handled it
+      const startKeys = this.startLinkKeys.get(ddSpan);
+      const lateLinks = toDatadogLinks(span.links?.filter(link => !startKeys?.has(`${link.traceId}:${link.spanId}`)));
+      if (lateLinks.length > 0 && typeof ddSpan.addLinks === 'function') {
+        ddSpan.addLinks(lateLinks);
+      }
+    } catch (error) {
+      this.logger.error('[DatadogBridge] Failed to add span links', { error, spanId: span.id });
+    }
+
+    try {
       if (typeof ddSpan.finish === 'function') {
+        this.pendingSend = true;
         ddSpan.finish(endTime.getTime());
       }
     } catch (error) {
@@ -452,6 +542,19 @@ export class DatadogBridge extends BaseExporter implements ObservabilityBridge {
     } finally {
       this.ddSpanMap.delete(span.id);
       this.releaseTraceContext(span.traceId);
+    }
+  }
+
+  /**
+   * Release the dd span held for a Mastra span that ended without being exported.
+   *
+   * The dd span is deliberately not finished: finishing it would send a span the
+   * user's filtering just removed. The per-trace context is released too, since
+   * createSpan() counted this span as open.
+   */
+  releaseSpan(spanId: string, traceId: string): void {
+    if (this.ddSpanMap.delete(spanId)) {
+      this.releaseTraceContext(traceId);
     }
   }
 
@@ -508,7 +611,10 @@ export class DatadogBridge extends BaseExporter implements ObservabilityBridge {
       }
     }
 
-    const knownFields = ['usage', 'model', 'provider', 'parameters'];
+    // `model`/`provider` are surfaced as native LLM Obs fields and `usage` as metrics;
+    // everything else (including `parameters` — model settings like reasoning_effort)
+    // flows into metadata so it reaches Datadog.
+    const knownFields = ['usage', 'model', 'provider'];
     const otherAttributes = omitKeys((span.attributes ?? {}) as Record<string, any>, knownFields);
 
     const contextKeySet = new Set(this.config.requestContextKeys ?? []);
@@ -601,6 +707,8 @@ export class DatadogBridge extends BaseExporter implements ObservabilityBridge {
       }
     }
 
+    await this.waitForBackgroundSend();
+
     try {
       await flushApmExporter();
       this.logger.debug('Datadog APM exporter flushed');
@@ -609,11 +717,31 @@ export class DatadogBridge extends BaseExporter implements ObservabilityBridge {
     }
   }
 
+  /**
+   * `llmobs.flush()` returns before the background writer's HTTP request
+   * completes and dd-trace gives nothing to await, so wait a bounded time
+   * instead. Starts one wait per batch of new data, so the repeated flushes
+   * during shutdown don't stack. A flush that overlaps a running wait joins
+   * it, so no caller resolves before the data it produced had its wait.
+   */
+  private async waitForBackgroundSend(): Promise<void> {
+    if (!(this.flushGraceMs > 0) || !Number.isFinite(this.flushGraceMs)) return;
+    if (this.pendingSend) {
+      this.pendingSend = false;
+      const wait: Promise<void> = new Promise<void>(resolve => setTimeout(resolve, this.flushGraceMs)).finally(() => {
+        if (this.graceWait === wait) this.graceWait = null;
+      });
+      this.graceWait = wait;
+    }
+    await this.graceWait;
+  }
+
   async shutdown(): Promise<void> {
     for (const [spanId, ddSpan] of this.ddSpanMap) {
       this.logger.warn(`[DatadogBridge] Force-finishing APM span that was not properly closed [id=${spanId}]`);
       try {
         if (typeof ddSpan.finish === 'function') {
+          this.pendingSend = true;
           ddSpan.finish();
         }
       } catch {
@@ -660,6 +788,13 @@ function fillRandomBytes(bytes: Uint8Array): void {
   for (let i = 0; i < bytes.length; i++) {
     bytes[i] = Math.floor(Math.random() * 256);
   }
+}
+
+function toDatadogSpanId(spanId: string): string {
+  if (/^[0-9a-f]{16}$/i.test(spanId)) {
+    return BigInt(`0x${spanId}`).toString(10);
+  }
+  return spanId;
 }
 
 function generateSpanId(): string {

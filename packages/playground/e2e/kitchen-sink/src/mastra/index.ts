@@ -4,23 +4,52 @@ import { computeNextFireAt } from '@mastra/core/workflows';
 import { MastraEditor } from '@mastra/editor';
 import { PinoLogger } from '@mastra/loggers';
 
-import { weatherAgent, omAgent, omAdaptiveAgent } from './agents';
+import {
+  askUserAgent,
+  builderAgent,
+  codeOverrideEditableAgent,
+  codeOverrideLockedAgent,
+  omAdaptiveAgent,
+  omAgent,
+  weatherAgent,
+} from './agents';
 import { simpleMcpServer } from './mcps';
 import { loggingProcessor, contentFilterProcessor } from './processors';
 import { responseQualityScorer, responseTimeScorer } from './scorers';
-import { storage } from './storage';
+import { initE2EStorage, storage } from './storage';
 import { complexWorkflow, enumWorkflow, lessComplexWorkflow } from './workflows/complex-workflow';
 import { scheduledWorkflow, multiScheduledWorkflow } from './workflows/scheduled-workflow';
 
+await initE2EStorage();
+
 export const mastra = new Mastra({
   workflows: { complexWorkflow, lessComplexWorkflow, enumWorkflow, scheduledWorkflow, multiScheduledWorkflow },
-  agents: { weatherAgent, omAgent, omAdaptiveAgent },
+  agents: {
+    weatherAgent,
+    omAgent,
+    omAdaptiveAgent,
+    codeOverrideEditableAgent,
+    codeOverrideLockedAgent,
+    builderAgent,
+    askUserAgent,
+  },
   logger: new PinoLogger({
     name: 'Mastra',
     level: 'error',
   }),
   storage,
-  editor: new MastraEditor(),
+  editor: new MastraEditor({
+    source: 'code',
+    builder: {
+      enabled: true,
+      features: {
+        agent: {
+          tools: true,
+          avatarUpload: true,
+        },
+      },
+    },
+  }),
   mcpServers: {
     simpleMcpServer,
   },
@@ -33,10 +62,38 @@ export const mastra = new Mastra({
     contentFilterProcessor,
   },
   server: {
+    ...(process.env.E2E_STUDIO_BASE_PATH ? { studioBase: process.env.E2E_STUDIO_BASE_PATH } : {}),
     apiRoutes: [
+      // Seeds a weather-agent thread with `count` user messages ("seed message N",
+      // one second apart) so the Studio history pagination can be exercised.
+      registerApiRoute('/e2e/seed-thread', {
+        method: 'POST',
+        handler: async c => {
+          const { threadId, count } = (await c.req.json()) as { threadId: string; count: number };
+          const memory = await weatherAgent.getMemory();
+          if (!memory) return c.json({ error: 'weather-agent has no memory' }, 500);
+
+          const resourceId = weatherAgent.id;
+          await memory.createThread({ threadId, resourceId, title: 'Seeded thread' });
+          const base = Date.parse('2026-01-01T00:00:00.000Z');
+          await memory.saveMessages({
+            messages: Array.from({ length: count }, (_, index) => ({
+              id: `seed-${index}`,
+              threadId,
+              resourceId,
+              role: 'user' as const,
+              createdAt: new Date(base + index * 1000),
+              content: { format: 2 as const, parts: [{ type: 'text' as const, text: `seed message ${index}` }] },
+            })),
+          });
+          return c.json({ threadId, count }, 201);
+        },
+      }),
       registerApiRoute('/e2e/reset-storage', {
         method: 'POST',
         handler: async c => {
+          await initE2EStorage();
+
           const clearTasks: Promise<void>[] = [];
 
           const workflowStore = await storage.getStore('workflows');
@@ -110,8 +167,8 @@ export const mastra = new Mastra({
                     ...schedule,
                     status: 'active',
                     nextFireAt,
-                    lastFireAt: null,
-                    lastRunId: null,
+                    lastFireAt: undefined,
+                    lastRunId: undefined,
                     createdAt: now,
                     updatedAt: now,
                   });

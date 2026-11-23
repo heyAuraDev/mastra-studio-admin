@@ -1,19 +1,204 @@
 import { Drawer as DrawerPrimitive } from '@base-ui/react/drawer';
-import { X } from 'lucide-react';
+import { cva } from 'class-variance-authority';
+import type { VariantProps } from 'class-variance-authority';
 import * as React from 'react';
 
 import { Button } from '@/ds/components/Button';
+import { IconCrossMedium } from '@/ds/icons/central/IconCrossMedium';
+import { dialogSurfaceStyle } from '@/ds/primitives/raised-surface';
 import { cn } from '@/lib/utils';
 
-// Swipe/stack transforms live in CSS (see drawer.css) — too unreadable as escaped
-// Tailwind arbitrary values. Everything native stays inline below.
+// Swipe/stack transforms live in drawer.css — unreadable as Tailwind arbitrary values.
 import './drawer.css';
 
 export type DrawerSide = 'top' | 'right' | 'bottom' | 'left';
+// Width of left/right drawers: `md` keeps each variant's width (20rem default, 32rem floating).
+export type DrawerSize = 'md' | 'lg' | 'xl';
 
-// `side` is the design-system-facing prop. Base UI's `swipeDirection` describes the
-// dismissal gesture, which is the opposite of "where the drawer is anchored" only for
-// naming — a bottom-anchored sheet is swiped `down` to dismiss.
+const drawerBackdropVariants = cva('drawer-backdrop fixed inset-0 z-50', {
+  variants: {
+    overlay: {
+      visible: 'bg-scrim backdrop-blur-xs',
+      transparent: 'bg-transparent',
+      none: 'hidden',
+    },
+  },
+  defaultVariants: {
+    overlay: 'visible',
+  },
+});
+
+const drawerViewportVariants = cva('fixed z-50 flex', {
+  variants: {
+    side: {
+      top: 'items-start justify-center',
+      bottom: 'items-end justify-center',
+      left: 'items-stretch justify-start',
+      right: 'items-stretch justify-end',
+    },
+    layout: {
+      default: 'inset-0',
+      floating: 'p-2 sm:p-3',
+      floatingOverlay: 'inset-0 p-2 sm:p-3',
+    },
+    size: {
+      md: '',
+      lg: '',
+      xl: '',
+    },
+  },
+  // A floating drawer without an overlay sizes its viewport to the popup plus the `p-2 sm:p-3` gutter.
+  compoundVariants: [
+    {
+      side: 'right',
+      layout: 'floating',
+      className: 'inset-y-0 right-0 max-w-full',
+    },
+    {
+      side: 'left',
+      layout: 'floating',
+      className: 'inset-y-0 left-0 max-w-full',
+    },
+    {
+      side: ['left', 'right'],
+      layout: 'floating',
+      size: 'md',
+      className: 'w-[calc(32rem+1.5rem)] sm:w-[calc(32rem+2rem)]',
+    },
+    {
+      side: ['left', 'right'],
+      layout: 'floating',
+      size: 'lg',
+      className: 'w-[calc(42rem+1.5rem)] sm:w-[calc(42rem+2rem)]',
+    },
+    {
+      side: ['left', 'right'],
+      layout: 'floating',
+      size: 'xl',
+      className: 'w-[calc(56rem+1.5rem)] sm:w-[calc(56rem+2rem)]',
+    },
+    {
+      side: 'bottom',
+      layout: 'floating',
+      className: 'inset-x-0 bottom-0 h-[calc(85dvh+1.5rem)] max-h-full sm:h-[calc(85dvh+2rem)]',
+    },
+    {
+      side: 'top',
+      layout: 'floating',
+      className: 'inset-x-0 top-0 h-[calc(85dvh+1.5rem)] max-h-full sm:h-[calc(85dvh+2rem)]',
+    },
+  ],
+  defaultVariants: {
+    side: 'bottom',
+    layout: 'default',
+    size: 'md',
+  },
+});
+
+// `drawer-popup` hooks into drawer.css for swipe/stack transforms; `::after` dims under nested drawers.
+// `overflow-y-auto` makes the x axis `auto` too: `overscroll-x-none` stops Chrome's sideways trackpad bounce.
+const drawerPopupVariants = cva(
+  cn(
+    'drawer-popup group/popup relative z-50 box-border flex [touch-action:auto] flex-col overflow-y-auto overscroll-x-none overscroll-y-contain will-change-transform outline-none',
+    'text-foreground',
+    dialogSurfaceStyle,
+    'data-[swiping]:select-none',
+    "after:pointer-events-none after:absolute after:inset-0 after:bg-transparent after:transition-[background-color] after:duration-[450ms] after:content-['']",
+    'data-[nested-drawer-open]:after:bg-black/25',
+  ),
+  {
+    variants: {
+      side: {
+        bottom: '',
+        top: '',
+        left: '',
+        right: '',
+      },
+      variant: {
+        default: '',
+        floating: 'drawer-popup-floating pointer-events-auto rounded-lg',
+      },
+      size: {
+        md: '',
+        lg: '',
+        xl: '',
+      },
+    },
+    compoundVariants: [
+      {
+        side: 'bottom',
+        variant: 'default',
+        className: '-mb-12 h-[var(--drawer-height,auto)] max-h-[calc(85vh_+_3rem)] w-full rounded-t-xl pb-12',
+      },
+      {
+        side: 'top',
+        variant: 'default',
+        className: '-mt-12 h-[var(--drawer-height,auto)] max-h-[calc(85vh_+_3rem)] w-full rounded-b-xl pt-12',
+      },
+      {
+        side: 'left',
+        variant: 'default',
+        className: 'h-full max-w-[85vw] rounded-r-xl',
+      },
+      {
+        side: 'right',
+        variant: 'default',
+        className: 'h-full max-w-[85vw] rounded-l-xl',
+      },
+      {
+        side: ['left', 'right'],
+        variant: 'floating',
+        className:
+          'h-[calc(100dvh-1.5rem)] max-w-[calc(100vw-1.5rem)] sm:h-[calc(100dvh-2rem)] sm:max-w-[calc(100vw-2rem)]',
+      },
+      {
+        side: ['top', 'bottom'],
+        variant: 'floating',
+        className:
+          'max-h-[calc(85dvh-1.5rem)] w-[calc(100vw-1.5rem)] sm:max-h-[calc(85dvh-2rem)] sm:w-[calc(100vw-2rem)]',
+      },
+      {
+        side: ['left', 'right'],
+        variant: 'default',
+        size: 'md',
+        className: 'w-[20rem]',
+      },
+      {
+        side: ['left', 'right'],
+        variant: 'floating',
+        size: 'md',
+        className: 'w-[32rem]',
+      },
+      {
+        side: ['left', 'right'],
+        size: 'lg',
+        className: 'w-2xl',
+      },
+      {
+        side: ['left', 'right'],
+        size: 'xl',
+        className: 'w-4xl',
+      },
+    ],
+    defaultVariants: {
+      side: 'bottom',
+      variant: 'default',
+      size: 'md',
+    },
+  },
+);
+
+type DrawerBackdropVariantsProps = VariantProps<typeof drawerBackdropVariants>;
+type DrawerViewportClassVariantsProps = VariantProps<typeof drawerViewportVariants>;
+type DrawerPopupVariantsProps = VariantProps<typeof drawerPopupVariants>;
+export type DrawerVariant = NonNullable<DrawerPopupVariantsProps['variant']>;
+type DrawerViewportLayout = NonNullable<DrawerViewportClassVariantsProps['layout']>;
+type DrawerViewportVariantsProps = Pick<DrawerViewportClassVariantsProps, 'side' | 'size'> & {
+  variant?: DrawerVariant;
+};
+export type DrawerOverlay = 'auto' | NonNullable<DrawerBackdropVariantsProps['overlay']>;
+
+// `side` = anchor edge; Base UI's `swipeDirection` = dismissal gesture (bottom sheet swipes `down`).
 const sideToSwipeDirection: Record<DrawerSide, 'up' | 'down' | 'left' | 'right'> = {
   top: 'up',
   bottom: 'down',
@@ -21,29 +206,91 @@ const sideToSwipeDirection: Record<DrawerSide, 'up' | 'down' | 'left' | 'right'>
   right: 'right',
 };
 
-const DrawerSideContext = React.createContext<DrawerSide>('bottom');
+type DrawerContextValue = {
+  side: DrawerSide;
+  variant: DrawerVariant;
+  size: DrawerSize;
+  resolvedOverlay: NonNullable<DrawerBackdropVariantsProps['overlay']>;
+};
 
-const useDrawerSide = () => React.useContext(DrawerSideContext);
+const resolveDrawerOverlay = (
+  overlay: DrawerOverlay,
+  variant: DrawerVariant,
+): NonNullable<DrawerBackdropVariantsProps['overlay']> => {
+  if (overlay !== 'auto') {
+    return overlay;
+  }
+
+  return variant === 'floating' ? 'none' : 'visible';
+};
+
+const DrawerContext = React.createContext<DrawerContextValue>({
+  side: 'bottom',
+  variant: 'default',
+  size: 'md',
+  resolvedOverlay: 'visible',
+});
+
+const useDrawerContext = () => React.useContext(DrawerContext);
+
+const resolveDrawerViewportLayout = (
+  variant: DrawerVariant,
+  overlay: NonNullable<DrawerBackdropVariantsProps['overlay']>,
+): DrawerViewportLayout => {
+  if (variant !== 'floating') {
+    return 'default';
+  }
+
+  return overlay === 'none' ? 'floating' : 'floatingOverlay';
+};
 
 export type DrawerProps<Payload = unknown> = Omit<DrawerPrimitive.Root.Props<Payload>, 'swipeDirection'> & {
   /** Edge the drawer is anchored to. Defaults to `bottom`. */
   side?: DrawerSide;
+  /** Visual treatment for the drawer panel. Defaults to `default`. */
+  variant?: DrawerVariant;
+  /** Width of left/right drawers: `md` (20rem, or 32rem floating), `lg` (42rem) or `xl` (56rem). No effect on top/bottom drawers. Defaults to `md`. */
+  size?: DrawerSize;
+  /** Backdrop behavior. `auto` renders a visible backdrop for default drawers and no backdrop for floating drawers. */
+  overlay?: DrawerOverlay;
 };
 
-function Drawer<Payload = unknown>({ side = 'bottom', children, ...props }: DrawerProps<Payload>) {
+function Drawer<Payload = unknown>({
+  side = 'bottom',
+  variant = 'default',
+  size = 'md',
+  overlay = 'auto',
+  modal,
+  disablePointerDismissal,
+  children,
+  ...props
+}: DrawerProps<Payload>) {
+  const resolvedOverlay = resolveDrawerOverlay(overlay, variant);
+  const resolvedModal = modal ?? (resolvedOverlay === 'none' ? false : undefined);
+  const resolvedDisablePointerDismissal = disablePointerDismissal ?? (resolvedOverlay === 'none' ? true : undefined);
+  const contextValue = React.useMemo<DrawerContextValue>(
+    () => ({ side, variant, size, resolvedOverlay }),
+    [side, variant, size, resolvedOverlay],
+  );
+
   return (
-    <DrawerSideContext.Provider value={side}>
-      <DrawerPrimitive.Root swipeDirection={sideToSwipeDirection[side]} {...props}>
+    <DrawerContext.Provider value={contextValue}>
+      <DrawerPrimitive.Root
+        swipeDirection={sideToSwipeDirection[side]}
+        modal={resolvedModal}
+        disablePointerDismissal={resolvedDisablePointerDismissal}
+        {...props}
+      >
         {children}
       </DrawerPrimitive.Root>
-    </DrawerSideContext.Provider>
+    </DrawerContext.Provider>
   );
 }
 Drawer.displayName = 'Drawer';
 
-// Generic (not `forwardRef`) so `handle` / `payload` stay type-safe for detached
-// triggers — mirrors the `Select` wrapper's approach to generic Base UI parts.
+// Generic (not `forwardRef`) so `handle` / `payload` stay type-safe on detached triggers.
 type DrawerTriggerProps<Payload = unknown> = DrawerPrimitive.Trigger.Props<Payload> & {
+  /** @deprecated Use Base UI's native `render` prop instead for stronger composition typing. */
   asChild?: boolean;
 };
 
@@ -59,6 +306,7 @@ function DrawerTrigger<Payload = unknown>({ asChild, children, ...props }: Drawe
 DrawerTrigger.displayName = 'DrawerTrigger';
 
 type DrawerCloseProps = DrawerPrimitive.Close.Props & {
+  /** @deprecated Use Base UI's native `render` prop instead for stronger composition typing. */
   asChild?: boolean;
 };
 
@@ -78,151 +326,163 @@ const DrawerProvider = DrawerPrimitive.Provider;
 const DrawerIndent = DrawerPrimitive.Indent;
 const DrawerIndentBackground = DrawerPrimitive.IndentBackground;
 const DrawerSwipeArea = DrawerPrimitive.SwipeArea;
-const createDrawerHandle = DrawerPrimitive.createHandle;
+// Inner region where pointer drags select text / scroll instead of swiping the drawer closed.
+const DrawerInteractive = DrawerPrimitive.Content;
 
 type DrawerBackdropProps = Omit<DrawerPrimitive.Backdrop.Props, 'className'> & {
   className?: string;
-};
+} & DrawerBackdropVariantsProps;
 
 // The `drawer-backdrop` class (drawer.css) fades the overlay with the swipe gesture.
-const DrawerBackdrop = React.forwardRef<HTMLDivElement, DrawerBackdropProps>(({ className, ...props }, ref) => (
-  <DrawerPrimitive.Backdrop
-    ref={ref}
-    data-slot="drawer-backdrop"
-    className={cn('drawer-backdrop fixed inset-0 z-50 bg-overlay backdrop-blur-xs', className)}
-    {...props}
-  />
-));
-DrawerBackdrop.displayName = 'DrawerBackdrop';
+const DrawerBackdrop = React.forwardRef<HTMLDivElement, DrawerBackdropProps>(
+  ({ className, overlay, ...props }, ref) => {
+    const { resolvedOverlay } = useDrawerContext();
+    const resolvedBackdropOverlay = overlay ?? resolvedOverlay;
 
-const viewportSideClasses: Record<DrawerSide, string> = {
-  top: 'items-start justify-center',
-  bottom: 'items-end justify-center',
-  left: 'items-stretch justify-start',
-  right: 'items-stretch justify-end',
-};
+    return (
+      <DrawerPrimitive.Backdrop
+        ref={ref}
+        data-slot="drawer-backdrop"
+        data-overlay={resolvedBackdropOverlay}
+        className={cn(drawerBackdropVariants({ overlay: resolvedBackdropOverlay }), className)}
+        {...props}
+      />
+    );
+  },
+);
+DrawerBackdrop.displayName = 'DrawerBackdrop';
 
 type DrawerViewportProps = Omit<DrawerPrimitive.Viewport.Props, 'className'> & {
   className?: string;
-};
+} & DrawerViewportVariantsProps;
 
-// A plain full-screen flex container, exactly like the Base UI examples. It must NOT
-// set `pointer-events: none` for modal drawers — that breaks the swipe gesture. The
-// non-modal opt-out (`pointer-events-none` here + `pointer-events-auto` on the popup)
-// is applied by `DrawerContent` only when there is no backdrop.
-const DrawerViewport = React.forwardRef<HTMLDivElement, DrawerViewportProps>(({ className, ...props }, ref) => {
-  const side = useDrawerSide();
-  return (
-    <DrawerPrimitive.Viewport
-      ref={ref}
-      data-slot="drawer-viewport"
-      className={cn('fixed inset-0 z-50 flex', viewportSideClasses[side], className)}
-      {...props}
-    />
-  );
-});
-DrawerViewport.displayName = 'DrawerViewport';
+// Keep the viewport pointer-interactive: Base UI wires native drag-to-dismiss to it.
+// Floating drawers without an overlay constrain the viewport so the page behind stays interactive.
+// Floating drawers with an overlay keep a full-screen viewport so overlay-start drags stay native.
+const DrawerViewport = React.forwardRef<HTMLDivElement, DrawerViewportProps>(
+  ({ className, side, variant, size, ...props }, ref) => {
+    const context = useDrawerContext();
+    const resolvedSide = side ?? context.side;
+    const resolvedVariant = variant ?? context.variant;
+    const resolvedSize = size ?? context.size;
+    const layout = resolveDrawerViewportLayout(resolvedVariant, context.resolvedOverlay);
 
-// Native popup styles — layout, colour, the `after:` dim overlay. The `drawer-popup`
-// class hooks into drawer.css for the swipe/stack transforms and transitions.
-const drawerPopupBaseClass = cn(
-  'drawer-popup group/popup relative z-50 box-border flex flex-col overflow-y-auto overscroll-contain outline-none [touch-action:auto] will-change-transform',
-  'border-border1 bg-surface3 text-neutral5 shadow-dialog',
-  'data-[swiping]:select-none',
-  // Dim layer drawn over a parent drawer while a nested drawer covers it.
-  "after:pointer-events-none after:absolute after:inset-0 after:bg-transparent after:transition-[background-color] after:duration-[450ms] after:content-['']",
-  'data-[nested-drawer-open]:after:bg-black/25',
+    return (
+      <DrawerPrimitive.Viewport
+        ref={ref}
+        data-slot="drawer-viewport"
+        data-variant={resolvedVariant}
+        className={cn(drawerViewportVariants({ side: resolvedSide, layout, size: resolvedSize }), className)}
+        {...props}
+      />
+    );
+  },
 );
-
-// Per-side layout. Top/bottom sheets bleed 3rem past the viewport edge
-// (`-mb-12`/`pb-12`) so a stacked parent's border stays flush as it peeks behind.
-// The slide/scale transforms for each side live in drawer.css.
-const popupSideClasses: Record<DrawerSide, string> = {
-  bottom: 'h-[var(--drawer-height,auto)] max-h-[calc(85vh_+_3rem)] w-full -mb-12 pb-12 rounded-t-xl border-x border-t',
-  top: 'h-[var(--drawer-height,auto)] max-h-[calc(85vh_+_3rem)] w-full -mt-12 pt-12 rounded-b-xl border-x border-b',
-  left: 'h-full w-[20rem] max-w-[85vw] rounded-r-xl border-y border-r',
-  right: 'h-full w-[20rem] max-w-[85vw] rounded-l-xl border-y border-l',
-};
+DrawerViewport.displayName = 'DrawerViewport';
 
 type DrawerPopupProps = Omit<DrawerPrimitive.Popup.Props, 'className'> & {
   className?: string;
-};
+} & DrawerPopupVariantsProps;
 
-const DrawerPopup = React.forwardRef<HTMLDivElement, DrawerPopupProps>(({ className, ...props }, ref) => {
-  const side = useDrawerSide();
-  return (
-    <DrawerPrimitive.Popup
-      ref={ref}
-      data-slot="drawer-popup"
-      className={cn(drawerPopupBaseClass, popupSideClasses[side], className)}
-      {...props}
-    />
-  );
-});
+const DrawerPopup = React.forwardRef<HTMLDivElement, DrawerPopupProps>(
+  ({ className, side, variant, size, ...props }, ref) => {
+    const context = useDrawerContext();
+    const resolvedSide = side ?? context.side;
+    const resolvedVariant = variant ?? context.variant;
+    const resolvedSize = size ?? context.size;
+
+    return (
+      <DrawerPrimitive.Popup
+        ref={ref}
+        data-slot="drawer-popup"
+        data-variant={resolvedVariant}
+        data-size={resolvedSize}
+        className={cn(
+          drawerPopupVariants({ side: resolvedSide, variant: resolvedVariant, size: resolvedSize }),
+          className,
+        )}
+        {...props}
+      />
+    );
+  },
+);
 DrawerPopup.displayName = 'DrawerPopup';
 
-type DrawerContentProps = Omit<DrawerPrimitive.Popup.Props, 'className'> & {
-  className?: string;
-  /** Portal target. Defaults to `document.body`. */
-  container?: HTMLElement | null;
-  /** Hide the dimmed backdrop layer (use for non-modal drawers). */
-  hideBackdrop?: boolean;
-  /** Hide the built-in close button. */
-  hideCloseButton?: boolean;
-  /** Hide the drag handle shown on top/bottom sheets. */
-  hideHandle?: boolean;
-};
-
-// Faded out while a nested drawer is open so the collapsed parent reads as a backdrop.
+// Inner-content fade while a nested drawer covers the parent. Off the popup itself so border/shadow stay crisp.
 const nestedFadeClass = cn(
   'transition-opacity duration-300 ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:duration-0',
   'group-data-[nested-drawer-open]/popup:opacity-0',
 );
 
-const HandleBar = () => (
-  <div className={cn('mx-auto my-2 h-1 w-12 shrink-0 rounded-full bg-surface5', nestedFadeClass)} />
+const DrawerHandleBar = () => (
+  <div
+    aria-hidden
+    data-slot="drawer-handle"
+    className={cn('mx-auto my-2 h-1 w-12 shrink-0 rounded-full bg-muted', nestedFadeClass)}
+  />
 );
+DrawerHandleBar.displayName = 'DrawerHandleBar';
 
-/**
- * Convenience composition of Portal + Backdrop + Viewport + Popup.
- *
- * Children sit in a plain `<div>`, not Base UI's `Drawer.Content`. `Drawer.Content`
- * marks its subtree as mouse-text-selectable, so a *pointer* drag inside it selects
- * text instead of swiping (touch still swipes). A plain `<div>` keeps the entire
- * panel drag-to-dismiss for pointer and touch alike. Pair this with not putting
- * `pointer-events: none` on a modal viewport — that also blocks the swipe.
- *
- * `hideBackdrop` marks the drawer as non-modal: it drops the backdrop and switches the
- * viewport to `pointer-events: none` (popup re-enables its own) so the page behind
- * stays interactive — the only case where that opt-out is correct.
- *
- * For layouts that need their own structure, compose the styled parts
- * (`DrawerPortal`, `DrawerBackdrop`, `DrawerViewport`, `DrawerPopup`) directly instead.
- */
+type DrawerFloatingSideHandleProps = {
+  side: DrawerSide;
+  variant: DrawerVariant;
+};
+
+const DrawerFloatingSideHandle = ({ side, variant }: DrawerFloatingSideHandleProps) => {
+  if (variant !== 'floating' || (side !== 'left' && side !== 'right')) {
+    return null;
+  }
+
+  return (
+    <div
+      aria-hidden
+      data-slot="drawer-side-handle"
+      className={cn(
+        'absolute top-1/2 z-10 flex h-20 w-5 -translate-y-1/2 cursor-ew-resize touch-none items-center justify-center select-none lg:hidden',
+        side === 'right' ? '-left-2' : '-right-2',
+      )}
+    >
+      <div className="h-10 w-1 rounded-full bg-border-strong" />
+    </div>
+  );
+};
+DrawerFloatingSideHandle.displayName = 'DrawerFloatingSideHandle';
+
+type DrawerContentProps = Omit<DrawerPrimitive.Popup.Props, 'className' | 'children'> & {
+  className?: string;
+  children?: React.ReactNode;
+  /** Shows the built-in top-right close button. Defaults to `true`. */
+  showCloseButton?: boolean;
+} & Pick<DrawerPopupVariantsProps, 'variant' | 'size'>;
+
+// Opinionated bundle: Portal + Backdrop + Viewport + Popup, with handle on top/bottom sheets.
+// Drop to the primitives for non-modal pages, custom portal targets, or chrome outside the popup.
 const DrawerContent = React.forwardRef<HTMLDivElement, DrawerContentProps>(
-  ({ className, children, container, hideBackdrop, hideCloseButton, hideHandle, ...props }, ref) => {
-    const side = useDrawerSide();
-    const showHandle = !hideHandle && (side === 'top' || side === 'bottom');
+  ({ className, children, variant, size, showCloseButton = true, ...props }, ref) => {
+    const { side, variant: contextVariant, size: contextSize, resolvedOverlay } = useDrawerContext();
+    const resolvedVariant = variant ?? contextVariant;
+    const resolvedSize = size ?? contextSize;
+    const showHandle = side === 'top' || side === 'bottom';
 
     return (
-      <DrawerPortal container={container ?? undefined}>
-        {!hideBackdrop && <DrawerBackdrop />}
-        <DrawerViewport className={hideBackdrop ? 'pointer-events-none' : undefined}>
-          <DrawerPopup ref={ref} className={cn(hideBackdrop && 'pointer-events-auto', className)} {...props}>
-            {showHandle && side === 'bottom' && <HandleBar />}
-            <div data-slot="drawer-content" className={cn('relative flex min-h-0 flex-1 flex-col', nestedFadeClass)}>
-              {children}
-              {!hideCloseButton && (
-                <DrawerPrimitive.Close
-                  render={
-                    <Button variant="ghost" size="sm" className="absolute top-3 right-3" aria-label="Close">
-                      <X />
-                    </Button>
-                  }
-                />
+      <DrawerPortal>
+        {resolvedOverlay !== 'none' && <DrawerBackdrop />}
+        <DrawerViewport variant={resolvedVariant} size={resolvedSize}>
+          <DrawerPopup ref={ref} variant={resolvedVariant} size={resolvedSize} className={className} {...props}>
+            {showHandle && side === 'bottom' && <DrawerHandleBar />}
+            <DrawerFloatingSideHandle side={side} variant={resolvedVariant} />
+            <div
+              data-slot="drawer-content"
+              className={cn(
+                'relative flex min-h-0 flex-1 flex-col',
+                '[&>form]:flex [&>form]:min-h-0 [&>form]:flex-1 [&>form]:flex-col [&>form]:gap-0',
+                nestedFadeClass,
               )}
+            >
+              {showCloseButton && <DrawerDefaultCloseButton />}
+              {children}
             </div>
-            {showHandle && side === 'top' && <HandleBar />}
+            {showHandle && side === 'top' && <DrawerHandleBar />}
           </DrawerPopup>
         </DrawerViewport>
       </DrawerPortal>
@@ -231,22 +491,35 @@ const DrawerContent = React.forwardRef<HTMLDivElement, DrawerContentProps>(
 );
 DrawerContent.displayName = 'DrawerContent';
 
+const DrawerDefaultCloseButton = () => (
+  <DrawerClose asChild>
+    <Button type="button" variant="ghost" size="icon-sm" className="absolute top-3 right-3 z-10" aria-label="Close">
+      <IconCrossMedium />
+    </Button>
+  </DrawerClose>
+);
+DrawerDefaultCloseButton.displayName = 'DrawerDefaultCloseButton';
+
 const DrawerHeader = ({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
-  <div data-slot="drawer-header" className={cn('flex flex-col gap-0.5 px-4 py-3 text-left', className)} {...props} />
+  <div
+    data-slot="drawer-header"
+    className={cn('flex flex-col gap-0.5 px-3 py-2.5 pr-12 text-left', className)}
+    {...props}
+  />
 );
 DrawerHeader.displayName = 'DrawerHeader';
 
 const DrawerFooter = ({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
   <div
     data-slot="drawer-footer"
-    className={cn('mt-auto flex flex-col-reverse gap-1.5 px-4 py-3 sm:flex-row sm:justify-end', className)}
+    className={cn('mt-auto flex flex-col-reverse gap-1.5 px-3 py-2.5 sm:flex-row sm:justify-end', className)}
     {...props}
   />
 );
 DrawerFooter.displayName = 'DrawerFooter';
 
 const DrawerBody = ({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
-  <div data-slot="drawer-body" className={cn('flex-1 px-4 py-3', className)} {...props} />
+  <div data-slot="drawer-body" className={cn('flex-1 px-3 py-2.5', className)} {...props} />
 );
 DrawerBody.displayName = 'DrawerBody';
 
@@ -255,7 +528,7 @@ type DrawerTitleProps = Omit<DrawerPrimitive.Title.Props, 'className'> & {
 };
 
 const DrawerTitle = React.forwardRef<HTMLHeadingElement, DrawerTitleProps>(({ className, ...props }, ref) => (
-  <DrawerPrimitive.Title ref={ref} className={cn('text-ui-md font-medium text-neutral6', className)} {...props} />
+  <DrawerPrimitive.Title ref={ref} className={cn('text-subheading text-foreground', className)} {...props} />
 ));
 DrawerTitle.displayName = 'DrawerTitle';
 
@@ -265,7 +538,7 @@ type DrawerDescriptionProps = Omit<DrawerPrimitive.Description.Props, 'className
 
 const DrawerDescription = React.forwardRef<HTMLParagraphElement, DrawerDescriptionProps>(
   ({ className, ...props }, ref) => (
-    <DrawerPrimitive.Description ref={ref} className={cn('text-ui-sm text-neutral3', className)} {...props} />
+    <DrawerPrimitive.Description ref={ref} className={cn('text-caption text-muted-foreground', className)} {...props} />
   ),
 );
 DrawerDescription.displayName = 'DrawerDescription';
@@ -288,7 +561,7 @@ export {
   DrawerIndent,
   DrawerIndentBackground,
   DrawerSwipeArea,
-  createDrawerHandle,
+  DrawerInteractive,
 };
 
 export type {

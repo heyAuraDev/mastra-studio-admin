@@ -1,8 +1,13 @@
-import type { InValue } from '@libsql/client';
 import type { IMastraLogger } from '@mastra/core/logger';
-import { safelyParseJSON, TABLE_SCHEMAS } from '@mastra/core/storage';
+import { isRunFenceConflictError, safelyParseJSON, TABLE_SCHEMAS } from '@mastra/core/storage';
 import type { StorageColumn, TABLE_NAMES } from '@mastra/core/storage';
 import { parseSqlIdentifier } from '@mastra/core/utils';
+import type { SqliteInValue as InValue } from './client';
+
+// Guards against unbounded recursion on pathologically deep values (e.g. long
+// chained Error.cause), which would otherwise throw an uncaught
+// `RangeError: Maximum call stack size exceeded`.
+const MAX_DEPTH = 100;
 
 /**
  * Safely serializes a value to JSON string with pre-sanitization.
@@ -21,12 +26,16 @@ export const safeStringify = (value: unknown): string => {
   // of the same object graph.
   const ancestors = new Set<object>();
 
-  const sanitize = (val: unknown): unknown => {
+  const sanitize = (val: unknown, depth: number = 0): unknown => {
     if (val === null || val === undefined) return val;
     if (typeof val === 'function') return undefined;
     if (typeof val === 'symbol') return undefined;
     if (typeof val === 'bigint') return val.toString();
     if (typeof val !== 'object') return val;
+
+    // Depth guard: stop recursing once the nesting exceeds the cap and return a
+    // sentinel instead of overflowing the call stack.
+    if (depth > MAX_DEPTH) return '[Max depth exceeded]';
 
     // Circular reference check: only drop if this object is an ancestor on the
     // current path. Shared sibling references must still be serialized.
@@ -42,20 +51,20 @@ export const safeStringify = (value: unknown): string => {
 
     // Call toJSON if available (like RequestContext)
     if (typeof (val as Record<string, unknown>).toJSON === 'function') {
-      return sanitize((val as { toJSON: () => unknown }).toJSON());
+      return sanitize((val as { toJSON: () => unknown }).toJSON(), depth + 1);
     }
 
     ancestors.add(val);
     try {
       // Recursively sanitize arrays
       if (Array.isArray(val)) {
-        return val.map(item => sanitize(item));
+        return val.map(item => sanitize(item, depth + 1));
       }
 
       // Recursively sanitize objects
       const result: Record<string, unknown> = {};
       for (const key of Object.keys(val)) {
-        const sanitized = sanitize((val as Record<string, unknown>)[key]);
+        const sanitized = sanitize((val as Record<string, unknown>)[key], depth + 1);
         if (sanitized !== undefined) {
           result[key] = sanitized;
         }
@@ -127,12 +136,58 @@ export function isLockError(error: any): boolean {
   );
 }
 
+const TRANSIENT_NETWORK_PATTERNS = [
+  'fetch failed',
+  'econnreset',
+  'etimedout',
+  'eai_again',
+  'socket hang up',
+  'und_err_',
+];
+
+/**
+ * Checks if an error (or any error in its `cause` chain) is a transient network failure
+ * such as `fetch failed` from a remote libsql client.
+ */
+export function isTransientNetworkError(error: unknown): boolean {
+  let current: any = error;
+  for (let depth = 0; current && depth < 5; depth++) {
+    const text = `${current.message ?? ''} ${current.code ?? ''}`.toLowerCase();
+    if (TRANSIENT_NETWORK_PATTERNS.some(pattern => text.includes(pattern))) {
+      return true;
+    }
+    current = current.cause;
+  }
+  return false;
+}
+
+/**
+ * Bounded fields for retry diagnostics. The caller gets the original error, so
+ * logs carry only its type and code: no message, cause chain, stack or SQL,
+ * which can hold application data (#29885).
+ */
+function describeWriteError(error: unknown): { errorType: string | undefined; errorCode: string | undefined } {
+  if (typeof error !== 'object' || error === null) return { errorType: typeof error, errorCode: undefined };
+  const code = (error as { code?: unknown }).code;
+  return { errorType: error.constructor?.name, errorCode: typeof code === 'string' ? code : undefined };
+}
+
+/**
+ * Wraps write operations with retry on SQLite lock errors.
+ *
+ * `getLogger` is read on every log call, so a logger set after construction
+ * (for example by `new Mastra({ logger })` or `mastra.setLogger()`) is used.
+ *
+ * `operationDescription` appears in log messages, so callers pass a fixed label
+ * or table name (`insert into table mastra_threads`, `persistWorkflowSnapshot`),
+ * never ids, SQL or record data.
+ */
 export function createExecuteWriteOperationWithRetry({
-  logger,
+  getLogger,
   maxRetries,
   initialBackoffMs,
 }: {
-  logger: IMastraLogger;
+  getLogger: () => IMastraLogger;
   maxRetries: number;
   initialBackoffMs: number;
 }) {
@@ -147,10 +202,11 @@ export function createExecuteWriteOperationWithRetry({
       try {
         return await operationFn();
       } catch (error: any) {
-        logger.debug(`LibSQLStore: Error caught in retry loop for ${operationDescription}`, {
-          errorType: error.constructor.name,
-          errorCode: error.code,
-          errorMessage: error.message,
+        // A superseded run's write: expected after a takeover, and never retryable.
+        if (isRunFenceConflictError(error)) throw error;
+        const details = describeWriteError(error);
+        getLogger().debug(`LibSQLStore: Error caught in retry loop for ${operationDescription}`, {
+          ...details,
           attempts,
           maxRetries,
         });
@@ -158,20 +214,21 @@ export function createExecuteWriteOperationWithRetry({
         if (isLockError(error)) {
           attempts++;
           if (attempts >= maxRetries) {
-            logger.error(
-              `LibSQLStore: Operation failed after ${maxRetries} attempts due to database lock: ${error.message}`,
-              { error, attempts, maxRetries },
-            );
+            getLogger().error(`LibSQLStore: Operation failed after ${maxRetries} attempts due to database lock`, {
+              ...details,
+              attempts,
+              maxRetries,
+            });
             throw error;
           }
-          logger.warn(
+          getLogger().warn(
             `LibSQLStore: Attempt ${attempts} failed due to database lock during ${operationDescription}. Retrying in ${backoff}ms...`,
-            { errorMessage: error.message, attempts, backoff, maxRetries },
+            { ...details, attempts, backoff, maxRetries },
           );
           await new Promise(resolve => setTimeout(resolve, backoff));
           backoff *= 2;
         } else {
-          logger.error(`LibSQLStore: Non-lock error during ${operationDescription}, not retrying`, { error });
+          getLogger().error(`LibSQLStore: Non-lock error during ${operationDescription}, not retrying`, details);
           throw error;
         }
       }

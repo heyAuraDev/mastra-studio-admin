@@ -1,8 +1,12 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { InvalidArgumentError } from 'commander';
 import { execa } from 'execa';
 import fsExtra from 'fs-extra';
 import type { PackageManager } from '../utils/package-manager';
+import { selectMatchingDistTag } from './create/command';
 import { EDITOR, isValidEditor } from './init/mcp-docs-server-install';
 import { areValidComponents, COMPONENTS, isValidLLMProvider, LLMProvider } from './init/utils';
 
@@ -39,6 +43,19 @@ export function getPackageManager(): PackageManager {
   }
 
   return 'npm'; // Default fallback
+}
+
+/**
+ * Wrap an async commander action so failures print a clean error message
+ * (never a stack trace) and exit non-zero.
+ */
+export function wrapAction(fn: (...args: any[]) => Promise<void>): (...args: any[]) => void {
+  return (...args: any[]) => {
+    fn(...args).catch((err: Error) => {
+      console.error(`Error: ${err.message}`);
+      process.exit(1);
+    });
+  };
 }
 
 export function parseMcp(value: string) {
@@ -78,26 +95,47 @@ export function shouldSkipDotenvLoading(): boolean {
 }
 
 /**
- * Get the version tag (e.g., 'beta', 'latest') for the currently running mastra CLI.
- * This queries npm dist-tags to find which tag corresponds to the current version.
+ * Node flags that make stack traces resolve through the bundle's source maps.
+ * Skipped when NODE_OPTIONS already sets either form of the flag, since a CLI
+ * flag would override a `--no-enable-source-maps` there. Callers place these
+ * before user-supplied args so `--no-enable-source-maps` in those still wins.
  */
-export async function getVersionTag(): Promise<string | undefined> {
+export function getSourceMapNodeArgs(sourcemapEnabled: boolean, nodeOptions: string | undefined): string[] {
+  // Node accepts underscores in option names, e.g. `--no-enable_source_maps`.
+  const setInNodeOptions = nodeOptions?.replaceAll('_', '-').includes('enable-source-maps');
+  return sourcemapEnabled && !setInNodeOptions ? ['--enable-source-maps'] : [];
+}
+
+/**
+ * Get the version tag (e.g., 'beta', 'latest') for the currently running mastra CLI.
+ * Create passes its known version to avoid resolving package metadata from an installed layout.
+ * Init omits it and preserves the existing best-effort undefined fallback.
+ */
+export async function getVersionTag(version?: string): Promise<string | undefined> {
   try {
-    const pkgPath = fileURLToPath(import.meta.resolve('mastra/package.json'));
-    const json = await fsExtra.readJSON(pkgPath);
-    const currentVersion = json.version;
+    let currentVersion = version;
+    if (!currentVersion) {
+      const pkgPath = fileURLToPath(import.meta.resolve('mastra/package.json'));
+      const json = await fsExtra.readJSON(pkgPath);
+      currentVersion = json.version;
+    }
+    if (!currentVersion) throw new Error('Missing mastra package version');
 
     const { stdout } = await execa('npm', ['dist-tag', 'ls', 'mastra'], {
       cwd: import.meta.dirname,
     });
-    const tagLine = stdout.split('\n').find((distLine: string) => distLine.endsWith(`: ${currentVersion}`));
-    const tag = tagLine ? tagLine.split(':')[0]?.trim() : undefined;
-
-    return tag;
+    const tag = selectMatchingDistTag(currentVersion, stdout);
+    if (tag) return tag;
   } catch {
-    // If we can't determine the tag, return undefined (will use default/latest)
-    return undefined;
+    // The caller-specific fallback is handled below.
   }
+
+  if (version) {
+    console.error('We could not resolve the mastra version tag, falling back to "latest"');
+    return 'latest';
+  }
+
+  return undefined;
 }
 
 /**
@@ -123,7 +161,7 @@ export async function gitInit({ cwd }: { cwd: string }) {
     [
       'commit',
       '-m',
-      '"Initial commit from Mastra"',
+      'Initial commit from Mastra',
       '--author="dane-ai-mastra[bot] <dane-ai-mastra[bot]@users.noreply.github.com>"',
     ],
     { cwd, stdio: 'ignore' },

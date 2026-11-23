@@ -1,0 +1,76 @@
+import { Button } from '@mastra/playground-ui/components/Button';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { IconStar } from '@mastra/playground-ui/icons/central/IconStar';
+import { cn } from '@mastra/playground-ui/utils/cn';
+import { useAuthCapabilities, isAuthenticated } from '@mastra/react/hooks/auth';
+import type { MouseEvent } from 'react';
+import { useBuilderAgentFeatures } from '@/domains/agent-builder';
+import { useToggleStoredAgentFavorite } from '@/domains/agent-builder/hooks/use-stored-agent-favorite';
+
+export interface FavoriteButtonProps {
+  agentId: string;
+  isFavorited?: boolean;
+  favoriteCount?: number;
+  size?: 'sm' | 'md';
+  className?: string;
+  /** Show the count badge next to the icon. Defaults to true. */
+  showCount?: boolean;
+}
+
+/**
+ * Toggles the favorite state for a stored agent. Renders nothing if the EE
+ * `agent.favorites` flag is off. Stops click propagation so it can sit inside a
+ * row that is itself a link.
+ */
+export const FavoriteButton = ({
+  agentId,
+  isFavorited = false,
+  favoriteCount,
+  size = 'md',
+  className,
+  showCount = true,
+}: FavoriteButtonProps) => {
+  const features = useBuilderAgentFeatures();
+  const toggle = useToggleStoredAgentFavorite(agentId);
+  const { data: capabilities, isLoading } = useAuthCapabilities();
+
+  if (isLoading) return null;
+  if (!features.favorites) return null;
+
+  const signedIn = capabilities ? isAuthenticated(capabilities) : false;
+  const label = isFavorited ? 'Unstar agent' : 'Star agent';
+  const disabledLabel = 'Sign in to star this agent';
+  const countLabel = favoriteCount === 1 ? 'Star' : 'Stars';
+  const isDisabled = toggle.isPending || !signedIn;
+
+  return (
+    <Button
+      type="button"
+      variant="default"
+      size={size}
+      aria-pressed={isFavorited}
+      aria-label={signedIn ? label : disabledLabel}
+      title={signedIn ? label : disabledLabel}
+      disabled={isDisabled}
+      onClick={(event: MouseEvent<HTMLButtonElement>) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!signedIn) return;
+        toggle.mutate({ favorited: !isFavorited });
+      }}
+      className={cn(
+        'shrink-0',
+        signedIn ? 'cursor-pointer' : 'cursor-not-allowed',
+        isFavorited && '[&_svg]:text-badge-amber-indicator',
+        className,
+      )}
+    >
+      <IconStar className={cn('shrink-0', isFavorited && 'fill-current')} aria-hidden />
+      {showCount && typeof favoriteCount === 'number' && (
+        <Txt as="span" variant="label" className="whitespace-nowrap">
+          <span className="tabular-nums">{favoriteCount}</span> {countLabel}
+        </Txt>
+      )}
+    </Button>
+  );
+};

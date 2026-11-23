@@ -1,15 +1,21 @@
-import { describe, beforeAll, afterAll } from 'vitest';
 import type { MastraStorage } from '@mastra/core/storage';
-import { createScoresTest } from './domains/scores';
-import { createMemoryTest } from './domains/memory';
-import { createWorkflowsTests } from './domains/workflows';
-import { createObservabilityTests } from './domains/observability';
+import { describe, beforeAll, afterAll } from 'vitest';
 import { createAgentsTests } from './domains/agents';
-import { createDatasetsTests } from './domains/datasets';
 import { createBackgroundTasksTests } from './domains/background-tasks';
+import { createChannelsTests } from './domains/channels';
+import { createDatasetsTests } from './domains/datasets';
 import { createExperimentsTests } from './domains/experiments';
 import { createFavoritesTests } from './domains/favorites';
+import { createMemoryTest } from './domains/memory';
+import { createObservabilityTests } from './domains/observability';
+import { createRunFencingTests } from './domains/run-fencing';
 import { createSchedulesTests } from './domains/schedules';
+import { createScoresTest } from './domains/scores';
+import { createSkillsTests } from './domains/skills';
+import { createToolProviderConnectionsTests } from './domains/tool-provider-connections';
+import { createWorkflowDefinitionsTests } from './domains/workflow-definitions';
+import { createWorkflowStepGuardTests } from './domains/workflow-step-guards';
+import { createWorkflowsTests } from './domains/workflows';
 export * from './domains/memory/data';
 export * from './domains/workflows/data';
 export * from './domains/scores/data';
@@ -19,6 +25,8 @@ export * from './domains/datasets/data';
 export * from './domains/experiments/data';
 export * from './domains/background-tasks/data';
 export * from './domains/schedules/data';
+export * from './domains/channels/data';
+export * from './domains/tool-provider-connections/data';
 
 /**
  * Test-specific feature flags for conditionally enabling test scenarios.
@@ -28,6 +36,35 @@ export * from './domains/schedules/data';
 export type TestCapabilities = {
   /** Whether the adapter supports listing scores by span (defaults to true) */
   listScoresBySpan?: boolean;
+  /** Whether scorer-based pagination is guaranteed to be ordered newest-first. */
+  deterministicScorePagination?: boolean;
+  /**
+   * Whether the adapter persists item-level tool mocks and experiment tool mock
+   * reports (defaults to true). Adapters that reject them (e.g. MySQL) set this
+   * to false so the round-trip suite asserts rejection instead of persistence.
+   */
+  toolMocks?: boolean;
+  /** Whether identity-aware dataset item insertion is supported (defaults to true). */
+  datasetItemIdentity?: boolean;
+  /** Whether permanent dataset item purge is supported by the test topology (defaults to true). */
+  datasetItemPurge?: boolean;
+  /**
+   * Whether late workflow-result writes preserve a deleted run. Concurrent adapters default to true;
+   * adapters pending alignment under COR-1448 set this to false. Pending adapters are Convex, DSQL,
+   * DynamoDB, Elasticsearch, MongoDB, MSSQL, MySQL, OracleDB, Redis, Spanner, Upstash, and Valkey.
+   */
+  workflowResultsNoopWhenRunMissing?: boolean;
+  /**
+   * Whether batchDeleteTraces supports tenant-scoped deletion via
+   * organizationId/resourceId (defaults to false). Adapters without tenant
+   * columns must reject scoped calls; the suite asserts that rejection.
+   */
+  scopedTraceDeletion?: boolean;
+  /**
+   * Whether skills list/listResolved apply the `metadata` filter against the
+   * resolved version (defaults to true). Pending adapters: MongoDB, MySQL, Spanner.
+   */
+  skillsMetadataFilter?: boolean;
 };
 
 export function createTestSuite(storage: MastraStorage, capabilities: TestCapabilities = {}) {
@@ -90,21 +127,45 @@ export function createTestSuite(storage: MastraStorage, capabilities: TestCapabi
         clearList.push(schedulesStorage.dangerouslyClearAll());
       }
 
+      const channelsStorage = await storage.getStore('channels');
+      if (channelsStorage) {
+        clearList.push(channelsStorage.dangerouslyClearAll());
+      }
+
+      const toolProviderConnectionsStorage = await storage.getStore('toolProviderConnections');
+      if (toolProviderConnectionsStorage) {
+        clearList.push(toolProviderConnectionsStorage.dangerouslyClearAll());
+      }
+
+      const workflowDefinitionsStorage = await storage.getStore('workflowDefinitions');
+      if (workflowDefinitionsStorage) {
+        clearList.push(workflowDefinitionsStorage.dangerouslyClearAll());
+      }
+
       // Clear all domain data after tests
       await Promise.all(clearList);
     });
 
     // Tests are registered unconditionally - each test internally handles
     // checking if the storage domain is available
-    createWorkflowsTests({ storage });
+    createWorkflowsTests({
+      storage,
+      workflowResultsNoopWhenRunMissing: capabilities.workflowResultsNoopWhenRunMissing,
+    });
     createMemoryTest({ storage });
     createScoresTest({ storage, capabilities });
-    createObservabilityTests({ storage });
+    createObservabilityTests({ storage, capabilities });
     createAgentsTests({ storage });
-    createDatasetsTests({ storage });
-    createExperimentsTests({ storage });
+    createDatasetsTests({ storage, capabilities });
+    createExperimentsTests({ storage, capabilities });
     createBackgroundTasksTests({ storage });
     createFavoritesTests({ storage });
+    createSkillsTests({ storage, metadataFilter: capabilities.skillsMetadataFilter ?? true });
     createSchedulesTests({ storage });
+    createChannelsTests({ storage });
+    createToolProviderConnectionsTests({ storage });
+    createWorkflowDefinitionsTests({ storage });
+    createRunFencingTests({ storage });
+    createWorkflowStepGuardTests({ storage });
   });
 }

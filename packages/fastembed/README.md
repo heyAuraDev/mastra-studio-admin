@@ -7,7 +7,7 @@ This package is a maintained fork of [fastembed-js](https://github.com/Anush008/
 ## Installation
 
 ```bash
-pnpm add @mastra/fastembed
+npm install @mastra/fastembed
 ```
 
 ## Usage
@@ -24,53 +24,28 @@ const memory = new Memory({
 });
 ```
 
-### Available Models
+### Input length
 
-```typescript
-import { fastembed } from '@mastra/fastembed';
+FastEmbed models embed at most 512 tokens per input (roughly 2,000 to 2,500 characters of English text). Longer inputs are truncated: text past the limit doesn't affect the embedding. The AI SDK v3 models return a warning when this happens. Chunk long documents to fit the window, for example with `maxSize: 1500` in `MDocument.chunk()`.
 
-// Default export (bge-small-en-v1.5 with v3 spec)
-const embedder = fastembed;
+### CPU usage
 
-// Named exports for v3 models
-const small = fastembed.small; // bge-small-en-v1.5
-const base = fastembed.base; // bge-base-en-v1.5
+Under a CPU limit, such as a container's CPU quota, FastEmbed runs each model with one thread per CPU the process may use. Without a limit, ONNX Runtime picks the count itself (one thread per physical core). Each loaded model has its own threads, so models loaded side by side add up. To leave CPU for the rest of the process, or when the limit isn't visible to the process (for example a Kubernetes CPU request without a limit), set the thread count per model with the `MASTRA_FASTEMBED_THREADS` environment variable:
 
-// V2 models (for AI SDK v5 compatibility)
-const smallV2 = fastembed.smallV2;
-const baseV2 = fastembed.baseV2;
-
-// Legacy v1 models (for backwards compatibility)
-const smallLegacy = fastembed.smallLegacy; // bge-small-en-v1.5 (v1 spec)
-const baseLegacy = fastembed.baseLegacy; // bge-base-en-v1.5 (v1 spec)
+```bash
+MASTRA_FASTEMBED_THREADS=2
 ```
 
-### Direct Usage with AI SDK
+The variable applies wherever FastEmbed loads a model, including `fastembed`, `fastembed.small`, and the other exported models. If you build a model yourself with `FlagEmbedding.init()` or `SparseTextEmbedding.init()`, the `threads` option sets the count for that model and takes precedence over the variable.
 
-```typescript
-import { embed } from 'ai';
-import { fastembed } from '@mastra/fastembed';
+## Documentation
 
-const result = await embed({
-  model: fastembed,
-  value: 'Text to embed',
-});
+- [Use FastEmbed for local semantic recall](https://mastra.ai/docs/memory/semantic-recall#using-fastembed-local)
 
-console.log(result.embedding); // number[]
-```
+## Changelog
 
-## Supported Models
+See the [package changelog](https://github.com/mastra-ai/mastra/blob/main/packages/fastembed/CHANGELOG.md) for version history and release notes.
 
-| Model                   | Dimensions | Description                 |
-| ----------------------- | ---------- | --------------------------- |
-| `bge-small-en-v1.5`     | 384        | Fast, default English model |
-| `bge-base-en-v1.5`      | 768        | Base English model          |
-| `bge-small-en`          | 384        | Fast English model          |
-| `bge-base-en`           | 768        | Base English model          |
-| `bge-small-zh-v1.5`     | 512        | Fast Chinese model          |
-| `all-MiniLM-L6-v2`      | 384        | Sentence Transformer model  |
-| `multilingual-e5-large` | 1024       | Multilingual model          |
+## Support
 
-## Attribution
-
-The core embedding engine is forked from [fastembed-js](https://github.com/Anush008/fastembed-js) by [Anush008](https://github.com/Anush008), licensed under MIT. See [LICENSE-fastembed](./LICENSE-fastembed) for the original license.
+We have an [open community Discord](https://discord.gg/mastra-ai). Come and say hello and let us know if you have any questions or need any help getting things running.

@@ -3,6 +3,18 @@ export * from './agent/hooks'; // Agent hooks
 export * from './agent/types';
 export type { MastraClientCredentials, MastraClientProviderProps } from './mastra-client-context';
 export { useMastraClient } from './mastra-client-context';
-export * from './lib/ai-sdk';
-export * from './ui';
+export * from './lib/mastra-db';
+export type * from './hooks/shared/query-options';
+export type { TaskItem } from '@mastra/core/signals';
+export type {
+  MastraDBMessage,
+  MastraMessageContentV2,
+  MastraMessagePart,
+  MastraToolApproval,
+  MastraToolInvocation,
+  MastraToolInvocationPart,
+  MessageSource,
+  MemoryInfo,
+} from '@mastra/core/agent/message-list';
 export * from './workflows'; // Workflow hooks
+export * from './voice'; // Voice helpers

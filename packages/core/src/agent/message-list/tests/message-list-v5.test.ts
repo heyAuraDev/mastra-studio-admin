@@ -17,6 +17,42 @@ const resourceId = 'test-resource';
 describe('MessageList V5 Support', () => {
   describe('V4/V5 Detection', () => {
     describe('hasAIV5CoreMessageCharacteristics', () => {
+      it('ignores malformed entries before valid v5 content', () => {
+        const message = {
+          role: 'assistant',
+          content: [undefined, { type: 'text', text: 'hello' }],
+        } as never;
+
+        expect(() => hasAIV5CoreMessageCharacteristics(message)).not.toThrow();
+        expect(hasAIV5CoreMessageCharacteristics(message)).toBe(true);
+      });
+
+      it('detects v6 approval content after a malformed entry', () => {
+        const message = {
+          role: 'assistant',
+          content: [
+            undefined,
+            {
+              type: 'tool-approval-request',
+              approvalId: 'approval-1',
+              toolCallId: 'call-1',
+            },
+          ],
+        } as never;
+
+        expect(() => TypeDetector.hasAIV6CoreMessageCharacteristics(message)).not.toThrow();
+        expect(TypeDetector.hasAIV6CoreMessageCharacteristics(message)).toBe(true);
+      });
+
+      it('classifies missing content without throwing', () => {
+        const message = { role: 'assistant', content: undefined } as never;
+
+        expect(() => TypeDetector.hasAIV6CoreMessageCharacteristics(message)).not.toThrow();
+        expect(() => hasAIV5CoreMessageCharacteristics(message)).not.toThrow();
+        expect(TypeDetector.hasAIV6CoreMessageCharacteristics(message)).toBe(false);
+        expect(hasAIV5CoreMessageCharacteristics(message)).toBe(true);
+      });
+
       it('should detect v5 messages with output in tool-result parts', () => {
         const v5Message: AIV5ModelMessage = {
           role: 'assistant',
@@ -584,19 +620,14 @@ describe('MessageList V5 Support', () => {
         expect(prompt).toHaveLength(0);
       });
 
-      it('prompt() should ensure proper message ordering for Gemini compatibility', () => {
+      it('prompt() should not insert a user turn before a leading assistant turn', () => {
         const list = new MessageList({ threadId, resourceId });
         list.add({ role: 'assistant', content: 'I am ready to help' }, 'response');
 
         const prompt = list.get.all.aiV5.prompt();
 
-        // Should have 2 messages: injected user at start, assistant (no user at end)
-        expect(prompt).toHaveLength(2);
+        expect(prompt).toHaveLength(1);
         expect(prompt[0]).toMatchObject({
-          role: 'user',
-          content: '.',
-        });
-        expect(prompt[1]).toMatchObject({
           role: 'assistant',
           content: [{ type: 'text', text: 'I am ready to help' }],
         });
@@ -1196,15 +1227,8 @@ describe('MessageList V5 Support', () => {
       const v4Prompt = list.get.all.aiV4.prompt();
       const v5Prompt = list.get.all.aiV5.prompt();
 
-      // Should add user message before assistant for Gemini compatibility
-      // Both V4 and V5 use same behavior now (prepend only, no append)
-      expect(v4Prompt).toHaveLength(2);
-      expect(v4Prompt[0].role).toBe('user');
-      expect(v4Prompt[1].role).toBe('assistant');
-
-      expect(v5Prompt).toHaveLength(2);
-      expect(v5Prompt[0].role).toBe('user');
-      expect(v5Prompt[1].role).toBe('assistant');
+      expect(v4Prompt.map(m => m.role)).toEqual(['assistant']);
+      expect(v5Prompt.map(m => m.role)).toEqual(['assistant']);
     });
 
     it('should handle tool invocations with missing fields gracefully', () => {
@@ -1841,6 +1865,375 @@ describe('MessageList V5 Support', () => {
       expect(toolPart.toolInvocation.result).toEqual({ status: 200, body: 'lots of data here' });
     });
 
+    it('should apply modelOutput from providerOptions on ingested AIV5 tool-result parts (client tool continuation)', async () => {
+      const list = new MessageList({ threadId, resourceId });
+
+      list.add('Take a screenshot', 'input');
+
+      // Mirrors the continuation message a client tool sends back over HTTP:
+      // raw result in output, toModelOutput result in providerOptions.mastra.modelOutput
+      const continuationMessage: AIV5ModelMessage = {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'call-client-1',
+            toolName: 'screenshotTool',
+            input: { url: 'https://example.com' },
+          },
+          {
+            type: 'tool-result',
+            toolCallId: 'call-client-1',
+            toolName: 'screenshotTool',
+            output: { type: 'json', value: { ok: true, _b64: 'base64imagedata' } },
+            providerOptions: {
+              mastra: {
+                modelOutput: {
+                  type: 'content',
+                  value: [{ type: 'media', data: 'base64imagedata', mediaType: 'image/jpeg' }],
+                },
+              },
+            },
+          },
+        ],
+      };
+
+      list.add(continuationMessage, 'input');
+
+      // llmPrompt should surface the transformed multimodal output, not the raw json
+      const prompt = await list.get.all.aiV5.llmPrompt();
+      const toolRole = prompt.find(m => m.role === 'tool');
+      expect(toolRole).toBeDefined();
+      const toolResultPart = (toolRole as any).content.find((p: any) => p.type === 'tool-result');
+      expect(toolResultPart.output).toEqual({
+        type: 'content',
+        value: [{ type: 'media', data: 'base64imagedata', mediaType: 'image/jpeg' }],
+      });
+
+      // Raw result should still be preserved in the stored messages
+      const dbMessages = list.get.all.db();
+      const toolDbMsg = dbMessages.find(m => m.content.parts?.some((p: any) => p.type === 'tool-invocation'));
+      const toolPart = toolDbMsg?.content.parts?.find((p: any) => p.type === 'tool-invocation') as any;
+      expect(toolPart.toolInvocation.result).toEqual({ ok: true, _b64: 'base64imagedata' });
+      expect(toolPart.providerMetadata?.mastra?.modelOutput).toEqual({
+        type: 'content',
+        value: [{ type: 'media', data: 'base64imagedata', mediaType: 'image/jpeg' }],
+      });
+    });
+
+    it('translates tool-result media to image-data for v6 (spec v3) models', async () => {
+      const list = new MessageList({ threadId, resourceId });
+
+      list.add('Take a screenshot', 'input');
+
+      const continuationMessage: AIV5ModelMessage = {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'call-v6-1',
+            toolName: 'screenshotTool',
+            input: { url: 'https://example.com' },
+          },
+          {
+            type: 'tool-result',
+            toolCallId: 'call-v6-1',
+            toolName: 'screenshotTool',
+            output: { type: 'json', value: { ok: true } },
+            providerOptions: {
+              mastra: {
+                modelOutput: {
+                  type: 'content',
+                  value: [{ type: 'media', data: 'base64imagedata', mediaType: 'image/jpeg' }],
+                },
+              },
+            },
+          },
+        ],
+      };
+
+      list.add(continuationMessage, 'input');
+
+      // v6 (spec 'v3') providers only accept image-data/file-data, not media.
+      const prompt = await list.get.all.aiV6.llmPrompt();
+      const toolRole = prompt.find(m => m.role === 'tool');
+      const toolResultPart = (toolRole as any).content.find((p: any) => p.type === 'tool-result');
+      expect(toolResultPart.output).toEqual({
+        type: 'content',
+        value: [{ type: 'image-data', data: 'base64imagedata', mediaType: 'image/jpeg' }],
+      });
+    });
+
+    it('translates non-image tool-result media to file-data for v6 (spec v3) models', async () => {
+      const list = new MessageList({ threadId, resourceId });
+
+      list.add('Fetch a document', 'input');
+
+      const continuationMessage: AIV5ModelMessage = {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'call-v6-2',
+            toolName: 'docTool',
+            input: {},
+          },
+          {
+            type: 'tool-result',
+            toolCallId: 'call-v6-2',
+            toolName: 'docTool',
+            output: { type: 'json', value: { ok: true } },
+            providerOptions: {
+              mastra: {
+                modelOutput: {
+                  type: 'content',
+                  value: [{ type: 'media', data: 'base64pdfdata', mediaType: 'application/pdf' }],
+                },
+              },
+            },
+          },
+        ],
+      };
+
+      list.add(continuationMessage, 'input');
+
+      const prompt = await list.get.all.aiV6.llmPrompt();
+      const toolRole = prompt.find(m => m.role === 'tool');
+      const toolResultPart = (toolRole as any).content.find((p: any) => p.type === 'tool-result');
+      expect(toolResultPart.output).toEqual({
+        type: 'content',
+        value: [{ type: 'file-data', data: 'base64pdfdata', mediaType: 'application/pdf' }],
+      });
+    });
+
+    it('translates image tool-result media to file content for v7 (spec v4) models', async () => {
+      const list = new MessageList({ threadId, resourceId });
+
+      list.add('Take a screenshot', 'input');
+
+      const continuationMessage: AIV5ModelMessage = {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'call-v7-1',
+            toolName: 'screenshotTool',
+            input: { url: 'https://example.com' },
+          },
+          {
+            type: 'tool-result',
+            toolCallId: 'call-v7-1',
+            toolName: 'screenshotTool',
+            output: { type: 'json', value: { ok: true } },
+            providerOptions: {
+              mastra: {
+                modelOutput: {
+                  type: 'content',
+                  value: [{ type: 'media', data: 'base64imagedata', mediaType: 'image/png' }],
+                },
+              },
+            },
+          },
+        ],
+      };
+
+      list.add(continuationMessage, 'input');
+
+      const prompt = await list.get.all.aiV7.llmPrompt();
+      const toolRole = prompt.find(m => m.role === 'tool');
+      const toolResultPart = (toolRole as any).content.find((p: any) => p.type === 'tool-result');
+      expect(toolResultPart.output).toEqual({
+        type: 'content',
+        value: [{ type: 'file', data: { type: 'data', data: 'base64imagedata' }, mediaType: 'image/png' }],
+      });
+    });
+
+    it('translates non-image tool-result media to file content for v7 (spec v4) models', async () => {
+      const list = new MessageList({ threadId, resourceId });
+
+      list.add('Fetch a document', 'input');
+
+      const continuationMessage: AIV5ModelMessage = {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'call-v7-2',
+            toolName: 'docTool',
+            input: {},
+          },
+          {
+            type: 'tool-result',
+            toolCallId: 'call-v7-2',
+            toolName: 'docTool',
+            output: { type: 'json', value: { ok: true } },
+            providerOptions: {
+              mastra: {
+                modelOutput: {
+                  type: 'content',
+                  value: [{ type: 'media', data: 'base64pdfdata', mediaType: 'application/pdf' }],
+                },
+              },
+            },
+          },
+        ],
+      };
+
+      list.add(continuationMessage, 'input');
+
+      const prompt = await list.get.all.aiV7.llmPrompt();
+      const toolRole = prompt.find(m => m.role === 'tool');
+      const toolResultPart = (toolRole as any).content.find((p: any) => p.type === 'tool-result');
+      expect(toolResultPart.output).toEqual({
+        type: 'content',
+        value: [{ type: 'file', data: { type: 'data', data: 'base64pdfdata' }, mediaType: 'application/pdf' }],
+      });
+    });
+
+    it('should convert MCP content-array tool results to multimodal model output without providerMetadata duplication', async () => {
+      const list = new MessageList({ threadId, resourceId });
+
+      list.add('Take a screenshot', 'input');
+
+      const toolResultMessage: MastraDBMessage = {
+        id: 'msg-mcp-image-tool',
+        role: 'assistant',
+        createdAt: new Date(),
+        threadId,
+        resourceId,
+        content: {
+          format: 2,
+          parts: [
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                toolCallId: 'call-mcp-image',
+                toolName: 'screenshot',
+                state: 'result',
+                args: {},
+                result: {
+                  content: [
+                    { type: 'text', text: 'Screenshot captured' },
+                    { type: 'image', data: 'base64data', mimeType: 'image/png' },
+                    { type: 'audio', mimeType: 'audio/wav' },
+                    { type: 'resource', resource: { uri: 'file:///tmp/output.txt', text: 'details' } },
+                  ],
+                },
+              },
+            },
+          ],
+        },
+      };
+
+      list.add(toolResultMessage, 'response');
+
+      const dbMessages = list.get.all.db();
+      const toolDbMsg = dbMessages.find(m => m.id === 'msg-mcp-image-tool');
+      const toolPart = toolDbMsg?.content.parts?.[0] as any;
+      expect(toolPart.providerMetadata?.mastra?.modelOutput).toBeUndefined();
+      expect(toolPart.toolInvocation.result.content[1].data).toBe('base64data');
+
+      const prompt = await list.get.all.aiV5.llmPrompt();
+      const toolRole = prompt.find(m => m.role === 'tool');
+      const toolResultPart = (toolRole as any).content.find((p: any) => p.type === 'tool-result');
+      expect(toolResultPart.output).toEqual({
+        type: 'content',
+        value: [
+          { type: 'text', text: 'Screenshot captured' },
+          { type: 'media', data: 'base64data', mediaType: 'image/png' },
+          { type: 'text', text: JSON.stringify({ type: 'audio', mimeType: 'audio/wav' }) },
+          {
+            type: 'text',
+            text: JSON.stringify({ type: 'resource', resource: { uri: 'file:///tmp/output.txt', text: 'details' } }),
+          },
+        ],
+      });
+    });
+
+    it('should preserve explicit modelOutput without inspecting circular MCP-style raw content', async () => {
+      const circularContentPart: Record<string, unknown> = { type: 'resource' };
+      circularContentPart.self = circularContentPart;
+      const list = new MessageList({ threadId, resourceId });
+
+      list.add('Summarize tool output', 'input');
+      list.add(
+        {
+          id: 'msg-explicit-model-output-mcp-shape',
+          role: 'assistant',
+          createdAt: new Date(),
+          threadId,
+          resourceId,
+          content: {
+            format: 2,
+            parts: [
+              {
+                type: 'tool-invocation',
+                toolInvocation: {
+                  toolCallId: 'call-explicit-model-output-mcp-shape',
+                  toolName: 'customTool',
+                  state: 'result',
+                  args: {},
+                  result: {
+                    content: [circularContentPart, { type: 'image', data: 'raw-base64', mimeType: 'image/png' }],
+                  },
+                },
+                providerMetadata: {
+                  mastra: {
+                    modelOutput: { type: 'text', value: 'Explicit summary wins' },
+                  },
+                },
+              },
+            ],
+          },
+        },
+        'response',
+      );
+
+      const prompt = await list.get.all.aiV5.llmPrompt();
+      const toolRole = prompt.find(m => m.role === 'tool');
+      const toolResultPart = (toolRole as any).content.find((p: any) => p.type === 'tool-result');
+      expect(toolResultPart.output).toEqual({ type: 'text', value: 'Explicit summary wins' });
+    });
+
+    it('should leave malformed MCP multimodal content as a regular tool result', async () => {
+      const list = new MessageList({ threadId, resourceId });
+
+      list.add('Take a screenshot', 'input');
+      list.add(
+        {
+          id: 'msg-mcp-invalid-image-tool',
+          role: 'assistant',
+          createdAt: new Date(),
+          threadId,
+          resourceId,
+          content: {
+            format: 2,
+            parts: [
+              {
+                type: 'tool-invocation',
+                toolInvocation: {
+                  toolCallId: 'call-mcp-invalid-image',
+                  toolName: 'screenshot',
+                  state: 'result',
+                  args: {},
+                  result: { content: [{ type: 'image', mimeType: 'image/png' }] },
+                },
+              },
+            ],
+          },
+        },
+        'response',
+      );
+
+      const prompt = await list.get.all.aiV5.llmPrompt();
+      const toolRole = prompt.find(m => m.role === 'tool');
+      const toolResultPart = (toolRole as any).content.find((p: any) => p.type === 'tool-result');
+      expect(toolResultPart.output).toEqual({
+        type: 'json',
+        value: { content: [{ type: 'image', mimeType: 'image/png' }] },
+      });
+    });
+
     it('should apply payload transforms to UI and drained transcript without mutating model messages', () => {
       const list = new MessageList({ threadId, resourceId });
 
@@ -2214,6 +2607,73 @@ describe('MessageList V5 Support', () => {
       // Default AI SDK conversion — json wrapping
       expect(toolResultPart.output.type).toBe('json');
       expect(toolResultPart.output.value).toEqual({ results: ['a', 'b', 'c'] });
+    });
+
+    it('should fall back to the raw result when a stored modelOutput is nullish', async () => {
+      const list = new MessageList({ threadId, resourceId });
+
+      list.add('Read the file', 'input');
+
+      // Durable runs used to persist `mastra.modelOutput: undefined` whenever a tool's
+      // toModelOutput opted out of mapping. Keying off presence blanked out `output`,
+      // and providers throw on a tool-result without one.
+      const toolResultMessage: MastraDBMessage = {
+        id: 'msg-nullish-model-output',
+        role: 'assistant',
+        createdAt: new Date(),
+        threadId,
+        resourceId,
+        content: {
+          format: 2,
+          parts: [
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                toolCallId: 'call-undefined',
+                toolName: 'read_file',
+                state: 'result',
+                args: { path: 'data.txt' },
+                result: { contents: 'the answer is 42' },
+              },
+              providerMetadata: {
+                mastra: { modelOutput: undefined } as any,
+              },
+            },
+            {
+              // Same thing after a JSON round-trip through storage, where `undefined`
+              // may have been normalized to `null`.
+              type: 'tool-invocation',
+              toolInvocation: {
+                toolCallId: 'call-null',
+                toolName: 'read_file_2',
+                state: 'result',
+                args: { path: 'other.txt' },
+                result: { contents: 'still 42' },
+              },
+              providerMetadata: {
+                mastra: { modelOutput: null } as any,
+              },
+            },
+          ],
+        },
+      };
+
+      list.add(toolResultMessage, 'response');
+
+      const prompt = await list.get.all.aiV5.llmPrompt();
+      const toolResults = prompt
+        .filter(m => m.role === 'tool')
+        .flatMap((m: any) => m.content.filter((p: any) => p.type === 'tool-result'));
+
+      const undefinedCase = toolResults.find((p: any) => p.toolCallId === 'call-undefined');
+      expect(undefinedCase.output).toBeDefined();
+      expect(undefinedCase.output.type).toBe('json');
+      expect(undefinedCase.output.value).toEqual({ contents: 'the answer is 42' });
+
+      const nullCase = toolResults.find((p: any) => p.toolCallId === 'call-null');
+      expect(nullCase.output).toBeDefined();
+      expect(nullCase.output.type).toBe('json');
+      expect(nullCase.output.value).toEqual({ contents: 'still 42' });
     });
   });
 });

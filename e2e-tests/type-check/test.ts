@@ -38,18 +38,34 @@ async function main() {
   const teardown = await setup(mockProject as any);
 
   const fixturePath = await mkdtemp(join(tmpdir(), `mastra-${providedContext.tag}-`));
-  process.env.npm_config_registry = providedContext.registry;
+  process.env.pnpm_config_registry = providedContext.registry;
   await setupTemplate(fixturePath, 'pnpm');
 
-  try {
-    spawnSync('pnpm', ['vitest', 'run'], {
+  // Every check runs even if an earlier one fails, so one CI run shows all failures.
+  const check = (label: string, args: string[]) => {
+    const result = spawnSync('pnpm', args, {
       cwd: fixturePath,
       stdio: 'inherit',
       env: {
         ...process.env,
-        npm_config_registry: providedContext.registry,
+        pnpm_config_registry: providedContext.registry,
       },
     });
+    if (result.error) throw result.error;
+    if (result.signal) throw new Error(`${label} terminated by ${result.signal}`);
+    if (result.status !== 0) {
+      console.error(`${label} failed with exit code ${result.status}`);
+      process.exitCode = result.status ?? 1;
+    }
+  };
+
+  try {
+    check('Type tests', ['vitest', 'run']);
+    check('MCP type tests', ['vitest', 'run', '--config', 'vitest.mcp.config.ts']);
+    // vitest only reports type errors located inside a test, so errors in imports or
+    // describe bodies (shared fixtures) need a plain tsc run.
+    check('tsc', ['exec', 'tsc', '--noEmit', '-p', 'tsconfig.json']);
+    check('tsc (exactOptionalPropertyTypes)', ['exec', 'tsc', '--noEmit', '-p', 'tsconfig.exact-optional.json']);
   } finally {
     await teardown();
   }

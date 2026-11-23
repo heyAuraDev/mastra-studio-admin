@@ -1,6 +1,7 @@
 import type { CoreMessage, Message } from '@internal/ai-sdk-v4';
 import type * as AIV5 from '@internal/ai-sdk-v5';
 import type * as AIV6 from '@internal/ai-v6';
+import type * as AIV7 from '@internal/ai-v7';
 
 import type { CreatedAgentSignal } from '../signals';
 import type { MastraDBMessage, MastraMessageV1, UIMessageWithMetadata } from './state/types';
@@ -10,6 +11,7 @@ export type { CoreMessage as CoreMessageV4, UIMessage as UIMessageV4 } from '@in
 export type * as AIV4Type from '@internal/ai-sdk-v4';
 export type * as AIV5Type from '@internal/ai-sdk-v5';
 export type * as AIV6Type from '@internal/ai-v6';
+export type * as AIV7Type from '@internal/ai-v7';
 
 // Re-export all message types from state/types for convenience
 export type {
@@ -17,6 +19,7 @@ export type {
   MastraMessageV1,
   MastraMessageContentV2,
   MastraMessagePart,
+  MastraErrorPart,
   UIMessageV4Part,
   MessageSource,
   MemoryInfo,
@@ -27,7 +30,25 @@ export type {
 export type AIV5ResponseMessage = AIV5.AssistantModelMessage | AIV5.ToolModelMessage;
 export type AIV6ResponseMessage = AIV6.AssistantModelMessage | AIV6.ToolModelMessage;
 
+/**
+ * v7 UIMessage typed by a newer `ai` than core's vendored copy. `ai` adds part
+ * types in patch releases (e.g. `SteeringMessageUIPart` in 7.0.163), and any part
+ * missing from the vendored copy made the whole `UIMessage[]` unassignable.
+ *
+ * The loose `{ type: string }` part is deliberate: core cannot know the shape of
+ * a part that did not exist when it was built, and it does not act on such parts
+ * at runtime. Object literals are still checked strictly, because excess property
+ * checks reject a literal part against `{ type: string }` and leave only
+ * `AIV7.UIMessage`.
+ *
+ * See https://github.com/mastra-ai/mastra/issues/29575
+ */
+export type AIV7ForwardCompatibleUIMessage = Omit<AIV7.UIMessage, 'parts'> & { parts: Array<{ type: string }> };
+
 export type MessageInput =
+  | AIV7.UIMessage
+  | AIV7ForwardCompatibleUIMessage
+  | AIV7.ModelMessage
   | AIV6.UIMessage
   | AIV6.ModelMessage
   | AIV5.UIMessage

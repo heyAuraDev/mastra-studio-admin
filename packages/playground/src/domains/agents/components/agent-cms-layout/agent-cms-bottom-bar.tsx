@@ -1,9 +1,9 @@
-import { Button } from '@mastra/playground-ui';
-import { ArrowLeft, ArrowRight } from 'lucide-react';
-
+import { Button } from '@mastra/playground-ui/components/Button';
+import { IconArrowLeft } from '@mastra/playground-ui/icons/central/IconArrowLeft';
+import { IconArrowRight } from '@mastra/playground-ui/icons/central/IconArrowRight';
+import { useLinkComponent } from '@mastra/playground-ui/lib/framework';
 import { useAgentEditFormContext } from '../../context/agent-edit-form-context';
 import { useAgentCmsNavigation } from '../agent-cms-sidebar/use-agent-cms-navigation';
-import { useLinkComponent } from '@/lib/framework';
 
 interface AgentCmsBottomBarProps {
   basePath: string;
@@ -11,13 +11,14 @@ interface AgentCmsBottomBarProps {
 }
 
 export function AgentCmsBottomBar({ basePath, currentPath }: AgentCmsBottomBarProps) {
-  const { form, isCodeAgentOverride } = useAgentEditFormContext();
+  const { form, isCodeAgentOverride, editorConfig } = useAgentEditFormContext();
   const { navigate } = useLinkComponent();
   const { previous, next, isNextDisabled } = useAgentCmsNavigation(
     basePath,
     currentPath,
     form.control,
     isCodeAgentOverride,
+    editorConfig,
   );
 
   if (!previous && !next) {
@@ -25,20 +26,24 @@ export function AgentCmsBottomBar({ basePath, currentPath }: AgentCmsBottomBarPr
   }
 
   return (
-    <div className="flex items-center justify-between border-t border-border1 px-8 py-4">
+    <div className="flex items-center justify-between border-t border-border px-5 py-4">
       <div>
         {previous && (
-          <Button type="button" variant="outline" onClick={() => navigate(previous.href)}>
-            <ArrowLeft />
+          <Button type="button" onClick={() => navigate(previous.href)} icon={<IconArrowLeft />}>
             {previous.name}
           </Button>
         )}
       </div>
       <div>
         {next && (
-          <Button type="button" variant="default" disabled={isNextDisabled} onClick={() => navigate(next.href)}>
+          <Button
+            type="button"
+            variant="default"
+            disabled={isNextDisabled}
+            onClick={() => navigate(next.href)}
+            icon={<IconArrowRight />}
+          >
             {next.name}
-            <ArrowRight />
           </Button>
         )}
       </div>

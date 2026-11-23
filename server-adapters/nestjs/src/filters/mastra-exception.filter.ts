@@ -1,8 +1,12 @@
-import { formatZodError } from '@mastra/server/handlers/error';
+import { formatZodError, isZodError } from '@mastra/server/handlers/error';
+import {
+  getCustomHTTPExceptionResponse,
+  getHTTPErrorResponse,
+  HTTPException as MastraHTTPException,
+} from '@mastra/server/server-adapter';
 import { Catch, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import type { ArgumentsHost, ExceptionFilter } from '@nestjs/common';
 import type { Request, Response } from 'express';
-import { ZodError } from 'zod';
 
 import { ValidationError } from '../services/route-handler.service';
 
@@ -11,18 +15,6 @@ interface NormalizedError {
   error: string;
   code?: string;
   issues?: Array<{ field?: string; path?: string[]; message: string }>;
-}
-
-function isZodErrorLike(exception: unknown): exception is ZodError {
-  return (
-    exception instanceof ZodError ||
-    (typeof exception === 'object' &&
-      exception !== null &&
-      'name' in exception &&
-      (exception as { name?: unknown }).name === 'ZodError' &&
-      'issues' in exception &&
-      Array.isArray((exception as { issues?: unknown }).issues))
-  );
 }
 
 /**
@@ -43,13 +35,39 @@ function isZodErrorLike(exception: unknown): exception is ZodError {
 export class MastraExceptionFilter implements ExceptionFilter {
   private readonly logger = new Logger(MastraExceptionFilter.name);
 
-  catch(exception: unknown, host: ArgumentsHost): void {
+  async catch(exception: unknown, host: ArgumentsHost): Promise<void> {
     const ctx = host.switchToHttp();
     const response = ctx.getResponse<Response>();
     const request = ctx.getRequest<Request>();
 
     // Don't try to send response if already sent
     if (response.headersSent) {
+      return;
+    }
+
+    if (exception instanceof ValidationError) {
+      response.status(exception.status).json(exception.body);
+      return;
+    }
+
+    const customResponse = getCustomHTTPExceptionResponse(exception);
+    if (customResponse) {
+      customResponse.headers.forEach((value, name) => {
+        if (name.toLowerCase() !== 'set-cookie') {
+          response.setHeader(name, value);
+        }
+      });
+      const setCookies = customResponse.headers.getSetCookie();
+      if (setCookies.length > 0) {
+        response.setHeader('set-cookie', setCookies);
+      }
+      response.status(customResponse.status).send(Buffer.from(await customResponse.arrayBuffer()));
+      return;
+    }
+
+    if (exception instanceof MastraHTTPException) {
+      const { status, body } = getHTTPErrorResponse(exception);
+      response.status(status).json(body);
       return;
     }
 
@@ -121,7 +139,7 @@ export class MastraExceptionFilter implements ExceptionFilter {
     }
 
     // Zod validation error
-    if (isZodErrorLike(exception)) {
+    if (isZodError(exception)) {
       const formatted = formatZodError(exception, 'request');
       return {
         status: HttpStatus.BAD_REQUEST,

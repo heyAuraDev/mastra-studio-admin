@@ -1,0 +1,299 @@
+import { Checkbox } from '@mastra/playground-ui/components/Checkbox';
+import { Field, FieldLabel } from '@mastra/playground-ui/components/Field';
+import { ScrollArea, ScrollAreaViewport } from '@mastra/playground-ui/components/ScrollArea';
+import { SearchInput } from '@mastra/playground-ui/components/SearchInput';
+import { Skeleton } from '@mastra/playground-ui/components/Skeleton';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { controlStateColorTransition } from '@mastra/playground-ui/primitives/transitions';
+import { quietTextHover } from '@mastra/playground-ui/primitives/typography';
+import { cn } from '@mastra/playground-ui/utils/cn';
+import { useToolkits } from '@mastra/react/hooks/tool-providers';
+import { memo, useMemo, useState } from 'react';
+import { useAgentColor } from '../../../contexts/agent-color-context';
+import { ToolkitConnectionControl } from './toolkit-connection-control';
+import type { ProviderSection, ToolkitOption } from './use-provider-toolkit-groups';
+
+const TEST_ID_PREFIX = 'tools-toolkit';
+
+interface ToolkitRow {
+  id: string;
+  label: string;
+  /** Backend-provided toolkit icon (typically a URL/data-URI). Absent for Built-in. */
+  icon?: string;
+}
+
+interface ToolkitFilterRowProps {
+  item: ToolkitRow;
+  checked: boolean;
+  disabled: boolean;
+  onToggle: (id: string) => void;
+  /** Set for provider toolkit rows; absent for the Built-in group. */
+  providerId?: string;
+  multipleAllowed?: boolean;
+}
+
+const ToolkitFilterRow = memo(
+  ({ item, checked, disabled, onToggle, providerId, multipleAllowed }: ToolkitFilterRowProps) => {
+    const agentColor = useAgentColor();
+    const checkboxStyle = checked
+      ? {
+          backgroundColor: agentColor.tint,
+          borderColor: agentColor.tint,
+          color: 'var(--background)',
+        }
+      : undefined;
+
+    return (
+      <li className="flex items-center gap-1">
+        <Field disabled={disabled} className="min-w-0 flex-1">
+          <FieldLabel
+            data-testid={`${TEST_ID_PREFIX}-filter-item-${item.id}`}
+            data-checked={checked ? 'true' : 'false'}
+            className={cn(
+              'flex shrink items-center gap-2 rounded-md px-2 py-1.5 select-none hover:bg-fill-subtle',
+              disabled && 'opacity-60',
+              'text-caption',
+            )}
+          >
+            <Checkbox
+              checked={checked}
+              onCheckedChange={() => onToggle(item.id)}
+              style={checkboxStyle}
+              data-testid={`${TEST_ID_PREFIX}-filter-checkbox-${item.id}`}
+              className="h-3.5 w-3.5 shrink-0 shadow-none data-[state=checked]:shadow-none [&_svg]:h-2.5 [&_svg]:w-2.5"
+            />
+            {item.icon && (
+              <img
+                src={item.icon}
+                alt=""
+                aria-hidden
+                data-testid={`${TEST_ID_PREFIX}-filter-icon-${item.id}`}
+                className="h-4 w-4 shrink-0 rounded object-contain"
+              />
+            )}
+            <span className="min-w-0 flex-1 truncate">{item.label}</span>
+          </FieldLabel>
+        </Field>
+        {providerId && (
+          <div className="shrink-0">
+            <ToolkitConnectionControl
+              providerId={providerId}
+              toolkit={item.id}
+              disabled={disabled}
+              multipleAllowed={multipleAllowed}
+            />
+          </div>
+        )}
+      </li>
+    );
+  },
+);
+
+ToolkitFilterRow.displayName = 'ToolkitFilterRow';
+
+interface ProviderToolkitSectionProps {
+  provider: ProviderSection;
+  term: string;
+  isChecked: (id: string) => boolean;
+  onToggle: (id: string) => void;
+  disabled: boolean;
+  multipleAllowed: boolean;
+}
+
+/**
+ * Renders a single provider's toolkit checkboxes. Owns its own toolkit fetch
+ * (`useToolkits`) so the pane never has to coordinate N async loads: while this
+ * provider's toolkits load it shows a skeleton, and only renders real rows once
+ * they resolve. Toolkit display names therefore appear correctly cased on first
+ * paint — there's no slug→name swap. Search is a plain synchronous filter over
+ * the resolved rows, so it simply has nothing to act on until the data is in.
+ */
+const ProviderToolkitSection = ({
+  provider,
+  term,
+  isChecked,
+  onToggle,
+  disabled,
+  multipleAllowed,
+}: ProviderToolkitSectionProps) => {
+  const { data, isLoading } = useToolkits({
+    providerId: provider.providerId,
+    queryOptions: { enabled: !!provider.providerId },
+  });
+
+  const toolkits = useMemo<ToolkitRow[]>(() => {
+    const names = new Map<string, string>();
+    const icons = new Map<string, string>();
+    for (const toolkit of data?.data ?? []) {
+      names.set(toolkit.slug, toolkit.name ?? toolkit.slug);
+      if (toolkit.icon) icons.set(toolkit.slug, toolkit.icon);
+    }
+    const rows: ToolkitRow[] = provider.presentSlugs
+      .map(slug => ({ id: slug, label: names.get(slug) ?? slug, icon: icons.get(slug) }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+    if (!term) return rows;
+    return rows.filter(t => t.label.toLowerCase().includes(term));
+  }, [data, provider.presentSlugs, term]);
+
+  if (isLoading) {
+    return (
+      <div className="flex flex-col gap-1 px-2">
+        <Skeleton className="h-4 w-20" />
+        {Array.from({ length: Math.min(provider.presentSlugs.length, 3) }).map((_, i) => (
+          <Skeleton key={i} className="h-7 w-full" />
+        ))}
+      </div>
+    );
+  }
+
+  if (toolkits.length === 0) return null;
+
+  return (
+    <div className="flex flex-col gap-0.5">
+      <Txt
+        variant="meta"
+        tone="muted"
+        data-testid={`tools-provider-section-${provider.providerId}`}
+        className="px-2 pt-1 uppercase"
+      >
+        {provider.providerName}
+      </Txt>
+      <ul className="flex flex-col gap-0.5">
+        {toolkits.map(item => (
+          <ToolkitFilterRow
+            key={item.id}
+            item={item}
+            checked={isChecked(item.id)}
+            disabled={disabled}
+            onToggle={onToggle}
+            providerId={provider.providerId}
+            multipleAllowed={multipleAllowed}
+          />
+        ))}
+      </ul>
+    </div>
+  );
+};
+
+interface ToolkitFilterPaneProps {
+  builtIn: ToolkitOption[];
+  providers: ProviderSection[];
+  isProvidersLoading: boolean;
+  isChecked: (id: string) => boolean;
+  onToggle: (id: string) => void;
+  onSelectAll: () => void;
+  onClearAll: () => void;
+  disabled?: boolean;
+  /** Per-provider capability: whether a toolkit may hold multiple connections. */
+  multipleAllowedByProvider: Map<string, boolean>;
+}
+
+/**
+ * Left-pane toolkit filter, grouped by provider. A synthetic "Built-in" group
+ * (for native tools/agents/workflows) renders immediately; each provider is its
+ * own {@link ProviderToolkitSection} that fetches and renders independently. A
+ * single search box and global Select all / Clear all act across every group.
+ * Selection semantics are a flat `Set<toolkit>` owned by the parent — provider
+ * grouping is presentational only.
+ */
+export const ToolkitFilterPane = ({
+  builtIn,
+  providers,
+  isProvidersLoading,
+  isChecked,
+  onToggle,
+  onSelectAll,
+  onClearAll,
+  disabled = false,
+  multipleAllowedByProvider,
+}: ToolkitFilterPaneProps) => {
+  const [search, setSearch] = useState('');
+  const term = search.trim().toLowerCase();
+
+  const filteredBuiltIn = useMemo(
+    () => (term ? builtIn.filter(t => t.label.toLowerCase().includes(term)) : builtIn),
+    [builtIn, term],
+  );
+
+  return (
+    <div
+      className="flex h-full min-h-0 flex-col gap-3 border-r border-border px-4 py-4"
+      data-testid={`${TEST_ID_PREFIX}-filter`}
+    >
+      <SearchInput
+        label="Search toolkits"
+        size="md"
+        className="flex-none"
+        data-testid={`${TEST_ID_PREFIX}-filter-search`}
+        placeholder="Search toolkits"
+        value={search}
+        onValueChange={setSearch}
+      />
+
+      <div className="flex shrink-0 items-center gap-2">
+        <button
+          type="button"
+          onClick={onSelectAll}
+          disabled={disabled}
+          data-testid={`${TEST_ID_PREFIX}-filter-select-all`}
+          className={cn(quietTextHover, controlStateColorTransition, 'disabled:cursor-not-allowed disabled:opacity-60')}
+        >
+          <Txt as="span" variant="meta" className="block">
+            Select all
+          </Txt>
+        </button>
+        <button
+          type="button"
+          onClick={onClearAll}
+          disabled={disabled}
+          data-testid={`${TEST_ID_PREFIX}-filter-clear-all`}
+          className={cn(quietTextHover, controlStateColorTransition, 'disabled:cursor-not-allowed disabled:opacity-60')}
+        >
+          <Txt as="span" variant="meta" className="block">
+            Clear all
+          </Txt>
+        </button>
+      </div>
+
+      <ScrollArea className="min-h-0 flex-1">
+        <ScrollAreaViewport className="pr-2">
+          <div className="flex flex-col gap-3">
+            {filteredBuiltIn.length > 0 && (
+              <ul className="flex flex-col gap-0.5">
+                {filteredBuiltIn.map(item => (
+                  <ToolkitFilterRow
+                    key={item.id}
+                    item={item}
+                    checked={isChecked(item.id)}
+                    disabled={disabled}
+                    onToggle={onToggle}
+                  />
+                ))}
+              </ul>
+            )}
+
+            {providers.map(provider => (
+              <ProviderToolkitSection
+                key={provider.providerId}
+                provider={provider}
+                term={term}
+                isChecked={isChecked}
+                onToggle={onToggle}
+                disabled={disabled}
+                multipleAllowed={multipleAllowedByProvider.get(provider.providerId) ?? false}
+              />
+            ))}
+
+            {isProvidersLoading && (
+              <div className="flex flex-col gap-1 px-2">
+                {Array.from({ length: 3 }).map((_, i) => (
+                  <Skeleton key={i} className="h-7 w-full" />
+                ))}
+              </div>
+            )}
+          </div>
+        </ScrollAreaViewport>
+      </ScrollArea>
+    </div>
+  );
+};

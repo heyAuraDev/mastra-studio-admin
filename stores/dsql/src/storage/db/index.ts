@@ -112,7 +112,12 @@ export function resolveDsqlConfig(config: DsqlDomainConfig): {
     host: config.host,
     database: config.database,
     user: config.user,
-    Client: AuroraDSQLClient,
+    // AuroraDSQLClient's constructor type doesn't match pg.PoolClient's,
+    // but it's compatible at runtime. The `as any` avoids a TS error in
+    // pnpm v11's stricter lockfile layout, where the connector's ESM-only
+    // type exports (`.d.mts`) aren't resolved by tsc when the consumer uses
+    // CommonJS module resolution.
+    Client: AuroraDSQLClient as any,
   });
   return {
     client: new PoolAdapter(pool),
@@ -367,6 +372,32 @@ export class DsqlDB extends MastraBase {
     });
   }
 
+  async pruneBatch({
+    tableName,
+    column,
+    cutoff,
+    limit,
+  }: {
+    tableName: string;
+    column: string;
+    cutoff: Date | number;
+    limit: number;
+  }): Promise<number> {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(column)) {
+      throw new Error(`Invalid retention identifier: ${tableName}.${column}`);
+    }
+    const table = getTableName({ indexName: tableName, schemaName: getSchemaName(this.schemaName) });
+    // Spans are keyed by trace and span; the run fencing tables by run.
+    const key = tableName === TABLE_SPANS ? '"traceId", "spanId"' : '"runId"';
+    const result = await this.client.query(
+      `DELETE FROM ${table} WHERE (${key}) IN (
+        SELECT ${key} FROM ${table} WHERE "${column}" < $1 ORDER BY "${column}" LIMIT $2
+      )`,
+      [cutoff, limit],
+    );
+    return result.rowCount ?? 0;
+  }
+
   async clearTable({ tableName }: { tableName: TABLE_NAMES }): Promise<void> {
     try {
       await withRetry(
@@ -515,7 +546,6 @@ export class DsqlDB extends MastraBase {
     // Timestamps (createdAt, updatedAt, createdAtZ, updatedAtZ) are managed:
     // - DEFAULT NOW() on column definition for createdAt/createdAtZ
     // - Application-level setting in update operations for updatedAt/updatedAtZ
-    return;
   }
 
   /**

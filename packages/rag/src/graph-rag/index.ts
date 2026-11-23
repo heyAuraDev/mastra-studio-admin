@@ -36,6 +36,20 @@ export interface GraphEmbedding {
   vector: number[];
 }
 
+/**
+ * JSON-safe snapshot of a GraphRAG instance, produced by `serialize()` and
+ * restored with `GraphRAG.deserialize()`.
+ */
+export interface GraphRAGSnapshot {
+  version: 1;
+  dimension: number;
+  threshold: number;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+const GRAPH_RAG_SNAPSHOT_VERSION = 1;
+
 export class GraphRAG {
   private nodes: Map<string, GraphNode>;
   private edges: GraphEdge[];
@@ -57,7 +71,12 @@ export class GraphRAG {
     if (node.embedding.length !== this.dimension) {
       throw new Error(`Embedding dimension must be ${this.dimension}`);
     }
-    this.nodes.set(node.id, node);
+    for (const component of node.embedding) {
+      if (!Number.isFinite(component)) {
+        throw new Error('Embedding must contain only finite numbers');
+      }
+    }
+    this.nodes.set(node.id, { ...node, embedding: [...node.embedding] });
   }
 
   // Add an edge between two nodes
@@ -65,19 +84,27 @@ export class GraphRAG {
     if (!this.nodes.has(edge.source) || !this.nodes.has(edge.target)) {
       throw new Error('Both source and target nodes must exist');
     }
+    if (!Number.isFinite(edge.weight)) {
+      throw new Error('Edge weight must be a finite number');
+    }
     this.edges.push(edge);
-    // Add reverse edge
-    this.edges.push({
-      source: edge.target,
-      target: edge.source,
-      weight: edge.weight,
-      type: edge.type,
-    });
+    if (edge.source !== edge.target) {
+      // Add reverse edge
+      this.edges.push({
+        source: edge.target,
+        target: edge.source,
+        weight: edge.weight,
+        type: edge.type,
+      });
+    }
   }
 
   // Helper method to get all nodes
   getNodes(): GraphNode[] {
-    return Array.from(this.nodes.values());
+    return Array.from(this.nodes.values(), node => ({
+      ...node,
+      ...(node.embedding ? { embedding: [...node.embedding] } : {}),
+    }));
   }
 
   // Helper method to get all edges
@@ -87,6 +114,75 @@ export class GraphRAG {
 
   getEdgesByType(type: string): GraphEdge[] {
     return this.edges.filter(edge => edge.type === type);
+  }
+
+  /**
+   * Produce a JSON-safe snapshot of the graph so it can be persisted and
+   * restored later instead of rebuilt with `createGraph`.
+   *
+   * The snapshot is a deep copy, including nested node metadata, so mutating it
+   * does not affect this instance.
+   * Note that every node carries its full embedding, so snapshots of large
+   * graphs can be several megabytes of JSON.
+   */
+  serialize(): GraphRAGSnapshot {
+    return {
+      version: GRAPH_RAG_SNAPSHOT_VERSION,
+      dimension: this.dimension,
+      threshold: this.threshold,
+      nodes: Array.from(this.nodes.values()).map(node => ({
+        ...node,
+        ...(node.embedding ? { embedding: [...node.embedding] } : {}),
+        ...(node.metadata ? { metadata: structuredClone(node.metadata) } : {}),
+      })),
+      edges: this.edges.map(edge => ({ ...edge })),
+    };
+  }
+
+  /**
+   * Rebuild a GraphRAG instance from a snapshot produced by `serialize()`.
+   *
+   * @throws if the snapshot version is unsupported, a node ID is duplicated,
+   * a node embedding does not match the snapshot dimension or contains nonfinite values,
+   * or an edge references an unknown node.
+   */
+  static deserialize(snapshot: GraphRAGSnapshot): GraphRAG {
+    if (snapshot?.version !== GRAPH_RAG_SNAPSHOT_VERSION) {
+      throw new Error(`Unsupported GraphRAG snapshot version: ${snapshot?.version}`);
+    }
+
+    const graph = new GraphRAG(snapshot.dimension, snapshot.threshold);
+
+    for (const node of snapshot.nodes ?? []) {
+      if (graph.nodes.has(node.id)) {
+        throw new Error(`Duplicate node id in snapshot: ${node.id}`);
+      }
+      // Route through addNode so embedding presence, dimension, and finite values are validated
+      // at load time rather than failing later inside query().
+      graph.addNode({
+        ...node,
+        ...(node.embedding ? { embedding: [...node.embedding] } : {}),
+        ...(node.metadata ? { metadata: structuredClone(node.metadata) } : {}),
+      });
+    }
+
+    for (const edge of snapshot.edges ?? []) {
+      if (!graph.nodes.has(edge.source)) {
+        throw new Error(`Edge references unknown node: ${edge.source}`);
+      }
+      if (!graph.nodes.has(edge.target)) {
+        throw new Error(`Edge references unknown node: ${edge.target}`);
+      }
+      if (!Number.isFinite(edge.weight)) {
+        throw new Error('Edge weight must be a finite number');
+      }
+    }
+
+    // Assign directly rather than via addEdge: the serialized edge list already
+    // contains both directions, and addEdge would add the reverse edge again.
+    graph.edges = (snapshot.edges ?? []).map(edge => ({ ...edge }));
+
+    return graph;
   }
 
   clear(): void {
@@ -153,16 +249,16 @@ export class GraphRAG {
     if (chunks.length !== embeddings.length) {
       throw new Error('Chunks and embeddings must have the same length');
     }
+    const graph = new GraphRAG(this.dimension, this.threshold);
+
     // Create nodes from chunks
     chunks.forEach((chunk, index) => {
-      const node: GraphNode = {
+      graph.addNode({
         id: index.toString(),
         content: chunk.text,
         embedding: embeddings[index]?.vector,
         metadata: { ...chunk.metadata },
-      };
-      this.addNode(node);
-      this.nodes.set(node.id, node);
+      });
     });
 
     // Create edges based on cosine similarity
@@ -174,7 +270,7 @@ export class GraphRAG {
 
         // Only create edges if similarity is above threshold
         if (similarity > this.threshold) {
-          this.addEdge({
+          graph.addEdge({
             source: i.toString(),
             target: j.toString(),
             weight: similarity,
@@ -183,6 +279,9 @@ export class GraphRAG {
         }
       }
     }
+
+    this.nodes = graph.nodes;
+    this.edges = graph.edges;
   }
 
   private selectWeightedNeighbor(neighbors: Array<{ id: string; weight: number }>): string {
@@ -274,13 +373,18 @@ export class GraphRAG {
     if (!query || query.length !== this.dimension) {
       throw new Error(`Query embedding must have dimension ${this.dimension}`);
     }
-    if (topK < 1) {
-      throw new Error('TopK must be greater than 0');
+    for (const component of query) {
+      if (!Number.isFinite(component)) {
+        throw new Error('Query embedding must contain only finite numbers');
+      }
     }
-    if (randomWalkSteps < 1) {
-      throw new Error('Random walk steps must be greater than 0');
+    if (!Number.isInteger(topK) || topK < 1) {
+      throw new Error('TopK must be a positive integer');
     }
-    if (restartProb <= 0 || restartProb >= 1) {
+    if (!Number.isInteger(randomWalkSteps) || randomWalkSteps < 1) {
+      throw new Error('Random walk steps must be a positive integer');
+    }
+    if (!Number.isFinite(restartProb) || restartProb <= 0 || restartProb >= 1) {
       throw new Error('Restart probability must be between 0 and 1');
     }
 

@@ -1,0 +1,4317 @@
+import { gunzipSync } from 'node:zlib';
+
+import { RequestContext } from '@mastra/core/request-context';
+import { Hono } from 'hono';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// ── Mocks ────────────────────────────────────────────────────────────────
+
+import { boardRegistryOf, createBoardRegistry, defineBoard } from '../boards/index.js';
+import type { BoardRegistry } from '../boards/index.js';
+import { createTestBoard, createTriageWorkRegistry, triageWorkBoard } from '../boards/test-utils.js';
+import { FactoryTransitionService } from '../rules/transition-service.js';
+import type { FactoryRuleActor } from '../rules/types.js';
+import type { AuditEmitter, AuditRecorder } from '../storage/domains/audit/domain.js';
+import {
+  FACTORY_PULL_REQUEST_RECONCILIATION_KEY,
+  FACTORY_RULE_MATERIALIZATION_KEY,
+} from '../storage/domains/work-items/base.js';
+import type { FactoryDeferredDecisionRecord, WorkItemUpdateConflictError } from '../storage/domains/work-items/base.js';
+
+let auditRecorded: Array<Record<string, any>> = [];
+let auditFailure: Error | undefined;
+/** Work the build seat was handed (see acceptsWork): production syncs acceptance labels from here. */
+let acceptedHook: Array<{ workItemId: string }> = [];
+/** Committed stage changes: production reports them and ends the left phase's goal from here. */
+let committedHook: Array<{ workItemId: string; fromStage?: string; toStage: string }> = [];
+
+const auditRecorder: AuditRecorder = {
+  async record(input) {
+    if (auditFailure) throw auditFailure;
+    auditRecorded.push({
+      orgId: input.orgId,
+      actorId: input.actorId,
+      actorType: input.actorType,
+      action: input.action,
+      factoryProjectId: input.factoryProjectId,
+      targets: input.targets,
+      metadata: input.metadata,
+      context: input.context,
+    });
+    return null;
+  },
+};
+
+const audit: AuditEmitter = {
+  async emit({ context, input }) {
+    try {
+      if (auditFailure) throw auditFailure;
+      const user = context.get('factoryAuthUser' as never) as { workosId: string; organizationId?: string } | undefined;
+      if (!user?.organizationId) return;
+      auditRecorded.push({
+        orgId: user.organizationId,
+        actorId: user.workosId,
+        actorType: 'human',
+        action: input.action,
+        factoryProjectId: input.factoryProjectId,
+        targets: input.targets,
+        metadata: input.metadata,
+      });
+    } catch (error) {
+      console.warn('[Audit] Failed to emit audit event', {
+        action: input.action,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+};
+import { createFactoryStorageForTests, finishQueuedRunsForTests } from '../storage/test-utils.js';
+import type { FactoryStorageTestSeed } from '../storage/test-utils.js';
+import { boardCheck } from '../work-items/board-check.js';
+import { FACTORY_ROUTE_CONTRACTS } from './contracts.js';
+import type { BoardPhasesResponse } from './contracts.js';
+import { fakeRouteAuth, mountApiRoutes } from './test-utils.js';
+import type { WorkItemRoutesDeps } from './work-items.js';
+import { parseCreateWorkItem, parseUpdateWorkItem, WorkItemRoutes } from './work-items.js';
+
+// ── Test harness ─────────────────────────────────────────────────────────
+
+function buildApp(
+  user: { workosId: string; organizationId?: string } | null,
+  startCoordinator?: { prepare: (input: any) => Promise<any> },
+  requestContext?: RequestContext,
+  // Work as projects stored before new projects' Work dropped Triage: these tests walk its lanes.
+  boardRegistry: BoardRegistry = createTriageWorkRegistry(),
+  sessionRepository?: WorkItemRoutesDeps['sessionRepository'],
+) {
+  const app = new Hono();
+  app.use('*', async (c, next) => {
+    if (user) c.set('factoryAuthUser' as never, user as never);
+    if (requestContext) c.set('requestContext' as never, requestContext as never);
+    await next();
+  });
+  mountApiRoutes(
+    app as any,
+    new WorkItemRoutes({
+      auth: fakeRouteAuth(),
+      audit,
+      projects: seed.projects,
+      workItems: seed.workItems,
+      boardRegistry,
+      // No intake rules to read: the route list, as before intake order.
+      intakeEvaluator: 'route-list',
+      queueHealth: seed.queueHealth,
+      transitionService: new FactoryTransitionService({
+        configVersion: 'factory-config-v1',
+        storage: seed.workItems,
+        boards: boardRegistry,
+        audit: auditRecorder,
+        onAccepted: async args => {
+          acceptedHook.push({ workItemId: args.workItemId });
+        },
+        onTransitionCommitted: async args => {
+          committedHook.push({ workItemId: args.workItemId, fromStage: args.fromStage, toStage: args.toStage });
+        },
+      }),
+      startCoordinator,
+      sessionRepository,
+      liveSessions: { parked: () => undefined, parkedIn: () => [] },
+    }).routes(),
+  );
+  return app;
+}
+
+const orgUser = { workosId: 'u1', organizationId: 'org1' };
+let PROJECT_ID = '';
+
+async function seedProject(orgId = 'org1') {
+  const project = await seed.projects.create({
+    orgId,
+    userId: 'u1',
+    input: { name: `${orgId} project` },
+  });
+  PROJECT_ID = project.id;
+}
+
+const listItems = () => seed.workItems.list({ orgId: 'org1', factoryProjectId: PROJECT_ID });
+
+function json(method: string, path: string, body?: unknown, user: typeof orgUser | null = orgUser) {
+  return buildApp(user).request(path, {
+    method,
+    ...(body !== undefined ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } : {}),
+  });
+}
+
+/** Session of a started run — what makes a card the Factory's own work. */
+const run = { execute: { sessionId: 'session-1', branch: 'factory/1', threadId: 'thread-1' } };
+
+const createBody = (overrides: Record<string, unknown> = {}) => ({
+  externalSource: {
+    integrationId: 'github',
+    type: 'issue',
+    externalId: '42',
+    url: 'https://github.com/acme/app/issues/42',
+  },
+  title: 'Fix the login flow',
+  stages: ['intake'],
+  metadata: { number: 42 },
+  ...overrides,
+});
+
+let seed: FactoryStorageTestSeed;
+
+beforeEach(async () => {
+  seed = await createFactoryStorageForTests();
+  auditRecorded = [];
+  auditFailure = undefined;
+  acceptedHook = [];
+  committedHook = [];
+  await seedProject();
+});
+
+afterEach(() => {
+  vi.clearAllMocks();
+  vi.useRealTimers();
+});
+
+describe('installed board catalog', () => {
+  it.each([true, false])('returns only structural metadata (with Work: %s)', async withWork => {
+    const board = defineBoard({
+      id: 'release',
+      title: 'Release Preview',
+      initialPhase: 'queued',
+      phases: {
+        queued: { title: 'Queued', kind: 'resting', next: 'preparing' },
+        preparing: {
+          title: 'Preparing',
+          kind: 'working',
+          role: 'release-preparer',
+          next: 'shipped',
+          onEnter: { 'github-issue': () => [] },
+        },
+        shipped: { title: 'Shipped', kind: 'terminal' },
+      },
+      transitionPolicy: () => undefined,
+    });
+    const app = buildApp(
+      orgUser,
+      undefined,
+      undefined,
+      withWork ? createBoardRegistry({ boards: [board] }) : boardRegistryOf([board]),
+    );
+    const response = await app.request(`/web/factory/projects/${PROJECT_ID}/boards`);
+    expect(response.status).toBe(200);
+    const { boards } = await response.json();
+    expect(boards.map((entry: { id: string }) => entry.id)).toEqual(withWork ? ['work', 'release'] : ['release']);
+    // Deprecated `title`/`role` stay beside their replacements for older clients.
+    expect(boards.at(-1)).toEqual({
+      id: 'release',
+      name: 'Release Preview',
+      title: 'Release Preview',
+      initialPhase: 'queued',
+      // No phase reviews or builds, so the board has no pull request loop: only its terminal phase finishes cards.
+      flow: { completed: 'shipped', canceled: 'shipped' },
+      phases: [
+        {
+          id: 'queued',
+          name: 'Queued',
+          title: 'Queued',
+          kind: 'resting',
+          nextPhases: ['preparing'],
+          transitions: [{ outcome: null, to: 'preparing' }],
+        },
+        {
+          id: 'preparing',
+          name: 'Preparing',
+          title: 'Preparing',
+          kind: 'working',
+          nextPhases: ['shipped'],
+          context: 'release-preparer',
+          role: 'release-preparer',
+          autoStart: false,
+          transitions: [{ outcome: null, to: 'shipped' }],
+        },
+        { id: 'shipped', name: 'Shipped', title: 'Shipped', kind: 'terminal', nextPhases: [], transitions: [] },
+      ],
+    });
+  });
+
+  it("names the phase playing each part of each board's pull request loop", async () => {
+    const app = buildApp(orgUser, undefined, undefined, createBoardRegistry());
+    const body = await (await app.request(`/web/factory/projects/${PROJECT_ID}/boards`)).json();
+    expect(FACTORY_ROUTE_CONTRACTS.boardCatalog.responseSchema.parse(body)).toEqual(body);
+    // Factory's Work has no Triage, so its flow names none.
+    expect(body.boards[0].flow).not.toHaveProperty('triage');
+    expect(body.boards[0]).toMatchObject({
+      id: 'work',
+      flow: { build: 'execute', pullRequestReview: 'pr-review', completed: 'done', canceled: 'canceled' },
+    });
+    // A project's Work that kept Triage names it.
+    const older = await (await buildApp(orgUser).request(`/web/factory/projects/${PROJECT_ID}/boards`)).json();
+    expect(older.boards[0]).toMatchObject({
+      id: 'work',
+      flow: {
+        triage: 'triage',
+        build: 'execute',
+        pullRequestReview: 'pr-review',
+        completed: 'done',
+        canceled: 'canceled',
+      },
+    });
+    // Which board is the default is DEFAULT_BOARD_ID, and the build context is the build phase's own.
+    expect(body.boards[0]).not.toHaveProperty('default');
+    expect(body.boards[0].flow).not.toHaveProperty('buildContext');
+  });
+
+  it('sends the conditions a phase starts and approves its exit tool under', async () => {
+    const lowEffort = {
+      operator: 'AND' as const,
+      conditions: [{ field: 'item.labels', operator: 'contains' as const, value: 'effort:low' }],
+    };
+    const board = defineBoard({
+      id: 'release',
+      name: 'Release',
+      initialPhase: 'queued',
+      phases: {
+        queued: { name: 'Queued', kind: 'resting', nextPhases: ['planning', 'shipping'] },
+        planning: {
+          name: 'Planning',
+          kind: 'working',
+          nextPhases: ['shipping'],
+          autoStart: true,
+          autoStartWhen: lowEffort,
+          exitTool: { id: 'submit_plan', autoApprove: true, autoApproveWhen: lowEffort },
+        },
+        shipping: { name: 'Shipping', kind: 'working', nextPhases: ['shipped'], autoStart: true, exitTool: 'ship' },
+        shipped: { name: 'Shipped', kind: 'terminal' },
+      },
+    });
+    const app = buildApp(orgUser, undefined, undefined, boardRegistryOf([board]));
+    const body = await (await app.request(`/web/factory/projects/${PROJECT_ID}/boards`)).json();
+    expect(FACTORY_ROUTE_CONTRACTS.boardCatalog.responseSchema.parse(body)).toEqual(body);
+    const [, planning, shipping] = body.boards[0].phases;
+    expect(planning).toMatchObject({
+      autoStart: true,
+      autoStartWhen: lowEffort,
+      exitTool: { id: 'submit_plan', autoApprove: true, autoApproveWhen: lowEffort },
+    });
+    // No condition means every card.
+    expect(shipping).toMatchObject({ autoStart: true, exitTool: { id: 'ship', autoApprove: false } });
+    expect(shipping).not.toHaveProperty('autoStartWhen');
+    expect(shipping.exitTool).not.toHaveProperty('autoApproveWhen');
+  });
+
+  it('sends the skill a custom phase runs, so Settings can show it', async () => {
+    const board = defineBoard({
+      id: 'release',
+      name: 'Release',
+      initialPhase: 'queued',
+      phases: {
+        queued: { name: 'Queued', kind: 'resting', nextPhases: ['drafting'] },
+        drafting: { name: 'Drafting', kind: 'working', nextPhases: ['shipped'], runner: { skill: 'release-notes' } },
+        shipped: { name: 'Shipped', kind: 'terminal' },
+      },
+    });
+    const app = buildApp(orgUser, undefined, undefined, boardRegistryOf([board]));
+    const body = await (await app.request(`/web/factory/projects/${PROJECT_ID}/boards`)).json();
+    expect(FACTORY_ROUTE_CONTRACTS.boardCatalog.responseSchema.parse(body)).toEqual(body);
+    const [queued, drafting] = body.boards[0].phases;
+    expect(drafting).toMatchObject({ kind: 'working', skill: 'release-notes' });
+    expect(queued).not.toHaveProperty('skill');
+  });
+
+  it('supports an empty installation', async () => {
+    const app = buildApp(orgUser, undefined, undefined, boardRegistryOf([]));
+    const response = await app.request(`/web/factory/projects/${PROJECT_ID}/boards`);
+    expect(await response.json()).toEqual({ boards: [] });
+  });
+
+  it('requires authentication and project membership', async () => {
+    expect((await buildApp(null).request(`/web/factory/projects/${PROJECT_ID}/boards`)).status).toBe(401);
+    expect((await buildApp({ workosId: 'u1' }).request(`/web/factory/projects/${PROJECT_ID}/boards`)).status).toBe(403);
+    await seedProject('other-org');
+    expect((await buildApp(orgUser).request(`/web/factory/projects/${PROJECT_ID}/boards`)).status).toBe(404);
+  });
+});
+
+// ── Auth / scoping ───────────────────────────────────────────────────────
+describe('auth and scoping', () => {
+  it('401s without a user', async () => {
+    const res = await json('GET', `/web/factory/projects/${PROJECT_ID}/work-items`, undefined, null);
+    expect(res.status).toBe(401);
+  });
+
+  it('403s without an organization', async () => {
+    const res = await buildApp({ workosId: 'u1' }).request(`/web/factory/projects/${PROJECT_ID}/work-items`);
+    expect(res.status).toBe(403);
+  });
+
+  it('404s when the project belongs to another org', async () => {
+    await seedProject('other-org');
+    const res = await json('GET', `/web/factory/projects/${PROJECT_ID}/work-items`);
+    expect(res.status).toBe(404);
+  });
+
+  it('404s on a non-uuid project id', async () => {
+    const res = await json('GET', `/web/factory/projects/not-a-uuid/work-items`);
+    expect(res.status).toBe(404);
+  });
+
+  it('is org-wide: another member of the same org sees the item', async () => {
+    await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    const res = await buildApp({ workosId: 'u2', organizationId: 'org1' }).request(
+      `/web/factory/projects/${PROJECT_ID}/work-items`,
+    );
+    const body = await res.json();
+    expect(body.workItems).toHaveLength(1);
+    expect(body.workItems[0].createdBy).toBe('u1');
+  });
+});
+
+// ── Create / upsert ──────────────────────────────────────────────────────
+describe('POST /web/factory/projects/:id/work-items', () => {
+  it('refuses a card filed onto the retired Review board, and files nothing', async () => {
+    const res = await json(
+      'POST',
+      `/web/factory/projects/${PROJECT_ID}/work-items`,
+      createBody({
+        board: 'review',
+        externalSource: { integrationId: 'github', type: 'pull-request', externalId: 'github-pr:7' },
+      }),
+    );
+    expect(res.status).toBe(422);
+    expect(await res.json()).toMatchObject({ error: 'invalid_board' });
+    expect(await seed.workItems.list({ orgId: 'org1', factoryProjectId: PROJECT_ID })).toEqual([]);
+  });
+
+  it('creates a work item with server-stamped history', async () => {
+    const res = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    expect(res.status).toBe(200);
+    const { workItem } = await res.json();
+    expect(workItem).toMatchObject({
+      orgId: 'org1',
+      createdBy: 'u1',
+      factoryProjectId: PROJECT_ID,
+      externalSource: {
+        integrationId: 'github',
+        type: 'issue',
+        externalId: '42',
+        url: 'https://github.com/acme/app/issues/42',
+      },
+      title: 'Fix the login flow',
+      board: 'work',
+      stages: ['intake'],
+      metadata: { number: 42 },
+    });
+    expect(workItem.stageHistory).toHaveLength(1);
+    expect(workItem.stageHistory[0]).toMatchObject({ stage: 'intake', by: 'u1' });
+    expect(workItem.stageHistory[0].enteredAt).toBeTruthy();
+    expect(workItem.stageHistory[0].exitedAt).toBeUndefined();
+  });
+
+  it('imports incident.io incidents and follow-ups onto an installed custom board at its initial phase', async () => {
+    const releaseBoard = defineBoard({
+      id: 'release',
+      title: 'Release',
+      initialPhase: 'queued',
+      phases: {
+        queued: { title: 'Queued', kind: 'resting', next: 'shipped' },
+        shipped: { title: 'Shipped', kind: 'terminal' },
+      },
+    });
+    const boardRegistry = boardRegistryOf([releaseBoard]);
+    const app = buildApp(orgUser, undefined, undefined, boardRegistry);
+    const importedItems = [
+      {
+        externalSource: {
+          integrationId: 'incidentio',
+          type: 'issue',
+          externalId: 'incidentio:incident:incident-1',
+          url: 'https://app.incident.io/acme/incidents/incident-1',
+        },
+        title: 'INC-42: API unavailable',
+      },
+      {
+        externalSource: {
+          integrationId: 'incidentio',
+          type: 'issue',
+          externalId: 'incidentio:follow-up:follow-up-1',
+          url: 'https://app.incident.io/acme/incidents/incident-1',
+        },
+        title: 'Add database failover alert',
+      },
+    ];
+
+    for (const importedItem of importedItems) {
+      const res = await app.request(`/web/factory/projects/${PROJECT_ID}/work-items`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(createBody({ ...importedItem, board: 'release', stages: undefined })),
+      });
+      expect(res.status).toBe(200);
+      expect((await res.json()).workItem).toMatchObject({
+        ...importedItem,
+        board: 'release',
+        stages: ['queued'],
+      });
+    }
+
+    await expect(listItems()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          externalSource: importedItems[0]!.externalSource,
+          board: 'release',
+          stages: ['queued'],
+        }),
+        expect.objectContaining({
+          externalSource: importedItems[1]!.externalSource,
+          board: 'release',
+          stages: ['queued'],
+        }),
+      ]),
+    );
+  });
+
+  it('rejects an external-source upsert that tries to bypass governed stage transition', async () => {
+    await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    const res = await json(
+      'POST',
+      `/web/factory/projects/${PROJECT_ID}/work-items`,
+      createBody({
+        stages: ['execute'],
+        sessions: { work: { sessionId: '/sb/wt/issue-42', branch: 'factory/issue-42', threadId: 't-1' } },
+      }),
+    );
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: 'governed_transition_required' });
+    const [workItem] = await listItems();
+    expect(workItem?.stages).toEqual(['intake']);
+    expect(workItem?.stageHistory).toHaveLength(1);
+    expect(workItem?.sessions).toEqual({});
+  });
+
+  it('never dedupes manual cards without an external source', async () => {
+    await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody({ externalSource: null }));
+    await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody({ externalSource: null }));
+    expect(await listItems()).toHaveLength(2);
+  });
+
+  it('400s on an invalid body', async () => {
+    const res = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody({ stages: [] }));
+    expect(res.status).toBe(400);
+    const bad = await json(
+      'POST',
+      `/web/factory/projects/${PROJECT_ID}/work-items`,
+      createBody({ externalSource: { integrationId: 'jira' } }),
+    );
+    expect(bad.status).toBe(400);
+  });
+});
+
+// ── Read wire ────────────────────────────────────────────────────────────
+describe('work item read wire', () => {
+  it('serves normalized source facts on create, list and update while retaining the legacy wire fields', async () => {
+    const response = await json(
+      'POST',
+      `/web/factory/projects/${PROJECT_ID}/work-items`,
+      createBody({
+        metadata: { number: 42, state: 'closed', labels: ['bug'], author: 'reporter', authorTrusted: true },
+      }),
+    );
+    const created = await response.json();
+    expect(FACTORY_ROUTE_CONTRACTS.workItemCreate.responseSchema.parse(created)).toEqual(created);
+    expect(created.workItem.workItem).toMatchObject({
+      provider: 'github',
+      key: 'acme/app#42',
+      title: 'Fix the login flow',
+      state: 'closed',
+      labels: ['bug'],
+      author: 'reporter',
+    });
+    expect(created.workItem.metadata).toMatchObject({ number: 42, author: 'reporter', authorTrusted: true });
+    expect(created.workItem.workItem.metadata).not.toHaveProperty('authorTrusted');
+
+    const listed = await (await json('GET', `/web/factory/projects/${PROJECT_ID}/work-items`)).json();
+    expect(FACTORY_ROUTE_CONTRACTS.workItemList.responseSchema.parse(listed)).toEqual(listed);
+    expect(listed.workItems[0].workItem).toEqual(created.workItem.workItem);
+
+    const updated = await (
+      await json('PATCH', `/web/factory/work-items/${created.workItem.id}`, { title: 'Updated title' })
+    ).json();
+    expect(FACTORY_ROUTE_CONTRACTS.workItemUpdate.responseSchema.parse(updated)).toEqual(updated);
+    expect(updated.workItem.workItem.title).toBe('Updated title');
+    expect(updated.workItem.title).toBe('Updated title');
+    for (const card of [created.workItem, listed.workItems[0], updated.workItem]) {
+      expect(card.workItem).not.toHaveProperty('kind');
+      expect(card.workItem.sources).toHaveLength(1);
+      expect(card.workItem.sources[0]).toMatchObject({ provider: 'github', sourceType: 'issue' });
+      expect(card.workItem.sources[0]).not.toHaveProperty('kind');
+    }
+  });
+
+  it('keeps internal tokens in storage and out of every read', async () => {
+    const { item } = await seed.workItems.upsert({
+      orgId: 'org1',
+      userId: 'u1',
+      factoryProjectId: PROJECT_ID,
+      input: {
+        externalSource: {
+          integrationId: 'github',
+          type: 'issue',
+          externalId: '42',
+          url: 'https://github.com/acme/app/issues/42',
+        },
+        title: 'Fix the login flow',
+        stages: ['intake'],
+        sessions: {},
+        metadata: {
+          number: 42,
+          [FACTORY_RULE_MATERIALIZATION_KEY]: 'rule-7:issue-42',
+          [FACTORY_PULL_REQUEST_RECONCILIATION_KEY]: 'merged',
+        },
+      },
+    });
+
+    const listed = await json('GET', `/web/factory/projects/${PROJECT_ID}/work-items`);
+    expect((await listed.json()).workItems[0].metadata).toEqual({ number: 42 });
+
+    const patched = await json('PATCH', `/web/factory/work-items/${item.id}`, { metadata: { prNumber: 7 } });
+    expect((await patched.json()).workItem.metadata).toEqual({ number: 42, prNumber: 7 });
+
+    const [stored] = await listItems();
+    expect(stored?.metadata[FACTORY_RULE_MATERIALIZATION_KEY]).toBe('rule-7:issue-42');
+    expect(stored?.metadata[FACTORY_PULL_REQUEST_RECONCILIATION_KEY]).toBe('merged');
+  });
+
+  it('hides the reconciler missing-source marker from list responses', async () => {
+    await seed.workItems.upsert({
+      orgId: 'org1',
+      userId: 'u1',
+      factoryProjectId: PROJECT_ID,
+      input: {
+        externalSource: {
+          integrationId: 'github',
+          type: 'issue',
+          externalId: '43',
+          url: 'https://github.com/acme/app/issues/43',
+        },
+        title: 'Gone upstream',
+        stages: ['intake'],
+        sessions: {},
+        metadata: { number: 43, externalSourceMissingAt: '2026-09-30T00:00:00.000Z' },
+      },
+    });
+
+    const listed = await json('GET', `/web/factory/projects/${PROJECT_ID}/work-items`);
+    expect((await listed.json()).workItems[0].metadata).toEqual({ number: 43 });
+  });
+
+  it('drops internal tokens from browser writes', async () => {
+    const created = await json(
+      'POST',
+      `/web/factory/projects/${PROJECT_ID}/work-items`,
+      createBody({
+        metadata: {
+          number: 42,
+          [FACTORY_RULE_MATERIALIZATION_KEY]: 'caller-materialization',
+          [FACTORY_PULL_REQUEST_RECONCILIATION_KEY]: 'merged',
+          externalSourceMissingAt: '2099-01-01T00:00:00.000Z',
+        },
+      }),
+    );
+    const { workItem } = await created.json();
+    expect(workItem.metadata).toEqual({ number: 42 });
+
+    const patched = await json('PATCH', `/web/factory/work-items/${workItem.id}`, {
+      metadata: {
+        prNumber: 7,
+        [FACTORY_RULE_MATERIALIZATION_KEY]: 'replacement-materialization',
+        [FACTORY_PULL_REQUEST_RECONCILIATION_KEY]: 'closed',
+        externalSourceMissingAt: '2099-01-01T00:00:00.000Z',
+      },
+    });
+    expect((await patched.json()).workItem.metadata).toEqual({ number: 42, prNumber: 7 });
+
+    const [stored] = await listItems();
+    expect(stored?.metadata).toEqual({ prNumber: 7 });
+    expect(stored?.workItem.metadata).toEqual({ number: 42 });
+  });
+});
+
+// ── Patch ────────────────────────────────────────────────────────────────
+describe('PATCH /web/factory/work-items/:id', () => {
+  async function createItem(overrides: Record<string, unknown> = {}) {
+    const res = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody(overrides));
+    return (await res.json()).workItem;
+  }
+
+  it('rejects direct stage mutation and leaves the canonical item unchanged', async () => {
+    const item = await createItem();
+    const res = await buildApp({ workosId: 'u2', organizationId: 'org1' }).request(
+      `/web/factory/work-items/${item.id}`,
+      {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ stages: ['execute'] }),
+      },
+    );
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: 'governed_transition_required' });
+    const [canonical] = await listItems();
+    expect(canonical?.stages).toEqual(['intake']);
+    expect(canonical?.stageHistory).toHaveLength(1);
+  });
+
+  it('assigns a legacy item to an installed board and phase', async () => {
+    const { item } = await seed.workItems.upsert({
+      orgId: 'org1',
+      userId: 'u1',
+      factoryProjectId: PROJECT_ID,
+      input: { title: 'Legacy item', stages: ['intake'], sessions: {} },
+    });
+    const releaseBoard = defineBoard({
+      id: 'release',
+      title: 'Release',
+      initialPhase: 'queued',
+      phases: {
+        queued: { title: 'Queued', kind: 'resting', next: 'shipped' },
+        shipped: { title: 'Shipped', kind: 'terminal' },
+      },
+    });
+    const app = buildApp(orgUser, undefined, undefined, boardRegistryOf([releaseBoard]));
+
+    const response = await app.request(`/web/factory/work-items/${item.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ board: 'release', stages: ['queued'] }),
+    });
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).workItem).toMatchObject({ board: 'release', stages: ['queued'] });
+  });
+
+  it('atomically assigns a legacy item to only one installed board', async () => {
+    const { item } = await seed.workItems.upsert({
+      orgId: 'org1',
+      userId: 'u1',
+      factoryProjectId: PROJECT_ID,
+      input: { title: 'Legacy item', stages: ['intake'], sessions: {} },
+    });
+    const releaseBoard = defineBoard({
+      id: 'release',
+      title: 'Release',
+      initialPhase: 'queued',
+      phases: { queued: { title: 'Queued', kind: 'resting' } },
+    });
+    const supportBoard = defineBoard({
+      id: 'support',
+      title: 'Support',
+      initialPhase: 'backlog',
+      phases: { backlog: { title: 'Backlog', kind: 'resting' } },
+    });
+    const app = buildApp(orgUser, undefined, undefined, boardRegistryOf([releaseBoard, supportBoard]));
+
+    const responses = await Promise.all([
+      app.request(`/web/factory/work-items/${item.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ board: 'release', stages: ['queued'] }),
+      }),
+      app.request(`/web/factory/work-items/${item.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ board: 'support', stages: ['backlog'] }),
+      }),
+    ]);
+
+    expect(responses.map(response => response.status).sort()).toEqual([200, 409]);
+    expect(await responses.find(response => response.status === 409)?.json()).toEqual({
+      error: 'board_already_assigned',
+    });
+    const assigned = await seed.workItems.get({ orgId: 'org1', id: item.id });
+    expect([
+      { board: 'release', stages: ['queued'] },
+      { board: 'support', stages: ['backlog'] },
+    ]).toContainEqual({ board: assigned?.board, stages: assigned?.stages });
+  });
+
+  it('distinguishes a stale revision from an assigned board conflict', async () => {
+    const { item } = await seed.workItems.upsert({
+      orgId: 'org1',
+      userId: 'u1',
+      factoryProjectId: PROJECT_ID,
+      input: { title: 'Legacy item', stages: ['intake'], sessions: {} },
+    });
+    await seed.workItems.update({
+      orgId: 'org1',
+      id: item.id,
+      userId: 'u2',
+      patch: { title: 'Concurrent edit' },
+    });
+
+    await expect(
+      seed.workItems.update({
+        orgId: 'org1',
+        id: item.id,
+        userId: 'u1',
+        patch: { board: 'release', stages: ['queued'] },
+        expectedBoard: null,
+        expectedRevision: item.revision,
+      }),
+    ).rejects.toMatchObject<WorkItemUpdateConflictError>({ reason: 'revision' });
+  });
+
+  it('rejects creation outside exclusive intake', async () => {
+    const res = await json(
+      'POST',
+      `/web/factory/projects/${PROJECT_ID}/work-items`,
+      createBody({ stages: ['intake', 'execute'] }),
+    );
+    expect(res.status).toBe(409);
+    expect(await listItems()).toHaveLength(0);
+  });
+
+  it('merges sessions and metadata instead of replacing', async () => {
+    const item = await createItem({
+      sessions: { work: { sessionId: '/sb/wt/a', branch: 'b-a', threadId: 't-a' } },
+      metadata: { number: 42, labels: ['bug'] },
+    });
+    const res = await json('PATCH', `/web/factory/work-items/${item.id}`, {
+      sessions: { review: { sessionId: '/sb/wt/r', branch: 'b-r', threadId: 't-r' } },
+      metadata: { prNumber: 7 },
+    });
+    const { workItem } = await res.json();
+    expect(Object.keys(workItem.sessions).sort()).toEqual(['review', 'work']);
+    expect(workItem.metadata).toEqual({ number: 42, labels: ['bug'], prNumber: 7 });
+  });
+
+  it('serializes concurrent patches so neither session merge is dropped', async () => {
+    const item = await createItem();
+    // Two runs file their session refs on the same card at once (e.g. a work
+    // run and a review run finishing kickoff together). Each merge reads the
+    // current `sessions` and writes it back — without the row lock the last
+    // write would silently drop the other role.
+    const [workRes, reviewRes] = await Promise.all([
+      json('PATCH', `/web/factory/work-items/${item.id}`, {
+        sessions: { work: { sessionId: '/sb/wt/a', branch: 'b-a', threadId: 't-a' } },
+      }),
+      json('PATCH', `/web/factory/work-items/${item.id}`, {
+        sessions: { review: { sessionId: '/sb/wt/r', branch: 'b-r', threadId: 't-r' } },
+      }),
+    ]);
+    expect(workRes.status).toBe(200);
+    expect(reviewRes.status).toBe(200);
+
+    const list = await json('GET', `/web/factory/projects/${PROJECT_ID}/work-items`);
+    const [workItem] = (await list.json()).workItems;
+    expect(Object.keys(workItem.sessions).sort()).toEqual(['review', 'work']);
+  });
+
+  it('404s for items in another org', async () => {
+    const item = await createItem();
+    const res = await buildApp({ workosId: 'u9', organizationId: 'org2' }).request(
+      `/web/factory/work-items/${item.id}`,
+      {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ title: 'Cross-tenant mutation' }),
+      },
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it('400s on an empty or invalid patch', async () => {
+    const item = await createItem();
+    expect((await json('PATCH', `/web/factory/work-items/${item.id}`, {})).status).toBe(400);
+    expect((await json('PATCH', `/web/factory/work-items/${item.id}`, { title: '' })).status).toBe(400);
+  });
+
+  it('no longer takes a hands-off plan grant: alone it changes nothing, beside a real field it is ignored', async () => {
+    const item = await createItem();
+    expect((await json('PATCH', `/web/factory/work-items/${item.id}`, { plansPreapproved: true })).status).toBe(400);
+    expect((await listItems())[0]).toMatchObject({ revision: item.revision });
+    expect((await listItems())[0]).not.toHaveProperty('plansPreapprovedAt');
+
+    const renamed = await json('PATCH', `/web/factory/work-items/${item.id}`, {
+      title: 'Renamed',
+      plansPreapproved: true,
+    });
+    expect(renamed.status).toBe(200);
+    expect((await listItems())[0]).toMatchObject({ title: 'Renamed' });
+  });
+});
+
+describe('POST /web/factory/projects/:id/work-items/:workItemId/transition', () => {
+  async function createItem(overrides: Record<string, unknown> = {}) {
+    const res = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody(overrides));
+    return (await res.json()).workItem;
+  }
+
+  const transition = (item: { id: string; revision: number }, overrides: Record<string, unknown> = {}) =>
+    json('POST', `/web/factory/projects/${PROJECT_ID}/work-items/${item.id}/transition`, {
+      board: 'work',
+      stage: 'planning',
+      expectedRevision: item.revision,
+      requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1',
+      cause: 'board_drag',
+      ...overrides,
+    });
+
+  it('moves through the rule authority and preserves storage-owned history', async () => {
+    const item = await createItem();
+    auditRecorded = [];
+    const res = await transition(item);
+    expect(res.status).toBe(200);
+    const { result } = await res.json();
+    expect(result).toMatchObject({ status: 'accepted', itemId: item.id, revision: 2, stage: 'planning' });
+    const [canonical] = await listItems();
+    expect(canonical?.stages).toEqual(['planning']);
+    expect(canonical?.stageHistory.map(entry => [entry.stage, entry.exitedAt !== undefined])).toEqual([
+      ['intake', true],
+      ['planning', false],
+    ]);
+    expect(auditRecorded).toContainEqual(
+      expect.objectContaining({
+        action: 'factory.work_item.stage_moved',
+        metadata: expect.objectContaining({ ingressType: 'human', configVersion: 'factory-config-v1' }),
+      }),
+    );
+  });
+
+  it('stamps the browser request onto the row a move leaves behind', async () => {
+    const item = await createItem();
+    auditRecorded = [];
+
+    const res = await buildApp(orgUser).request(
+      `/web/factory/projects/${PROJECT_ID}/work-items/${item.id}/transition`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'user-agent': 'Mozilla/5.0 (factory board)',
+          'x-forwarded-for': '203.0.113.7, 10.0.0.1',
+        },
+        body: JSON.stringify({
+          board: 'work',
+          stage: 'planning',
+          expectedRevision: item.revision,
+          requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1',
+          cause: 'board_drag',
+        }),
+      },
+    );
+
+    expect(res.status).toBe(200);
+    expect(auditRecorded).toContainEqual(
+      expect.objectContaining({
+        action: 'factory.work_item.stage_moved',
+        context: { location: '203.0.113.7', userAgent: 'Mozilla/5.0 (factory board)' },
+      }),
+    );
+  });
+
+  it('accepts a human cancel over HTTP', async () => {
+    const item = await createItem();
+    const res = await transition(item, { stage: 'canceled' });
+    expect(res.status).toBe(200);
+    expect((await res.json()).result).toMatchObject({ status: 'accepted', stage: 'canceled' });
+    expect((await listItems())[0]?.stages).toEqual(['canceled']);
+  });
+
+  it('returns typed stale without overwriting the winner', async () => {
+    const item = await createItem();
+    expect((await transition(item)).status).toBe(200);
+    const stale = await transition(item, { requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2', stage: 'triage' });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({ result: { status: 'rejected', code: 'stale' } });
+    expect((await listItems())[0]?.stages).toEqual(['planning']);
+  });
+
+  it('replays immutable ingress without evaluating a second destination', async () => {
+    const item = await createItem();
+    const first = await transition(item);
+    const replay = await transition(item, { stage: 'triage' });
+    expect(await replay.json()).toEqual(await first.json());
+    expect((await listItems())[0]?.stages).toEqual(['planning']);
+  });
+
+  it('rejects non-UUID human request identities before they can collide across work items', async () => {
+    const item = await createItem();
+    const res = await transition(item, { requestId: 'reused-human-request' });
+    expect(res.status).toBe(400);
+  });
+
+  it('re-runs the lane only when the body asks to re-enter it', async () => {
+    const decisionCount = async () =>
+      ((await (await json('GET', `/web/factory/projects/${PROJECT_ID}/decisions`)).json()).decisions as unknown[])
+        .length;
+    const item = await createItem();
+    const moved = (await (await transition(item, { stage: 'triage' })).json()).result;
+    expect(await decisionCount()).toBe(1);
+
+    const stayed = await transition(
+      { id: item.id, revision: moved.revision },
+      { stage: 'triage', requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2' },
+    );
+    expect(stayed.status).toBe(200);
+    expect(await decisionCount()).toBe(1);
+
+    await finishQueuedRunsForTests(seed.workItems);
+    const reentered = await transition(
+      { id: item.id, revision: (await stayed.json()).result.revision },
+      { stage: 'triage', reenter: true, requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3' },
+    );
+    expect(reentered.status).toBe(200);
+    expect(await decisionCount()).toBe(2);
+  });
+
+  it('rejects a work item addressed through the Review board', async () => {
+    const item = await createItem();
+    const res = await transition(item, { board: 'review' });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toMatchObject({ result: { status: 'rejected', code: 'invalid_transition' } });
+  });
+});
+
+describe('POST transition moving a card to another board', () => {
+  // On live projects, Work cards that belong on another board (e.g. OSS Features) had no manual
+  // path off their board: the transition endpoint rejected any `board` other than the card's.
+
+  // A board sharing a phase name with Work: on another board, a same-named phase is a new phase.
+  const previewBoard = defineBoard({
+    id: 'preview',
+    title: 'Preview',
+    initialPhase: 'inbox',
+    phases: {
+      inbox: { title: 'Inbox', kind: 'resting', nextPhases: ['triage'] },
+      triage: {
+        title: 'Triage',
+        kind: 'working',
+        runner: { context: 'triage', skill: 'preview-triage' },
+        next: 'done',
+      },
+      done: { title: 'Done', kind: 'terminal' },
+    },
+  });
+  const registry = () => boardRegistryOf([triageWorkBoard, createTestBoard(), previewBoard]);
+
+  async function createItem(overrides: Record<string, unknown> = {}) {
+    const res = await buildApp(orgUser, undefined, undefined, registry()).request(
+      `/web/factory/projects/${PROJECT_ID}/work-items`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(createBody(overrides)),
+      },
+    );
+    return (await res.json()).workItem;
+  }
+
+  const move = (item: { id: string; revision: number }, overrides: Record<string, unknown> = {}) =>
+    buildApp(orgUser, undefined, undefined, registry()).request(
+      `/web/factory/projects/${PROJECT_ID}/work-items/${item.id}/transition`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          board: 'release',
+          stage: 'queued',
+          expectedRevision: item.revision,
+          requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaab1',
+          cause: 'move_to_board',
+          ...overrides,
+        }),
+      },
+    );
+
+  it("a person moves a Work card to another board's phase, keeping its id, sessions and history", async () => {
+    const created = await createItem();
+    // A triage session from an earlier run stays on the card; only its board placement changes.
+    await seed.workItems.update({ orgId: 'org1', id: created.id, userId: 'u1', patch: { sessions: run } });
+    const item = (await seed.workItems.get({ orgId: 'org1', id: created.id }))!;
+    auditRecorded = [];
+
+    const res = await move(item);
+
+    expect(res.status).toBe(200);
+    const { result } = await res.json();
+    expect(result).toMatchObject({ status: 'accepted', itemId: created.id, stage: 'queued' });
+    const stored = (await seed.workItems.get({ orgId: 'org1', id: created.id }))!;
+    expect(stored.board).toBe('release');
+    expect(stored.stages).toEqual(['queued']);
+    expect(stored.sessions).toEqual(item.sessions);
+    expect(stored.sessions.execute).toMatchObject(run.execute);
+    expect(stored.stageHistory.map(entry => [entry.stage, entry.exitedAt !== undefined])).toEqual([
+      ['intake', true],
+      ['queued', false],
+    ]);
+    expect(auditRecorded).toContainEqual(
+      expect.objectContaining({
+        action: 'factory.work_item.stage_moved',
+        actorType: 'human',
+        actorId: 'u1',
+        metadata: expect.objectContaining({ ingressType: 'human', fromBoard: 'work', toBoard: 'release' }),
+      }),
+    );
+  });
+
+  it('holds a busy card, then supersedes the run the old board proposed once it moves', async () => {
+    const item = await createItem();
+    const triaged = await move(item, { board: 'work', stage: 'triage' });
+    expect(triaged.status).toBe(200);
+    const { result } = await triaged.json();
+
+    // The triage run is still queued: moving the card away would strand it mid-flight.
+    const busy = await move(
+      { id: item.id, revision: result.revision },
+      { requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaab2' },
+    );
+    expect(busy.status).toBe(422);
+    expect(await busy.json()).toMatchObject({ result: { status: 'rejected', code: 'card_busy' } });
+
+    // A dispatcher parks the run for a person's approval; the proposal is not a live run.
+    const ownerId = 'dispatcher-1';
+    const now = new Date();
+    const [claimed] = await seed.workItems.claimDeferredDecisions({
+      ownerId,
+      now,
+      leaseExpiresAt: new Date(now.getTime() + 60_000),
+      limit: 10,
+    });
+    await seed.workItems.proposeDeferredDecision(
+      { id: claimed!.id, orgId: claimed!.orgId, factoryProjectId: claimed!.factoryProjectId, ownerId },
+      now,
+    );
+
+    const moved = await move(
+      { id: item.id, revision: result.revision },
+      { requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaab5' },
+    );
+
+    expect(moved.status).toBe(200);
+    // The old board's proposed run means nothing on the new board.
+    const proposals = await seed.workItems.listDeferredDecisions('org1', PROJECT_ID, { statuses: ['proposed'] });
+    expect(proposals).toHaveLength(0);
+    expect((await seed.workItems.get({ orgId: 'org1', id: item.id }))?.board).toBe('release');
+  });
+
+  it('returns typed stale on a lost revision race without moving the card', async () => {
+    const item = await createItem();
+    const res = await move({ id: item.id, revision: item.revision + 5 });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ result: { status: 'rejected', code: 'stale' } });
+    expect((await seed.workItems.get({ orgId: 'org1', id: item.id }))?.board).not.toBe('release');
+  });
+
+  it('refuses a board that is not installed and a phase the target board does not declare', async () => {
+    const item = await createItem();
+
+    const unknownBoard = await move(item, { board: 'oss-features' });
+    expect(unknownBoard.status).toBe(422);
+    expect(await unknownBoard.json()).toMatchObject({
+      result: { status: 'rejected', code: 'invalid_transition', reason: 'Board "oss-features" is not installed.' },
+    });
+
+    const unknownPhase = await move(item, { stage: 'missing', requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaab3' });
+    expect(unknownPhase.status).toBe(422);
+    expect(await unknownPhase.json()).toMatchObject({
+      result: { status: 'rejected', code: 'invalid_transition', reason: expect.stringContaining('no phase missing') },
+    });
+    expect((await seed.workItems.get({ orgId: 'org1', id: item.id }))?.board).not.toBe('release');
+  });
+
+  it("refuses the target board's terminal phase: a card finishes on its own board", async () => {
+    const item = await createItem();
+    const res = await move(item, { stage: 'shipped' });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toMatchObject({ result: { status: 'rejected', code: 'invalid_transition' } });
+    expect((await seed.workItems.get({ orgId: 'org1', id: item.id }))?.board).not.toBe('release');
+  });
+
+  it('refuses to move a finished card off its board', async () => {
+    const item = await createItem();
+    const canceled = await move(item, { board: 'work', stage: 'canceled' });
+    expect(canceled.status).toBe(200);
+    const { result } = await canceled.json();
+
+    const res = await move(
+      { id: item.id, revision: result.revision },
+      { requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaab4' },
+    );
+
+    expect(res.status).toBe(422);
+    expect(await res.json()).toMatchObject({ result: { status: 'rejected', code: 'invalid_transition' } });
+    expect((await seed.workItems.get({ orgId: 'org1', id: item.id }))?.stages).toEqual(['canceled']);
+  });
+
+  it('enters a same-named phase on the other board as a new phase: its runner queues and the move is audited', async () => {
+    const item = await createItem();
+    const triaged = await move(item, { board: 'work', stage: 'triage' });
+    expect(triaged.status).toBe(200);
+    const { result } = await triaged.json();
+    await finishQueuedRunsForTests(seed.workItems);
+    auditRecorded = [];
+
+    const res = await move(
+      { id: item.id, revision: result.revision },
+      { board: 'preview', stage: 'triage', requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaab6' },
+    );
+
+    expect(res.status).toBe(200);
+    const moved = (await res.json()).result;
+    expect(moved.status).toBe('accepted');
+    // Preview's Triage is not Work's Triage: entering it starts Preview's own runner, and the
+    // card's notice names both boards — the phase names alone would hide the move.
+    expect(moved.decisions).toContainEqual(
+      expect.objectContaining({
+        type: 'invokeSkill',
+        skillName: 'preview-triage',
+        startsAfterOwnMove: true,
+        precedingMessage:
+          'This work was moved from the triage stage on the Work board to the triage stage on the Preview board.',
+      }),
+    );
+    expect((await seed.workItems.get({ orgId: 'org1', id: item.id }))?.board).toBe('preview');
+    // Leaving Work's triage for Preview's is a stage change: the old phase's goal must end.
+    await vi.waitFor(() =>
+      expect(committedHook).toContainEqual({ workItemId: item.id, fromStage: 'triage', toStage: 'triage' }),
+    );
+    expect(auditRecorded).toContainEqual(
+      expect.objectContaining({
+        action: 'factory.work_item.stage_moved',
+        metadata: expect.objectContaining({ fromBoard: 'work', toBoard: 'preview' }),
+      }),
+    );
+  });
+
+  it('holds a busy card even when the destination phase shares its name', async () => {
+    const item = await createItem();
+    const triaged = await move(item, { board: 'work', stage: 'triage' });
+    expect(triaged.status).toBe(200);
+    const { result } = await triaged.json();
+
+    // The triage run is still queued: the same-named phase on another board is no exception.
+    const res = await move(
+      { id: item.id, revision: result.revision },
+      { board: 'preview', stage: 'triage', requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaab7' },
+    );
+
+    expect(res.status).toBe(422);
+    expect(await res.json()).toMatchObject({ result: { status: 'rejected', code: 'card_busy' } });
+    expect((await seed.workItems.get({ orgId: 'org1', id: item.id }))?.board).toBe('work');
+  });
+
+  it('queues the destination runner even when the move names run_start as its cause', async () => {
+    // A run-start cause marks the card's own agent landing it where its run already is; crossing
+    // boards is never that, so the destination phase's runner still queues.
+    const item = await createItem();
+    const res = await move(item, { board: 'preview', stage: 'triage', cause: 'run_start' });
+    expect(res.status).toBe(200);
+    const { result } = await res.json();
+    expect(result.status).toBe('accepted');
+    expect(result.decisions).toContainEqual(
+      expect.objectContaining({ type: 'invokeSkill', skillName: 'preview-triage', startsAfterOwnMove: true }),
+    );
+    expect((await seed.workItems.get({ orgId: 'org1', id: item.id }))?.board).toBe('preview');
+  });
+
+  it("accepts the work when a person hands the card to the destination board's build seat", async () => {
+    const created = await createItem();
+    const toPreview = await move(created, { board: 'preview', stage: 'inbox' });
+    expect(toPreview.status).toBe(200);
+    const parked = (await seed.workItems.get({ orgId: 'org1', id: created.id }))!;
+    expect(acceptedHook).toEqual([]);
+    // The move's own notice is delivered before the next move, as a running dispatcher would.
+    await finishQueuedRunsForTests(seed.workItems);
+
+    // Inbox is a resting phase Work does not have; handing the card to Work's builder accepts it.
+    const toBuild = await move(
+      { id: created.id, revision: parked.revision },
+      { board: 'work', stage: 'planning', requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaab9' },
+    );
+    expect(toBuild.status).toBe(200);
+    const stored = (await seed.workItems.get({ orgId: 'org1', id: created.id }))!;
+    expect(stored.board).toBe('work');
+    // The move is the approval: the acceptance hook (production: GitHub labels) fires for the card.
+    await vi.waitFor(() => expect(acceptedHook).toEqual([{ workItemId: created.id }]));
+  });
+
+  it('holds a busy card whatever cause the request names', async () => {
+    const item = await createItem();
+    const triaged = await move(item, { board: 'work', stage: 'triage' });
+    expect(triaged.status).toBe(200);
+    const { result } = await triaged.json();
+
+    const res = await move(
+      { id: item.id, revision: result.revision },
+      { cause: 'run_start', requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaab8' },
+    );
+
+    expect(res.status).toBe(422);
+    expect(await res.json()).toMatchObject({ result: { status: 'rejected', code: 'card_busy' } });
+    expect((await seed.workItems.get({ orgId: 'org1', id: item.id }))?.board).toBe('work');
+  });
+});
+
+describe('PUT /web/factory/projects/:id/work-items/:workItemId/working-pull-request', () => {
+  async function issueWithPullRequests() {
+    const res = await json(
+      'POST',
+      `/web/factory/projects/${PROJECT_ID}/work-items`,
+      createBody({ externalSource: { integrationId: 'github', type: 'issue', externalId: 'github:7:issue:1' } }),
+    );
+    const { workItem } = await res.json();
+    const attach = (
+      number: number,
+      state: string,
+      cardMetadata?: (metadata: Record<string, unknown>) => Record<string, unknown>,
+    ) =>
+      seed.workItems.attachSource({
+        orgId: 'org1',
+        id: workItem.id,
+        source: { integrationId: 'github', type: 'pull-request', externalId: `github:7:pull-request:${number}` },
+        metadata: { githubPullRequestNumber: number, state },
+        cardMetadata,
+      });
+    await attach(2, 'open', metadata => ({
+      ...metadata,
+      pullRequestHeadSha: 'abc',
+      untrustedPullRequests: ['github:pull-request:github:7:pull-request:2'],
+    }));
+    await attach(3, 'closed');
+    return (await seed.workItems.get({ orgId: 'org1', id: workItem.id }))!;
+  }
+  const pick = (item: { id: string; revision: number }, pullRequest: number, expectedRevision = item.revision) =>
+    json('PUT', `/web/factory/projects/${PROJECT_ID}/work-items/${item.id}/working-pull-request`, {
+      pullRequest,
+      expectedRevision,
+    });
+
+  it("makes an outsider's linked pull request the card's working one when a person picks it", async () => {
+    const item = await issueWithPullRequests();
+    auditRecorded = [];
+
+    const res = await pick(item, 2);
+
+    expect(res.status).toBe(200);
+    const stored = await seed.workItems.get({ orgId: 'org1', id: item.id });
+    expect(stored?.metadata).toMatchObject({ openPullRequestNumber: 2, pullRequestHeadSha: null });
+    expect(stored?.metadata?.untrustedPullRequests).toEqual(['github:pull-request:github:7:pull-request:2']);
+    expect(auditRecorded).toContainEqual(expect.objectContaining({ action: 'factory.work_item.updated' }));
+  });
+
+  it('refuses a pull request that is not linked to the card, or is closed', async () => {
+    const item = await issueWithPullRequests();
+
+    expect(await (await pick(item, 9)).json()).toMatchObject({ error: 'pull_request_not_linked' });
+    expect(await (await pick(item, 3)).json()).toMatchObject({ error: 'pull_request_not_open' });
+    expect((await seed.workItems.get({ orgId: 'org1', id: item.id }))?.metadata).not.toHaveProperty(
+      'openPullRequestNumber',
+    );
+  });
+
+  it('refuses a pick when the pull request closes while the pick is being made', async () => {
+    const item = await issueWithPullRequests();
+    const update = seed.workItems.update.bind(seed.workItems);
+    const closing = vi.spyOn(seed.workItems, 'update').mockImplementationOnce(async input => {
+      // The provider closes it after the endpoint read the card; closing touches the source, not the card's revision.
+      await seed.workItems.syncWorkItemSource({
+        orgId: 'org1',
+        factoryProjectId: PROJECT_ID,
+        provider: 'github',
+        externalId: 'pull-request:github:7:pull-request:2',
+        patch: { state: 'closed' },
+      });
+      return update(input);
+    });
+
+    const res = await pick(item, 2);
+
+    closing.mockRestore();
+    expect(res.status).toBe(422);
+    expect(await res.json()).toMatchObject({ error: 'pull_request_not_open' });
+    expect((await seed.workItems.get({ orgId: 'org1', id: item.id }))?.metadata).not.toHaveProperty(
+      'openPullRequestNumber',
+    );
+  });
+
+  it('refuses a pick made against an older revision of the card', async () => {
+    const item = await issueWithPullRequests();
+
+    const res = await pick(item, 2, item.revision - 1);
+
+    expect(res.status).toBe(409);
+    expect((await seed.workItems.get({ orgId: 'org1', id: item.id }))?.metadata).not.toHaveProperty(
+      'openPullRequestNumber',
+    );
+  });
+});
+
+describe('POST /web/factory/projects/:id/runs/start', () => {
+  const startBody = (workItemId?: string) => ({
+    sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1',
+    threadTitle: 'Investigate issue 42',
+    kickoffKey: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1',
+    workItem: {
+      id: workItemId,
+      role: 'plan',
+      input: createBody({ stages: ['intake'] }),
+    },
+  });
+
+  it('passes authenticated tenant identity and the Factory default model to the coordinator', async () => {
+    await seed.projects.update({
+      orgId: 'org1',
+      id: PROJECT_ID,
+      input: { defaultModelId: 'anthropic/claude-fable-5' },
+    });
+    const created = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    const { workItem } = await created.json();
+    auditRecorded = [];
+    const prepare = vi.fn(async (input: any) => ({
+      workItemId: input.workItem.id,
+      bindingId: 'binding-1',
+      threadId: input.sessionId,
+      resourceId: input.sessionId,
+      sessionId: input.sessionId,
+      branch: 'factory/issue-42',
+      revision: 2,
+      kickoffStatus: 'pending',
+      replayed: false,
+    }));
+    const requestContext = new RequestContext();
+    requestContext.set('user', orgUser);
+    const app = buildApp(orgUser, { prepare }, requestContext);
+
+    const res = await app.request(`/web/factory/projects/${PROJECT_ID}/runs/start`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(startBody(workItem.id)),
+    });
+
+    expect(res.status).toBe(202);
+    expect(prepare).toHaveBeenCalledWith(
+      expect.objectContaining({
+        orgId: 'org1',
+        userId: 'u1',
+        factoryProjectId: PROJECT_ID,
+        modelScope: 'factory',
+        defaultModelId: 'anthropic/claude-fable-5',
+        requestContext,
+      }),
+    );
+    expect(auditRecorded).toEqual([]);
+  });
+
+  it('starts the run under the caller, whatever actor the body claims', async () => {
+    const created = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    const { workItem } = await created.json();
+    const prepare = vi.fn(async (input: any) => ({
+      workItemId: input.workItem.id,
+      bindingId: 'binding-1',
+      threadId: input.sessionId,
+      resourceId: input.sessionId,
+      sessionId: input.sessionId,
+      branch: 'factory/issue-42',
+      revision: 2,
+      kickoffStatus: 'pending',
+      replayed: false,
+    }));
+    const app = buildApp(orgUser, { prepare });
+
+    const res = await app.request(`/web/factory/projects/${PROJECT_ID}/runs/start`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        ...startBody(workItem.id),
+        actor: { type: 'system', id: 'forged' },
+        userId: 'forged',
+        orgId: 'forged',
+      }),
+    });
+
+    expect(res.status).toBe(202);
+    expect(prepare).toHaveBeenCalledWith(expect.objectContaining({ orgId: 'org1', userId: 'u1' }));
+  });
+
+  it('rejects a non-UUID kickoff identity before coordination', async () => {
+    const prepare = vi.fn();
+    const app = buildApp(orgUser, { prepare });
+
+    const res = await app.request(`/web/factory/projects/${PROJECT_ID}/runs/start`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...startBody('cccccccc-cccc-4ccc-8ccc-ccccccccccc1'), kickoffKey: 'reused-kickoff' }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it.each(['', 'not-a-uuid', 'x'.repeat(65), 42])(
+    'rejects an explicitly supplied invalid work item identity: %o',
+    async id => {
+      const prepare = vi.fn();
+      const app = buildApp(orgUser, { prepare });
+      const body = startBody();
+
+      const res = await app.request(`/web/factory/projects/${PROJECT_ID}/runs/start`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...body, workItem: { ...body.workItem, id } }),
+      });
+
+      expect(res.status).toBe(400);
+      expect(prepare).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects a start without a work item id', async () => {
+    const prepare = vi.fn();
+    const app = buildApp(orgUser, { prepare });
+    const body = startBody();
+
+    const res = await app.request(`/web/factory/projects/${PROJECT_ID}/runs/start`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    expect(res.status).toBe(400);
+    expect(prepare).not.toHaveBeenCalled();
+  });
+});
+
+// ── Delete ───────────────────────────────────────────────────────────────
+describe('DELETE /web/factory/work-items/:id', () => {
+  it('removes the item for the org', async () => {
+    const created = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    const { workItem } = await created.json();
+    const res = await json('DELETE', `/web/factory/work-items/${workItem.id}`);
+    expect((await res.json()).ok).toBe(true);
+    expect(await listItems()).toHaveLength(0);
+  });
+
+  it('404s for unknown or cross-org items', async () => {
+    expect((await json('DELETE', `/web/factory/work-items/00000000-0000-4000-8000-000000000099`)).status).toBe(404);
+  });
+});
+
+// ── Related Work / Review items ──────────────────────────────────────────
+describe('work item relations', () => {
+  const create = async (externalId: string, overrides: Record<string, unknown> = {}) => {
+    const response = await json(
+      'POST',
+      `/web/factory/projects/${PROJECT_ID}/work-items`,
+      createBody({
+        externalSource: { integrationId: 'github', type: 'issue', externalId },
+        ...overrides,
+      }),
+    );
+    return { response, body: await response.json() };
+  };
+
+  it('creates separate related items and preserves the relation on source-key reuse', async () => {
+    const { body: parent } = await create('parent');
+    const { body: child } = await create('child', {
+      externalSource: { integrationId: 'github', type: 'pull-request', externalId: 'child' },
+      parentWorkItemId: parent.workItem.id,
+    });
+
+    expect(child.workItem.parentWorkItemId).toBe(parent.workItem.id);
+    // A pull request filed without a board lands on Work, where it is reviewed.
+    expect(child.workItem.board).toBe('work');
+
+    const { body: repeated } = await create('child', {
+      externalSource: { integrationId: 'github', type: 'pull-request', externalId: 'child' },
+      parentWorkItemId: null,
+      title: 'Updated review title',
+    });
+    expect(repeated.workItem).toMatchObject({
+      id: child.workItem.id,
+      parentWorkItemId: parent.workItem.id,
+      title: 'Updated review title',
+    });
+  });
+
+  it('attaches a parent when a repeated source-key upsert supplies one', async () => {
+    const { body: parent } = await create('late-parent');
+    const pullRequestSource = { integrationId: 'github', type: 'pull-request', externalId: 'late-child' };
+    const { body: existing } = await create('late-child', { externalSource: pullRequestSource });
+    const { body: related } = await create('late-child', {
+      externalSource: pullRequestSource,
+      parentWorkItemId: parent.workItem.id,
+    });
+
+    expect(related.workItem).toMatchObject({ id: existing.workItem.id, parentWorkItemId: parent.workItem.id });
+  });
+
+  it('rejects missing, cross-project, self, and cyclic relations', async () => {
+    const missing = await create('missing', {
+      parentWorkItemId: '00000000-0000-4000-8000-000000000099',
+    });
+    expect(missing.response.status).toBe(400);
+
+    const otherProject = await seed.projects.create({
+      orgId: 'org1',
+      userId: 'u1',
+      input: { name: 'Other project' },
+    });
+    const otherParentResponse = await json(
+      'POST',
+      `/web/factory/projects/${otherProject.id}/work-items`,
+      createBody({
+        externalSource: { integrationId: 'github', type: 'issue', externalId: 'other-project' },
+      }),
+    );
+    const otherParent = (await otherParentResponse.json()).workItem;
+    const crossProject = await create('cross-project', { parentWorkItemId: otherParent.id });
+    expect(crossProject.response.status).toBe(400);
+
+    const { body: first } = await create('first');
+    const { body: second } = await create('second', { parentWorkItemId: first.workItem.id });
+    expect(
+      (
+        await json('PATCH', `/web/factory/work-items/${first.workItem.id}`, {
+          parentWorkItemId: first.workItem.id,
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await json('PATCH', `/web/factory/work-items/${first.workItem.id}`, {
+          parentWorkItemId: second.workItem.id,
+        })
+      ).status,
+    ).toBe(400);
+  });
+
+  it('clears a relation explicitly and when the parent is deleted', async () => {
+    const { body: parent } = await create('delete-parent');
+    const { body: child } = await create('delete-child', { parentWorkItemId: parent.workItem.id });
+
+    const cleared = await json('PATCH', `/web/factory/work-items/${child.workItem.id}`, { parentWorkItemId: null });
+    expect((await cleared.json()).workItem.parentWorkItemId).toBeNull();
+
+    await json('PATCH', `/web/factory/work-items/${child.workItem.id}`, { parentWorkItemId: parent.workItem.id });
+    expect((await json('DELETE', `/web/factory/work-items/${parent.workItem.id}`)).status).toBe(200);
+    expect((await listItems())[0]?.parentWorkItemId).toBeNull();
+  });
+});
+
+describe('GET /web/factory/projects/:id/decisions', () => {
+  it('names the linked-card source on the summary and leaves it null for other effects', async () => {
+    const now = new Date('2030-01-01T00:00:00.000Z');
+    await seed.workItems.commitRuleEvaluation({
+      orgId: 'org1',
+      factoryProjectId: PROJECT_ID,
+      workItemId: null,
+      ingress: { identity: 'decision-source' },
+      expectedRevision: null,
+      actor: { type: 'system', id: 'rules' },
+      outcome: { status: 'accepted' },
+      decisions: [
+        {
+          type: 'upsertLinkedWorkItem',
+          idempotencyKey: 'decision-source-linked',
+          board: 'review',
+          source: 'github-pr',
+          sourceKey: 'github-pr:7',
+          title: 'Fix the login flow',
+          url: null,
+          stage: 'intake',
+          metadata: {},
+        },
+        {
+          type: 'sendMessage',
+          role: 'work',
+          message: 'Notify the session.',
+          idempotencyKey: 'decision-source-message',
+        },
+      ],
+      causalChain: [],
+      now,
+    });
+
+    const body = await (await json('GET', `/web/factory/projects/${PROJECT_ID}/decisions`)).json();
+    expect(body.decisions).toHaveLength(2);
+    expect(body.decisions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'upsertLinkedWorkItem', source: 'github-pr' }),
+        expect.objectContaining({ type: 'sendMessage', source: null }),
+      ]),
+    );
+  });
+});
+
+describe('GET /web/factory/projects/:id/decisions retry eligibility', () => {
+  it('reports decisions that have not failed as not retryable, matching the retry route', async () => {
+    const created = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    const workItem = (await seed.workItems.update({
+      orgId: 'org1',
+      id: (await created.json()).workItem.id,
+      userId: 'u1',
+      patch: { stages: ['triage'] },
+    }))!.item;
+    const now = new Date();
+    await seed.workItems.commitRuleEvaluation({
+      orgId: 'org1',
+      factoryProjectId: PROJECT_ID,
+      workItemId: workItem.id,
+      ingress: { identity: 'not-failed' },
+      expectedRevision: workItem.revision,
+      actor: { type: 'system', id: 'rules' },
+      outcome: { status: 'accepted' },
+      decisions: ['succeeded', 'superseded', 'proposed'].map(key => ({
+        type: 'invokeSkill' as const,
+        role: 'triage',
+        skillName: 'factory-triage',
+        idempotencyKey: key,
+      })),
+      causalChain: [],
+      now,
+    });
+    const claimed = await seed.workItems.claimDeferredDecisions({
+      ownerId: 'worker-1',
+      now,
+      leaseExpiresAt: new Date(now.getTime() + 60_000),
+      limit: 3,
+    });
+    expect(claimed).toHaveLength(3);
+    const [succeeded, superseded, proposed] = claimed.map(decision => ({
+      id: decision.id,
+      orgId: decision.orgId,
+      factoryProjectId: decision.factoryProjectId,
+      ownerId: 'worker-1',
+    }));
+    await seed.workItems.completeDeferredDecision(succeeded!, now);
+    await seed.workItems.supersedeLeasedDecision(superseded!, now);
+    await seed.workItems.proposeDeferredDecision(proposed!, now);
+
+    const body = await (await json('GET', `/web/factory/projects/${PROJECT_ID}/decisions`)).json();
+    expect(body.decisions.map((decision: { status: string }) => decision.status).sort()).toEqual([
+      'proposed',
+      'succeeded',
+      'superseded',
+    ]);
+    for (const decision of body.decisions) {
+      expect(decision).toMatchObject({ failureCode: null, canRetry: false });
+      const retry = await json('POST', `/web/factory/projects/${PROJECT_ID}/decisions/${decision.id}/retry`);
+      expect(retry.status).toBe(409);
+      expect((await seed.workItems.getDeferredDecision('org1', PROJECT_ID, decision.id))?.status).toBe(decision.status);
+    }
+  });
+});
+
+describe('GET /web/factory/projects/:id/attention', () => {
+  it('refuses to retry a failed run once the card has left the phase it was decided for', async () => {
+    const created = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    const workItem = (await seed.workItems.update({
+      orgId: 'org1',
+      id: (await created.json()).workItem.id,
+      userId: 'u1',
+      patch: { stages: ['triage'] },
+    }))!.item;
+    const decidedAt = new Date(Date.now() + 1_000);
+    await seed.workItems.commitRuleEvaluation({
+      orgId: 'org1',
+      factoryProjectId: PROJECT_ID,
+      workItemId: workItem.id,
+      ingress: { identity: 'stale-retry' },
+      expectedRevision: workItem.revision,
+      actor: { type: 'system', id: 'rules' },
+      outcome: { status: 'accepted' },
+      decisions: [{ type: 'invokeSkill', role: 'triage', skillName: 'factory-triage', idempotencyKey: 'stale-retry' }],
+      causalChain: [],
+      now: decidedAt,
+    });
+    const [claimed] = await seed.workItems.claimDeferredDecisions({
+      ownerId: 'worker-1',
+      now: decidedAt,
+      leaseExpiresAt: new Date(decidedAt.getTime() + 60_000),
+      limit: 1,
+    });
+    const failed = await seed.workItems.failDeferredDecision({
+      id: claimed!.id,
+      orgId: claimed!.orgId,
+      factoryProjectId: claimed!.factoryProjectId,
+      ownerId: 'worker-1',
+      now: decidedAt,
+      availableAt: decidedAt,
+      lastError: 'Session unavailable.',
+      failureCode: 'session_unavailable',
+      terminal: true,
+    });
+    const listDecisions = async () =>
+      (await (await json('GET', `/web/factory/projects/${PROJECT_ID}/decisions`)).json()).decisions;
+    await expect(listDecisions()).resolves.toMatchObject([{ id: failed!.id, canRetry: true }]);
+
+    vi.useFakeTimers({ now: new Date(decidedAt.getTime() + 60_000), toFake: ['Date'] });
+    try {
+      await seed.workItems.update({ orgId: 'org1', id: workItem.id, userId: 'u1', patch: { stages: ['planning'] } });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    await expect(listDecisions()).resolves.toMatchObject([{ id: failed!.id, canRetry: false }]);
+    await expect((await json('GET', `/web/factory/projects/${PROJECT_ID}/attention`)).json()).resolves.toMatchObject({
+      items: [{ decisionId: failed!.id, canRetry: false }],
+    });
+    const retry = await json('POST', `/web/factory/projects/${PROJECT_ID}/decisions/${failed!.id}/retry`);
+    expect(retry.status).toBe(409);
+    await expect(retry.json()).resolves.toEqual({ error: 'decision_not_retryable' });
+    expect((await seed.workItems.getDeferredDecision('org1', PROJECT_ID, failed!.id))?.status).toBe('failed');
+  });
+
+  it('tracks read and archived failure occurrences across retries', async () => {
+    const created = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    const createdBody = await created.json();
+    const workItem = createdBody.workItem;
+    const now = new Date('2030-01-01T00:00:00.000Z');
+    await seed.workItems.commitRuleEvaluation({
+      orgId: 'org1',
+      factoryProjectId: PROJECT_ID,
+      workItemId: workItem.id,
+      ingress: { identity: 'attention-failure' },
+      expectedRevision: workItem.revision,
+      actor: { type: 'system', id: 'rules' },
+      outcome: { status: 'accepted' },
+      decisions: [
+        {
+          type: 'sendMessage',
+          role: 'work',
+          message: 'Notify the session.',
+          idempotencyKey: 'attention-failure',
+        },
+      ],
+      causalChain: [],
+      now,
+    });
+
+    const failNextAttempt = async () => {
+      const [claimed] = await seed.workItems.claimDeferredDecisions({
+        ownerId: 'worker-1',
+        now,
+        leaseExpiresAt: new Date(now.getTime() + 60_000),
+        limit: 1,
+      });
+      if (!claimed) throw new Error('Expected a deferred decision');
+      const failed = await seed.workItems.failDeferredDecision({
+        id: claimed.id,
+        orgId: claimed.orgId,
+        factoryProjectId: claimed.factoryProjectId,
+        ownerId: 'worker-1',
+        now,
+        availableAt: now,
+        lastError: 'No active Factory binding for role work.',
+        failureCode: 'source_control_missing',
+        terminal: true,
+      });
+      if (!failed) throw new Error('Expected a failed deferred decision');
+      return failed;
+    };
+
+    const firstFailure = await failNextAttempt();
+    const firstKey = `factory:${PROJECT_ID}:attention:automation-failed:${firstFailure.id}:1`;
+    const findMany = vi.spyOn(seed.storage.ops, 'findMany');
+    await expect((await json('GET', `/web/factory/projects/${PROJECT_ID}/attention`)).json()).resolves.toMatchObject({
+      items: [
+        {
+          key: firstKey,
+          kind: 'automation-failed',
+          decisionId: firstFailure.id,
+          occurrence: 1,
+          workItemId: workItem.id,
+          title: 'Fix the login flow',
+          detail: 'No active Factory binding for role work.',
+          decisionType: 'sendMessage',
+          failureCode: 'source_control_missing',
+          canRetry: true,
+          occurredAt: now.toISOString(),
+          read: false,
+          archived: false,
+          target: { kind: 'work-item', workItemId: workItem.id, board: 'work' },
+        },
+      ],
+      kinds: {
+        'automation-failed': { open: 1, unread: 1, latest: { key: firstKey, at: now.toISOString(), unread: true } },
+      },
+      hasMore: false,
+    });
+    const receiptRead = findMany.mock.calls.find(([collection]) => collection === 'factory_attention_receipts');
+    expect(receiptRead?.[1]).toMatchObject({ source_id: { in: [firstFailure.id] } });
+    const decisionReads = findMany.mock.calls.filter(([collection]) => collection === 'factory_deferred_decisions');
+    expect(decisionReads.every(([, , options]) => options?.limit !== undefined)).toBe(true);
+
+    expect(
+      (
+        await json('PATCH', `/web/factory/work-items/${workItem.id}`, {
+          sessions: {
+            triage: { sessionId: 'session-triage', branch: 'factory/triage', threadId: 'thread-triage' },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    await expect((await json('GET', `/web/factory/projects/${PROJECT_ID}/attention`)).json()).resolves.toMatchObject({
+      items: [{ decisionId: firstFailure.id, target: { kind: 'work-item', workItemId: workItem.id, board: 'work' } }],
+    });
+
+    expect(
+      (
+        await json('PATCH', `/web/factory/work-items/${workItem.id}`, {
+          sessions: {
+            work: { sessionId: 'session-attention', branch: 'factory/attention', threadId: 'thread-attention' },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    await expect((await json('GET', `/web/factory/projects/${PROJECT_ID}/attention`)).json()).resolves.toMatchObject({
+      items: [
+        {
+          decisionId: firstFailure.id,
+          target: { kind: 'thread', sessionId: 'session-attention', threadId: 'thread-attention' },
+        },
+      ],
+    });
+    const receiptPath = `/web/factory/projects/${PROJECT_ID}/attention/automation-failed/${firstFailure.id}/1`;
+    expect((await json('POST', `${receiptPath}/read`)).status).toBe(200);
+    await expect(
+      (await json('GET', `/web/factory/projects/${PROJECT_ID}/attention?view=unread`)).json(),
+    ).resolves.toMatchObject({ items: [], kinds: { 'automation-failed': { open: 1, unread: 0 } } });
+
+    expect((await json('POST', `${receiptPath}/archive`)).status).toBe(200);
+    await expect((await json('GET', `/web/factory/projects/${PROJECT_ID}/attention`)).json()).resolves.toMatchObject({
+      items: [],
+      kinds: { 'automation-failed': { open: 0, unread: 0 } },
+    });
+    expect((await json('POST', `${receiptPath}/read`)).status).toBe(200);
+    await expect(
+      (await json('GET', `/web/factory/projects/${PROJECT_ID}/attention?view=archived`)).json(),
+    ).resolves.toMatchObject({
+      items: [{ key: firstKey, read: true, archived: true }],
+    });
+
+    expect((await json('POST', `${receiptPath}/restore`)).status).toBe(200);
+    await expect((await json('GET', `/web/factory/projects/${PROJECT_ID}/attention`)).json()).resolves.toMatchObject({
+      items: [{ key: firstKey, read: true, archived: false }],
+      kinds: { 'automation-failed': { open: 1, unread: 0 } },
+    });
+    await seed.workItems.setAttentionReceipt({
+      orgId: 'org1',
+      factoryProjectId: PROJECT_ID,
+      userId: 'u2',
+      identity: {
+        kind: 'automation-failed',
+        sourceId: firstFailure.id,
+        occurrence: firstFailure.failureOccurrence,
+      },
+      action: 'archive',
+      now,
+    });
+
+    expect((await json('POST', `/web/factory/projects/${PROJECT_ID}/decisions/${firstFailure.id}/retry`)).status).toBe(
+      200,
+    );
+    const receiptsAfterRetry = await Promise.all(
+      ['u1', 'u2'].map(userId =>
+        seed.workItems.listAttentionReceipts({
+          orgId: 'org1',
+          factoryProjectId: PROJECT_ID,
+          userId,
+          identities: [
+            {
+              kind: 'automation-failed',
+              sourceId: firstFailure.id,
+              occurrence: firstFailure.failureOccurrence,
+            },
+          ],
+        }),
+      ),
+    );
+    expect(receiptsAfterRetry).toEqual([[], []]);
+    const secondFailure = await failNextAttempt();
+    expect(secondFailure.failureOccurrence).toBe(2);
+    await expect((await json('GET', `/web/factory/projects/${PROJECT_ID}/attention`)).json()).resolves.toMatchObject({
+      items: [
+        {
+          key: `factory:${PROJECT_ID}:attention:automation-failed:${secondFailure.id}:2`,
+          read: false,
+          archived: false,
+        },
+      ],
+      kinds: { 'automation-failed': { open: 1, unread: 1 } },
+    });
+
+    const readAll = await json('POST', `/web/factory/projects/${PROJECT_ID}/attention/read-all`);
+    expect(readAll.status).toBe(200);
+    await expect(readAll.json()).resolves.toEqual({ ok: true, hasMore: false });
+    await expect((await json('GET', `/web/factory/projects/${PROJECT_ID}/attention`)).json()).resolves.toMatchObject({
+      items: [{ occurrence: 2, read: true, archived: false }],
+      kinds: { 'automation-failed': { open: 1, unread: 0 } },
+    });
+
+    const [retried, staleReceipt] = await Promise.all([
+      seed.workItems.retryDeferredDecision('org1', PROJECT_ID, secondFailure.id, now),
+      seed.workItems.setAttentionReceipt({
+        orgId: 'org1',
+        factoryProjectId: PROJECT_ID,
+        userId: 'u3',
+        identity: {
+          kind: 'automation-failed',
+          sourceId: secondFailure.id,
+          occurrence: secondFailure.failureOccurrence,
+        },
+        action: 'archive',
+        now,
+      }),
+    ]);
+    expect(retried).toMatchObject({ status: 'retry' });
+    expect(staleReceipt).toBeNull();
+    await expect(
+      seed.workItems.listAttentionReceipts({
+        orgId: 'org1',
+        factoryProjectId: PROJECT_ID,
+        userId: 'u3',
+        identities: [
+          {
+            kind: 'automation-failed',
+            sourceId: secondFailure.id,
+            occurrence: secondFailure.failureOccurrence,
+          },
+        ],
+      }),
+    ).resolves.toEqual([]);
+  });
+
+  it('lists a parked run as an attention item and drops it once it is superseded', async () => {
+    const created = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    const workItem = (await created.json()).workItem;
+    const now = new Date('2030-01-01T00:00:00.000Z');
+    await seed.workItems.commitRuleEvaluation({
+      orgId: 'org1',
+      factoryProjectId: PROJECT_ID,
+      workItemId: workItem.id,
+      ingress: { identity: 'approval-queue' },
+      expectedRevision: workItem.revision,
+      actor: { type: 'system', id: 'rules' },
+      outcome: { status: 'accepted' },
+      decisions: [
+        {
+          type: 'invokeSkill',
+          role: 'triage',
+          skillName: 'factory-triage',
+          idempotencyKey: 'approval-queue-triage',
+        },
+      ],
+      causalChain: [],
+      now,
+    });
+    const [claimed] = await seed.workItems.claimDeferredDecisions({
+      ownerId: 'worker-1',
+      now,
+      leaseExpiresAt: new Date(now.getTime() + 60_000),
+      limit: 1,
+    });
+    if (!claimed) throw new Error('Expected a proposed decision');
+    await seed.workItems.proposeDeferredDecision(
+      { id: claimed.id, orgId: claimed.orgId, factoryProjectId: claimed.factoryProjectId, ownerId: 'worker-1' },
+      now,
+    );
+
+    await expect((await json('GET', `/web/factory/projects/${PROJECT_ID}/attention`)).json()).resolves.toMatchObject({
+      items: [
+        {
+          key: `factory:${PROJECT_ID}:attention:automation-proposed:${claimed.id}:0`,
+          kind: 'automation-proposed',
+          decisionId: claimed.id,
+          occurrence: 0,
+          workItemId: workItem.id,
+          detail: 'Waiting for approval to run triage',
+          decisionType: 'invokeSkill',
+          read: false,
+          archived: false,
+        },
+      ],
+      kinds: { 'automation-proposed': { open: 1, unread: 1 } },
+    });
+
+    await seed.workItems.supersedeTerminalDecisionsForWorkItem({
+      orgId: 'org1',
+      factoryProjectId: PROJECT_ID,
+      workItemId: workItem.id,
+      supersededAt: now,
+    });
+    await expect((await json('GET', `/web/factory/projects/${PROJECT_ID}/attention`)).json()).resolves.toMatchObject({
+      items: [],
+      kinds: { 'automation-proposed': { open: 0 } },
+    });
+  });
+
+  it('stamps the approver on the decision when a proposed run is approved', async () => {
+    const created = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    const workItem = (await created.json()).workItem;
+    const now = new Date('2030-01-01T00:00:00.000Z');
+    await seed.workItems.commitRuleEvaluation({
+      orgId: 'org1',
+      factoryProjectId: PROJECT_ID,
+      workItemId: workItem.id,
+      ingress: { identity: 'approve-attribution' },
+      expectedRevision: workItem.revision,
+      actor: { type: 'system', id: 'rules' },
+      outcome: { status: 'accepted' },
+      decisions: [
+        {
+          type: 'invokeSkill',
+          role: 'triage',
+          skillName: 'factory-triage',
+          idempotencyKey: 'approve-attribution-triage',
+        },
+      ],
+      causalChain: [],
+      now,
+    });
+    const [claimed] = await seed.workItems.claimDeferredDecisions({
+      ownerId: 'worker-1',
+      now,
+      leaseExpiresAt: new Date(now.getTime() + 60_000),
+      limit: 1,
+    });
+    if (!claimed) throw new Error('Expected a proposed decision');
+    await seed.workItems.proposeDeferredDecision(
+      { id: claimed.id, orgId: claimed.orgId, factoryProjectId: claimed.factoryProjectId, ownerId: 'worker-1' },
+      now,
+    );
+
+    const approved = await json('POST', `/web/factory/projects/${PROJECT_ID}/decisions/${claimed.id}/approve`);
+    expect(approved.status).toBe(200);
+
+    const decision = await seed.workItems.getDeferredDecision('org1', PROJECT_ID, claimed.id);
+    expect(decision?.approvedBy).toBe('u1');
+  });
+
+  it('orders a re-failed old decision by its latest failure occurrence', async () => {
+    const createdAt = new Date('2030-01-01T00:00:00.000Z');
+    await seed.workItems.commitRuleEvaluation({
+      orgId: 'org1',
+      factoryProjectId: PROJECT_ID,
+      workItemId: null,
+      ingress: { identity: 'attention-refailure-order' },
+      expectedRevision: null,
+      actor: { type: 'system', id: 'rules' },
+      outcome: { status: 'accepted' },
+      decisions: [
+        {
+          type: 'sendMessage',
+          role: 'work',
+          message: 'Older decision.',
+          idempotencyKey: 'attention-refailure-older',
+        },
+        {
+          type: 'sendMessage',
+          role: 'work',
+          message: 'Newer decision.',
+          idempotencyKey: 'attention-refailure-newer',
+        },
+      ],
+      causalChain: [],
+      now: createdAt,
+    });
+    const claimed = await seed.workItems.claimDeferredDecisions({
+      ownerId: 'worker-1',
+      now: createdAt,
+      leaseExpiresAt: new Date(createdAt.getTime() + 60_000),
+      limit: 2,
+    });
+    const [older, newer] = [...claimed].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+    if (!older || !newer) throw new Error('Expected two deferred decisions');
+    const fail = (decision: FactoryDeferredDecisionRecord, now: Date) =>
+      seed.workItems.failDeferredDecision({
+        id: decision.id,
+        orgId: decision.orgId,
+        factoryProjectId: decision.factoryProjectId,
+        ownerId: 'worker-1',
+        now,
+        availableAt: now,
+        lastError: `Failure ${decision.id}`,
+        failureCode: 'unknown',
+        terminal: true,
+      });
+    const firstFailureAt = new Date(createdAt.getTime() + 60_000);
+    const newerFailureAt = new Date(createdAt.getTime() + 120_000);
+    await fail(older, firstFailureAt);
+    await fail(newer, newerFailureAt);
+
+    const refailureAt = new Date(createdAt.getTime() + 180_000);
+    await seed.workItems.retryDeferredDecision('org1', PROJECT_ID, older.id, refailureAt);
+    const [reclaimed] = await seed.workItems.claimDeferredDecisions({
+      ownerId: 'worker-1',
+      now: refailureAt,
+      leaseExpiresAt: new Date(refailureAt.getTime() + 60_000),
+      limit: 1,
+    });
+    if (!reclaimed) throw new Error('Expected the retried decision');
+    await fail(reclaimed, refailureAt);
+
+    const firstPage = await (await json('GET', `/web/factory/projects/${PROJECT_ID}/attention?limit=1`)).json();
+    expect(firstPage).toMatchObject({
+      items: [{ decisionId: older.id, occurrence: 2, occurredAt: refailureAt.toISOString() }],
+      hasMore: true,
+    });
+    if (typeof firstPage.nextCursor !== 'string') throw new Error('Expected an attention cursor');
+    await expect(
+      (
+        await json(
+          'GET',
+          `/web/factory/projects/${PROJECT_ID}/attention?limit=1&before=${encodeURIComponent(firstPage.nextCursor)}`,
+        )
+      ).json(),
+    ).resolves.toMatchObject({
+      items: [{ decisionId: newer.id, occurredAt: newerFailureAt.toISOString() }],
+      hasMore: false,
+    });
+  });
+
+  it('rejects malformed structured receipt rows', async () => {
+    const now = new Date('2030-01-01T00:00:00.000Z');
+    await seed.storage.ops.insertOne('factory_attention_receipts', {
+      org_id: 'org1',
+      factory_project_id: PROJECT_ID,
+      user_id: 'u1',
+      kind: 'automation-failed',
+      source_id: 'bad-state',
+      occurrence: 0,
+      state: 'corrupt',
+      read_at: now,
+      archived_at: null,
+      created_at: now,
+      updated_at: now,
+    });
+    await seed.storage.ops.insertOne('factory_attention_receipts', {
+      org_id: 'org1',
+      factory_project_id: PROJECT_ID,
+      user_id: 'u1',
+      kind: 'corrupt',
+      source_id: 'bad-kind',
+      occurrence: 0,
+      state: 'read',
+      read_at: now,
+      archived_at: null,
+      created_at: now,
+      updated_at: now,
+    });
+
+    await expect(
+      seed.workItems.listAttentionReceipts({
+        orgId: 'org1',
+        factoryProjectId: PROJECT_ID,
+        userId: 'u1',
+        identities: [{ kind: 'automation-failed', sourceId: 'bad-state', occurrence: 0 }],
+      }),
+    ).rejects.toThrow("Unsupported attention receipt state 'corrupt'.");
+    const invalidIdentity = JSON.parse('{"kind":"corrupt","sourceId":"bad-kind","occurrence":0}');
+    await expect(
+      seed.workItems.listAttentionReceipts({
+        orgId: 'org1',
+        factoryProjectId: PROJECT_ID,
+        userId: 'u1',
+        identities: [invalidIdentity],
+      }),
+    ).rejects.toThrow("Unsupported attention receipt kind 'corrupt'.");
+  });
+  it('accepts receipts for legacy failed decisions at occurrence zero', async () => {
+    const now = new Date('2030-01-01T00:00:00.000Z');
+    await seed.workItems.commitRuleEvaluation({
+      orgId: 'org1',
+      factoryProjectId: PROJECT_ID,
+      workItemId: null,
+      ingress: { identity: 'legacy-attention-failure' },
+      expectedRevision: null,
+      actor: { type: 'system', id: 'rules' },
+      outcome: { status: 'accepted' },
+      decisions: [
+        {
+          type: 'sendMessage',
+          role: 'work',
+          message: 'Legacy failure.',
+          idempotencyKey: 'legacy-attention-failure',
+        },
+      ],
+      causalChain: [],
+      now,
+    });
+    const [legacy] = await seed.workItems.listDeferredDecisions('org1', PROJECT_ID);
+    if (!legacy) throw new Error('Expected a legacy deferred decision');
+    await seed.storage.ops.updateMany(
+      'factory_deferred_decisions',
+      { id: legacy.id, org_id: 'org1', factory_project_id: PROJECT_ID },
+      {
+        status: 'failed',
+        last_error: 'Legacy terminal failure.',
+        failure_code: 'unsupported_provider_item',
+        completed_at: now,
+        updated_at: now,
+      },
+    );
+
+    await expect((await json('GET', `/web/factory/projects/${PROJECT_ID}/attention`)).json()).resolves.toMatchObject({
+      items: [
+        {
+          key: `factory:${PROJECT_ID}:attention:automation-failed:${legacy.id}:0`,
+          occurrence: 0,
+          failureCode: 'unsupported_provider_item',
+          canRetry: false,
+          read: false,
+        },
+      ],
+    });
+    expect((await json('POST', `/web/factory/projects/${PROJECT_ID}/decisions/${legacy.id}/retry`)).status).toBe(409);
+    expect(
+      (await json('POST', `/web/factory/projects/${PROJECT_ID}/attention/automation-failed/${legacy.id}/0junk/read`))
+        .status,
+    ).toBe(422);
+    expect(
+      (await json('POST', `/web/factory/projects/${PROJECT_ID}/attention/automation-failed/${legacy.id}/0/read`))
+        .status,
+    ).toBe(200);
+  });
+
+  it('scans past a fully archived raw decision page', async () => {
+    const created = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    const workItem = (await created.json()).workItem;
+    const now = new Date('2030-01-01T00:00:00.000Z');
+    await seed.workItems.commitRuleEvaluation({
+      orgId: 'org1',
+      factoryProjectId: PROJECT_ID,
+      workItemId: workItem.id,
+      ingress: { identity: 'attention-pagination' },
+      expectedRevision: workItem.revision,
+      actor: { type: 'system', id: 'rules' },
+      outcome: { status: 'accepted' },
+      decisions: Array.from({ length: 51 }, (_, index) => ({
+        type: 'sendMessage',
+        role: 'work',
+        message: `Message ${index}`,
+        idempotencyKey: `attention-pagination-${index}`,
+      })),
+      causalChain: [],
+      now,
+    });
+    const claimed = await seed.workItems.claimDeferredDecisions({
+      ownerId: 'worker-1',
+      now,
+      leaseExpiresAt: new Date(now.getTime() + 60_000),
+      limit: 51,
+    });
+    const failed: FactoryDeferredDecisionRecord[] = [];
+    for (const decision of claimed) {
+      const record = await seed.workItems.failDeferredDecision({
+        id: decision.id,
+        orgId: decision.orgId,
+        factoryProjectId: decision.factoryProjectId,
+        ownerId: 'worker-1',
+        now,
+        availableAt: now,
+        lastError: `Terminal failure ${decision.id}.`,
+        failureCode: 'unknown',
+        terminal: true,
+      });
+      if (record) failed.push(record);
+    }
+    const newestFirst = [...failed].sort(
+      (a, b) => b.createdAt.getTime() - a.createdAt.getTime() || b.id.localeCompare(a.id),
+    );
+    for (const decision of newestFirst.slice(0, 50)) {
+      await seed.workItems.setAttentionReceipt({
+        orgId: 'org1',
+        factoryProjectId: PROJECT_ID,
+        userId: 'u1',
+        identity: { kind: 'automation-failed', sourceId: decision.id, occurrence: decision.failureOccurrence },
+        action: 'archive',
+        now,
+      });
+    }
+    const target = newestFirst[50];
+    if (!target) throw new Error('Expected an unarchived attention item');
+
+    await expect(
+      (await json('GET', `/web/factory/projects/${PROJECT_ID}/attention?limit=1`)).json(),
+    ).resolves.toMatchObject({
+      items: [{ decisionId: target.id }],
+      kinds: { 'automation-failed': { open: 1, unread: 1 } },
+      hasMore: false,
+    });
+    await expect(
+      (
+        await json(
+          'GET',
+          `/web/factory/projects/${PROJECT_ID}/attention?limit=1&search=${encodeURIComponent(target.id)}`,
+        )
+      ).json(),
+    ).resolves.toMatchObject({
+      items: [{ decisionId: target.id }],
+      hasMore: false,
+    });
+
+    const listPage = seed.workItems.listDecisionPageByStatus.bind(seed.workItems);
+    let scannedPages = 0;
+    let lastScanned: FactoryDeferredDecisionRecord | undefined;
+    const pageSpy = vi.spyOn(seed.workItems, 'listDecisionPageByStatus').mockImplementation(async input => {
+      if (input.status !== 'failed' || input.limit === 1) return listPage(input);
+      scannedPages += 1;
+      const decisions = Array.from({ length: 50 }, (_, index) => {
+        const ordinal = scannedPages * 50 + index;
+        const occurredAt = new Date(now.getTime() - ordinal * 1_000);
+        return {
+          ...target,
+          id: `00000000-0000-4000-8000-${String(ordinal).padStart(12, '0')}`,
+          workItemId: null,
+          lastError: 'Unrelated terminal failure.',
+          completedAt: occurredAt,
+          updatedAt: occurredAt,
+        };
+      });
+      lastScanned = decisions.at(-1);
+      return { decisions, hasMore: true };
+    });
+    const bounded = await (
+      await json('GET', `/web/factory/projects/${PROJECT_ID}/attention?search=never-matches`)
+    ).json();
+    pageSpy.mockRestore();
+
+    expect(scannedPages).toBe(4);
+    expect(bounded).toMatchObject({ items: [], hasMore: true });
+    expect(typeof bounded.nextCursor).toBe('string');
+    expect(JSON.parse(Buffer.from(bounded.nextCursor, 'base64url').toString('utf8'))).toEqual({
+      'automation-failed': [lastScanned?.completedAt?.toISOString(), lastScanned?.id],
+    });
+  });
+});
+
+// ── Metrics ──────────────────────────────────────────────────────────────
+describe('GET /web/factory/projects/:id/metrics', () => {
+  it('401s without a user and 404s for projects outside the org', async () => {
+    expect((await json('GET', `/web/factory/projects/${PROJECT_ID}/metrics`, undefined, null)).status).toBe(401);
+
+    await seedProject('other-org');
+    expect((await json('GET', `/web/factory/projects/${PROJECT_ID}/metrics`)).status).toBe(404);
+  });
+
+  it('resolves the from/to range window, defaulting when absent or malformed', async () => {
+    const bodyFor = async (query: string) =>
+      (await (await json('GET', `/web/factory/projects/${PROJECT_ID}/metrics${query}`)).json()).metrics;
+
+    // No params → default 30-day window.
+    expect((await bodyFor('')).daysCovered).toBe(30);
+
+    // Explicit inclusive 7-calendar-day window.
+    const to = new Date().toISOString().slice(0, 10);
+    const from = new Date(Date.parse(`${to}T00:00:00.000Z`) - 6 * 86_400_000).toISOString().slice(0, 10);
+    expect((await bodyFor(`?from=${from}&to=${to}`)).daysCovered).toBe(7);
+
+    // Malformed params fall back to the default.
+    expect((await bodyFor('?from=evil&to=evil')).daysCovered).toBe(30);
+  });
+
+  it('aggregates the cards the Factory ran: throughput, WIP, and source mix', async () => {
+    // Freeze the clock so the cards and the one-day window below share a date
+    // even when the run straddles UTC midnight.
+    vi.useFakeTimers({ now: new Date('2026-06-15T12:00:00.000Z'), toFake: ['Date'] });
+    // One card completed today (intake → done), one still in intake.
+    const created = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody({ sessions: run }));
+    const { workItem } = await created.json();
+    await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items/${workItem.id}/transition`, {
+      board: 'work',
+      stage: 'done',
+      expectedRevision: workItem.revision,
+      requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3',
+      cause: 'board_drag',
+    });
+    await json(
+      'POST',
+      `/web/factory/projects/${PROJECT_ID}/work-items`,
+      createBody({ externalSource: null, title: 'Manual card', sessions: run }),
+    );
+    // Synced from the repo, never run: not the Factory's work.
+    await json(
+      'POST',
+      `/web/factory/projects/${PROJECT_ID}/work-items`,
+      createBody({ externalSource: { integrationId: 'github', type: 'issue', externalId: '43' }, title: 'Upstream' }),
+    );
+
+    // One-day window matching when the cards were filed; multi-day series and
+    // board-lifetime clipping are covered by the range test above and the unit tests.
+    const today = new Date().toISOString().slice(0, 10);
+    const res = await json('GET', `/web/factory/projects/${PROJECT_ID}/metrics?from=${today}&to=${today}`);
+    expect(res.status).toBe(200);
+    const { metrics } = await res.json();
+
+    expect(metrics.daysCovered).toBe(1);
+    expect(metrics.throughput).toHaveLength(1);
+    expect(metrics.throughput.reduce((sum: number, p: any) => sum + p.count, 0)).toBe(1);
+    expect(metrics.leadTime.samples).toBe(1);
+    // The manual card sits in intake — queued, not in flight — and the synced
+    // card is out of the population entirely.
+    expect(metrics.wipTotal).toBe(0);
+    expect(metrics.sourceMix).toEqual(
+      expect.arrayContaining([
+        { source: 'github:issue', count: 1 },
+        { source: 'manual', count: 1 },
+      ]),
+    );
+    expect(metrics.sourceMix).toHaveLength(2);
+  });
+
+  it('returns zeroed metrics for an empty board', async () => {
+    const res = await json('GET', `/web/factory/projects/${PROJECT_ID}/metrics`);
+    const { metrics } = await res.json();
+    expect(metrics.throughput).toHaveLength(30);
+    expect(metrics.leadTime).toEqual({ medianMs: null, p90Ms: null, samples: 0 });
+    expect(metrics.wipTotal).toBe(0);
+    expect(metrics.agentCoverage).toEqual([]);
+  });
+
+  it('serves per-stage coverage: agent-finished triage vs human-approved planning', async () => {
+    // The rules engine queues triage (intake → triage), the bound agent run
+    // finishes it (triage → planning), then a human approves planning into done.
+    const created = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody({ sessions: run }));
+    const { workItem } = await created.json();
+    const service = new FactoryTransitionService({
+      configVersion: 'factory-config-v1',
+      storage: seed.workItems,
+      boards: createTriageWorkRegistry(),
+    });
+    const move = (stage: 'triage' | 'planning', expectedRevision: number, identity: string, actor: FactoryRuleActor) =>
+      service.transition({
+        orgId: 'org1',
+        factoryProjectId: PROJECT_ID,
+        workItemId: workItem.id,
+        board: 'work',
+        stage,
+        expectedRevision,
+        actor,
+        ingress: { type: 'rule', identity },
+        cause: 'auto_triage',
+      });
+    const triaged = await move('triage', workItem.revision, 'auto-1', {
+      type: 'system',
+      id: 'factory-rule-dispatcher',
+    });
+    expect(triaged.status).toBe('accepted');
+    const planned = await move('planning', (triaged as { revision: number }).revision, 'auto-2', {
+      type: 'agent',
+      bindingId: 'binding-1',
+      role: 'triage',
+    });
+    expect(planned.status).toBe('accepted');
+    const approved = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items/${workItem.id}/transition`, {
+      board: 'work',
+      stage: 'done',
+      expectedRevision: (planned as { revision: number }).revision,
+      requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa7',
+      cause: 'board_drag',
+    });
+    expect(approved.status).toBe(200);
+
+    const res = await json('GET', `/web/factory/projects/${PROJECT_ID}/metrics?days=7`);
+    expect(res.status).toBe(200);
+    const { metrics } = await res.json();
+
+    expect(metrics.agentCoverage).toEqual([
+      // Intake is the inbox — filing a card is not a pass through the pipeline.
+      // Exited by the agent run, first visit → the agent's pass, item is done.
+      { stage: 'triage', passes: 1, byAgent: 1, outcomes: { done: 1, canceled: 0, reworked: 0, inFlight: 0 } },
+      // Agent-entered, human-exited → the human finished this one.
+      { stage: 'planning', passes: 1, byAgent: 0, outcomes: { done: 0, canceled: 0, reworked: 0, inFlight: 0 } },
+    ]);
+  });
+});
+
+describe('run activity on the work-item listing', () => {
+  async function startRun(sessionId: string) {
+    const { item } = await seed.workItems.prepareRunStart({
+      orgId: 'org1',
+      userId: 'u1',
+      factoryProjectId: PROJECT_ID,
+      workItem: { input: { title: `Work for ${sessionId}`, stages: ['execute'] } },
+      role: 'execute',
+      session: { sessionId, branch: `factory/${sessionId}`, threadId: `thread-${sessionId}` },
+      resourceId: sessionId,
+      kickoffKey: `kickoff-${sessionId}`,
+      kickoffMessage: null,
+    });
+    return item;
+  }
+
+  it('stamps only the starting role, preserving other roles’ sessions and startedBy (#22254)', async () => {
+    const first = await seed.workItems.prepareRunStart({
+      orgId: 'org1',
+      userId: 'u1',
+      factoryProjectId: PROJECT_ID,
+      workItem: { input: { title: 'Multi-role card', stages: ['triage', 'execute'] } },
+      role: 'triage',
+      session: { sessionId: 'session-triage', branch: 'factory/triage', threadId: 'thread-triage' },
+      resourceId: 'session-triage',
+      kickoffKey: 'kickoff-triage',
+      kickoffMessage: null,
+    });
+
+    const second = await seed.workItems.prepareRunStart({
+      orgId: 'org1',
+      userId: 'u2',
+      factoryProjectId: PROJECT_ID,
+      workItem: { id: first.item.id, input: { title: 'Multi-role card', stages: ['triage', 'execute'] } },
+      role: 'execute',
+      session: { sessionId: 'session-execute', branch: 'factory/execute', threadId: 'thread-execute' },
+      resourceId: 'session-execute',
+      kickoffKey: 'kickoff-execute',
+      kickoffMessage: null,
+    });
+
+    expect(second.item.sessions.triage).toMatchObject({ sessionId: 'session-triage', startedBy: 'u1' });
+    expect(second.item.sessions.execute).toMatchObject({ sessionId: 'session-execute', startedBy: 'u2' });
+  });
+
+  describe('repeat reads of an unchanged board', () => {
+    const listPath = () => `/web/factory/projects/${PROJECT_ID}/work-items`;
+
+    it('answers 304 without a body while the cards are unchanged', async () => {
+      await startRun('session-running');
+      const app = buildApp(orgUser);
+
+      const first = await app.request(listPath());
+      const etag = first.headers.get('etag');
+      expect(first.status).toBe(200);
+      expect(etag).toBeTruthy();
+      expect(first.headers.get('cache-control')).toBe('private, no-cache');
+
+      const again = await app.request(listPath(), { headers: { 'if-none-match': etag! } });
+      expect(again.status).toBe(304);
+      expect(await again.text()).toBe('');
+    });
+
+    it('sends the board again once a card changes', async () => {
+      const card = await startRun('session-idle');
+      const app = buildApp(orgUser);
+      const etag = (await app.request(listPath())).headers.get('etag')!;
+
+      await json('PATCH', `/web/factory/work-items/${card.id}`, { title: 'Renamed' });
+
+      const after = await app.request(listPath(), { headers: { 'if-none-match': etag } });
+      expect(after.status).toBe(200);
+      expect(after.headers.get('etag')).not.toBe(etag);
+      expect((await after.json()).workItems[0].title).toBe('Renamed');
+    });
+
+    it('gzips the body for clients that accept it', async () => {
+      await startRun('session-idle');
+      const res = await buildApp(orgUser).request(listPath(), { headers: { 'accept-encoding': 'gzip, br' } });
+
+      expect(res.headers.get('content-encoding')).toBe('gzip');
+      expect(res.headers.get('vary')).toContain('Accept-Encoding');
+      const body = JSON.parse(gunzipSync(Buffer.from(await res.arrayBuffer())).toString('utf8'));
+      expect(FACTORY_ROUTE_CONTRACTS.workItemList.responseSchema.parse(body)).toEqual(body);
+      expect(body.workItems).toHaveLength(1);
+    });
+  });
+
+  const boardPath = () => `/web/factory/projects/${PROJECT_ID}/work-items`;
+  const listedIds = async (res: Response) =>
+    FACTORY_ROUTE_CONTRACTS.workItemList.responseSchema.parse(await res.json()).workItems.map(item => item.id);
+  const createCard = async (externalId: string, overrides: Record<string, unknown> = {}): Promise<{ id: string }> => {
+    const res = await json(
+      'POST',
+      boardPath(),
+      createBody({ externalSource: { integrationId: 'github', type: 'issue', externalId }, ...overrides }),
+    );
+    const { workItem } = await res.json();
+    return workItem;
+  };
+
+  describe('a board read that sends its cursor back (?since=)', () => {
+    // Steps past the window a `since` read goes back to catch a writer whose clock runs behind.
+    const later = () => vi.setSystemTime(Date.now() + 10_000);
+    const read = async (since?: string) => {
+      const res = await buildApp(orgUser).request(since === undefined ? boardPath() : `${boardPath()}?since=${since}`);
+      const text = await res.text();
+      return { ...FACTORY_ROUTE_CONTRACTS.workItemList.responseSchema.parse(JSON.parse(text)), bytes: text.length };
+    };
+    /** A board of `count` cards, read in full once every write to it is older than the window. */
+    const boardOf = async (count: number) => {
+      const cards: { id: string }[] = [];
+      for (let from = 0; from < count; from += 50) {
+        const ids = Array.from({ length: Math.min(50, count - from) }, (_, i) => `issue-${from + i}`);
+        cards.push(...(await Promise.all(ids.map(id => createCard(id)))));
+      }
+      later();
+      return { cards, board: await read() };
+    };
+
+    /** The card tables read from here on, and the table of deleted ids. */
+    const cardReads = () => {
+      const tables = ['factory_board_items', 'factory_work_items', 'factory_work_item_sources', 'work_items'];
+      const findMany = vi.spyOn(seed.storage.ops, 'findMany');
+      return () =>
+        findMany.mock.calls
+          .map(([collection]) => collection)
+          .filter(collection => [...tables, 'factory_board_item_tombstones'].includes(collection));
+    };
+
+    beforeEach(() => void vi.useFakeTimers({ toFake: ['Date'] }));
+
+    it('sends only the cards written and the ids removed since the cursor', async () => {
+      const { cards, board } = await boardOf(4);
+      later();
+      await json('PATCH', `/web/factory/work-items/${cards[1]!.id}`, { title: 'Renamed' });
+      await json('PATCH', `/web/factory/work-items/${cards[2]!.id}`, { title: 'Reworded' });
+      await json('DELETE', `/web/factory/work-items/${cards[3]!.id}`);
+      later();
+
+      const next = await read(board.cursor);
+
+      expect(next.workItems.map(card => card.title).sort()).toEqual(['Renamed', 'Reworded']);
+      expect(next).toMatchObject({ removedIds: [cards[3]!.id], check: boardCheck((await read()).workItems) });
+      later();
+      expect(await read(next.cursor)).toMatchObject({ workItems: [], removedIds: [], check: next.check });
+    });
+
+    it('sends a card stamped before the cursor that the cursor’s read did not hold', async () => {
+      const { board } = await boardOf(1);
+      // A second writer: its card lands after the read, stamped by a clock behind this one.
+      vi.setSystemTime(Date.now() - 2_000);
+      const late = await createCard('late');
+      later();
+
+      expect((await read(board.cursor)).workItems.map(card => card.id)).toEqual([late.id]);
+    });
+
+    it.each(['not-a-cursor', ''])('sends the whole board for the cursor %j, which it did not issue', async since => {
+      await boardOf(2);
+
+      const answer = await read(since);
+
+      expect(answer.workItems).toHaveLength(2);
+      expect(answer.cursor).toEqual(expect.any(String));
+      expect(answer.removedIds).toBeUndefined();
+    });
+
+    it('answers one changed card in the same bytes on a board of 50 cards and of 2,000', async () => {
+      const bytes = [];
+      for (const count of [50, 2_000]) {
+        await seedProject();
+        const { cards, board } = await boardOf(count);
+        later();
+        await json('PATCH', `/web/factory/work-items/${cards[0]!.id}`, { title: 'Renamed' });
+        const answer = await read(board.cursor);
+        bytes.push(answer.bytes - answer.check!.length);
+      }
+
+      expect(bytes[1]).toBe(bytes[0]);
+    }, 60_000);
+
+    it('names a board that holds an edit its reader was never sent', async () => {
+      const { cards, board } = await boardOf(2);
+      // A writer whose clock runs further behind than a `since` read goes back.
+      vi.setSystemTime(Date.now() - 6_000);
+      await json('PATCH', `/web/factory/work-items/${cards[0]!.id}`, { title: 'Renamed' });
+      // Past the age at which the list is read whole again, which finds the edit.
+      vi.setSystemTime(Date.now() + 70_000);
+
+      const next = await read(board.cursor);
+
+      expect(next).toMatchObject({ workItems: [], removedIds: [] });
+      expect(next.check).not.toBe(boardCheck(board.workItems));
+      const whole = await read();
+      expect(whole.workItems.map(card => card.title)).toContain('Renamed');
+      expect(next.check).toBe(boardCheck(whole.workItems));
+    });
+
+    it.each([50, 2_000])(
+      'reads no card to answer a reader that holds the cached board of %i cards',
+      async count => {
+        const { board } = await boardOf(count);
+        const reads = cardReads();
+
+        for (let poll = 0; poll < 3; poll++) {
+          expect(await read(board.cursor)).toMatchObject({ workItems: [], removedIds: [], cursor: board.cursor });
+        }
+
+        expect(reads()).toEqual([]);
+      },
+      60_000,
+    );
+
+    it('reads only the deleted ids to answer a cursor older than the cached board', async () => {
+      const { cards, board } = await boardOf(3);
+      later();
+      await json('PATCH', `/web/factory/work-items/${cards[0]!.id}`, { title: 'Renamed' });
+      await read(board.cursor);
+      const reads = cardReads();
+
+      const next = await read(board.cursor);
+      const all = await read('1');
+
+      expect(next.workItems.map(card => card.title)).toEqual(['Renamed']);
+      expect(all.workItems).toHaveLength(3);
+      expect(reads()).toEqual(['factory_board_item_tombstones', 'factory_board_item_tombstones']);
+    });
+
+    it('gzips what moved for a reader that accepts it', async () => {
+      const { cards, board } = await boardOf(1);
+      later();
+      await json('PATCH', `/web/factory/work-items/${cards[0]!.id}`, { title: 'Renamed' });
+
+      const res = await buildApp(orgUser).request(`${boardPath()}?since=${board.cursor}`, {
+        headers: { 'accept-encoding': 'gzip, br' },
+      });
+
+      expect(res.headers.get('content-encoding')).toBe('gzip');
+      expect(res.headers.get('vary')).toBe('Accept-Encoding');
+      const body = JSON.parse(gunzipSync(Buffer.from(await res.arrayBuffer())).toString('utf8'));
+      expect(body.workItems.map((card: { title: string }) => card.title)).toEqual(['Renamed']);
+    });
+
+    it('leaves a card deleted after the list was read for the next read to remove', async () => {
+      const { cards, board } = await boardOf(2);
+      later();
+      await json('PATCH', `/web/factory/work-items/${cards[0]!.id}`, { title: 'Renamed' });
+      const listed = await read();
+      const findMany = seed.storage.ops.findMany.bind(seed.storage.ops);
+      let deleting: Promise<unknown> | undefined;
+      vi.spyOn(seed.storage.ops, 'findMany').mockImplementation(async (collection, ...rest) => {
+        // The delete lands between this read's list and its read of the deleted ids.
+        if (collection === 'factory_board_item_tombstones') {
+          await (deleting ??= json('DELETE', `/web/factory/work-items/${cards[1]!.id}`));
+        }
+        return findMany(collection, ...rest);
+      });
+
+      const next = await read(board.cursor);
+
+      expect(next.workItems.map(card => card.title)).toEqual(['Renamed']);
+      expect(next).toMatchObject({ removedIds: [], check: boardCheck(listed.workItems) });
+      later();
+      expect((await read(next.cursor)).removedIds).toEqual([cards[1]!.id]);
+    });
+
+    it('sends a board showing Review cards whole, without a cursor', async () => {
+      const card = await createCard('pull-request');
+      await createCard('issue');
+      // A row as the retired Review board left it.
+      await seed.storage.ops.updateMany('factory_board_items', { id: card.id }, { board: 'review' });
+
+      const answer = await read('1');
+
+      expect(answer.workItems).toHaveLength(2);
+      expect(answer.cursor).toBeUndefined();
+      expect(answer.removedIds).toBeUndefined();
+    });
+
+    it('answers a narrowed list as it does without a cursor', async () => {
+      const held = await startRun('session-mine');
+      await startRun('session-other');
+      const { cursor } = await read();
+      later();
+      await json('PATCH', `/web/factory/work-items/${held.id}`, { title: 'Renamed' });
+
+      const narrowed = `${boardPath()}?sessionId=session-mine`;
+      const answer = await buildApp(orgUser).request(`${narrowed}&since=${cursor}`);
+
+      expect(answer.headers.get('etag')).toBe((await buildApp(orgUser).request(narrowed)).headers.get('etag'));
+      expect(await answer.json()).not.toHaveProperty('removedIds');
+    });
+
+    it('lists the card named by its id, not what moved since the cursor', async () => {
+      const { cards, board } = await boardOf(2);
+      later();
+      await json('PATCH', `/web/factory/work-items/${cards[1]!.id}`, { title: 'Renamed' });
+
+      const answer = await buildApp(orgUser).request(`${boardPath()}?workItemId=${cards[0]!.id}&since=${board.cursor}`);
+
+      expect(await listedIds(answer)).toEqual([cards[0]!.id]);
+    });
+  });
+
+  describe('one session’s cards (?sessionId=)', () => {
+    const scopedPath = (...sessionIds: string[]) =>
+      `${boardPath()}?${sessionIds.map(sessionId => `sessionId=${encodeURIComponent(sessionId)}`).join('&')}`;
+
+    it('lists the card that holds the session', async () => {
+      const mine = await startRun('session-mine');
+      await startRun('session-other');
+      const app = buildApp(orgUser);
+
+      const res = await app.request(scopedPath('session-mine'));
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(FACTORY_ROUTE_CONTRACTS.workItemList.responseSchema.parse(body)).toEqual(body);
+      expect(body.workItems.map((item: { id: string }) => item.id)).toEqual([mine.id]);
+    });
+
+    it('lists the cards of every session named, in board order', async () => {
+      const first = await startRun('session-first');
+      await startRun('session-second');
+      const third = await startRun('session-third');
+      const board = await listedIds(await buildApp(orgUser).request(boardPath()));
+
+      const res = await buildApp(orgUser).request(scopedPath('session-third', 'session-first'));
+
+      expect(await listedIds(res)).toEqual(board.filter(id => id === first.id || id === third.id));
+    });
+
+    it('lists nothing for a session no card holds', async () => {
+      await startRun('session-other');
+
+      const res = await buildApp(orgUser).request(scopedPath('session-unknown'));
+
+      expect(res.status).toBe(200);
+      expect(await listedIds(res)).toEqual([]);
+    });
+
+    it('brings the cards related to the session’s card: its parent, its children and the pull request pushed from its branch', async () => {
+      const mine = await startRun('session-mine');
+      const parent = await createCard('parent');
+      await json('PATCH', `/web/factory/work-items/${mine.id}`, { parentWorkItemId: parent.id });
+      const child = await createCard('child', { parentWorkItemId: mine.id });
+      const pullRequest = await createCard('pr-7', {
+        externalSource: { integrationId: 'github', type: 'pull-request', externalId: 'pr-7' },
+        metadata: { number: 7, headBranch: 'factory/session-mine' },
+      });
+      await createCard('unrelated');
+
+      const res = await buildApp(orgUser).request(scopedPath('session-mine'));
+
+      expect((await listedIds(res)).toSorted()).toEqual([mine.id, parent.id, child.id, pullRequest.id].toSorted());
+    });
+
+    it('answers 304 through writes to other cards, and sends the session’s card again once it changes', async () => {
+      const mine = await startRun('session-mine');
+      const other = await startRun('session-other');
+      const app = buildApp(orgUser);
+      const etag = (await app.request(scopedPath('session-mine'))).headers.get('etag')!;
+
+      await json('PATCH', `/web/factory/work-items/${other.id}`, { title: 'Renamed elsewhere' });
+      const unchanged = await app.request(scopedPath('session-mine'), { headers: { 'if-none-match': etag } });
+      expect(unchanged.status).toBe(304);
+      expect(await unchanged.text()).toBe('');
+
+      await json('PATCH', `/web/factory/work-items/${mine.id}`, { title: 'Renamed' });
+      const changed = await app.request(scopedPath('session-mine'), { headers: { 'if-none-match': etag } });
+      expect(changed.status).toBe(200);
+      expect((await changed.json()).workItems[0].title).toBe('Renamed');
+    });
+
+    it('refuses a blank session id rather than sending the whole board', async () => {
+      await startRun('session-mine');
+
+      const res = await buildApp(orgUser).request(`${boardPath()}?sessionId=`);
+
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe('the cards holding a session (?scope=sessions)', () => {
+    const sessionsPath = () => `${boardPath()}?scope=sessions`;
+
+    it('lists every card holding a session, in board order, without the cards holding none', async () => {
+      const first = await startRun('session-first');
+      await createCard('unstarted');
+      const second = await startRun('session-second');
+      const board = await listedIds(await buildApp(orgUser).request(boardPath()));
+      const app = buildApp(orgUser);
+
+      const res = await app.request(sessionsPath());
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(FACTORY_ROUTE_CONTRACTS.workItemList.responseSchema.parse(body)).toEqual(body);
+      expect(body.workItems.map((item: { id: string }) => item.id)).toEqual(
+        board.filter(id => id === first.id || id === second.id),
+      );
+    });
+
+    it('brings the pull request pushed from a session’s branch, though it holds no session', async () => {
+      const mine = await startRun('session-mine');
+      const pullRequest = await createCard('pr-7', {
+        externalSource: { integrationId: 'github', type: 'pull-request', externalId: 'pr-7' },
+        metadata: { number: 7, headBranch: 'factory/session-mine' },
+      });
+      await createCard('unrelated');
+
+      const res = await buildApp(orgUser).request(sessionsPath());
+
+      expect((await listedIds(res)).toSorted()).toEqual([mine.id, pullRequest.id].toSorted());
+    });
+
+    it('answers 304 through writes to cards holding no session, and sends the list again once a listed card changes', async () => {
+      const mine = await startRun('session-mine');
+      const unstarted = await createCard('unstarted');
+      const app = buildApp(orgUser);
+      const etag = (await app.request(sessionsPath())).headers.get('etag')!;
+
+      await json('PATCH', `/web/factory/work-items/${unstarted.id}`, { title: 'Renamed elsewhere' });
+      const unchanged = await app.request(sessionsPath(), { headers: { 'if-none-match': etag } });
+      expect(unchanged.status).toBe(304);
+      expect(await unchanged.text()).toBe('');
+
+      await json('PATCH', `/web/factory/work-items/${mine.id}`, { title: 'Renamed' });
+      const changed = await app.request(sessionsPath(), { headers: { 'if-none-match': etag } });
+      expect(changed.status).toBe(200);
+      expect((await changed.json()).workItems[0].title).toBe('Renamed');
+    });
+
+    it.each([
+      ['an unknown scope', '?scope=everything'],
+      ['a scope combined with session ids', '?scope=sessions&sessionId=session-mine'],
+    ])('refuses %s rather than guessing which cards to send', async (_case, query) => {
+      await startRun('session-mine');
+
+      const res = await buildApp(orgUser).request(`${boardPath()}${query}`);
+
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe('the cards holding no session (?started=false)', () => {
+    const unstarted = async (query = '') => {
+      const res = await buildApp(orgUser).request(`${boardPath()}?started=false${query}`);
+      const body = FACTORY_ROUTE_CONTRACTS.workItemList.responseSchema.parse(await res.json());
+      return { titles: body.workItems.map(item => item.title), total: body.total };
+    };
+    const rename = (card: { id: string }, title: string) =>
+      json('PATCH', `/web/factory/work-items/${card.id}`, { title });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('lists the cards holding no session, most recently updated first, and counts them', async () => {
+      vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-01T10:00:00Z') });
+      await startRun('session-mine');
+      const oldest = await createCard('1', { title: 'Oldest card' });
+      vi.setSystemTime(new Date('2026-11-01T10:01:00Z'));
+      await createCard('2', { title: 'Middle card' });
+      vi.setSystemTime(new Date('2026-11-01T10:02:00Z'));
+      await createCard('3', { title: 'Newest card' });
+      vi.setSystemTime(new Date('2026-11-01T10:03:00Z'));
+      await json('PATCH', `/web/factory/work-items/${oldest.id}`, { metadata: { note: 'looked at' } });
+
+      expect(await unstarted()).toEqual({
+        titles: ['Oldest card', 'Newest card', 'Middle card'],
+        total: 3,
+      });
+    });
+
+    it('finds a card by every word typed, in any case, in its title, its key, its number or its source id', async () => {
+      await createCard('github:7:issue:12', { title: 'Fix the login flow', metadata: { number: 12 } });
+      await createCard('github:7:issue:345', { title: 'Rework the login palette', metadata: { number: 345 } });
+      await createCard('linear:issue-uuid', {
+        title: 'Tidy the settings page',
+        externalSource: { integrationId: 'linear', type: 'issue', externalId: 'linear:issue-uuid' },
+        metadata: { identifier: 'ENG-77' },
+      });
+
+      expect((await unstarted('&q=LOGIN%20fix')).titles).toEqual(['Fix the login flow']);
+      expect((await unstarted('&q=%2312')).titles).toEqual(['Fix the login flow']);
+      expect((await unstarted('&q=34')).titles).toEqual(['Rework the login palette']);
+      expect((await unstarted('&q=issue:345')).titles).toEqual(['Rework the login palette']);
+      expect((await unstarted('&q=eng-77')).titles).toEqual(['Tidy the settings page']);
+      expect(await unstarted('&q=fix%20palette')).toEqual({ titles: [], total: 0 });
+      expect((await unstarted('&q=login')).total).toBe(2);
+    });
+
+    it('finds the card a pasted link names, as the board’s search does', async () => {
+      await createCard('github:7:issue:12', {
+        title: 'Fix the login flow',
+        externalSource: {
+          integrationId: 'github',
+          type: 'issue',
+          externalId: 'github:7:issue:12',
+          url: 'https://github.com/acme/app/issues/12',
+        },
+        metadata: { number: 12 },
+      });
+      await createCard('github:7:issue:120', {
+        title: 'Rework the login palette',
+        externalSource: {
+          integrationId: 'github',
+          type: 'issue',
+          externalId: 'github:7:issue:120',
+          url: 'https://github.com/acme/app/issues/120',
+        },
+        metadata: { number: 120 },
+      });
+
+      const pasted = encodeURIComponent('https://github.com/acme/app/issues/12#issuecomment-1');
+      expect(await unstarted(`&q=${pasted}`)).toEqual({ titles: ['Fix the login flow'], total: 1 });
+    });
+
+    it('never lists a card holding a session, whatever is typed', async () => {
+      await startRun('session-mine');
+      await createCard('1', { title: 'Work nobody started' });
+
+      expect(await unstarted('&q=work')).toEqual({ titles: ['Work nobody started'], total: 1 });
+    });
+
+    it('sends the first 20 matches unless told a limit, with the count of every match', async () => {
+      for (let number = 1; number <= 23; number += 1) {
+        await createCard(String(number), { title: number % 2 ? `Palette ${number}` : `Login ${number}` });
+      }
+
+      const all = await unstarted();
+      expect(all.titles).toHaveLength(20);
+      expect(all.total).toBe(23);
+      const typed = await unstarted('&q=palette&limit=5');
+      expect(typed.titles).toHaveLength(5);
+      expect(typed.titles.every(title => title.startsWith('Palette'))).toBe(true);
+      expect(typed.total).toBe(12);
+      expect((await unstarted('&limit=500')).titles).toHaveLength(23);
+    });
+
+    it('answers 304 while nothing changed, and sends the count again once only it changed', async () => {
+      vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-01T10:00:00Z') });
+      const older = await createCard('1', { title: 'Palette, older' });
+      vi.setSystemTime(new Date('2026-11-01T10:01:00Z'));
+      await createCard('2', { title: 'Palette, newer' });
+      const path = `${boardPath()}?started=false&q=palette&limit=1`;
+      const app = buildApp(orgUser);
+      const first = await app.request(path);
+      const etag = first.headers.get('etag')!;
+      expect(await first.json()).toMatchObject({ workItems: [{ title: 'Palette, newer' }], total: 2 });
+
+      const unchanged = await app.request(path, { headers: { 'if-none-match': etag } });
+      expect(unchanged.status).toBe(304);
+
+      // The card that was past the limit stops matching: the listed card is the same, the count is not.
+      await rename(older, 'Login');
+      const changed = await app.request(path, { headers: { 'if-none-match': etag } });
+      expect(changed.status).toBe(200);
+      expect(await changed.json()).toMatchObject({ workItems: [{ title: 'Palette, newer' }], total: 1 });
+    });
+  });
+
+  describe('the cards filed from given sources (?source=)', () => {
+    const sourcePath = (...sources: string[]) =>
+      `${boardPath()}?${sources.map(source => `source=${encodeURIComponent(source)}`).join('&')}`;
+
+    it('lists the cards filed from a source named by its id or its URL, whatever sessions they hold', async () => {
+      const byId = await createCard('github:7:issue:12');
+      const byUrl = await createCard('github-issue:13', {
+        externalSource: {
+          integrationId: 'github',
+          type: 'issue',
+          externalId: 'github-issue:13',
+          url: 'https://github.com/acme/app/issues/13',
+        },
+      });
+      const started = await createCard('github:7:pull-request:14');
+      await json('PATCH', `/web/factory/work-items/${started.id}`, {
+        sessions: { review: { sessionId: 'session-review', branch: 'factory/pr-14', threadId: 'thread-review' } },
+      });
+      await createCard('github:7:issue:99');
+
+      const res = await buildApp(orgUser).request(
+        sourcePath(
+          'github:7:issue:12',
+          'https://github.com/acme/app/issues/13',
+          'github:7:pull-request:14',
+          'github:7:issue:404',
+        ),
+      );
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(FACTORY_ROUTE_CONTRACTS.workItemList.responseSchema.parse(body)).toEqual(body);
+      expect(body.workItems.map((item: { id: string }) => item.id).toSorted()).toEqual(
+        [byId.id, byUrl.id, started.id].toSorted(),
+      );
+      expect(body).not.toHaveProperty('total');
+    });
+
+    it('lists nothing when no card is filed from the sources', async () => {
+      await createCard('github:7:issue:12');
+
+      expect(await listedIds(await buildApp(orgUser).request(sourcePath('github:7:issue:404')))).toEqual([]);
+    });
+
+    it('lists the issue card a pull request is attached to, by its id or its URL', async () => {
+      const issue = await createCard('github:7:issue:1');
+      await seed.workItems.attachSource({
+        orgId: 'org1',
+        id: issue.id,
+        source: {
+          integrationId: 'github',
+          type: 'pull-request',
+          externalId: 'github:7:pull-request:2',
+          url: 'https://github.com/acme/app/pull/2',
+        },
+        metadata: { githubPullRequestNumber: 2 },
+      });
+
+      const app = buildApp(orgUser);
+      expect(await listedIds(await app.request(sourcePath('github:7:pull-request:2')))).toEqual([issue.id]);
+      expect(await listedIds(await app.request(sourcePath('https://github.com/acme/app/pull/2')))).toEqual([issue.id]);
+      expect(await listedIds(await app.request(sourcePath('github:7:pull-request:3')))).toEqual([]);
+    });
+  });
+
+  describe('the cards named by their ids (?workItemId=)', () => {
+    const idPath = (...ids: string[]) => `${boardPath()}?${ids.map(id => `workItemId=${id}`).join('&')}`;
+
+    it('lists only the named cards, in board order, whatever sessions they hold and without their relatives', async () => {
+      const parent = await createCard('github:7:issue:12');
+      const child = await createCard('github:7:issue:13', { parentWorkItemId: parent.id });
+      const started = await createCard('github:7:pull-request:14');
+      await json('PATCH', `/web/factory/work-items/${started.id}`, {
+        sessions: { review: { sessionId: 'session-review', branch: 'factory/pr-14', threadId: 'thread-review' } },
+      });
+      const board = await listedIds(await buildApp(orgUser).request(boardPath()));
+
+      const res = await buildApp(orgUser).request(idPath(started.id, child.id));
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(FACTORY_ROUTE_CONTRACTS.workItemList.responseSchema.parse(body)).toEqual(body);
+      expect(body.workItems.map((item: { id: string }) => item.id)).toEqual(
+        board.filter(id => id === started.id || id === child.id),
+      );
+      expect(body).not.toHaveProperty('total');
+    });
+
+    it('lists nothing, without an error, when no card has the id', async () => {
+      await createCard('github:7:issue:12');
+
+      const res = await buildApp(orgUser).request(idPath('11111111-2222-4333-8444-555555555555'));
+
+      expect(res.status).toBe(200);
+      expect(await listedIds(res)).toEqual([]);
+    });
+  });
+
+  it.each([
+    ['a wish for the started cards', '?started=true', 'invalid_started'],
+    ['unstarted cards combined with a scope', '?started=false&scope=sessions', 'invalid_started'],
+    ['unstarted cards combined with session ids', '?started=false&sessionId=session-mine', 'invalid_started'],
+    ['typed text without started=false', '?q=login', 'invalid_search'],
+    ['typed text with a scope', '?scope=sessions&q=login', 'invalid_search'],
+    ['typed text longer than 200 characters', `?started=false&q=${'a'.repeat(201)}`, 'invalid_search'],
+    ['a blank source', '?source=', 'invalid_source'],
+    ['a source longer than 512 characters', `?source=${'a'.repeat(513)}`, 'invalid_source'],
+    ['more than 100 sources', `?${Array.from({ length: 101 }, (_, i) => `source=s${i}`).join('&')}`, 'invalid_source'],
+    ['sources combined with a scope', '?source=github-issue:1&scope=sessions', 'invalid_source'],
+    ['sources combined with unstarted cards', '?source=github-issue:1&started=false', 'invalid_source'],
+    ['sources combined with session ids', '?source=github-issue:1&sessionId=session-mine', 'invalid_source'],
+    ['an id that is not a card id', '?workItemId=backlog-1', 'invalid_work_item_id'],
+    [
+      'more than 100 ids',
+      `?${Array.from({ length: 101 }, () => `workItemId=${PROJECT_ID}`).join('&')}`,
+      'invalid_work_item_id',
+    ],
+    ['ids combined with sources', `?workItemId=${PROJECT_ID}&source=github-issue:1`, 'invalid_work_item_id'],
+    ['ids combined with a scope', `?workItemId=${PROJECT_ID}&scope=sessions`, 'invalid_work_item_id'],
+    ['ids combined with unstarted cards', `?workItemId=${PROJECT_ID}&started=false`, 'invalid_work_item_id'],
+    ['ids combined with session ids', `?workItemId=${PROJECT_ID}&sessionId=session-mine`, 'invalid_work_item_id'],
+  ])('refuses %s rather than sending the whole board', async (_case, query, error) => {
+    await createCard('github-issue:1');
+
+    const res = await buildApp(orgUser).request(`${boardPath()}${query}`);
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error });
+  });
+});
+
+describe('GET /web/factory/projects/:id/work-items/starters', () => {
+  const startersPath = () => `/web/factory/projects/${PROJECT_ID}/work-items/starters`;
+  const create = async (overrides: Record<string, unknown>) =>
+    (await (await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody(overrides))).json())
+      .workItem;
+
+  it('401s without a user and 404s for projects outside the org', async () => {
+    expect((await json('GET', startersPath(), undefined, null)).status).toBe(401);
+
+    await seedProject('other-org');
+    expect((await json('GET', startersPath())).status).toBe(404);
+  });
+
+  it('counts the cards behind each starter on the default board', async () => {
+    const issue = (externalId: string) => ({ integrationId: 'github', type: 'issue', externalId });
+    await create({ externalSource: issue('1'), metadata: { labels: ['bug', 'Memory'] } });
+    await create({ externalSource: issue('2'), metadata: { labels: ['Memory'] } });
+    await create({ externalSource: issue('3'), stages: ['intake'], sessions: { triage: run.execute } });
+    await create({
+      externalSource: { integrationId: 'github', type: 'pull-request', externalId: 'pr-7' },
+      metadata: { number: 7, state: 'open', sourceCreatedAt: '2030-01-10T00:00:00.000Z' },
+    });
+    vi.useFakeTimers({ now: new Date('2030-01-12T00:00:00.000Z'), toFake: ['Date'] });
+
+    const res = await json('GET', startersPath());
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(FACTORY_ROUTE_CONTRACTS.workItemStarters.responseSchema.parse(body)).toEqual(body);
+    expect(body).toEqual({
+      failed: 0,
+      changesRequested: 0,
+      review: { count: 1, oldestOpenedAt: '2030-01-10T00:00:00.000Z' },
+      undecided: 1,
+      untriaged: 2,
+      unplannedBugs: 1,
+      sweep: { area: 'Memory', count: 2 },
+      stale: 0,
+    });
+  });
+
+  it('counts an open card whose newest run decision failed', async () => {
+    const card = await create({});
+    const now = new Date(Date.now() + 1_000);
+    await seed.workItems.commitRuleEvaluation({
+      orgId: 'org1',
+      factoryProjectId: PROJECT_ID,
+      workItemId: card.id,
+      ingress: { identity: 'failing-run' },
+      expectedRevision: card.revision,
+      actor: { type: 'system', id: 'rules' },
+      outcome: { status: 'accepted' },
+      decisions: [{ type: 'invokeSkill', role: 'triage', skillName: 'factory-triage', idempotencyKey: 'failing-run' }],
+      causalChain: [],
+      now,
+    });
+    expect((await (await json('GET', startersPath())).json()).failed).toBe(0);
+    const [claimed] = await seed.workItems.claimDeferredDecisions({
+      ownerId: 'worker-1',
+      now,
+      leaseExpiresAt: new Date(now.getTime() + 60_000),
+      limit: 1,
+    });
+    await seed.workItems.failDeferredDecision({
+      id: claimed!.id,
+      orgId: 'org1',
+      factoryProjectId: PROJECT_ID,
+      ownerId: 'worker-1',
+      now,
+      availableAt: now,
+      lastError: 'Sandbox quota exceeded',
+      failureCode: 'session_unavailable',
+      terminal: true,
+    });
+
+    expect((await (await json('GET', startersPath())).json()).failed).toBe(1);
+  });
+});
+
+describe('GET /web/factory/projects/:id/work-items/activity', () => {
+  const activityPath = (since: string) =>
+    `/web/factory/projects/${PROJECT_ID}/work-items/activity?since=${encodeURIComponent(since)}`;
+
+  it('401s without a user and 404s for projects outside the org', async () => {
+    const since = '2026-06-01T00:00:00.000Z';
+    expect((await json('GET', activityPath(since), undefined, null)).status).toBe(401);
+
+    await seedProject('other-org');
+    expect((await json('GET', activityPath(since))).status).toBe(404);
+  });
+
+  it('lists when cards were created and completed since the instant, and counts every card', async () => {
+    vi.useFakeTimers({ now: new Date('2026-06-10T12:00:00.000Z'), toFake: ['Date'] });
+    await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody({ externalSource: null }));
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    const created = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    const { workItem } = await created.json();
+    vi.setSystemTime(new Date('2026-06-16T09:00:00.000Z'));
+    await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items/${workItem.id}/transition`, {
+      board: 'work',
+      stage: 'done',
+      expectedRevision: workItem.revision,
+      requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4',
+      cause: 'board_drag',
+    });
+
+    const res = await json('GET', activityPath('2026-06-12T00:00:00.000Z'));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(FACTORY_ROUTE_CONTRACTS.workItemActivity.responseSchema.parse(body)).toEqual(body);
+    expect(body).toEqual({
+      total: 2,
+      createdAt: ['2026-06-15T12:00:00.000Z'],
+      doneAt: ['2026-06-16T09:00:00.000Z'],
+    });
+  });
+
+  describe('asked again by a tab that kept the answer', () => {
+    const since = '2026-06-12T00:00:00.000Z';
+    const createAt = async (instant: string) => {
+      vi.setSystemTime(new Date(instant));
+      await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody({ externalSource: null }));
+    };
+
+    it('answers 304 without a body while no card of the period changed', async () => {
+      vi.useFakeTimers({ now: new Date('2026-06-15T12:00:00.000Z'), toFake: ['Date'] });
+      await createAt('2026-06-15T12:00:00.000Z');
+      const app = buildApp(orgUser);
+
+      const first = await app.request(activityPath(since));
+      const etag = first.headers.get('etag');
+      expect(first.status).toBe(200);
+      expect(etag).toBeTruthy();
+
+      const again = await app.request(activityPath(since), { headers: { 'if-none-match': etag! } });
+      expect(again.status).toBe(304);
+      expect(await again.text()).toBe('');
+    });
+
+    it('sends the instants again once a card is created inside the period', async () => {
+      vi.useFakeTimers({ now: new Date('2026-06-15T12:00:00.000Z'), toFake: ['Date'] });
+      await createAt('2026-06-15T12:00:00.000Z');
+      const app = buildApp(orgUser);
+      const etag = (await app.request(activityPath(since))).headers.get('etag');
+      expect(etag).toBeTruthy();
+
+      await createAt('2026-06-16T09:00:00.000Z');
+
+      const after = await app.request(activityPath(since), { headers: { 'if-none-match': etag! } });
+      expect(after.status).toBe(200);
+      expect(after.headers.get('etag')).not.toBe(etag);
+      const body = await after.json();
+      expect(body.total).toBe(2);
+      // The instants follow the board's order, which this case does not pin.
+      expect(body.createdAt.toSorted()).toEqual(['2026-06-15T12:00:00.000Z', '2026-06-16T09:00:00.000Z']);
+      expect(body.doneAt).toEqual([]);
+    });
+  });
+
+  it.each([
+    ['no instant', ''],
+    ['a date without a time', '?since=2026-06-12'],
+    ['text that is not an instant', '?since=last-week'],
+  ])('refuses %s rather than guessing a window', async (_case, query) => {
+    const res = await json('GET', `/web/factory/projects/${PROJECT_ID}/work-items/activity${query}`);
+
+    expect(res.status).toBe(400);
+  });
+});
+
+describe('GET /web/factory/projects/:id/boards/:boardKey/phases', () => {
+  type Phases = BoardPhasesResponse;
+  interface Filed {
+    id: string;
+    revision: number;
+  }
+
+  const teammate = { workosId: 'u2', organizationId: 'org1' };
+  const itemsPath = () => `/web/factory/projects/${PROJECT_ID}/work-items`;
+  const phasesPath = (query = '', board = 'work') =>
+    `/web/factory/projects/${PROJECT_ID}/boards/${board}/phases${query && `?${query}`}`;
+  const at = (instant: string) => vi.setSystemTime(new Date(instant));
+
+  const file = async (externalId: string, overrides: Record<string, unknown> = {}, user = orgUser): Promise<Filed> => {
+    const res = await json(
+      'POST',
+      itemsPath(),
+      createBody({
+        externalSource: { integrationId: 'github', type: 'issue', externalId },
+        title: `Card ${externalId}`,
+        metadata: {},
+        ...overrides,
+      }),
+      user,
+    );
+    expect(res.ok).toBe(true);
+    return (await res.json()).workItem;
+  };
+
+  const move = async (card: Filed, stage: string, user = orgUser) => {
+    const res = await json(
+      'POST',
+      `${itemsPath()}/${card.id}/transition`,
+      { board: 'work', stage, expectedRevision: card.revision, requestId: crypto.randomUUID(), cause: 'board_drag' },
+      user,
+    );
+    expect(res.status).toBe(200);
+  };
+
+  const read = async (query = '', app = buildApp(orgUser)): Promise<Phases> => {
+    const res = await app.request(phasesPath(query));
+    expect(res.status).toBe(200);
+    return FACTORY_ROUTE_CONTRACTS.boardPhases.responseSchema.parse(await res.json());
+  };
+
+  const under = (body: Phases, phase: string) => {
+    const found = body.phases.find(entry => entry.phase === phase);
+    if (!found) throw new Error(`The answer has no ${phase} phase`);
+    return { total: found.total, ids: found.cards.map(card => card.id) };
+  };
+
+  beforeEach(() => void vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-01T10:00:00Z') }));
+
+  it('401s without a user and 404s for projects outside the org', async () => {
+    expect((await json('GET', phasesPath(), undefined, null)).status).toBe(401);
+
+    await seedProject('other-org');
+    expect((await json('GET', phasesPath())).status).toBe(404);
+  });
+
+  it('lists the board’s phases in order, each with how many cards it holds and the first of them, latest entry first', async () => {
+    await file('1');
+    at('2026-11-01T10:01:00Z');
+    const second = await file('2');
+    at('2026-11-01T10:02:00Z');
+    const third = await file('3');
+    const { boards } = await (await json('GET', `/web/factory/projects/${PROJECT_ID}/boards`)).json();
+    const phases: string[] = boards
+      .find((board: { id: string }) => board.id === 'work')
+      .phases.map((phase: { id: string }) => phase.id);
+
+    const body = await read('limit=2');
+
+    expect(body.phases.map(entry => entry.phase)).toEqual(phases);
+    expect(under(body, 'intake')).toEqual({ total: 3, ids: [third.id, second.id] });
+    expect(body.phases.filter(entry => entry.phase !== 'intake').map(entry => entry.total)).toEqual(
+      phases.slice(1).map(() => 0),
+    );
+    expect(body).toMatchObject({ boardTotal: 3, matchingTotal: 3, related: [] });
+  });
+
+  it('shows a card that is in none of the board’s phases under the first one, and no card of another board', async () => {
+    const release = defineBoard({
+      id: 'release',
+      title: 'Release',
+      initialPhase: 'queued',
+      phases: {
+        queued: { title: 'Queued', kind: 'resting', next: 'shipped' },
+        shipped: { title: 'Shipped', kind: 'terminal' },
+      },
+      transitionPolicy: () => undefined,
+    });
+    const app = buildApp(orgUser, undefined, undefined, createBoardRegistry({ boards: [release] }));
+    const filed = await app.request(itemsPath(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(createBody({ externalSource: null, board: 'release', stages: ['queued'], metadata: {} })),
+    });
+    expect(filed.ok).toBe(true);
+    const onRelease: Filed = (await filed.json()).workItem;
+    const lost = await file('1');
+    await seed.workItems.update({ orgId: 'org1', id: lost.id, userId: 'u1', patch: { stages: ['retired-lane'] } });
+
+    const work = await read('', app);
+    const other = FACTORY_ROUTE_CONTRACTS.boardPhases.responseSchema.parse(
+      await (await app.request(phasesPath('', 'release'))).json(),
+    );
+
+    expect(work.phases[0]?.cards.map(card => card.id)).toEqual([lost.id]);
+    expect(work.phases.slice(1).every(entry => entry.total === 0)).toBe(true);
+    expect(work.boardTotal).toBe(1);
+    expect(other.phases.map(entry => [entry.phase, entry.cards.map(card => card.id)])).toEqual([
+      ['queued', [onRelease.id]],
+      ['shipped', []],
+    ]);
+  });
+
+  it('lists a card that is in two phases under both, and counts it once among the board’s cards', async () => {
+    const both = await file('1', { metadata: { labels: ['bug'] } });
+    await seed.workItems.update({
+      orgId: 'org1',
+      id: both.id,
+      userId: 'u1',
+      patch: { stages: ['triage', 'execute'] },
+    });
+    await file('2');
+
+    const whole = await read();
+    const bugs = await read('label=bug');
+
+    expect(under(whole, 'triage').ids).toEqual([both.id]);
+    expect(under(whole, 'execute').ids).toEqual([both.id]);
+    expect(whole).toMatchObject({ boardTotal: 2, matchingTotal: 2 });
+    expect([under(bugs, 'triage').total, under(bugs, 'execute').total, under(bugs, 'intake').total]).toEqual([1, 1, 0]);
+    // The filters lower how many match; the board still has both cards.
+    expect(bugs).toMatchObject({ boardTotal: 2, matchingTotal: 1 });
+  });
+
+  describe('the order of a phase (?sort=)', () => {
+    it('orders by creation when asked, newest or oldest first, whatever entered the phase last', async () => {
+      const older = await file('1');
+      at('2026-11-01T10:01:00Z');
+      const newer = await file('2');
+      at('2026-11-01T10:02:00Z');
+      await move(newer, 'planning');
+      at('2026-11-01T10:03:00Z');
+      await move(older, 'planning');
+
+      expect(under(await read(), 'planning').ids).toEqual([older.id, newer.id]);
+      expect(under(await read('sort=created-newest'), 'planning').ids).toEqual([newer.id, older.id]);
+      expect(under(await read('sort=created-oldest'), 'planning').ids).toEqual([older.id, newer.id]);
+    });
+
+    it('puts first the cards the signed-in user last moved into the phase', async () => {
+      const [a, b, c] = [await file('1'), await file('2'), await file('3')];
+      at('2026-11-01T10:01:00Z');
+      await move(a, 'planning');
+      at('2026-11-01T10:02:00Z');
+      await move(b, 'planning', teammate);
+      at('2026-11-01T10:03:00Z');
+      await move(c, 'planning');
+
+      expect(under(await read('sort=recent'), 'planning').ids).toEqual([c.id, b.id, a.id]);
+      expect(under(await read('sort=recent-mine'), 'planning').ids).toEqual([c.id, a.id, b.id]);
+      expect(under(await read('sort=recent-mine', buildApp(teammate)), 'planning').ids).toEqual([b.id, c.id, a.id]);
+    });
+
+    it('keeps cards that entered at the same instant in one order: by id, descending', async () => {
+      const cards = [await file('1'), await file('2'), await file('3')];
+
+      expect(under(await read(), 'intake').ids).toEqual(
+        cards
+          .map(card => card.id)
+          .sort()
+          .reverse(),
+      );
+    });
+  });
+
+  describe('how deep a phase is listed (?limit=, ?window=, ?item=)', () => {
+    const fileTwoPhases = async () => {
+      const intake: Filed[] = [];
+      const planning: Filed[] = [];
+      for (const [nth, stage] of ['intake', 'intake', 'intake', 'planning', 'planning'].entries()) {
+        at(`2026-11-01T10:0${nth}:00Z`);
+        const card = await file(String(nth));
+        if (stage === 'planning') await move(card, 'planning');
+        (stage === 'planning' ? planning : intake).push(card);
+      }
+      // Latest entry first, as the phases list them.
+      return { intake: intake.reverse().map(card => card.id), planning: planning.reverse().map(card => card.id) };
+    };
+
+    it('deepens only the phase a window names', async () => {
+      const { intake, planning } = await fileTwoPhases();
+
+      const body = await read('limit=1&window=intake:2');
+
+      expect(under(body, 'intake')).toEqual({ total: 3, ids: intake.slice(0, 2) });
+      expect(under(body, 'planning')).toEqual({ total: 2, ids: planning.slice(0, 1) });
+    });
+
+    it('answers for the asked card with its place and its body, and lists its phase no deeper', async () => {
+      const { intake, planning } = await fileTwoPhases();
+
+      const body = await read(`limit=1&item=${intake[2]}&cards=true`);
+
+      expect(under(body, 'intake')).toEqual({ total: 3, ids: intake.slice(0, 1) });
+      expect(under(body, 'planning')).toEqual({ total: 2, ids: planning.slice(0, 1) });
+      expect(body.item).toEqual({
+        id: intake[2],
+        version: expect.any(String),
+        places: [{ phase: 'intake', position: 2 }],
+      });
+      // The first card of each phase, then the asked one: three bodies, not the phase above it.
+      expect(body.workItems?.map(card => card.id)).toEqual([intake[0], planning[0], intake[2]]);
+      expect(body.workItems?.[2]?.version).toBe(body.item?.version);
+    });
+
+    it('answers no asked card for one the board does not hold', async () => {
+      await fileTwoPhases();
+
+      const body = await read(`limit=1&item=${crypto.randomUUID()}`);
+
+      expect(body).not.toHaveProperty('item');
+    });
+
+    it('ignores a window for a phase the board no longer has, so a reader that deepened it keeps its board', async () => {
+      const { intake, planning } = await fileTwoPhases();
+
+      const body = await read('limit=1&window=retired-phase:5&window=planning:2');
+
+      expect(under(body, 'intake')).toEqual({ total: 3, ids: intake.slice(0, 1) });
+      expect(under(body, 'planning')).toEqual({ total: 2, ids: planning });
+    });
+  });
+
+  it.each([
+    ['an order it does not know', 'sort=sideways'],
+    ['a window without a count', 'window=intake'],
+    ['a window of no card', 'window=intake:0'],
+    ['two windows for one phase', 'window=intake:2&window=intake:3'],
+    ['an asked card that is not an id', 'item=first'],
+    ['a card bodies flag other than true', 'cards=yes'],
+  ])('refuses %s rather than answering another view', async (_case, query) => {
+    const res = await json('GET', phasesPath(query));
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'invalid_phases_query' });
+  });
+
+  it('404s for a board the project does not have', async () => {
+    const res = await json('GET', phasesPath('', 'missing'));
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'board_not_found' });
+  });
+
+  describe('a searched or filtered view', () => {
+    const fileMixedBoard = async () => {
+      const issue = await file('1', {
+        title: 'Fix the login flow',
+        metadata: { number: 101, labels: ['bug', 'Memory'], author: 'octocat', assignees: ['hubot'] },
+      });
+      const pullRequest = await file('pr-7', {
+        externalSource: { integrationId: 'github', type: 'pull-request', externalId: 'pr-7' },
+        title: 'Tidy the palette',
+        metadata: { number: 7, labels: ['bug'], author: 'monalisa', requestedReviewers: ['defunkt'] },
+      });
+      const linearA = await file('LIN-1', {
+        externalSource: { integrationId: 'linear', type: 'issue', externalId: 'LIN-1' },
+        title: 'Palette contrast',
+        metadata: { linearProjectId: 'project-a', assignee: 'Ada' },
+      });
+      const linearB = await file('LIN-2', {
+        externalSource: { integrationId: 'linear', type: 'issue', externalId: 'LIN-2' },
+        title: 'Slow sync',
+        metadata: { linearProjectId: 'project-b' },
+      });
+      const byHand = await file('', { externalSource: null, title: 'Write the changelog' }, teammate);
+      return new Map([
+        [issue.id, 'issue'],
+        [pullRequest.id, 'pull request'],
+        [linearA.id, 'linear a'],
+        [linearB.id, 'linear b'],
+        [byHand.id, 'by hand'],
+      ]);
+    };
+
+    it.each([
+      ['a search word', 'q=palette', ['linear a', 'pull request']],
+      ['every search word', 'q=the%20login', ['issue']],
+      ['a card number', 'q=%23101', ['issue']],
+      ['a label', 'label=bug', ['issue', 'pull request']],
+      ['every picked label', 'label=bug&label=Memory', ['issue']],
+      ['a source', 'source=github', ['issue', 'pull request']],
+      ['cards filed by hand', 'source=manual', ['by hand']],
+      ['pull requests', 'source=pull-request', ['pull request']],
+      ['any picked source', 'source=pull-request&source=linear', ['linear a', 'linear b', 'pull request']],
+      ['a Linear project picked alone', 'linearProject=project-a', ['linear a']],
+      ['a source’s author', 'author=github:octocat', ['issue']],
+      ['the person who filed a card by hand', 'author=factory:u2', ['by hand']],
+      ['an assignee', 'assignee=github:hubot&assignee=linear:ada', ['issue', 'linear a']],
+      ['a requested reviewer', 'reviewer=github:defunkt', ['pull request']],
+      ['a person who worked on the card', 'worked=factory:u2', ['by hand']],
+      ['a person involved in any way', 'teammate=github:defunkt&teammate=github:hubot', ['issue', 'pull request']],
+      ['every field at once', 'label=bug&source=github&author=github:monalisa', ['pull request']],
+      ['a search and a filter at once', 'label=bug&q=login', ['issue']],
+      ['nothing, when no card matches every field', 'label=Memory&reviewer=github:defunkt', []],
+    ])('keeps the cards that match %s, and counts only them', async (_case, query, expected) => {
+      const names = await fileMixedBoard();
+
+      const body = await read(query);
+
+      const intake = under(body, 'intake');
+      expect(intake.ids.map(id => names.get(id)).sort()).toEqual(expected);
+      expect(intake.total).toBe(expected.length);
+      expect(body.matchingTotal).toBe(expected.length);
+      // The board's own count ignores the search and the filters.
+      expect(body.boardTotal).toBe(5);
+    });
+  });
+
+  describe('a search for a pasted link or a whole name', () => {
+    const github = (type: 'issue' | 'pull-request', repository: string, number: number) => ({
+      integrationId: 'github',
+      type,
+      externalId: `github:${repository}:${type}:${number}`,
+      url: `https://github.com/${repository}/${type === 'issue' ? 'issues' : 'pull'}/${number}`,
+    });
+    const fileLinkedBoard = async () => {
+      // Its pull request was opened from its session, so the pull request rides on the issue's card.
+      const issue = await file('', {
+        externalSource: github('issue', 'acme/app', 12),
+        title: 'Fix the login flow',
+        metadata: { number: 12 },
+      });
+      await seed.workItems.attachSource({
+        orgId: 'org1',
+        id: issue.id,
+        source: github('pull-request', 'acme/app', 307),
+        metadata: { githubPullRequestNumber: 307, headBranch: 'octo.cat/login-redirect' },
+      });
+      // Its number starts with the attached pull request's.
+      const pullRequest = await file('', {
+        externalSource: github('pull-request', 'acme/app', 30772),
+        title: 'Tidy the palette',
+        metadata: { number: 30772 },
+      });
+      const linear = await file('', {
+        externalSource: {
+          integrationId: 'linear',
+          type: 'issue',
+          externalId: 'linear:issue-uuid',
+          url: 'https://linear.app/acme/issue/ENG-42/slow-sync',
+        },
+        title: 'Slow sync',
+        metadata: { identifier: 'ENG-42' },
+      });
+      const otherRepository = await file('', {
+        externalSource: github('issue', 'acme/web', 5),
+        title: 'List open issues in the sidebar',
+        metadata: { number: 5 },
+      });
+      return {
+        issue,
+        names: new Map([
+          [issue.id, 'issue'],
+          [pullRequest.id, 'pull request'],
+          [linear.id, 'linear'],
+          [otherRepository.id, 'other repository'],
+        ]),
+      };
+    };
+    const found = async (names: Map<string, string>, q: string) => {
+      const body = await read(`q=${encodeURIComponent(q)}`);
+      expect(body.matchingTotal).toBe(under(body, 'intake').total);
+      return under(body, 'intake')
+        .ids.map(id => names.get(id))
+        .sort();
+    };
+
+    it.each([
+      ['a link to a pull request attached to an issue’s card', 'https://github.com/acme/app/pull/307', ['issue']],
+      ['a link to a page of it, in any case', 'https://GitHub.com/Acme/App/pull/307/files#diff-1a2b', ['issue']],
+      ['a link without its scheme', 'github.com/acme/app/pull/307?tab=checks', ['issue']],
+      ['the issue link GitHub gives the same number', 'https://github.com/acme/app/issues/307', ['issue']],
+      [
+        'a link to a pull request, never to one whose number starts the same',
+        'https://github.com/acme/app/pull/30772',
+        ['pull request'],
+      ],
+      ['a Linear link with another title in it', 'https://linear.app/acme/issue/ENG-42/renamed-since', ['linear']],
+      ['a repository’s link', 'https://github.com/acme/app', ['issue', 'pull request']],
+      ['a link and a word', 'https://github.com/acme/app login', ['issue']],
+      ['an attached pull request’s key, never one it starts', 'acme/app#307', ['issue']],
+      ['an attached pull request’s number, never one it starts', '#307', ['issue']],
+      // Bare digits read as a word: they find the numbers holding them.
+      ['digits of a number', '307', ['issue', 'pull request']],
+      ['a branch, whole', 'octo.cat/login-redirect', ['issue']],
+      // Every GitHub issue link holds `issues`; only one title does.
+      ['a word of links but of one title', 'issues', ['other repository']],
+      ['a link to an issue no card carries', 'https://github.com/acme/app/issues/404', []],
+    ])('finds the cards for %s', async (_case, q, expected) => {
+      const { names } = await fileLinkedBoard();
+
+      expect(await found(names, q)).toEqual(expected);
+    });
+
+    it('finds the card a Factory link opens', async () => {
+      const { issue, names } = await fileLinkedBoard();
+
+      expect(await found(names, `https://factory.example.com/factories/${PROJECT_ID}/cards/${issue.id}`)).toEqual([
+        'issue',
+      ]);
+      expect(await found(names, issue.id)).toEqual(['issue']);
+    });
+  });
+
+  describe('the cards an answer names', () => {
+    const fileParentAndPullRequest = async () => {
+      const parent = await file('parent');
+      at('2026-11-01T10:01:00Z');
+      const pullRequest = await file('child', {
+        externalSource: { integrationId: 'github', type: 'pull-request', externalId: 'child' },
+        parentWorkItemId: parent.id,
+      });
+      return { parent, pullRequest };
+    };
+
+    it('names the cards related to a listed card that no phase lists, without any card body', async () => {
+      const { parent, pullRequest } = await fileParentAndPullRequest();
+
+      const res = await json('GET', phasesPath('limit=1'));
+      const raw = await res.json();
+      const body = FACTORY_ROUTE_CONTRACTS.boardPhases.responseSchema.parse(raw);
+
+      expect(under(body, 'intake')).toEqual({ total: 2, ids: [pullRequest.id] });
+      expect(body.related.map(card => card.id)).toEqual([parent.id]);
+      expect(raw).not.toHaveProperty('workItems');
+      // Once a phase lists the parent, it is no longer only related.
+      expect((await read()).related).toEqual([]);
+    });
+
+    it('sends with cards=true the body of every named card, as the list route sends it', async () => {
+      const { parent, pullRequest } = await fileParentAndPullRequest();
+      await move(await file('unrelated'), 'planning');
+      const listed = await (await json('GET', itemsPath())).json();
+      const wire = (id: string) => listed.workItems.find((card: { id: string }) => card.id === id);
+
+      const raw = await (await json('GET', phasesPath('limit=1&window=planning:1&cards=true'))).json();
+
+      const unrelated = raw.phases.find((entry: { phase: string }) => entry.phase === 'planning').cards[0];
+      const sent = raw.workItems.map(({ version: _version, ...card }: { version: string }) => card);
+      expect(sent).toEqual([wire(pullRequest.id), wire(unrelated.id), wire(parent.id)]);
+      // A reader tells its copy of a card from the answer's by its version.
+      expect(raw.related).toEqual([{ id: parent.id, version: raw.workItems[2].version }]);
+      expect(raw.workItems[2].version).toEqual(expect.any(String));
+    });
+
+    it('declares the version of each body it sends, so a typed reader takes it from the answer', async () => {
+      await file('1');
+      const schema = FACTORY_ROUTE_CONTRACTS.boardPhases.responseSchema;
+
+      const raw = await (await json('GET', phasesPath('cards=true'))).json();
+
+      expect(schema.parse(raw)).toEqual(raw);
+      const [{ version: _version, ...unversioned }] = raw.workItems;
+      expect(schema.safeParse({ ...raw, workItems: [unversioned] }).success).toBe(false);
+    });
+
+    it('names a card by the same version in the by-id read, so a reader can tell it holds the body', async () => {
+      const card = await file('1');
+
+      const phases = await read();
+      const byId = await (await json('GET', `${itemsPath()}?workItemId=${card.id}`)).json();
+
+      expect(byId.workItems).toMatchObject([{ id: card.id, version: phases.phases[0]?.cards[0]?.version }]);
+    });
+  });
+
+  describe('asked again by a board that kept the answer', () => {
+    it('answers 304 without a body while nothing the view shows changed', async () => {
+      await file('1');
+      const app = buildApp(orgUser);
+
+      const first = await app.request(phasesPath());
+      const etag = first.headers.get('etag');
+      expect(first.status).toBe(200);
+      expect(etag).toBeTruthy();
+      expect(first.headers.get('cache-control')).toBe('private, no-cache');
+
+      const again = await app.request(phasesPath(), { headers: { 'if-none-match': etag! } });
+      expect(again.status).toBe(304);
+      expect(await again.text()).toBe('');
+    });
+
+    it('sends the answer again, with the card’s new version, once a listed card changes', async () => {
+      const card = await file('1');
+      const app = buildApp(orgUser);
+      const first = await app.request(phasesPath());
+      const etag = first.headers.get('etag');
+      const before = FACTORY_ROUTE_CONTRACTS.boardPhases.responseSchema.parse(await first.json());
+
+      at('2026-11-01T10:05:00Z');
+      await json('PATCH', `/web/factory/work-items/${card.id}`, { title: 'Renamed' });
+
+      const after = await app.request(phasesPath(), { headers: { 'if-none-match': etag! } });
+      expect(after.status).toBe(200);
+      const body = FACTORY_ROUTE_CONTRACTS.boardPhases.responseSchema.parse(await after.json());
+      expect(under(body, 'intake').ids).toEqual([card.id]);
+      expect(body.phases[0]?.cards[0]?.version).not.toBe(before.phases[0]?.cards[0]?.version);
+    });
+
+    it('sends a new version when a source sync changes a listed card in the millisecond of its last write', async () => {
+      const card = await file('1');
+      at('2026-11-01T10:00:07Z');
+      await json('PATCH', `/web/factory/work-items/${card.id}`, { title: 'Renamed' });
+      const app = buildApp(orgUser);
+      const view = phasesPath('cards=true');
+      const first = await app.request(view);
+      const before = await first.json();
+
+      // The clock has not moved: the sync stamps the card with the instant the rename did.
+      await seed.workItems.syncWorkItemSource({
+        orgId: 'org1',
+        factoryProjectId: PROJECT_ID,
+        provider: 'github',
+        externalId: before.workItems[0].workItem.externalId,
+        patch: { labels: ['urgent'] },
+      });
+
+      const after = await app.request(view, { headers: { 'if-none-match': first.headers.get('etag')! } });
+      expect(after.status).toBe(200);
+      const body = await after.json();
+      expect(body.workItems[0]).toMatchObject({ changedAt: before.workItems[0].changedAt });
+      expect(body.workItems[0].workItem.labels).toEqual(['urgent']);
+      expect(body.phases[0].cards[0].version).not.toBe(before.phases[0].cards[0].version);
+      expect(body.workItems[0].version).toBe(body.phases[0].cards[0].version);
+    });
+
+    it('sends a new version of a Review card that reads as a Work card once Review closes, though nothing wrote it', async () => {
+      const closed = await file('closed', {
+        externalSource: { integrationId: 'github', type: 'pull-request', externalId: 'closed' },
+      });
+      const open = await file('open', {
+        externalSource: { integrationId: 'github', type: 'pull-request', externalId: 'open' },
+      });
+      // Rows as the retired Review board left them: one done, one still in review.
+      const stored = (id: string, stages: string[]) =>
+        seed.storage.ops.updateMany('factory_board_items', { id }, { board: 'review', stages });
+      await stored(closed.id, ['done']);
+      await stored(open.id, ['review']);
+      const app = buildApp(orgUser);
+      const byId = async () =>
+        (await (await app.request(`${itemsPath()}?workItemId=${closed.id}`)).json()).workItems[0];
+      at('2026-11-01T10:01:00Z');
+      await json('PATCH', `/web/factory/work-items/${open.id}`, { title: 'Still open' });
+      const held = await byId();
+      expect(held).toMatchObject({ board: 'review' });
+      const etag = (await app.request(phasesPath())).headers.get('etag');
+
+      at('2026-11-01T10:02:00Z');
+      await seed.workItems.update({
+        orgId: 'org1',
+        id: open.id,
+        userId: orgUser.workosId,
+        patch: { stages: ['done'] },
+      });
+
+      const after = await app.request(phasesPath(), { headers: { 'if-none-match': etag! } });
+      expect(after.status).toBe(200);
+      const done = FACTORY_ROUTE_CONTRACTS.boardPhases.responseSchema
+        .parse(await after.json())
+        .phases.find(entry => entry.phase === 'done');
+      const named = done?.cards.find(card => card.id === closed.id);
+      const now = await byId();
+      expect(now).toMatchObject({ board: 'work', changedAt: held.changedAt });
+      expect(named?.version).toBe(now.version);
+      expect(named?.version).not.toBe(held.version);
+    });
+
+    it('still answers 304 when the card that changed is outside every window', async () => {
+      const deep = await file('1');
+      at('2026-11-01T10:01:00Z');
+      await file('2');
+      const app = buildApp(orgUser);
+      const etag = (await app.request(phasesPath('limit=1'))).headers.get('etag');
+
+      at('2026-11-01T10:05:00Z');
+      await json('PATCH', `/web/factory/work-items/${deep.id}`, { title: 'Renamed below the fold' });
+
+      const again = await app.request(phasesPath('limit=1'), { headers: { 'if-none-match': etag! } });
+      expect(again.status).toBe(304);
+    });
+
+    it('sends the answer again once a total changes, though the listed cards did not', async () => {
+      const oldest = await file('1');
+      const app = buildApp(orgUser);
+      const view = phasesPath('limit=1&sort=created-oldest');
+      const etag = (await app.request(view)).headers.get('etag');
+
+      at('2026-11-01T10:05:00Z');
+      await file('2');
+
+      const after = await app.request(view, { headers: { 'if-none-match': etag! } });
+      expect(after.status).toBe(200);
+      const body = FACTORY_ROUTE_CONTRACTS.boardPhases.responseSchema.parse(await after.json());
+      expect(under(body, 'intake')).toEqual({ total: 2, ids: [oldest.id] });
+    });
+
+    it('gzips the answer for a reader that accepts it', async () => {
+      const card = await file('1');
+
+      const res = await buildApp(orgUser).request(phasesPath(), { headers: { 'accept-encoding': 'gzip' } });
+
+      expect(res.headers.get('content-encoding')).toBe('gzip');
+      const body = JSON.parse(gunzipSync(Buffer.from(await res.arrayBuffer())).toString());
+      expect(under(body, 'intake').ids).toEqual([card.id]);
+    });
+  });
+});
+
+describe('GET /web/factory/projects/:id/work-items/filter-options', () => {
+  const itemsPath = () => `/web/factory/projects/${PROJECT_ID}/work-items`;
+  const optionsPath = () => `${itemsPath()}/filter-options`;
+  const file = (overrides: Record<string, unknown>, user = orgUser) =>
+    json('POST', itemsPath(), createBody({ metadata: {}, ...overrides }), user);
+
+  it('401s without a user and 404s for projects outside the org', async () => {
+    expect((await json('GET', optionsPath(), undefined, null)).status).toBe(401);
+
+    await seedProject('other-org');
+    expect((await json('GET', optionsPath())).status).toBe(404);
+  });
+
+  it('offers every label, every person a source names and every Factory user who acted, over all the project’s cards', async () => {
+    await file({
+      externalSource: { integrationId: 'github', type: 'issue', externalId: '1' },
+      metadata: { labels: ['bug', 'Memory'], author: 'octocat', assignees: ['hubot'] },
+    });
+    await file({
+      externalSource: { integrationId: 'github', type: 'pull-request', externalId: 'pr-7' },
+      metadata: { labels: ['bug', 'area: docs'], author: 'octocat', requestedReviewers: ['defunkt'] },
+    });
+    await file({
+      externalSource: { integrationId: 'linear', type: 'issue', externalId: 'LIN-1' },
+      metadata: { assignee: 'Ada' },
+    });
+    await file({ externalSource: null, title: 'Filed by hand' }, { workosId: 'u2', organizationId: 'org1' });
+
+    const res = await json('GET', optionsPath());
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(FACTORY_ROUTE_CONTRACTS.workItemFilterOptions.responseSchema.parse(body)).toEqual(body);
+    expect(body).toEqual({
+      labels: ['area: docs', 'bug', 'Memory'],
+      people: [
+        { id: 'linear:ada', name: 'Ada', source: 'linear' },
+        { id: 'github:defunkt', name: 'defunkt', source: 'github' },
+        { id: 'github:hubot', name: 'hubot', source: 'github' },
+        { id: 'github:octocat', name: 'octocat', source: 'github' },
+      ],
+      actorIds: ['u1', 'u2'],
+    });
+  });
+
+  it('answers 304 while no card changed, and the options again once one did', async () => {
+    await file({ metadata: { labels: ['bug'] } });
+    const app = buildApp(orgUser);
+    const first = await app.request(optionsPath());
+    const etag = first.headers.get('etag');
+    expect(first.status).toBe(200);
+    expect(first.headers.get('cache-control')).toBe('private, no-cache');
+
+    const again = await app.request(optionsPath(), { headers: { 'if-none-match': etag! } });
+    expect(again.status).toBe(304);
+    expect(await again.text()).toBe('');
+
+    await file({
+      externalSource: { integrationId: 'github', type: 'issue', externalId: '2' },
+      metadata: { labels: ['docs'] },
+    });
+
+    const after = await app.request(optionsPath(), { headers: { 'if-none-match': etag! } });
+    expect(after.status).toBe(200);
+    expect((await after.json()).labels).toEqual(['bug', 'docs']);
+  });
+});
+
+describe('GET /web/factory/projects/:id/health/thresholds', () => {
+  it('401s without a user and 404s for projects outside the org', async () => {
+    expect((await json('GET', `/web/factory/projects/${PROJECT_ID}/health/thresholds`, undefined, null)).status).toBe(
+      401,
+    );
+
+    await seedProject('other-org');
+    expect((await json('GET', `/web/factory/projects/${PROJECT_ID}/health/thresholds`)).status).toBe(404);
+  });
+
+  it('returns the default config when unset and the saved config after saveConfig', async () => {
+    const res = await json('GET', `/web/factory/projects/${PROJECT_ID}/health/thresholds`);
+    expect(res.status).toBe(200);
+    expect((await res.json()).thresholds).toEqual([14400, 86400, 259200]);
+
+    await seed.queueHealth.saveConfig('org1', PROJECT_ID, { thresholdsSeconds: [60, 300, 3600] });
+    const res2 = await json('GET', `/web/factory/projects/${PROJECT_ID}/health/thresholds`);
+    expect((await res2.json()).thresholds).toEqual([60, 300, 3600]);
+  });
+});
+
+// ── Audit events ─────────────────────────────────────────────────────────
+describe('audit events', () => {
+  async function createItem(overrides: Record<string, unknown> = {}) {
+    const res = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody(overrides));
+    return (await res.json()).workItem;
+  }
+
+  it('records work_item.opened on POST with actor, project, and target', async () => {
+    const item = await createItem();
+    expect(auditRecorded).toHaveLength(1);
+    expect(auditRecorded[0]).toMatchObject({
+      orgId: 'org1',
+      actorId: 'u1',
+      action: 'factory.work_item.created',
+      factoryProjectId: PROJECT_ID,
+      targets: [{ type: 'work_item', id: item.id, name: 'Fix the login flow' }],
+      metadata: {
+        externalSource: {
+          integrationId: 'github',
+          type: 'issue',
+          externalId: '42',
+          url: 'https://github.com/acme/app/issues/42',
+        },
+        stages: ['intake'],
+      },
+    });
+  });
+
+  it('audits only the bounded non-stage refresh when a source-key POST reuses the canonical item', async () => {
+    const item = await createItem();
+    auditRecorded = [];
+
+    const reused = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    expect(reused.status).toBe(200);
+    expect((await reused.json()).workItem.id).toBe(item.id);
+    expect(auditRecorded.map(event => event.action)).toEqual(['factory.work_item.updated']);
+    expect(auditRecorded[0]?.metadata.fields).not.toContain('stages');
+    expect(auditRecorded[0]?.metadata.fields).not.toContain('sessions');
+  });
+
+  it('does not audit a rejected legacy stage PATCH as a movement', async () => {
+    const item = await createItem();
+    auditRecorded = [];
+
+    const rejected = await json('PATCH', `/web/factory/work-items/${item.id}`, { stages: ['execute'] });
+    expect(rejected.status).toBe(409);
+    expect(auditRecorded).toEqual([]);
+  });
+
+  it('files a session onto a role as an update, never as a run start', async () => {
+    const item = await createItem();
+    auditRecorded = [];
+
+    const session = { sessionId: '/sb/wt/issue-42', branch: 'factory/issue-42', threadId: 't-1' };
+    await json('PATCH', `/web/factory/work-items/${item.id}`, { sessions: { work: session } });
+    expect(auditRecorded.map(e => e.action)).toEqual(['factory.work_item.updated']);
+    expect(auditRecorded[0].metadata).toEqual({ fields: ['sessions'] });
+  });
+
+  it('records only updated when the patch does not move stages', async () => {
+    const item = await createItem();
+    auditRecorded = [];
+
+    await json('PATCH', `/web/factory/work-items/${item.id}`, { title: 'Renamed card' });
+    expect(auditRecorded.map(e => e.action)).toEqual(['factory.work_item.updated']);
+    expect(auditRecorded[0].metadata).toEqual({ fields: ['title'] });
+  });
+
+  it('records work_item.deleted on DELETE', async () => {
+    const item = await createItem();
+    auditRecorded = [];
+
+    await json('DELETE', `/web/factory/work-items/${item.id}`);
+    expect(auditRecorded).toHaveLength(1);
+    expect(auditRecorded[0]).toMatchObject({
+      action: 'factory.work_item.deleted',
+      factoryProjectId: PROJECT_ID,
+      targets: [{ type: 'work_item', id: item.id, name: 'Fix the login flow' }],
+    });
+  });
+
+  it('never blocks the mutation when the audit insert throws', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    auditFailure = new Error('audit db down');
+
+    const created = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    expect(created.status).toBe(200);
+    const { workItem } = await created.json();
+
+    const transitioned = await json(
+      'POST',
+      `/web/factory/projects/${PROJECT_ID}/work-items/${workItem.id}/transition`,
+      {
+        board: 'work',
+        stage: 'done',
+        expectedRevision: workItem.revision,
+        requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4',
+        cause: 'board_drag',
+      },
+    );
+    expect(transitioned.status).toBe(200);
+
+    const deleted = await json('DELETE', `/web/factory/work-items/${workItem.id}`);
+    expect(deleted.status).toBe(200);
+    expect(await listItems()).toHaveLength(0);
+
+    warn.mockRestore();
+  });
+});
+
+// ── Validation units ─────────────────────────────────────────────────────
+describe('parseCreateWorkItem', () => {
+  it('accepts a minimal manual work item', () => {
+    expect(parseCreateWorkItem({ title: ' Card ', stages: ['intake'] })).toEqual({
+      title: 'Card',
+      stages: ['intake'],
+    });
+  });
+
+  it('accepts a normalized external source', () => {
+    expect(parseCreateWorkItem(createBody())).toEqual(createBody());
+  });
+
+  it('rejects bad stages, malformed external sources, and oversized metadata', () => {
+    expect(parseCreateWorkItem(createBody({ stages: ['in take'] }))).toBeNull();
+    expect(parseCreateWorkItem(createBody({ stages: ['a', 'a'] }))).toBeNull();
+    expect(parseCreateWorkItem(createBody({ externalSource: { integrationId: 'github' } }))).toBeNull();
+    expect(parseCreateWorkItem(createBody({ metadata: { blob: 'x'.repeat(20_000) } }))).toBeNull();
+  });
+
+  it('rejects malformed sessions', () => {
+    expect(parseCreateWorkItem(createBody({ sessions: { work: { sessionId: '/p' } } }))).toBeNull();
+    expect(
+      parseCreateWorkItem(createBody({ sessions: { '': { sessionId: '/p', branch: 'b', threadId: 't' } } })),
+    ).toBeNull();
+  });
+});
+
+describe('parseUpdateWorkItem', () => {
+  it('rejects an empty or unknown-only patch and passes through valid fields', () => {
+    expect(parseUpdateWorkItem({})).toBeNull();
+    expect(parseUpdateWorkItem({ stages: ['done'] })).toEqual({ stages: ['done'] });
+    expect(parseUpdateWorkItem({ url: null })).toBeNull();
+  });
+});
+
+describe('GET /web/factory/projects/:id/work-items/:workItemId/session-repository', () => {
+  async function createItem() {
+    const res = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody());
+    return (await res.json()).workItem as { id: string };
+  }
+
+  const ask = (
+    sessionRepository: WorkItemRoutesDeps['sessionRepository'],
+    path: string,
+    user: typeof orgUser = orgUser,
+  ) => buildApp(user, undefined, undefined, undefined, sessionRepository).request(path);
+
+  it('sends the repository the server files a session under, without the unnamed candidates', async () => {
+    const item = await createItem();
+    const sessionRepository = vi.fn(async () => ({
+      status: 'resolved' as const,
+      projectRepositoryId: 'link-1',
+      slug: 'acme/app',
+      unnamed: { repositories: ['acme/app', 'acme/web'] },
+    }));
+    const res = await ask(
+      sessionRepository,
+      `/web/factory/projects/${PROJECT_ID}/work-items/${item.id}/session-repository`,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: 'resolved', projectRepositoryId: 'link-1', slug: 'acme/app' });
+    expect(sessionRepository).toHaveBeenCalledWith(
+      expect.objectContaining({
+        orgId: 'org1',
+        factoryProjectId: PROJECT_ID,
+        item: expect.objectContaining({ id: item.id }),
+      }),
+    );
+  });
+
+  it('sends why a card has no repository', async () => {
+    const item = await createItem();
+    const hint = 'Source-control repository 1 is not linked to this Factory.';
+    const res = await ask(
+      async () => ({ status: 'unlinked', hint }),
+      `/web/factory/projects/${PROJECT_ID}/work-items/${item.id}/session-repository`,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: 'unlinked', hint });
+  });
+
+  it('404s for a card of another project or org without resolving it', async () => {
+    const item = await createItem();
+    const homeProject = PROJECT_ID;
+    const sessionRepository = vi.fn();
+    await seedProject('org1');
+    const otherProject = await ask(
+      sessionRepository,
+      `/web/factory/projects/${PROJECT_ID}/work-items/${item.id}/session-repository`,
+    );
+    expect(otherProject.status).toBe(404);
+    const otherOrg = await ask(
+      sessionRepository,
+      `/web/factory/projects/${homeProject}/work-items/${item.id}/session-repository`,
+      { workosId: 'u9', organizationId: 'org2' },
+    );
+    expect(otherOrg.status).toBe(404);
+    expect(sessionRepository).not.toHaveBeenCalled();
+  });
+});

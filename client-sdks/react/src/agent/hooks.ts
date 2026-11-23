@@ -1,43 +1,220 @@
-import type { UIMessage } from '@ai-sdk/react';
 import { v4 as uuid } from '@lukeed/uuid';
 import { MastraClient } from '@mastra/client-js';
+import type { SendAgentSignalParams } from '@mastra/client-js';
+import type { AIV5Type, MastraDBMessage, MastraToolInvocationPart } from '@mastra/core/agent/message-list';
+import { AIV5Adapter } from '@mastra/core/agent/message-list';
 import type { CoreUserMessage } from '@mastra/core/llm';
 import type { TracingOptions } from '@mastra/core/observability';
 import type { RequestContext } from '@mastra/core/request-context';
-import type { ChunkType, NetworkChunkType } from '@mastra/core/stream';
+import type { TaskItem } from '@mastra/core/signals';
+import type { ChunkType, DataChunkType, NetworkChunkType, ThreadRunStatusChunk } from '@mastra/core/stream';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { MastraUIMessage } from '../lib/ai-sdk';
-import { finishStreamingAssistantMessage, toUIMessage } from '../lib/ai-sdk';
-import { resolveInitialMessages } from '../lib/ai-sdk/memory/resolveInitialMessages';
-import { AISdkNetworkTransformer } from '../lib/ai-sdk/transformers/AISdkNetworkTransformer';
-import { fromCoreUserMessageToUIMessage } from '../lib/ai-sdk/utils/fromCoreUserMessageToUIMessage';
+import {
+  accumulateChunk,
+  accumulateNetworkChunk,
+  CLIENT_MESSAGE_ID_KEY,
+  finishStreamingAssistantMessage,
+  fromCoreUserMessagesToMastraDBMessage,
+} from '../lib/mastra-db';
+import type { MastraDBMessageMetadata } from '../lib/mastra-db';
 import { useMastraClient } from '../mastra-client-context';
+import {
+  extractLatestTasksFromMessages,
+  extractTasksFromSignalChunk,
+  extractTasksFromToolResultChunk,
+} from './extract-tasks';
 import { extractRunIdFromMessages } from './extractRunIdFromMessages';
+import { mergeHistoryIntoConversation } from './merge-history';
 import { convertSignalDataToBase64String } from './signal-data';
-import type { ModelSettings } from './types';
+import type { ClientToolsInput, ClientToolsResolver, ModelSettings } from './types';
+import { createUserMessage } from './user-message';
 
-type ToolsInput = any;
+const extractPendingToolApprovalIdsFromMessages = (messages: MastraDBMessage[], runId?: string) => {
+  const pendingToolApprovalIds = new Set<string>();
+
+  for (const message of messages) {
+    const metadata = message.content?.metadata as MastraDBMessageMetadata | undefined;
+    if (!metadata) continue;
+
+    const metadataSources = [
+      metadata.pendingToolApprovals,
+      metadata.requireApprovalMetadata,
+      metadata.suspendedTools,
+    ] as Array<Record<string, { toolCallId?: unknown; runId?: unknown }> | undefined>;
+
+    for (const source of metadataSources) {
+      if (!source || typeof source !== 'object') continue;
+
+      for (const suspensionData of Object.values(source)) {
+        if (runId && suspensionData?.runId !== runId) continue;
+        const toolCallId = suspensionData?.toolCallId;
+        if (typeof toolCallId === 'string' && toolCallId.length > 0) {
+          pendingToolApprovalIds.add(toolCallId);
+        }
+      }
+    }
+  }
+
+  return pendingToolApprovalIds;
+};
+
+const toolCallHasOutput = (parts: MastraDBMessage['content']['parts'], toolCallId: string): boolean =>
+  parts.some(part => {
+    if (part.type !== 'tool-invocation') return false;
+    const invocation = (part as MastraToolInvocationPart).toolInvocation;
+    if (invocation.toolCallId !== toolCallId) return false;
+    return invocation.state === 'result' || (invocation as { result?: unknown }).result != null;
+  });
+
+const filterUnresolvedApprovals = <T extends { toolCallId: string }>(
+  entries: Record<string, T> | undefined,
+  parts: MastraDBMessage['content']['parts'],
+): Record<string, T> | undefined => {
+  if (!entries || typeof entries !== 'object') return undefined;
+  const pending = Object.fromEntries(
+    Object.entries(entries).filter(
+      ([, approval]) =>
+        approval &&
+        typeof approval === 'object' &&
+        typeof approval.toolCallId === 'string' &&
+        !toolCallHasOutput(parts, approval.toolCallId),
+    ),
+  );
+  return Object.keys(pending).length ? pending : undefined;
+};
+
+/**
+ * Normalize persisted initial messages back into the stream-friendly shape the
+ * UI renders from. Mirrors `main`'s `resolveInitialMessages`:
+ *
+ * - Converts persisted `pendingToolApprovals` (DB shape) into
+ *   `requireApprovalMetadata` (stream shape) so reloaded threads still render
+ *   approve/decline buttons, filtering out approvals whose tool already
+ *   produced output, and marks the message `mode: 'stream'`.
+ * - Drops assistant completion messages flagged `suppressFeedback`, which are
+ *   persisted by the supervisor agent but must stay hidden on reload.
+ */
+const resolveInitialMessages = (messages: MastraDBMessage[]): MastraDBMessage[] =>
+  messages
+    .filter(message => {
+      const metadata = message.content?.metadata as MastraDBMessageMetadata | undefined;
+      if (metadata?.completionResult?.suppressFeedback || metadata?.isTaskCompleteResult?.suppressFeedback) {
+        return false;
+      }
+      return true;
+    })
+    .map(message => {
+      const metadata = message.content?.metadata as MastraDBMessageMetadata | undefined;
+
+      // A persisted/refetched thread must never show a stuck "sending" bubble
+      // and must never carry the optimistic correlation key: the pending status
+      // and its `clientMessageId` are transient UI state. The `clientMessageId`
+      // can survive into storage (it is sent to the server with the message), so
+      // strip it on every reload regardless of pending status; the rendered row
+      // key falls back to the stable server `id`.
+      const normalizedMessage =
+        metadata && (metadata.status === 'pending' || CLIENT_MESSAGE_ID_KEY in metadata)
+          ? (() => {
+              const { [CLIENT_MESSAGE_ID_KEY]: _omitClientMessageId, ...rest } = metadata;
+              const { status: _omitStatus, ...restWithoutStatus } = rest;
+              return {
+                ...message,
+                content: {
+                  ...message.content,
+                  metadata: metadata.status === 'pending' ? restWithoutStatus : rest,
+                },
+              };
+            })()
+          : message;
+
+      const normalizedMetadata = normalizedMessage.content?.metadata as MastraDBMessageMetadata | undefined;
+      if (
+        !normalizedMetadata?.pendingToolApprovals &&
+        !normalizedMetadata?.requireApprovalMetadata &&
+        !normalizedMetadata?.suspendedTools
+      ) {
+        return normalizedMessage;
+      }
+
+      const { pendingToolApprovals, requireApprovalMetadata, suspendedTools, ...restMetadata } = normalizedMetadata;
+      const parts = normalizedMessage.content.parts;
+      const pending = filterUnresolvedApprovals(pendingToolApprovals, parts);
+      const required = { ...filterUnresolvedApprovals(requireApprovalMetadata, parts), ...pending };
+      const suspended = filterUnresolvedApprovals(suspendedTools, parts);
+
+      return {
+        ...normalizedMessage,
+        content: {
+          ...normalizedMessage.content,
+          metadata: {
+            ...restMetadata,
+            ...(pendingToolApprovals ? { mode: 'stream' as const } : {}),
+            ...(pending ? { pendingToolApprovals: pending } : {}),
+            ...(Object.keys(required).length ? { requireApprovalMetadata: required } : {}),
+            ...(suspended ? { suspendedTools: suspended } : {}),
+          },
+        },
+      };
+    });
+
+type SignalContinuationOptions = {
+  model?: string;
+  maxSteps?: number;
+  modelSettings?: {
+    frequencyPenalty?: number;
+    presencePenalty?: number;
+    maxRetries?: number;
+    maxOutputTokens?: number;
+    temperature?: number;
+    topK?: number;
+    topP?: number;
+  };
+  instructions?: ModelSettings['instructions'];
+  system?: ModelSettings['system'];
+  providerOptions?: ModelSettings['providerOptions'];
+  requireToolApproval?: boolean;
+  tracingOptions?: TracingOptions;
+};
+
+type ActiveContinuation = {
+  model?: string;
+  requestContext?: RequestContext;
+};
 
 export interface MastraChatProps {
   agentId: string;
   resourceId?: string;
   threadId?: string;
-  initialMessages?: MastraUIMessage[];
+  initialMessages?: MastraDBMessage[];
   /** Persistent request context used for tool approval/decline calls (e.g. agentVersionId). */
   requestContext?: RequestContext;
+  /**
+   * Client-side tool definitions. Forwarded once to `subscribeToThread` so
+   * the client-js subscription drives the full client-tool execution loop
+   * (execute, emit tool-result, continuation) without any logic in React.
+   */
+  clientTools?: ClientToolsInput;
   onSignalSent?: (signalId: string, preview: string) => void;
   onSignalEcho?: (signalId: string) => void;
   onThreadSignalsUnsupported?: () => void;
   /**
-   * Opt into the agent-signals streaming path (sendSignal + subscribeToThread).
-   * Defaults to `false` so consumers stay on the legacy `streamUntilIdle` route
-   * unless they explicitly enable the signals path.
+   * Use the agent-signals streaming path (sendSignal + subscribeToThread).
+   * Defaults to `false`; set to `true` to opt into thread signals.
    */
   enableThreadSignals?: boolean;
+  /** Override the legacy stream route for editor-owned hidden agents. */
+  streamPath?: string;
+  /**
+   * Load stored thread messages through the thread subscription instead of
+   * `initialMessages`. The subscription sends them as one `thread-history`
+   * chunk and skips run parts already covered by it. Requires thread signals.
+   */
+  withInitialHistory?: boolean | { perPage?: number };
 }
 
 interface SharedArgs {
   coreUserMessages: CoreUserMessage[];
+  model?: string;
   requestContext?: RequestContext;
   threadId?: string;
   modelSettings?: ModelSettings;
@@ -45,7 +222,20 @@ interface SharedArgs {
   tracingOptions?: TracingOptions;
 }
 
-export type SendMessageArgs = { message: string; coreUserMessages?: CoreUserMessage[] } & (
+/** JSON-serializable metadata attached to a user message sent through `useChat`. */
+export type UserMessageMetadata = NonNullable<SendAgentSignalParams['signal']['metadata']>;
+
+export type SendMessageArgs = {
+  message: string;
+  coreUserMessages?: CoreUserMessage[];
+  /**
+   * Custom metadata for the user message. It is merged into the optimistic
+   * message's `content.metadata` and, on the thread-signals path, sent with the
+   * outgoing message. Internal keys (`mode`, `status`, `clientMessageId`) take
+   * precedence over user-supplied values.
+   */
+  metadata?: UserMessageMetadata;
+} & (
   | ({ mode: 'generate' } & Omit<GenerateArgs, 'coreUserMessages'>)
   | ({ mode: 'stream' } & Omit<StreamArgs, 'coreUserMessages'>)
   | ({ mode: 'network' } & Omit<NetworkArgs, 'coreUserMessages'>)
@@ -53,29 +243,78 @@ export type SendMessageArgs = { message: string; coreUserMessages?: CoreUserMess
 );
 
 export type GenerateArgs = SharedArgs & {
-  onFinish?: (messages: UIMessage[]) => Promise<void>;
-  clientTools?: ToolsInput;
+  onFinish?: (messages: MastraDBMessage[]) => Promise<void>;
+  clientTools?: ClientToolsInput;
+  clientToolsResolver?: ClientToolsResolver;
 };
 
 export type StreamArgs = SharedArgs & {
   onChunk?: (chunk: ChunkType) => Promise<void>;
-  clientTools?: ToolsInput;
+  clientTools?: ClientToolsInput;
+  clientToolsResolver?: ClientToolsResolver;
   signalId?: string;
+  /**
+   * Client-generated correlation id stamped on the optimistic pending bubble
+   * and the outgoing message metadata so the server echo can reconcile them.
+   */
+  clientMessageId?: string;
+  /** Custom user-message metadata sent alongside the thread signal. */
+  metadata?: UserMessageMetadata;
 };
 
 export type NetworkArgs = SharedArgs & {
   onNetworkChunk?: (chunk: NetworkChunkType) => Promise<void>;
 };
 
+const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null;
+
+const getErrorName = (error: unknown) => (isObject(error) && typeof error.name === 'string' ? error.name : undefined);
+
+const isAbortError = (error: unknown) => getErrorName(error) === 'AbortError';
+
 const isThreadSignalUnsupportedError = (error: unknown) => {
-  const candidate = error as { status?: number; message?: string; body?: unknown } | undefined;
-  const status = candidate?.status;
+  if (!isObject(error)) return false;
+
+  const status = error.status;
   if (status === 404 || status === 405 || status === 501) {
     return true;
   }
 
-  return status === 400 && candidate?.message?.includes('No active agent run found for signal target');
+  return (
+    status === 400 &&
+    typeof error.message === 'string' &&
+    error.message.includes('No active agent run found for signal target')
+  );
 };
+
+type DataChunk = Extract<ChunkType, DataChunkType>;
+
+const isDataChunk = (chunk: ChunkType): chunk is DataChunk =>
+  typeof chunk.type === 'string' && chunk.type.startsWith('data-');
+
+/**
+ * Convert AI-SDK v5 UIMessages returned by the server (generate mode) into
+ * `MastraDBMessage[]`, stamping the supplied metadata onto each message's
+ * `content.metadata`. Private helper — `useChat` never exposes the AI-SDK
+ * shape to consumers.
+ */
+const dbFromServerUiMessages = (
+  uiMessages: AIV5Type.UIMessage[],
+  metadata: MastraDBMessageMetadata,
+): MastraDBMessage[] =>
+  uiMessages.map(uiMsg => {
+    const dbMsg = AIV5Adapter.fromUIMessage(uiMsg);
+    return {
+      ...dbMsg,
+      content: {
+        ...dbMsg.content,
+        metadata: {
+          ...(dbMsg.content.metadata ?? {}),
+          ...metadata,
+        },
+      },
+    };
+  });
 
 export const useChat = ({
   agentId,
@@ -83,46 +322,133 @@ export const useChat = ({
   threadId,
   initialMessages,
   requestContext: propsRequestContext,
+  clientTools: hookClientTools,
   onSignalSent,
   onSignalEcho,
   onThreadSignalsUnsupported,
   enableThreadSignals = false,
+  streamPath,
+  withInitialHistory,
 }: MastraChatProps) => {
   const threadSignalsDisabled = enableThreadSignals === false;
   const _currentRunId = useRef<string | undefined>(undefined);
   const _onChunk = useRef<((chunk: ChunkType) => Promise<void>) | undefined>(undefined);
   const _networkRunId = useRef<string | undefined>(undefined);
   const _onNetworkChunk = useRef<((chunk: NetworkChunkType) => Promise<void>) | undefined>(undefined);
-  const _requestContext = useRef<RequestContext | undefined>(propsRequestContext);
-  // Tracks the active streamUntilIdle request so a subsequent stream() call can
-  // abort the previous one. Without this, a still-open prior stream keeps its
-  // background-task pubsub subscription alive and fans events into a second
+  const _activeContinuation = useRef<ActiveContinuation>({ requestContext: propsRequestContext });
+  // Tracks the active stream (untilIdle) request so a subsequent stream() call
+  // can abort the previous one. Without this, a still-open prior stream keeps
+  // its background-task pubsub subscription alive and fans events into a second
   // concurrent UI consumer, producing duplicate bg-task events and duplicate
   // continuation turns on the server.
   const _streamAbortRef = useRef<AbortController | null>(null);
   const _threadSubscriptionAbortRef = useRef<AbortController | null>(null);
+  const _threadSubscriptionRef = useRef<{ abort?: () => Promise<boolean> | boolean; unsubscribe?: () => void } | null>(
+    null,
+  );
   const _threadSubscriptionKeyRef = useRef<string | undefined>(undefined);
   const _threadSubscriptionPromiseRef = useRef<Promise<void> | null>(null);
   const _threadSignalsUnsupportedRef = useRef(false);
-  const [messages, setMessages] = useState<MastraUIMessage[]>([]);
+  const [messages, setMessages] = useState<MastraDBMessage[]>([]);
+  const [tasks, setTasks] = useState<TaskItem[]>([]);
+  const liveTasks = useRef<TaskItem[] | undefined>(undefined);
   const [toolCallApprovals, setToolCallApprovals] = useState<{
     [toolCallId: string]: { status: 'approved' | 'declined' };
   }>({});
   const [networkToolCallApprovals, setNetworkToolCallApprovals] = useState<{
     [toolName: string]: { status: 'approved' | 'declined' };
   }>({});
+  const pendingToolApprovalIdsRef = useRef(new Set<string>());
+  const liveApprovalIds = useRef(new Set<string>());
+  const liveRunId = useRef<string | undefined>(undefined);
+  const liveRunFinished = useRef(false);
+  const pendingRunStatuses = useRef<Map<string, ThreadRunStatusChunk> | undefined>(undefined);
+  const [isAwaitingToolApproval, setIsAwaitingToolApproval] = useState(false);
 
   const baseClient = useMastraClient();
   const [isRunning, setIsRunning] = useState(false);
+  const [subscriptionHistory, setSubscriptionHistory] = useState<
+    { key: string; messages: MastraDBMessage[] } | undefined
+  >(undefined);
+  // `hasMore` from the initial `thread-history` chunk, keyed by the subscription
+  // that delivered it so a stale page never describes a different thread or config.
+  const [subscriptionPagination, setSubscriptionPagination] = useState<
+    { key: string; pagination: { hasMore: boolean } } | undefined
+  >(undefined);
+  const historyKey = `${agentId}:${resourceId ?? ''}:${threadId ?? ''}`;
+  const historyConfigKey = !withInitialHistory
+    ? ''
+    : withInitialHistory === true
+      ? 'history'
+      : `history:${withInitialHistory.perPage ?? ''}`;
+  const initialHistoryPagination: { hasMore: boolean } | undefined =
+    withInitialHistory &&
+    !threadSignalsDisabled &&
+    threadId &&
+    subscriptionPagination?.key ===
+      `${agentId}:${resourceId || agentId}:${threadId}:${streamPath ?? ''}:${historyConfigKey}`
+      ? subscriptionPagination.pagination
+      : undefined;
+  const hydratedMessages =
+    withInitialHistory && subscriptionHistory?.key === historyKey ? subscriptionHistory.messages : initialMessages;
+
+  const lastHydration = useRef<
+    | {
+        agentId: string;
+        resourceId?: string;
+        threadId?: string;
+        initialMessages: MastraChatProps['initialMessages'];
+        formattedMessages: MastraDBMessage[];
+      }
+    | undefined
+  >(undefined);
 
   useEffect(() => {
-    const formattedMessages = resolveInitialMessages(initialMessages || []);
-    setMessages(formattedMessages);
-    _currentRunId.current = extractRunIdFromMessages(formattedMessages);
-  }, [initialMessages]);
+    const previous = lastHydration.current;
+    const sameThread =
+      previous?.agentId === agentId && previous.resourceId === resourceId && previous.threadId === threadId;
+    if (sameThread && previous.initialMessages === hydratedMessages) return;
+    const formattedMessages = resolveInitialMessages(hydratedMessages ?? []);
+    lastHydration.current = { agentId, resourceId, threadId, initialMessages: hydratedMessages, formattedMessages };
+
+    if (sameThread) {
+      setMessages(current =>
+        mergeHistoryIntoConversation({
+          conversation: current,
+          history: formattedMessages,
+          previousHistory: previous.formattedMessages,
+        }),
+      );
+      setTasks(liveTasks.current ?? extractLatestTasksFromMessages(formattedMessages));
+      // History may arrive before the live approval event, but must not undo
+      // a live approval decision or terminal event, nor switch the active run.
+      const historyRunId = extractRunIdFromMessages(formattedMessages);
+      if (liveRunFinished.current) return;
+      if (!liveRunId.current && isRunning && historyRunId !== _currentRunId.current) return;
+    } else {
+      liveTasks.current = undefined;
+      liveApprovalIds.current.clear();
+      liveRunId.current = undefined;
+      liveRunFinished.current = false;
+      if (previous) setIsRunning(false);
+      setMessages(formattedMessages);
+      setTasks(extractLatestTasksFromMessages(formattedMessages));
+    }
+    const pendingApprovals = extractPendingToolApprovalIdsFromMessages(formattedMessages, liveRunId.current);
+    for (const toolCallId of liveApprovalIds.current) {
+      if (pendingToolApprovalIdsRef.current.has(toolCallId)) pendingApprovals.add(toolCallId);
+      else pendingApprovals.delete(toolCallId);
+    }
+    pendingToolApprovalIdsRef.current = pendingApprovals;
+    setIsAwaitingToolApproval(pendingApprovals.size > 0);
+    _currentRunId.current = liveRunId.current ?? extractRunIdFromMessages(formattedMessages);
+  }, [agentId, resourceId, threadId, hydratedMessages, isRunning, isAwaitingToolApproval]);
 
   useEffect(() => {
-    _requestContext.current = propsRequestContext;
+    _activeContinuation.current = {
+      ..._activeContinuation.current,
+      requestContext: propsRequestContext,
+    };
   }, [propsRequestContext]);
 
   type SignalContentPart =
@@ -193,28 +519,102 @@ export const useChat = ({
   };
 
   const closeThreadSubscription = useCallback(() => {
-    _threadSubscriptionAbortRef.current?.abort();
+    const subscription = _threadSubscriptionRef.current;
+    if (subscription?.unsubscribe) {
+      subscription.unsubscribe();
+    } else {
+      _threadSubscriptionAbortRef.current?.abort();
+    }
+    _threadSubscriptionRef.current = null;
     _threadSubscriptionAbortRef.current = null;
     _threadSubscriptionKeyRef.current = undefined;
     _threadSubscriptionPromiseRef.current = null;
+    setSubscriptionPagination(undefined);
   }, []);
 
   const processStreamChunk = useCallback(
     async (chunk: ChunkType, onChunk?: (chunk: ChunkType) => Promise<void>) => {
-      setMessages(prev => toUIMessage({ chunk, conversation: prev, metadata: { mode: 'stream' } }));
+      const isTerminal = chunk.type === 'finish' || chunk.type === 'abort' || chunk.type === 'error';
+      // A delayed terminal event must not finish another run's message, clear
+      // its approvals, or trigger its completion callback.
+      if (isTerminal && liveRunId.current && chunk.runId !== liveRunId.current) return;
+      const runId = 'runId' in chunk && typeof chunk.runId === 'string' ? chunk.runId : undefined;
+      setMessages(prev => {
+        const metadata = { mode: 'stream' as const, runId };
+        const next = accumulateChunk({ chunk, conversation: prev, metadata });
+        // A resumed response can already exist in history; explicit framing
+        // establishes ownership even when the accumulator deduplicates it.
+        if ((chunk.type === 'start' || chunk.type === 'step-start') && chunk.payload?.messageId && runId) {
+          return next.map(message =>
+            message.id === chunk.payload.messageId && message.role === 'assistant'
+              ? { ...message, content: { ...message.content, metadata: { ...message.content.metadata, ...metadata } } }
+              : message,
+          );
+        }
+        return next;
+      });
 
-      if (chunk.type === 'data-user-message' && 'data' in chunk && typeof chunk.data?.id === 'string') {
+      const streamedTasks = extractTasksFromToolResultChunk(chunk) ?? extractTasksFromSignalChunk(chunk);
+      if (streamedTasks !== undefined) {
+        liveTasks.current = streamedTasks;
+        setTasks(streamedTasks);
+      }
+
+      if (
+        chunk.type === 'data-user-message' &&
+        isDataChunk(chunk) &&
+        (chunk.data?.type === 'user-message' || chunk.data?.type === 'user') &&
+        typeof chunk.data?.id === 'string'
+      ) {
         onSignalEcho?.(chunk.data.id);
       }
 
       if (chunk.type === 'start') {
         setIsRunning(true);
         if ('runId' in chunk && typeof chunk.runId === 'string') {
+          if (liveRunId.current !== chunk.runId) liveApprovalIds.current.clear();
+          liveRunFinished.current = false;
+          liveRunId.current = chunk.runId;
           _currentRunId.current = chunk.runId;
         }
       }
 
-      if (chunk.type === 'finish' || chunk.type === 'abort' || chunk.type === 'error') {
+      if (chunk.type === 'tool-call-approval' || chunk.type === 'tool-call-suspended') {
+        const toolCallId = chunk.payload?.toolCallId;
+        if (typeof toolCallId === 'string') {
+          liveApprovalIds.current.add(toolCallId);
+          pendingToolApprovalIdsRef.current.add(toolCallId);
+          setIsAwaitingToolApproval(true);
+        }
+        // Some runs (e.g. Inngest durable agents) emit no `start` chunk, so the
+        // approval chunk is the only place the run ID reaches the client.
+        if (runId) {
+          if (!liveRunId.current || liveRunFinished.current) {
+            liveRunId.current = runId;
+            liveRunFinished.current = false;
+          }
+          if (liveRunId.current === runId) {
+            _currentRunId.current = runId;
+          }
+        }
+        setIsRunning(false);
+      }
+
+      if (chunk.type === 'tool-call-resumed') {
+        const toolCallId = chunk.payload?.toolCallId;
+        if (typeof toolCallId === 'string') {
+          // Keep it as a live decision so stale hydrated history can't re-mark it pending.
+          liveApprovalIds.current.add(toolCallId);
+          pendingToolApprovalIdsRef.current.delete(toolCallId);
+          setIsAwaitingToolApproval(pendingToolApprovalIdsRef.current.size > 0);
+        }
+      }
+
+      if (isTerminal) {
+        if (chunk.runId === liveRunId.current) liveRunFinished.current = true;
+        for (const toolCallId of pendingToolApprovalIdsRef.current) liveApprovalIds.current.add(toolCallId);
+        pendingToolApprovalIdsRef.current.clear();
+        setIsAwaitingToolApproval(false);
         setIsRunning(false);
       }
 
@@ -225,56 +625,124 @@ export const useChat = ({
 
   const ensureThreadSubscription = useCallback(
     async ({ threadId, resourceId }: { threadId: string; resourceId?: string }) => {
-      const subscriptionKey = `${agentId}:${resourceId ?? ''}:${threadId}`;
+      const subscriptionKey = `${agentId}:${resourceId ?? ''}:${threadId}:${streamPath ?? ''}:${historyConfigKey}`;
       if (_threadSubscriptionKeyRef.current === subscriptionKey && _threadSubscriptionPromiseRef.current) {
         await _threadSubscriptionPromiseRef.current;
         return;
       }
 
-      _threadSubscriptionAbortRef.current?.abort();
+      closeThreadSubscription();
       const subscriptionAbort = new AbortController();
       _threadSubscriptionAbortRef.current = subscriptionAbort;
       _threadSubscriptionKeyRef.current = subscriptionKey;
+
+      // Release the cached subscription state, but only while this attempt
+      // still owns it — a newer attempt cleans up after itself.
+      const releaseSubscriptionRefs = () => {
+        if (_threadSubscriptionAbortRef.current !== subscriptionAbort) return;
+        _threadSubscriptionRef.current = null;
+        _threadSubscriptionAbortRef.current = null;
+        _threadSubscriptionKeyRef.current = undefined;
+        _threadSubscriptionPromiseRef.current = null;
+        setSubscriptionPagination(undefined);
+      };
 
       const clientWithAbort = new MastraClient({
         ...baseClient!.options,
         abortSignal: subscriptionAbort.signal,
       });
-      const subscriptionAgent = clientWithAbort.getAgent(agentId);
+      const subscriptionAgent = clientWithAbort.getAgent(agentId, undefined, { stream: streamPath });
 
       _threadSubscriptionPromiseRef.current = subscriptionAgent
-        .subscribeToThread({ resourceId, threadId })
+        .subscribeToThread({
+          resourceId,
+          threadId,
+          withRunStatus: true,
+          ...(withInitialHistory ? { withInitialHistory } : {}),
+        })
         .then(response => {
-          void response
+          const subscription = response;
+          if (_threadSubscriptionAbortRef.current !== subscriptionAbort) {
+            subscription.unsubscribe();
+            return;
+          }
+
+          _threadSubscriptionRef.current = subscription;
+          void subscription
             .processDataStream({
-              onChunk: chunk => processStreamChunk(chunk),
+              onChunk: chunk => {
+                if (chunk.type === 'thread-history') {
+                  if (_threadSubscriptionAbortRef.current === subscriptionAbort) {
+                    const { hasMore, activeRunId } = chunk.payload;
+                    if (
+                      activeRunId &&
+                      activeRunId !== liveRunId.current &&
+                      (!liveRunId.current || liveRunFinished.current)
+                    ) {
+                      liveRunId.current = activeRunId;
+                      liveRunFinished.current = false;
+                      _currentRunId.current = activeRunId;
+                      setIsRunning(pendingToolApprovalIdsRef.current.size === 0);
+                    }
+                    setSubscriptionPagination(
+                      typeof hasMore === 'boolean' ? { key: subscriptionKey, pagination: { hasMore } } : undefined,
+                    );
+                  }
+                  // Merge history into `messages` now, as a queued update, so the
+                  // live chunks right behind it accumulate onto the stored parts.
+                  const history = resolveInitialMessages(chunk.payload.messages);
+                  const previousHistory = lastHydration.current?.formattedMessages ?? [];
+                  setMessages(current =>
+                    mergeHistoryIntoConversation({ conversation: current, history, previousHistory }),
+                  );
+                  setSubscriptionHistory({
+                    key: `${agentId}:${resourceId ?? ''}:${threadId}`,
+                    messages: chunk.payload.messages,
+                  });
+                  return;
+                }
+                if (chunk.type === 'thread-run-status') {
+                  if (chunk.runId !== liveRunId.current) {
+                    pendingRunStatuses.current?.set(chunk.runId, chunk);
+                    return;
+                  }
+                  setIsRunning(false);
+                  if (chunk.payload.status !== 'suspended') {
+                    liveRunFinished.current = true;
+                    for (const toolCallId of pendingToolApprovalIdsRef.current) liveApprovalIds.current.add(toolCallId);
+                    pendingToolApprovalIdsRef.current.clear();
+                    setIsAwaitingToolApproval(false);
+                  }
+                  return;
+                }
+                return processStreamChunk(chunk);
+              },
             })
             .catch(error => {
-              if ((error as { name?: string }).name !== 'AbortError') {
+              if (!isAbortError(error)) {
                 console.error('[useChat] Thread subscription failed', error);
                 setIsRunning(false);
               }
             })
             .finally(() => {
-              if (_threadSubscriptionAbortRef.current === subscriptionAbort) {
-                _threadSubscriptionAbortRef.current = null;
-                _threadSubscriptionKeyRef.current = undefined;
-                _threadSubscriptionPromiseRef.current = null;
+              if (_threadSubscriptionRef.current === subscription) {
+                _threadSubscriptionRef.current = null;
               }
+              releaseSubscriptionRefs();
             });
         })
         .catch(error => {
+          // Release on every failure so the next call retries with a fresh
+          // fetch instead of re-awaiting this rejected promise. Without this,
+          // an aborted mount-time subscribe strands the channel and the reply
+          // never arrives until reload (issue #18768).
+          releaseSubscriptionRefs();
+
           if (isThreadSignalUnsupportedError(error)) {
             markThreadSignalsUnsupported();
-            if (_threadSubscriptionAbortRef.current === subscriptionAbort) {
-              _threadSubscriptionAbortRef.current = null;
-              _threadSubscriptionKeyRef.current = undefined;
-              _threadSubscriptionPromiseRef.current = null;
-            }
             return;
           }
-
-          if ((error as { name?: string }).name !== 'AbortError') {
+          if (!isAbortError(error)) {
             console.error('[useChat] Thread subscription failed', error);
             setIsRunning(false);
           }
@@ -283,7 +751,16 @@ export const useChat = ({
 
       await _threadSubscriptionPromiseRef.current;
     },
-    [agentId, baseClient, markThreadSignalsUnsupported, processStreamChunk],
+    [
+      agentId,
+      baseClient,
+      closeThreadSubscription,
+      historyConfigKey,
+      markThreadSignalsUnsupported,
+      processStreamChunk,
+      streamPath,
+      withInitialHistory,
+    ],
   );
 
   useEffect(() => {
@@ -298,7 +775,7 @@ export const useChat = ({
     }
 
     void ensureThreadSubscription({ threadId, resourceId: resourceId || agentId }).catch(error => {
-      if ((error as { name?: string }).name !== 'AbortError') {
+      if (!isAbortError(error)) {
         console.error('[useChat] Thread subscription failed', error);
       }
     });
@@ -306,6 +783,7 @@ export const useChat = ({
 
   const generate = async ({
     coreUserMessages,
+    model,
     requestContext,
     threadId,
     modelSettings,
@@ -313,6 +791,7 @@ export const useChat = ({
     onFinish,
     tracingOptions,
     clientTools,
+    clientToolsResolver,
   }: GenerateArgs) => {
     const {
       frequencyPenalty,
@@ -323,27 +802,31 @@ export const useChat = ({
       topK,
       topP,
       instructions,
+      system,
       providerOptions,
       maxSteps,
       requireToolApproval,
     } = modelSettings || {};
     const resolvedRequestContext = requestContext ?? propsRequestContext;
-    _requestContext.current = resolvedRequestContext;
+    const resolvedClientTools = clientTools ?? hookClientTools;
+    _activeContinuation.current = {
+      model,
+      requestContext: resolvedRequestContext,
+    };
     setIsRunning(true);
 
-    // Create a new client instance with the abort signal
-    // We can't use useMastraClient hook here, so we'll create the client directly
     const clientWithAbort = new MastraClient({
       ...baseClient!.options,
       abortSignal: signal,
     });
 
-    const agent = clientWithAbort.getAgent(agentId);
+    const agent = clientWithAbort.getAgent(agentId, undefined, { stream: streamPath });
 
     const runId = uuid();
     _currentRunId.current = runId;
 
     const response = await agent.generate(coreUserMessages, {
+      model,
       runId,
       maxSteps,
       modelSettings: {
@@ -356,12 +839,14 @@ export const useChat = ({
         topP,
       },
       instructions,
+      system,
       requestContext: resolvedRequestContext,
       ...(threadId ? { memory: { thread: threadId, resource: resourceId || agentId } } : {}),
-      providerOptions: providerOptions as any,
+      providerOptions,
       tracingOptions,
       requireToolApproval,
-      clientTools,
+      clientTools: resolvedClientTools,
+      clientToolsResolver,
     });
 
     // Check if suspended for tool approval
@@ -370,21 +855,14 @@ export const useChat = ({
 
       // Add uiMessages with requireApprovalMetadata so UI shows approval buttons
       if (response.response?.uiMessages) {
-        const mastraUIMessages: MastraUIMessage[] = (response.response.uiMessages || []).map((message: any) => ({
-          ...message,
-          metadata: {
-            mode: 'generate',
-            requireApprovalMetadata: {
-              [toolName]: {
-                toolCallId,
-                toolName,
-                args,
-              },
-            },
+        const dbMessages = dbFromServerUiMessages(response.response.uiMessages, {
+          mode: 'generate',
+          requireApprovalMetadata: {
+            [toolName]: { toolCallId, toolName, args },
           },
-        }));
+        });
 
-        setMessages(prev => [...prev, ...mastraUIMessages]);
+        setMessages(prev => [...prev, ...dbMessages]);
       }
 
       // Set isRunning to false so approval buttons are enabled
@@ -396,20 +874,15 @@ export const useChat = ({
     setIsRunning(false);
 
     if (response && 'uiMessages' in response.response && response.response.uiMessages) {
-      void onFinish?.(response.response.uiMessages);
-      const mastraUIMessages: MastraUIMessage[] = (response.response.uiMessages || []).map(message => ({
-        ...message,
-        metadata: {
-          mode: 'generate',
-        },
-      }));
-
-      setMessages(prev => [...prev, ...mastraUIMessages]);
+      const dbMessages = dbFromServerUiMessages(response.response.uiMessages, { mode: 'generate' });
+      void onFinish?.(dbMessages);
+      setMessages(prev => [...prev, ...dbMessages]);
     }
   };
 
   const stream = async ({
     coreUserMessages,
+    model,
     requestContext,
     threadId,
     onChunk,
@@ -417,7 +890,10 @@ export const useChat = ({
     signal,
     tracingOptions,
     clientTools,
+    clientToolsResolver,
     signalId,
+    clientMessageId,
+    metadata,
   }: StreamArgs) => {
     const {
       frequencyPenalty,
@@ -428,13 +904,36 @@ export const useChat = ({
       topK,
       topP,
       instructions,
+      system,
       providerOptions,
       maxSteps,
       requireToolApproval,
     } = modelSettings || {};
 
     const resolvedRequestContext = requestContext ?? propsRequestContext;
-    _requestContext.current = resolvedRequestContext;
+    const resolvedClientTools = clientTools ?? hookClientTools;
+    const signalContinuationOptions: SignalContinuationOptions = {
+      model,
+      maxSteps,
+      modelSettings: {
+        frequencyPenalty,
+        presencePenalty,
+        maxRetries,
+        maxOutputTokens: maxTokens,
+        temperature,
+        topK,
+        topP,
+      },
+      instructions,
+      system,
+      providerOptions,
+      requireToolApproval,
+      tracingOptions,
+    };
+    _activeContinuation.current = {
+      model,
+      requestContext: resolvedRequestContext,
+    };
     setIsRunning(true);
 
     _streamAbortRef.current?.abort();
@@ -451,13 +950,40 @@ export const useChat = ({
       abortSignal: internalAbort.signal,
     });
 
-    const agent = clientWithAbort.getAgent(agentId);
+    const agent = clientWithAbort.getAgent(agentId, undefined, { stream: streamPath });
+
+    // Stop (or a newer send) aborts this controller on purpose; that ends the send, it doesn't fail it.
+    // A caller-supplied signal keeps normal fetch semantics and still rejects.
+    const stoppedHere = (error: unknown) => isAbortError(error) && internalAbort.signal.aborted && !signal?.aborted;
+    const releaseRunning = () => {
+      // A newer send owns the running state once it has replaced this controller.
+      if (!_streamAbortRef.current || _streamAbortRef.current === internalAbort) setIsRunning(false);
+    };
+    const settleStopped = () => {
+      releaseRunning();
+      // The server never confirmed this turn, so its optimistic bubble must not stay pending.
+      if (signalId) {
+        setMessages(s => s.filter(m => !(m.id === signalId && m.content.metadata?.status === 'pending')));
+      }
+    };
 
     const streamWithLegacyRoute = async () => {
+      try {
+        await runLegacyRoute();
+      } catch (error) {
+        if (!stoppedHere(error)) throw error;
+        settleStopped();
+      }
+    };
+
+    const runLegacyRoute = async () => {
       const runId = uuid();
-      const response = await agent.streamUntilIdle(coreUserMessages, {
+      _currentRunId.current = runId;
+      const response = await agent.stream(coreUserMessages, {
+        model,
         runId,
         maxSteps,
+        untilIdle: true,
         modelSettings: {
           frequencyPenalty,
           presencePenalty,
@@ -468,12 +994,14 @@ export const useChat = ({
           topP,
         },
         instructions,
+        system,
         requestContext: resolvedRequestContext,
         ...(threadId ? { memory: { thread: threadId, resource: resourceId || agentId } } : {}),
-        providerOptions: providerOptions as any,
+        providerOptions,
         requireToolApproval,
         tracingOptions,
-        clientTools,
+        clientTools: resolvedClientTools,
+        clientToolsResolver,
       });
 
       _onChunk.current = onChunk;
@@ -486,7 +1014,7 @@ export const useChat = ({
       if (_streamAbortRef.current === internalAbort) {
         _streamAbortRef.current = null;
       }
-      setIsRunning(false);
+      releaseRunning();
     };
 
     if (!threadId || _threadSignalsUnsupportedRef.current || threadSignalsDisabled) {
@@ -504,46 +1032,127 @@ export const useChat = ({
     }
 
     const resolvedSignalId = signalId ?? uuid();
-    onSignalSent?.(resolvedSignalId, getSignalPreview(coreUserMessages));
+    const messageContents = getSignalContents(coreUserMessages);
+    // RequestContext serializes to a plain record via its toJSON(), but the class has no
+    // index signature, so it isn't assignable to the generated `Record<string, unknown>` body type.
+    const requestContextRecord = resolvedRequestContext as Record<string, unknown> | undefined;
+    const streamOptions = {
+      model,
+      maxSteps,
+      modelSettings: {
+        frequencyPenalty,
+        presencePenalty,
+        maxRetries,
+        maxOutputTokens: maxTokens,
+        temperature,
+        topK,
+        topP,
+      },
+      instructions,
+      system,
+      requestContext: requestContextRecord,
+      providerOptions: providerOptions as any,
+      requireToolApproval,
+      tracingOptions,
+      clientTools: resolvedClientTools,
+      clientToolsResolver,
+    };
 
+    const liveRunIdBeforeSend = liveRunId.current;
+    // An outcome can reach SSE before the acceptance response supplies its run ID.
+    const earlyRunStatuses = new Map<string, ThreadRunStatusChunk>();
+    pendingRunStatuses.current = earlyRunStatuses;
     try {
-      await agent.sendSignal({
-        signal: {
-          id: resolvedSignalId,
-          type: 'user-message',
-          contents: getSignalContents(coreUserMessages),
-        },
+      const result = await agent.sendMessage({
+        message:
+          clientMessageId || metadata
+            ? {
+                contents: messageContents,
+                metadata: { ...metadata, ...(clientMessageId ? { [CLIENT_MESSAGE_ID_KEY]: clientMessageId } : {}) },
+              }
+            : messageContents,
         resourceId: resourceId || agentId,
         threadId,
         ifIdle: {
           streamOptions: {
-            maxSteps,
-            modelSettings: {
-              frequencyPenalty,
-              presencePenalty,
-              maxRetries,
-              maxOutputTokens: maxTokens,
-              temperature,
-              topK,
-              topP,
-            },
-            instructions,
-            requestContext: resolvedRequestContext,
-            providerOptions: providerOptions as any,
-            requireToolApproval,
-            tracingOptions,
+            ...signalContinuationOptions,
+            requestContext: requestContextRecord,
+            clientTools: resolvedClientTools,
+            clientToolsResolver,
           },
         },
       });
+      // SSE may already have finished this run or moved on while the request was pending.
+      if (
+        _streamAbortRef.current === internalAbort &&
+        liveRunId.current === liveRunIdBeforeSend &&
+        liveRunId.current !== result.runId
+      ) {
+        liveApprovalIds.current.clear();
+        liveRunId.current = result.runId;
+        liveRunFinished.current = false;
+        _currentRunId.current = result.runId;
+        setIsRunning(true);
+        const earlyStatus = earlyRunStatuses.get(result.runId);
+        if (earlyStatus) {
+          setIsRunning(false);
+          if (earlyStatus.payload.status !== 'suspended') {
+            liveRunFinished.current = true;
+            for (const toolCallId of pendingToolApprovalIdsRef.current) liveApprovalIds.current.add(toolCallId);
+            pendingToolApprovalIdsRef.current.clear();
+            setIsAwaitingToolApproval(false);
+          }
+        }
+      }
+      const echoedSignalId =
+        result.signal &&
+        typeof result.signal === 'object' &&
+        'id' in result.signal &&
+        typeof result.signal.id === 'string'
+          ? result.signal.id
+          : resolvedSignalId;
+      onSignalSent?.(echoedSignalId, getSignalPreview(coreUserMessages));
+      if (pendingToolApprovalIdsRef.current.size > 0) {
+        setIsRunning(false);
+      }
     } catch (error) {
-      onSignalEcho?.(resolvedSignalId);
-      if (isThreadSignalUnsupportedError(error)) {
-        markThreadSignalsUnsupported();
-        setMessages(prev => [...prev, ...coreUserMessages.map(fromCoreUserMessageToUIMessage)] as MastraUIMessage[]);
-        await streamWithLegacyRoute();
+      if (stoppedHere(error)) {
+        settleStopped();
         return;
       }
+      if (isThreadSignalUnsupportedError(error)) {
+        try {
+          await agent.sendSignal({
+            signal: {
+              id: resolvedSignalId,
+              type: 'user-message',
+              contents: messageContents,
+              ...(metadata ? { metadata } : {}),
+            },
+            resourceId: resourceId || agentId,
+            threadId,
+            ifIdle: { streamOptions },
+          });
+          onSignalSent?.(resolvedSignalId, getSignalPreview(coreUserMessages));
+          return;
+        } catch (signalError) {
+          onSignalEcho?.(resolvedSignalId);
+          if (stoppedHere(signalError)) {
+            settleStopped();
+            return;
+          }
+          if (isThreadSignalUnsupportedError(signalError)) {
+            markThreadSignalsUnsupported();
+            setMessages(prev => [...prev, fromCoreUserMessagesToMastraDBMessage(coreUserMessages)]);
+            await streamWithLegacyRoute();
+            return;
+          }
+          throw signalError;
+        }
+      }
       throw error;
+    } finally {
+      if (pendingRunStatuses.current === earlyRunStatuses) pendingRunStatuses.current = undefined;
     }
 
     if (_streamAbortRef.current === internalAbort) {
@@ -553,6 +1162,7 @@ export const useChat = ({
 
   const network = async ({
     coreUserMessages,
+    model,
     requestContext,
     threadId,
     onNetworkChunk,
@@ -564,21 +1174,24 @@ export const useChat = ({
       modelSettings || {};
 
     const resolvedRequestContext = requestContext ?? propsRequestContext;
-    _requestContext.current = resolvedRequestContext;
+    _activeContinuation.current = {
+      model,
+      requestContext: resolvedRequestContext,
+    };
     setIsRunning(true);
 
-    // Create a new client instance with the abort signal
-    // We can't use useMastraClient hook here, so we'll create the client directly
     const clientWithAbort = new MastraClient({
       ...baseClient!.options,
       abortSignal: signal,
     });
 
-    const agent = clientWithAbort.getAgent(agentId);
+    const agent = clientWithAbort.getAgent(agentId, undefined, { stream: streamPath });
 
     const runId = uuid();
+    _currentRunId.current = runId;
 
     const response = await agent.network(coreUserMessages, {
+      model,
       maxSteps,
       modelSettings: {
         frequencyPenalty,
@@ -598,34 +1211,77 @@ export const useChat = ({
     _onNetworkChunk.current = onNetworkChunk;
     _networkRunId.current = runId;
 
-    const transformer = new AISdkNetworkTransformer();
-
+    // Accumulate network chunks into `messages` as `MastraDBMessage` (temporary
+    // bridge until the next major), while still forwarding chunks to the
+    // consumer for side-effects (OM, working memory, thread list, errors).
     await response.processDataStream({
       onChunk: async (chunk: NetworkChunkType) => {
-        setMessages(prev => transformer.transform({ chunk, conversation: prev, metadata: { mode: 'network' } }));
+        setMessages(prev =>
+          accumulateNetworkChunk({ chunk, conversation: prev, metadata: { mode: 'network', runId } }),
+        );
         void onNetworkChunk?.(chunk);
       },
     });
 
+    setMessages(prev => finishStreamingAssistantMessage(prev));
     setIsRunning(false);
   };
 
   const handleCancelRun = () => {
-    _streamAbortRef.current?.abort();
-    _streamAbortRef.current = null;
+    const runId = _currentRunId.current;
+    const agent = baseClient?.getAgent(agentId);
+    const threadSubscription = _threadSubscriptionRef.current;
+    const streamAbort = _streamAbortRef.current;
+    const cancellationAbort = new AbortController();
+    const timeout = setTimeout(
+      () => cancellationAbort.abort(new Error('Agent run cancellation was not acknowledged')),
+      10_000,
+    );
+    // Stop execution explicitly: aborting the HTTP request only detaches a durable observer.
+    const cancellation = (async () => {
+      if (agent && runId) {
+        while (true) {
+          cancellationAbort.signal.throwIfAborted();
+          const options = { signal: cancellationAbort.signal };
+          const result = threadId
+            ? await agent.abortThread({ threadId, resourceId: resourceId || agentId, expectedRunId: runId }, options)
+            : await agent.abortRun(runId, options);
+          if (result.aborted) return;
+          // Stop can overtake stream registration. Keep the request alive until cancellation is applied.
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
+      await threadSubscription?.abort?.();
+    })()
+      .catch(error => {
+        // Older servers and non-durable agents still stop when their HTTP request is aborted.
+        if (isObject(error) && (error.status === 404 || error.status === 501)) return;
+        throw error;
+      })
+      .finally(() => {
+        clearTimeout(timeout);
+        streamAbort?.abort();
+        if (_streamAbortRef.current === streamAbort) _streamAbortRef.current = null;
+      });
+    void cancellation.catch(error => console.error('[useChat] Failed to abort agent run', error));
     closeThreadSubscription();
     setMessages(prev => finishStreamingAssistantMessage(prev));
+    liveRunFinished.current = true;
+    pendingToolApprovalIdsRef.current.clear();
+    setIsAwaitingToolApproval(false);
     setIsRunning(false);
     _currentRunId.current = undefined;
     _onChunk.current = undefined;
     _networkRunId.current = undefined;
     _onNetworkChunk.current = undefined;
-    _requestContext.current = undefined;
+    _activeContinuation.current = {};
+    return cancellation;
   };
 
-  const approveToolCall = async (toolCallId: string) => {
+  const approveToolCall = async (toolCallId: string, resumeData?: unknown) => {
     const onChunk = _onChunk.current;
     const currentRunId = _currentRunId.current;
+    const continuation = _activeContinuation.current;
 
     if (!currentRunId)
       return console.info('[approveToolCall] approveToolCall can only be called after a stream has started');
@@ -633,56 +1289,113 @@ export const useChat = ({
     setIsRunning(true);
     setToolCallApprovals(prev => ({ ...prev, [toolCallId]: { status: 'approved' } }));
 
-    const agent = baseClient.getAgent(agentId);
-    const response = await agent.approveToolCall({
-      runId: currentRunId,
-      toolCallId,
-      requestContext: _requestContext.current,
-    });
-
-    if (_threadSubscriptionKeyRef.current) {
+    const agent = baseClient.getAgent(agentId, undefined, { stream: streamPath });
+    if (_threadSubscriptionKeyRef.current && threadId) {
+      try {
+        await agent.sendToolApproval({
+          resourceId: resourceId || agentId,
+          threadId,
+          toolCallId,
+          approved: true,
+          ...(continuation.model !== undefined ? { streamOptions: { model: continuation.model } } : {}),
+          ...(resumeData !== undefined ? { resumeData } : {}),
+          requestContext: continuation.requestContext,
+        });
+        liveRunId.current ??= currentRunId;
+        liveApprovalIds.current.add(toolCallId);
+        pendingToolApprovalIdsRef.current.delete(toolCallId);
+        setIsAwaitingToolApproval(pendingToolApprovalIdsRef.current.size > 0);
+        setIsRunning(false);
+      } catch (error) {
+        setToolCallApprovals(prev => {
+          const next = { ...prev };
+          delete next[toolCallId];
+          return next;
+        });
+        setIsRunning(false);
+        throw error;
+      }
       return;
     }
 
-    await response.processDataStream({
-      onChunk: async (chunk: ChunkType) => {
-        // Without this, React might batch intermediate chunks which would break the message reconstruction over time
+    try {
+      const response =
+        resumeData !== undefined
+          ? await agent.resumeStream(resumeData as Parameters<typeof agent.resumeStream>[0], {
+              runId: currentRunId,
+              toolCallId,
+              ...continuation,
+            })
+          : await agent.approveToolCall({
+              runId: currentRunId,
+              toolCallId,
+              ...continuation,
+            });
 
-        setMessages(prev => toUIMessage({ chunk, conversation: prev, metadata: { mode: 'stream' } }));
-
-        void (onChunk ?? _onChunk.current)?.(chunk);
-      },
-    });
-    setIsRunning(false);
+      await response.processDataStream({
+        onChunk: async (chunk: ChunkType) => {
+          await processStreamChunk(chunk, onChunk);
+        },
+      });
+      setIsRunning(false);
+    } catch (error) {
+      setToolCallApprovals(prev => {
+        const next = { ...prev };
+        delete next[toolCallId];
+        return next;
+      });
+      setIsRunning(false);
+      throw error;
+    }
   };
 
   const declineToolCall = async (toolCallId: string) => {
     const onChunk = _onChunk.current;
     const currentRunId = _currentRunId.current;
+    const continuation = _activeContinuation.current;
 
     if (!currentRunId)
       return console.info('[declineToolCall] declineToolCall can only be called after a stream has started');
 
     setIsRunning(true);
     setToolCallApprovals(prev => ({ ...prev, [toolCallId]: { status: 'declined' } }));
-    const agent = baseClient.getAgent(agentId);
-    const response = await agent.declineToolCall({
-      runId: currentRunId,
-      toolCallId,
-      requestContext: _requestContext.current,
-    });
-
-    if (_threadSubscriptionKeyRef.current) {
+    const agent = baseClient.getAgent(agentId, undefined, { stream: streamPath });
+    if (_threadSubscriptionKeyRef.current && threadId) {
+      try {
+        await agent.sendToolApproval({
+          resourceId: resourceId || agentId,
+          threadId,
+          toolCallId,
+          approved: false,
+          ...(continuation.model !== undefined ? { streamOptions: { model: continuation.model } } : {}),
+          requestContext: continuation.requestContext,
+        });
+        liveRunId.current ??= currentRunId;
+        liveApprovalIds.current.add(toolCallId);
+        pendingToolApprovalIdsRef.current.delete(toolCallId);
+        setIsAwaitingToolApproval(pendingToolApprovalIdsRef.current.size > 0);
+        setIsRunning(false);
+      } catch (error) {
+        setToolCallApprovals(prev => {
+          const next = { ...prev };
+          delete next[toolCallId];
+          return next;
+        });
+        setIsRunning(false);
+        throw error;
+      }
       return;
     }
 
+    const response = await agent.declineToolCall({
+      runId: currentRunId,
+      toolCallId,
+      ...continuation,
+    });
+
     await response.processDataStream({
       onChunk: async (chunk: ChunkType) => {
-        // Without this, React might batch intermediate chunks which would break the message reconstruction over time
-
-        setMessages(prev => toUIMessage({ chunk, conversation: prev, metadata: { mode: 'stream' } }));
-
-        void (onChunk ?? _onChunk.current)?.(chunk);
+        await processStreamChunk(chunk, onChunk);
       },
     });
     setIsRunning(false);
@@ -690,6 +1403,7 @@ export const useChat = ({
 
   const approveToolCallGenerate = async (toolCallId: string) => {
     const currentRunId = _currentRunId.current;
+    const continuation = _activeContinuation.current;
 
     if (!currentRunId)
       return console.info(
@@ -699,22 +1413,16 @@ export const useChat = ({
     setIsRunning(true);
     setToolCallApprovals(prev => ({ ...prev, [toolCallId]: { status: 'approved' } }));
 
-    const agent = baseClient.getAgent(agentId);
+    const agent = baseClient.getAgent(agentId, undefined, { stream: streamPath });
     const response = await agent.approveToolCallGenerate({
       runId: currentRunId,
       toolCallId,
-      requestContext: _requestContext.current,
+      ...continuation,
     });
 
     if (response && 'uiMessages' in response.response && response.response.uiMessages) {
-      const mastraUIMessages: MastraUIMessage[] = (response.response.uiMessages || []).map((message: any) => ({
-        ...message,
-        metadata: {
-          mode: 'generate',
-        },
-      }));
-
-      setMessages(prev => [...prev, ...mastraUIMessages]);
+      const dbMessages = dbFromServerUiMessages(response.response.uiMessages, { mode: 'generate' });
+      setMessages(prev => [...prev, ...dbMessages]);
     }
 
     setIsRunning(false);
@@ -722,6 +1430,7 @@ export const useChat = ({
 
   const declineToolCallGenerate = async (toolCallId: string) => {
     const currentRunId = _currentRunId.current;
+    const continuation = _activeContinuation.current;
 
     if (!currentRunId)
       return console.info(
@@ -731,22 +1440,16 @@ export const useChat = ({
     setIsRunning(true);
     setToolCallApprovals(prev => ({ ...prev, [toolCallId]: { status: 'declined' } }));
 
-    const agent = baseClient.getAgent(agentId);
+    const agent = baseClient.getAgent(agentId, undefined, { stream: streamPath });
     const response = await agent.declineToolCallGenerate({
       runId: currentRunId,
       toolCallId,
-      requestContext: _requestContext.current,
+      ...continuation,
     });
 
     if (response && 'uiMessages' in response.response && response.response.uiMessages) {
-      const mastraUIMessages: MastraUIMessage[] = (response.response.uiMessages || []).map((message: any) => ({
-        ...message,
-        metadata: {
-          mode: 'generate',
-        },
-      }));
-
-      setMessages(prev => [...prev, ...mastraUIMessages]);
+      const dbMessages = dbFromServerUiMessages(response.response.uiMessages, { mode: 'generate' });
+      setMessages(prev => [...prev, ...dbMessages]);
     }
 
     setIsRunning(false);
@@ -755,92 +1458,134 @@ export const useChat = ({
   const approveNetworkToolCall = async (toolName: string, runId?: string) => {
     const onNetworkChunk = _onNetworkChunk.current;
     const networkRunId = runId || _networkRunId.current;
+    const continuation = _activeContinuation.current;
 
     if (!networkRunId)
       return console.info(
         '[approveNetworkToolCall] approveNetworkToolCall can only be called after a network stream has started',
       );
 
+    _currentRunId.current = networkRunId;
     setIsRunning(true);
     setNetworkToolCallApprovals(prev => ({
       ...prev,
       [runId ? `${runId}-${toolName}` : toolName]: { status: 'approved' },
     }));
 
-    const agent = baseClient.getAgent(agentId);
+    const agent = baseClient.getAgent(agentId, undefined, { stream: streamPath });
     const response = await agent.approveNetworkToolCall({
       runId: networkRunId,
-      requestContext: _requestContext.current,
+      ...continuation,
     });
-
-    const transformer = new AISdkNetworkTransformer();
 
     await response.processDataStream({
       onChunk: async (chunk: NetworkChunkType) => {
-        setMessages(prev => transformer.transform({ chunk, conversation: prev, metadata: { mode: 'network' } }));
+        setMessages(prev =>
+          accumulateNetworkChunk({ chunk, conversation: prev, metadata: { mode: 'network', runId: networkRunId } }),
+        );
         void onNetworkChunk?.(chunk);
       },
     });
 
+    setMessages(prev => finishStreamingAssistantMessage(prev));
     setIsRunning(false);
   };
 
   const declineNetworkToolCall = async (toolName: string, runId?: string) => {
     const onNetworkChunk = _onNetworkChunk.current;
     const networkRunId = runId || _networkRunId.current;
+    const continuation = _activeContinuation.current;
 
     if (!networkRunId)
       return console.info(
         '[declineNetworkToolCall] declineNetworkToolCall can only be called after a network stream has started',
       );
 
+    _currentRunId.current = networkRunId;
     setIsRunning(true);
     setNetworkToolCallApprovals(prev => ({
       ...prev,
       [runId ? `${runId}-${toolName}` : toolName]: { status: 'declined' },
     }));
 
-    const agent = baseClient.getAgent(agentId);
+    const agent = baseClient.getAgent(agentId, undefined, { stream: streamPath });
     const response = await agent.declineNetworkToolCall({
       runId: networkRunId,
-      requestContext: _requestContext.current,
+      ...continuation,
     });
-
-    const transformer = new AISdkNetworkTransformer();
 
     await response.processDataStream({
       onChunk: async (chunk: NetworkChunkType) => {
-        setMessages(prev => transformer.transform({ chunk, conversation: prev, metadata: { mode: 'network' } }));
+        setMessages(prev =>
+          accumulateNetworkChunk({ chunk, conversation: prev, metadata: { mode: 'network', runId: networkRunId } }),
+        );
         void onNetworkChunk?.(chunk);
       },
     });
 
+    setMessages(prev => finishStreamingAssistantMessage(prev));
     setIsRunning(false);
   };
 
-  const sendMessage = async ({ mode = 'stream', ...args }: SendMessageArgs) => {
-    const nextMessage: Omit<CoreUserMessage, 'id'> = { role: 'user', content: [{ type: 'text', text: args.message }] };
-    const coreUserMessages = [nextMessage];
+  const sendMessage = async ({ mode = 'stream', metadata: userMetadata, ...args }: SendMessageArgs) => {
+    if (!isRunning && !isAwaitingToolApproval) _currentRunId.current = undefined;
+    const coreUserMessages = [createUserMessage(args.message, args.coreUserMessages)];
 
-    if (args.coreUserMessages) {
-      coreUserMessages.push(...args.coreUserMessages);
-    }
-
-    const uiMessages = coreUserMessages.map(fromCoreUserMessageToUIMessage);
-    const signalId =
+    // Use the same multipart message for the request and optimistic display.
+    // Sending separate attachment messages would persist separate rows on reload.
+    const coreDbUserMessage = fromCoreUserMessagesToMastraDBMessage(coreUserMessages);
+    const dbUserMessage: MastraDBMessage = userMetadata
+      ? {
+          ...coreDbUserMessage,
+          content: {
+            ...coreDbUserMessage.content,
+            metadata: { ...coreDbUserMessage.content.metadata, ...userMetadata },
+          },
+        }
+      : coreDbUserMessage;
+    const clientSetId =
       mode === 'stream' && args.threadId && !_threadSignalsUnsupportedRef.current && !threadSignalsDisabled
-        ? uiMessages[0]?.id
+        ? `client-set-${uuid()}`
         : undefined;
-    if (!signalId) {
-      setMessages(s => [...s, ...uiMessages] as MastraUIMessage[]);
+    const signalId = clientSetId;
+    const clientMessageId = clientSetId;
+
+    if (signalId) {
+      // Signal path: append the user turn optimistically as `pending` with a
+      // visibly client-owned id. The server echo can replace the final message
+      // id while the matching client id reconciles the pending bubble.
+      const metadata: MastraDBMessageMetadata = {
+        ...dbUserMessage.content.metadata,
+        mode: 'stream',
+        status: 'pending',
+        [CLIENT_MESSAGE_ID_KEY]: clientMessageId,
+      };
+      const pendingMessage = { ...dbUserMessage, id: clientSetId, content: { ...dbUserMessage.content, metadata } };
+      setMessages(s => [...s, pendingMessage]);
+    } else {
+      setMessages(s => [...s, dbUserMessage]);
     }
 
-    if (mode === 'generate') {
-      await generate({ ...args, coreUserMessages });
-    } else if (mode === 'stream') {
-      await stream({ ...args, coreUserMessages, signalId });
-    } else if (mode === 'network') {
-      await network({ ...args, coreUserMessages });
+    try {
+      if (mode === 'generate') {
+        await generate({ ...args, coreUserMessages });
+      } else if (mode === 'stream') {
+        await stream({ ...args, coreUserMessages, signalId, clientMessageId, metadata: userMetadata });
+      } else if (mode === 'network') {
+        await network({ ...args, coreUserMessages });
+      }
+    } catch (error) {
+      // A failed send (subscription setup, request, or stream) must not leave
+      // the chat stranded in a "running" state until reload (issue #18768).
+      setIsRunning(false);
+      // Drop the optimistic bubble instead of leaving it pending until reload
+      // (issue #26831). If the server did accept the turn before the response
+      // was lost, the message can still reappear through the live subscription
+      // echo or when the caller reloads thread history.
+      if (signalId) {
+        setMessages(s => s.filter(m => !(m.id === signalId && m.content.metadata?.status === 'pending')));
+      }
+      throw error;
     }
   };
 
@@ -848,7 +1593,17 @@ export const useChat = ({
     setMessages,
     sendMessage,
     isRunning,
+    activeRunId: isRunning || isAwaitingToolApproval ? _currentRunId.current : undefined,
+    isAwaitingToolApproval,
     messages,
+    /**
+     * Pagination of the initial `thread-history` page from `withInitialHistory`:
+     * `hasMore: true` when older messages exist, `false` when the page reached the
+     * start of the thread, and `undefined` while history is disabled, pending, or
+     * the subscription for the current agent/resource/thread/config has ended.
+     */
+    initialHistoryPagination,
+    tasks,
     approveToolCall,
     declineToolCall,
     approveToolCallGenerate,

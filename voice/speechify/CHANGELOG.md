@@ -1,5 +1,215 @@
 # @mastra/voice-speechify
 
+## 0.15.0
+
+### Minor Changes
+
+- Default to Speechify's Simba 3.5 and move to the `@speechify/api` SDK. ([#28513](https://github.com/mastra-ai/mastra/pull/28513))
+
+  `simba-3.5` is Speechify's recommended model: 48 languages on one id, and every catalog voice, cloned voices included, speaks all of them. Pass `language` to choose one; without it the voice's own locale decides. `simba-3.2` and `simba-3.0` stay selectable. `simba-english` and `simba-multilingual` are retired for new workspaces and are served by `simba-3.2` and `simba-3.5` from 2026-11-21.
+
+  ```typescript
+  import { SpeechifyVoice } from '@mastra/voice-speechify';
+
+  const voice = new SpeechifyVoice(); // simba-3.5 with the harper_32 voice
+
+  await voice.speak('Olá, mundo', { language: 'pt-BR' });
+  ```
+
+  - The deprecated `@speechify/api-sdk` is replaced by `@speechify/api`. The `speak()` options are `speaker`, `model`, `language`, `audioFormat` (`mp3`, `ogg`, `aac` or `pcm`), `outputFormat` and `options`; `options` keys now follow the API's snake_case, such as `loudness_normalization`.
+  - `getSpeakers()` reads Speechify's catalog live and reports each voice's name, locale, gender and the models that render it. The bundled voice list is gone: most of its ids no longer existed, and it was missing over nine hundred current voices. `speaker` accepts any catalog id.
+  - Requests carry `Speechify-Caller: mastra` and the package version, so Speechify can warn before a model change reaches Mastra users.
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+## 0.15.0-alpha.1
+
+### Minor Changes
+
+- Default to Speechify's Simba 3.5 and move to the `@speechify/api` SDK. ([#28513](https://github.com/mastra-ai/mastra/pull/28513))
+
+  `simba-3.5` is Speechify's recommended model: 48 languages on one id, and every catalog voice, cloned voices included, speaks all of them. Pass `language` to choose one; without it the voice's own locale decides. `simba-3.2` and `simba-3.0` stay selectable. `simba-english` and `simba-multilingual` are retired for new workspaces and are served by `simba-3.2` and `simba-3.5` from 2026-11-21.
+
+  ```typescript
+  import { SpeechifyVoice } from '@mastra/voice-speechify';
+
+  const voice = new SpeechifyVoice(); // simba-3.5 with the harper_32 voice
+
+  await voice.speak('Olá, mundo', { language: 'pt-BR' });
+  ```
+
+  - The deprecated `@speechify/api-sdk` is replaced by `@speechify/api`. The `speak()` options are `speaker`, `model`, `language`, `audioFormat` (`mp3`, `ogg`, `aac` or `pcm`), `outputFormat` and `options`; `options` keys now follow the API's snake_case, such as `loudness_normalization`.
+  - `getSpeakers()` reads Speechify's catalog live and reports each voice's name, locale, gender and the models that render it. The bundled voice list is gone: most of its ids no longer existed, and it was missing over nine hundred current voices. `speaker` accepts any catalog id.
+  - Requests carry `Speechify-Caller: mastra` and the package version, so Speechify can warn before a model change reaches Mastra users.
+
+## 0.14.3-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+## 0.14.2
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 0.14.2-alpha.0
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 0.14.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 0.14.1-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+## 0.14.1-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 0.14.0
+
+### Minor Changes
+
+- Added support for Speechify's Simba 3.2 and Simba 3.0 text-to-speech models. Simba 3.2 is Speechify's latest streaming model with lower latency and richer expressivity, and is the recommended model for English speech. ([#19411](https://github.com/mastra-ai/mastra/pull/19411))
+
+  ```typescript
+  import { SpeechifyVoice } from '@mastra/voice-speechify';
+
+  // Set as the default model
+  const voice = new SpeechifyVoice({
+    speechModel: { name: 'simba-3.2' },
+  });
+
+  // Or override per request
+  const stream = await voice.speak('Hello world', { model: 'simba-3.2' });
+  ```
+
+  Note: `simba-3.2` and `simba-3.0` are currently English only. The default model remains `simba-english`.
+
+### Patch Changes
+
+- Fixed voice selection for the Simba 3 models. Speechify's `simba-3.2` and `simba-3.0` serve a curated voice set only (`beatrice_32`, `dominic_32`, `edmund_32`, `geffen_32`, `harper_32`, `hugh_32`, `imogen_32`, `wyatt_32`), so pairing them with a classic catalog voice like `george` failed with an API error. ([#19415](https://github.com/mastra-ai/mastra/pull/19415))
+  - Added the curated Simba 3 voices to the voice list, so they type-check as `speaker` and appear in `getSpeakers()`
+  - The default speaker now follows the configured model: `harper_32` for Simba 3 models, `george` otherwise
+
+  ```typescript
+  import { SpeechifyVoice } from '@mastra/voice-speechify';
+
+  // Works out of the box now — defaults to the harper_32 voice
+  const voice = new SpeechifyVoice({
+    speechModel: { name: 'simba-3.2' },
+  });
+
+  // Or pick a curated voice explicitly
+  new SpeechifyVoice({
+    speechModel: { name: 'simba-3.2' },
+    speaker: 'imogen_32',
+  });
+  ```
+
+  When overriding the model per request, pass a matching speaker too: `voice.speak('Hi', { model: 'simba-3.2', speaker: 'harper_32' })`.
+
+## 0.14.0-alpha.0
+
+### Minor Changes
+
+- Added support for Speechify's Simba 3.2 and Simba 3.0 text-to-speech models. Simba 3.2 is Speechify's latest streaming model with lower latency and richer expressivity, and is the recommended model for English speech. ([#19411](https://github.com/mastra-ai/mastra/pull/19411))
+
+  ```typescript
+  import { SpeechifyVoice } from '@mastra/voice-speechify';
+
+  // Set as the default model
+  const voice = new SpeechifyVoice({
+    speechModel: { name: 'simba-3.2' },
+  });
+
+  // Or override per request
+  const stream = await voice.speak('Hello world', { model: 'simba-3.2' });
+  ```
+
+  Note: `simba-3.2` and `simba-3.0` are currently English only. The default model remains `simba-english`.
+
+### Patch Changes
+
+- Fixed voice selection for the Simba 3 models. Speechify's `simba-3.2` and `simba-3.0` serve a curated voice set only (`beatrice_32`, `dominic_32`, `edmund_32`, `geffen_32`, `harper_32`, `hugh_32`, `imogen_32`, `wyatt_32`), so pairing them with a classic catalog voice like `george` failed with an API error. ([#19415](https://github.com/mastra-ai/mastra/pull/19415))
+  - Added the curated Simba 3 voices to the voice list, so they type-check as `speaker` and appear in `getSpeakers()`
+  - The default speaker now follows the configured model: `harper_32` for Simba 3 models, `george` otherwise
+
+  ```typescript
+  import { SpeechifyVoice } from '@mastra/voice-speechify';
+
+  // Works out of the box now — defaults to the harper_32 voice
+  const voice = new SpeechifyVoice({
+    speechModel: { name: 'simba-3.2' },
+  });
+
+  // Or pick a curated voice explicitly
+  new SpeechifyVoice({
+    speechModel: { name: 'simba-3.2' },
+    speaker: 'imogen_32',
+  });
+  ```
+
+  When overriding the model per request, pass a matching speaker too: `voice.speak('Hi', { model: 'simba-3.2', speaker: 'harper_32' })`.
+
+## 0.13.0
+
+### Minor Changes
+
+- Random bump ([#18178](https://github.com/mastra-ai/mastra/pull/18178))
+
+## 0.13.0-alpha.0
+
+### Minor Changes
+
+- Random bump ([#18178](https://github.com/mastra-ai/mastra/pull/18178))
+
+## 0.12.4
+
+### Patch Changes
+
+- Security remediation for the 2026-06-17 "easy-day-js" supply-chain incident. Patch bump to publish clean versions and move the `latest` dist-tag forward, superseding the compromised versions that declared the malicious `easy-day-js` dependency. ([#18056](https://github.com/mastra-ai/mastra/pull/18056))
+
+## 0.12.4-alpha.0
+
+### Patch Changes
+
+- Security remediation for the 2026-06-17 "easy-day-js" supply-chain incident. Patch bump to publish clean versions and move the `latest` dist-tag forward, superseding the compromised versions that declared the malicious `easy-day-js` dependency. ([#18056](https://github.com/mastra-ai/mastra/pull/18056))
+
+## 0.12.1
+
+### Patch Changes
+
+- Moved shared voice primitives and route metadata into the new `@internal/voice` package so voice providers no longer depend on `@mastra/core` and server voice routes share the same route definitions. ([#16725](https://github.com/mastra-ai/mastra/pull/16725))
+
+  `@mastra/core/voice` continues to re-export the voice APIs for backwards compatibility.
+
+## 0.12.1-alpha.0
+
+### Patch Changes
+
+- Moved shared voice primitives and route metadata into the new `@internal/voice` package so voice providers no longer depend on `@mastra/core` and server voice routes share the same route definitions. ([#16725](https://github.com/mastra-ai/mastra/pull/16725))
+
+  `@mastra/core/voice` continues to re-export the voice APIs for backwards compatibility.
+
 ## 0.12.0
 
 ### Minor Changes

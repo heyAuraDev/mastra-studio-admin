@@ -1,7 +1,12 @@
-import { CodeEditor, cn } from '@mastra/playground-ui';
-import { ChevronRight, Check, X, Loader2 } from 'lucide-react';
+import { Code } from '@mastra/playground-ui/components/Code';
+import { CodeEditor } from '@mastra/playground-ui/components/CodeEditor';
+import { DisclosureChevron } from '@mastra/playground-ui/components/DisclosureChevron';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import type { BrowserToolCallEntry } from '@mastra/playground-ui/domains/agents/context/browser-tool-calls-context';
+import { IconCheckmark2Medium } from '@mastra/playground-ui/icons/central/IconCheckmark2Medium';
+import { IconCrossMedium } from '@mastra/playground-ui/icons/central/IconCrossMedium';
+import { IconLoadingCircle } from '@mastra/playground-ui/icons/central/IconLoadingCircle';
 import { useState } from 'react';
-import type { BrowserToolCallEntry } from '../../context/browser-tool-calls-context';
 
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
   // AgentBrowser tools
@@ -84,38 +89,47 @@ export function BrowserToolCallItem({ entry }: BrowserToolCallItemProps) {
   };
 
   return (
-    <div className="border-b border-border1 last:border-b-0">
+    <div className="border-b border-border last:border-b-0">
       <button
         type="button"
         onClick={() => setIsExpanded(prev => !prev)}
         aria-expanded={isExpanded}
-        className="flex items-center gap-2 w-full px-3 py-0.5 text-left hover:bg-surface3 transition-colors"
+        className="flex w-full items-center gap-2 px-3 py-0.5 text-left hover:bg-fill-subtle"
       >
-        <ChevronRight
-          className={cn('h-3 w-3 text-neutral3 transition-transform shrink-0', isExpanded && 'rotate-90')}
-        />
+        <DisclosureChevron direction="right" className="size-3 text-muted-foreground" />
 
         <StatusDot status={entry.status} />
 
-        <span className="text-xs font-medium text-neutral6 shrink-0">{displayName}</span>
+        <Txt as="span" variant="column" tone="ink" className="shrink-0">
+          {displayName}
+        </Txt>
 
-        {keyArg && <span className="text-xs text-neutral3 truncate">{keyArg}</span>}
+        {keyArg && (
+          <Txt as="span" variant="caption" tone="muted" className="truncate">
+            {keyArg}
+          </Txt>
+        )}
       </button>
 
       {isExpanded && (
-        <div className="px-3 pb-2 space-y-2">
+        <div className="space-y-2 px-3 pb-2">
           <div>
-            <p className="text-xs font-medium text-neutral4 pb-1">Arguments</p>
+            <Txt variant="column" tone="muted" className="pb-1">
+              Arguments
+            </Txt>
             <CodeEditor data={displayArgs} data-testid="browser-tool-args" />
           </div>
 
           {entry.result !== undefined && entry.result !== null && (
             <div>
-              <p className="text-xs font-medium text-neutral4 pb-1">Result</p>
+              <Txt variant="column" tone="muted" className="pb-1">
+                Result
+              </Txt>
               {typeof entry.result === 'string' ? (
-                <pre className="whitespace-pre text-xs bg-surface4 p-2 rounded-md overflow-x-auto max-h-40 overflow-y-auto">
-                  {entry.result}
-                </pre>
+                <Code
+                  className="max-h-40 overflow-x-auto overflow-y-auto rounded-md bg-muted p-2 text-caption whitespace-pre"
+                  code={entry.result}
+                />
               ) : (
                 <CodeEditor
                   data={entry.result as Record<string, unknown> | Record<string, unknown>[]}
@@ -133,10 +147,10 @@ export function BrowserToolCallItem({ entry }: BrowserToolCallItemProps) {
 function StatusDot({ status }: { status: BrowserToolCallEntry['status'] }) {
   switch (status) {
     case 'pending':
-      return <Loader2 className="h-3 w-3 text-neutral4 animate-spin shrink-0" />;
+      return <IconLoadingCircle className="size-icon-xs shrink-0 animate-spin text-muted-foreground" />;
     case 'complete':
-      return <Check className="h-3 w-3 text-green-500 shrink-0" />;
+      return <IconCheckmark2Medium className="size-icon-xs shrink-0 text-success-indicator" />;
     case 'error':
-      return <X className="h-3 w-3 text-red-500 shrink-0" />;
+      return <IconCrossMedium className="size-icon-xs shrink-0 text-destructive-foreground" />;
   }
 }

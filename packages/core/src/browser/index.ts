@@ -2,19 +2,28 @@
 // MastraBrowser Base Class
 // ============================================================================
 
-export { MastraBrowser } from './browser';
+export {
+  MastraBrowser,
+  BrowserProfileInUseError,
+  DEFAULT_BROWSER_VIEWPORT,
+  resolveViewportSize,
+  resolveLaunchViewport,
+} from './browser';
 export type {
   BrowserStatus,
   BrowserLifecycleHook,
   BrowserConfig,
   BrowserConfigBase,
   CdpUrlProvider,
+  BrowserViewport,
+  BrowserViewportSize,
   ScreencastOptions,
   ScreencastStream,
   ScreencastFrameData,
   ScreencastEvents,
   MouseEventParams,
   KeyboardEventParams,
+  BrowserCookie,
 } from './browser';
 
 // ============================================================================
@@ -30,6 +39,13 @@ export type { BrowserState, BrowserTabState, BrowserScope, ThreadSession, Thread
 
 export { ScreencastStream as ScreencastStreamImpl, SCREENCAST_DEFAULTS } from './screencast';
 export type { CdpSessionLike, CdpSessionProvider } from './screencast';
+
+// ============================================================================
+// Recording
+// ============================================================================
+
+export { createBrowserRecordingTools } from './recording';
+export type { BrowserRecordingOptions } from './recording';
 
 // ============================================================================
 // Error handling

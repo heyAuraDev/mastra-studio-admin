@@ -1,0 +1,1112 @@
+import type {
+  AgentControllerThinkingLevel,
+  AgentControllerThread,
+  AgentControllerWireEvent,
+  MastraDBMessage,
+  MastraMessagePart,
+} from '@mastra/core/agent-controller';
+/** Acknowledgement for approval/suspension commands; `ok` is true only when a pending target claimed it. */
+export type AgentControllerCommandRejection = 'not_pending' | 'stale_tool_call' | 'aborting' | 'no_pending_suspension';
+
+export interface AgentControllerCommandAck {
+  ok: boolean;
+  /** Set when `ok` is false. */
+  reason?: AgentControllerCommandRejection;
+}
+
+export type { MastraDBMessage, MastraMessageContentV2, MastraMessagePart } from '@mastra/core/agent-controller';
+import type { RequestContext } from '@mastra/core/request-context';
+import type { StorageListMessagesOutput } from '@mastra/core/storage';
+
+import type { QueryParams, RouteResponse } from '../route-types.generated.js';
+import type {
+  AgentControllerActiveRun,
+  AgentControllerAvailableModel,
+  AgentControllerGoalRecord,
+  AgentControllerModeInfo,
+  AgentControllerSessionState,
+  AgentControllerThreadInfo,
+  AgentControllerWorkspaceStatus,
+  ClientOptions,
+  CreateAgentControllerSessionResponse,
+  CreateAgentControllerThreadResponse,
+  PermissionPolicy,
+  PermissionRules,
+  SendNotificationInput,
+  SendNotificationResult,
+  ToolCategory,
+} from '../types';
+import { isTerminalReconnectError, parseClientRequestContext } from '../utils';
+import { BaseResource } from './base';
+
+/**
+ * Agent controller session client.
+ *
+ * Mirrors the controller HTTP routes served when an AgentController is
+ * registered on a Mastra instance (`new Mastra({ agentControllers })`). The
+ * routes are served under `/agent-controller`:
+ *
+ *   GET  /agent-controller                                          listAgentControllers
+ *   POST /agent-controller/:id/sessions                             session().create()
+ *   GET  /agent-controller/:id/sessions/:sessionId/stream           session().subscribe()
+ *   POST /agent-controller/:id/sessions/:sessionId/messages         session().sendMessage()
+ *   POST /agent-controller/:id/sessions/:sessionId/abort            session().abort()
+ *   POST /agent-controller/:id/sessions/:sessionId/tool-approval    session().approveTool()
+ */
+
+/** One arm of the wire union, selected by its `type`. */
+type WireEventOf<T extends AgentControllerWireEvent['type']> = Extract<AgentControllerWireEvent, { type: T }>;
+
+/** A `MastraDBMessage` before {@link hydrateMessage} turns its `createdAt` back into a `Date`. */
+type SerializedMastraDBMessage = WireEventOf<'message_start'>['message'];
+
+type AgentControllerModernListMessagesOptions = Omit<
+  QueryParams<'GET /agent-controller/:controllerId/sessions/:sessionId/threads/:threadId/messages'>,
+  'limit'
+> & {
+  limit?: never;
+};
+
+type AgentControllerLegacyPagedListMessagesOptions = {
+  /** @deprecated Use `perPage` instead. May only be combined with `page`. */
+  limit: number;
+  page?: number;
+  perPage?: never;
+  orderBy?: never;
+  filter?: never;
+  include?: never;
+};
+
+/** Pagination, ordering, filtering, and include options for an Agent Controller thread's messages. */
+export type AgentControllerListMessagesOptions =
+  | AgentControllerModernListMessagesOptions
+  | AgentControllerLegacyPagedListMessagesOptions;
+
+/** A page of hydrated Agent Controller thread messages. */
+export type AgentControllerListMessagesResult = StorageListMessagesOutput;
+
+type SerializedAgentControllerListMessagesResult = Omit<
+  RouteResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/threads/:threadId/messages'>,
+  'messages'
+> & {
+  messages: SerializedMastraDBMessage[];
+};
+
+/** An `AgentControllerThread` before {@link hydrateThread} turns its timestamps back into `Date`s. */
+type SerializedThread = WireEventOf<'thread_created'>['thread'];
+
+/**
+ * Notifications reach a session as agent signals carried on messages, not as
+ * controller events. These two arms predate that and no controller emits them.
+ */
+type NotificationEvent =
+  | {
+      type: 'notification';
+      notificationId?: string;
+      message: string;
+      source?: string;
+      kind?: string;
+      priority?: string;
+      status?: string;
+      attributes?: Record<string, unknown>;
+      metadata?: Record<string, unknown>;
+    }
+  | {
+      type: 'notification_summary';
+      message: string;
+      pending: number;
+      bySource: Record<string, number>;
+      byPriority: Record<string, number>;
+      notificationIds: string[];
+    };
+
+/** The timestamps the SDK gives back as `Date`s. {@link hydrateKnownEvent} is typed against this, so the two cannot drift. */
+type Hydrated<T> = T extends { type: 'thread_created' }
+  ? Omit<T, 'thread'> & { thread: AgentControllerThread }
+  : T extends { type: 'message_start' }
+    ? Omit<T, 'message'> & { message: MastraDBMessage }
+    : T;
+
+/**
+ * AgentController events the SDK types explicitly: the wire union `@mastra/core`
+ * derives from the controller's own events, with timestamps hydrated. This is a
+ * discriminated union, so narrowing on `event.type` gives the right payload.
+ */
+export type KnownAgentControllerEvent = Hydrated<AgentControllerWireEvent> | NotificationEvent;
+
+/** Any other agent controller event the SDK doesn't model explicitly. */
+export interface OtherAgentControllerEvent {
+  type: string;
+  [key: string]: unknown;
+}
+
+/**
+ * An agent controller event. Comparing `event.type` to a literal does NOT
+ * narrow this union — {@link OtherAgentControllerEvent} types `type` as
+ * `string`, which matches every literal. Narrow with
+ * {@link isKnownAgentControllerEvent} first, then switch on `type`.
+ */
+export type AgentControllerEvent = KnownAgentControllerEvent | OtherAgentControllerEvent;
+
+// Runtime mirror of the union — Record keyed by its `type` makes tsc reject a
+// missing or extra entry.
+const KNOWN_AGENT_CONTROLLER_EVENT_TYPES = new Set<string>(
+  Object.keys({
+    agent_start: true,
+    agent_end: true,
+    message_start: true,
+    message_update: true,
+    message_end: true,
+    state_changed: true,
+    tool_input_start: true,
+    tool_input_delta: true,
+    tool_input_end: true,
+    tool_start: true,
+    tool_update: true,
+    shell_output: true,
+    command_exit: true,
+    tool_end: true,
+    tool_approval_required: true,
+    tool_suspended: true,
+    tool_suspension_cancelled: true,
+    mode_changed: true,
+    model_changed: true,
+    thread_changed: true,
+    thread_created: true,
+    thread_deleted: true,
+    thread_owner_changed: true,
+    thread_title_updated: true,
+    subagent_start: true,
+    subagent_text_delta: true,
+    subagent_tool_start: true,
+    subagent_tool_end: true,
+    subagent_end: true,
+    subagent_model_changed: true,
+    task_updated: true,
+    notification: true,
+    notification_summary: true,
+    usage_update: true,
+    display_state_changed: true,
+    goal_evaluation: true,
+    follow_up_queued: true,
+    om_observation_start: true,
+    om_observation_end: true,
+    om_observation_failed: true,
+    om_reflection_start: true,
+    om_reflection_end: true,
+    om_reflection_failed: true,
+    om_buffering_start: true,
+    om_buffering_end: true,
+    om_buffering_failed: true,
+    om_model_changed: true,
+    om_activation: true,
+    om_status: true,
+    om_thread_title_updated: true,
+    workspace_ready: true,
+    workspace_error: true,
+    workspace_status_changed: true,
+    task_complete_evaluation: true,
+    info: true,
+    error: true,
+  } satisfies Record<KnownAgentControllerEvent['type'], true>),
+);
+
+/** Narrows to the explicitly typed events; see {@link AgentControllerEvent}. */
+export function isKnownAgentControllerEvent(event: AgentControllerEvent): event is KnownAgentControllerEvent {
+  return KNOWN_AGENT_CONTROLLER_EVENT_TYPES.has(event.type);
+}
+
+const toDate = (value: Date | string): Date => (value instanceof Date ? value : new Date(value));
+
+function hydrateMessage(message: SerializedMastraDBMessage): MastraDBMessage {
+  return { ...message, createdAt: toDate(message.createdAt) };
+}
+
+function hydrateThread(thread: SerializedThread): AgentControllerThread {
+  return { ...thread, createdAt: toDate(thread.createdAt), updatedAt: toDate(thread.updatedAt) };
+}
+
+/** A frame straight off the stream: still wire-shaped, so its timestamps are strings. */
+type ParsedEvent = AgentControllerWireEvent | NotificationEvent | OtherAgentControllerEvent;
+
+function isKnownParsedEvent(event: ParsedEvent): event is AgentControllerWireEvent | NotificationEvent {
+  return KNOWN_AGENT_CONTROLLER_EVENT_TYPES.has(event.type);
+}
+
+/** The stream carries every timestamp as an ISO string; give consumers back the `Date`s {@link Hydrated} promises. */
+function hydrateKnownEvent(event: AgentControllerWireEvent | NotificationEvent): KnownAgentControllerEvent {
+  switch (event.type) {
+    case 'message_start':
+      return { ...event, message: hydrateMessage(event.message) };
+    case 'thread_created':
+      return { ...event, thread: hydrateThread(event.thread) };
+    default:
+      return event;
+  }
+}
+
+function hydrateEventTimestamps(event: ParsedEvent): AgentControllerEvent {
+  return isKnownParsedEvent(event) ? hydrateKnownEvent(event) : event;
+}
+
+/**
+ * Resume payload for the built-in `submit_plan` suspension.
+ *
+ * The tool suspends with only the plan file `path`; hosts read that file to render
+ * the approval. `path`/`title`/`plan` let the host back-fill what it rendered so the
+ * persisted tool result (`submittedPlan`) replays the plan durably in history even
+ * after the plan file changes or disappears.
+ */
+export interface PlanResume {
+  action: 'approved' | 'rejected';
+  feedback?: string;
+  path?: string;
+  title?: string;
+  plan?: string;
+}
+
+/**
+ * Options accepted by session methods that trigger or resume agent execution.
+ * The `requestContext` is merged into the server-derived request context for
+ * that run (server-controlled keys win), so it reaches dynamic instructions,
+ * tools, and workspace resolution — mirroring `agent.generate()`.
+ */
+export interface AgentControllerRequestOptions {
+  requestContext?: RequestContext | Record<string, any>;
+}
+
+/** Options for subscribing to an agent controller session's event stream. */
+export interface SubscribeAgentControllerSessionOptions {
+  /**
+   * Set to false to omit `display_state_changed` snapshots, including the initial one. The stream then opens
+   * with the session's current state as events: `message_start` for the message being streamed, and the latest
+   * `om_status`. Defaults to true.
+   */
+  displayState?: boolean;
+  /** Called for each event received over the stream. */
+  onEvent: (event: AgentControllerEvent) => void;
+  /**
+   * Called when the stream errors or ends and no (further) reconnect will be
+   * attempted — the subscription is dead after this fires.
+   */
+  onError?: (error: unknown) => void;
+  /**
+   * Called each time the stream is re-established after a drop (reconnect
+   * only). The server does NOT replay events missed while disconnected, so
+   * stateful consumers MUST re-sync from here (e.g. `session.state()`) or
+   * they will silently lose the gap.
+   */
+  onReconnect?: () => void;
+  /**
+   * Automatically re-establish the stream after an established stream drops
+   * (clean close or transport error). Does not apply to the initial
+   * connection — `subscribe()` rejects if it can't connect. Retries back off
+   * exponentially from `delayMs` (default 1s) up to `maxDelayMs` (default
+   * 30s); `maxRetries` (default Infinity) bounds the attempts per outage —
+   * the counter resets once a connection is re-established. When retries are
+   * exhausted, `onError` fires.
+   */
+  reconnect?:
+    | boolean
+    | {
+        maxRetries?: number;
+        delayMs?: number;
+        maxDelayMs?: number;
+      };
+  /**
+   * Treat the stream as dropped after this many milliseconds without
+   * receiving any bytes. Server heartbeats (every 25s) count, so a healthy
+   * idle stream never trips it; a half-open connection (laptop sleep, proxy
+   * or NAT timeout) does. Also bounds opening the stream: the initial
+   * `subscribe()` rejects, and a reconnect attempt counts as failed, when no
+   * response arrives in time. A timeout is handled like any other drop —
+   * `reconnect` / `onReconnect` if enabled, otherwise `onError`.
+   * Default 60000; `0` disables.
+   */
+  idleTimeoutMs?: number;
+}
+
+export interface AgentControllerSubscription {
+  /** Stop reading and release the underlying stream. */
+  unsubscribe: () => void;
+}
+
+/**
+ * A session addressed by its `sessionId` within one agent controller. Sessions
+ * are get-or-create on the server, so re-creating the same sessionId resumes
+ * the existing conversation rather than forking it. Many sessions can work on
+ * one `resourceId` (whose threads and memory they use); each has its own run
+ * loop, thread binding, and mode/model/state.
+ */
+export class AgentControllerSession extends BaseResource {
+  constructor(
+    options: ClientOptions,
+    private readonly controllerId: string,
+    private readonly sessionId: string,
+  ) {
+    super(options);
+  }
+
+  private base() {
+    return `/agent-controller/${encodeURIComponent(this.controllerId)}/sessions/${encodeURIComponent(this.sessionId)}`;
+  }
+
+  /**
+   * Create or resume this session. `resourceId` names whose threads and memory
+   * the session works on. Without it the server resumes the session on the
+   * resource it already has (the live session's, or the resource of the thread
+   * with the session's id), falling back to the sessionId. Pass `tags` to scope
+   * initial thread selection — a thread is a resume candidate only when its
+   * metadata matches every tag. Pass `threadId` to bind the session to one
+   * exact thread, creating it with that id when it does not exist.
+   */
+  create(options?: {
+    resourceId?: string;
+    tags?: Record<string, string>;
+    threadId?: string;
+  }): Promise<CreateAgentControllerSessionResponse> {
+    return this.request(`/agent-controller/${encodeURIComponent(this.controllerId)}/sessions`, {
+      method: 'POST',
+      body: {
+        resourceId: options?.resourceId,
+        sessionId: this.sessionId,
+        tags: options?.tags,
+        threadId: options?.threadId,
+      },
+    });
+  }
+
+  /**
+   * Subscribe to this session's event stream (SSE). The assistant's reply to a
+   * message arrives here as `message_*` events, not on the sendMessage call.
+   *
+   * The returned promise resolves once the stream is actually established and
+   * rejects when it cannot be. A rejected subscribe leaves nothing running —
+   * `reconnect` governs only re-establishment after an established stream
+   * drops, so callers that want connect-time retry can loop around
+   * `subscribe()` themselves and keep cancellation control.
+   */
+  async subscribe(options: SubscribeAgentControllerSessionOptions): Promise<AgentControllerSubscription> {
+    // Normalize reconnect knobs defensively: NaN/negative delays would produce
+    // zero-delay timers and a NaN retry cap would never exhaust (`n >= NaN` is
+    // always false), turning an outage into a hot retry loop.
+    const finiteOr = (value: number | undefined, fallback: number) =>
+      typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
+    const retriesOr = (value: number | undefined, fallback: number) =>
+      value === Infinity || (typeof value === 'number' && Number.isFinite(value) && value >= 0) ? value : fallback;
+    const reconnectOptions =
+      options.reconnect === true
+        ? { maxRetries: Infinity, delayMs: 1000, maxDelayMs: 30_000 }
+        : options.reconnect
+          ? {
+              maxRetries: retriesOr(options.reconnect.maxRetries, Infinity),
+              delayMs: finiteOr(options.reconnect.delayMs, 1000),
+              maxDelayMs: finiteOr(options.reconnect.maxDelayMs, 30_000),
+            }
+          : null;
+    const idleTimeoutMs = finiteOr(options.idleTimeoutMs, 60_000);
+
+    /** Exponential backoff for the Nth (1-based) retry of an outage streak. */
+    const backoffDelay = (attempt: number) =>
+      reconnectOptions ? Math.min(reconnectOptions.delayMs * 2 ** (attempt - 1), reconnectOptions.maxDelayMs) : 0;
+
+    let cancelled = false;
+    let currentReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    // Aborts the fetch behind the stream currently being opened or read.
+    let currentAbort: AbortController | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let delayResolve: (() => void) | undefined;
+
+    const settleDelay = () => {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = undefined;
+      }
+      const resolve = delayResolve;
+      delayResolve = undefined;
+      resolve?.();
+    };
+
+    const delay = (ms: number) =>
+      new Promise<void>(resolve => {
+        delayResolve = resolve;
+        reconnectTimer = setTimeout(settleDelay, ms);
+      });
+
+    const idleTimeoutError = () => {
+      const error = new Error(`Agent controller session stream received no data for ${idleTimeoutMs}ms`);
+      error.name = 'AgentControllerStreamIdleError';
+      return error;
+    };
+
+    const requestStream = async (): Promise<Response> => {
+      const abort = new AbortController();
+      currentAbort = abort;
+      let openTimer: ReturnType<typeof setTimeout> | undefined;
+      const request = this.request(
+        `${this.base()}/stream${options.displayState === false ? '?displayState=false' : ''}`,
+        {
+          stream: true,
+          signal: abort.signal,
+        },
+      ) as Promise<Response>;
+      // If the timeout wins the race, a late response must be cancelled and a late
+      // rejection must not surface as unhandled.
+      request
+        .then(response => {
+          if (abort.signal.aborted) {
+            void response.body?.cancel().catch(() => {});
+          }
+        })
+        .catch(() => {});
+      let response: Response;
+      try {
+        if (idleTimeoutMs > 0) {
+          // Race rather than rely on abort alone: a custom fetch may ignore the signal.
+          response = await Promise.race([
+            request,
+            new Promise<never>((_resolve, reject) => {
+              openTimer = setTimeout(() => {
+                const error = idleTimeoutError();
+                abort.abort(error);
+                reject(error);
+              }, idleTimeoutMs);
+            }),
+          ]);
+        } else {
+          response = await request;
+        }
+      } finally {
+        clearTimeout(openTimer);
+      }
+      if (abort.signal.aborted) {
+        // Lost the race (timeout or unsubscribe) after the response arrived.
+        void response.body?.cancel().catch(() => {});
+        throw abort.signal.reason;
+      }
+      if (!response.body) {
+        throw new Error('No response body for agent controller session stream');
+      }
+      return response;
+    };
+
+    const streamEndedError = () => new Error('Agent controller session stream ended unexpectedly');
+
+    const findFrameSeparator = (text: string): { index: number; length: number } | null => {
+      const candidates = [
+        { index: text.indexOf('\r\n\r\n'), length: 4 },
+        { index: text.indexOf('\n\n'), length: 2 },
+        { index: text.indexOf('\r\r'), length: 2 },
+      ].filter(candidate => candidate.index !== -1);
+      if (candidates.length === 0) return null;
+      return candidates.reduce((earliest, candidate) => (candidate.index < earliest.index ? candidate : earliest));
+    };
+
+    type PumpResult =
+      | { kind: 'done' }
+      | { kind: 'cancelled' }
+      | { kind: 'consumer_error' }
+      | { kind: 'transport_error'; error: unknown };
+
+    const pump = async (response: Response): Promise<PumpResult> => {
+      const reader = response.body!.getReader();
+      currentReader = reader;
+      const abort = currentAbort;
+      const decoder = new TextDecoder();
+      let buffer = '';
+      // A half-open connection never errors or closes, so read() would await
+      // forever. Any bytes (including `: heartbeat` comments) re-arm the timer;
+      // on expiry we cancel the reader and report a transport drop.
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      let timedOut = false;
+      const armIdleTimer = () => {
+        if (idleTimeoutMs <= 0) return;
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          timedOut = true;
+          void reader.cancel(idleTimeoutError()).catch(() => {});
+          abort?.abort(idleTimeoutError());
+        }, idleTimeoutMs);
+      };
+
+      try {
+        armIdleTimer();
+        while (!cancelled) {
+          let chunk: Awaited<ReturnType<typeof reader.read>>;
+          try {
+            chunk = await reader.read();
+          } catch (error) {
+            if (timedOut && !cancelled) return { kind: 'transport_error', error: idleTimeoutError() };
+            throw error;
+          }
+          // A cancel-induced `done` must not be mistaken for a clean close.
+          if (timedOut && !cancelled) return { kind: 'transport_error', error: idleTimeoutError() };
+          const { done, value } = chunk;
+          if (done) return cancelled ? { kind: 'cancelled' } : { kind: 'done' };
+          armIdleTimer();
+          // A read() that resolved just before unsubscribe() must not deliver its
+          // frame: cancellation happened while we were awaiting.
+          if (cancelled) return { kind: 'cancelled' };
+          buffer += decoder.decode(value, { stream: true });
+
+          let separator: { index: number; length: number } | null;
+          while ((separator = findFrameSeparator(buffer)) !== null) {
+            const frame = buffer.slice(0, separator.index);
+            buffer = buffer.slice(separator.index + separator.length);
+            for (const line of frame.split(/\r\n|\n|\r/)) {
+              if (!line.startsWith('data:')) continue;
+              const data = line.slice(5).trim();
+              if (!data) continue;
+              let event: AgentControllerEvent;
+              try {
+                event = hydrateEventTimestamps(JSON.parse(data));
+              } catch {
+                continue;
+              }
+              // An earlier onEvent in this same buffered chunk may have called
+              // unsubscribe(); stop before delivering any further frames.
+              if (cancelled) return { kind: 'cancelled' };
+              try {
+                options.onEvent(event);
+              } catch (cause) {
+                if (!cancelled) safeOnError(cause);
+                return { kind: 'consumer_error' };
+              }
+            }
+          }
+        }
+        return { kind: 'cancelled' };
+      } catch (error) {
+        return cancelled ? { kind: 'cancelled' } : { kind: 'transport_error', error };
+      } finally {
+        clearTimeout(idleTimer);
+        if (currentReader === reader) currentReader = null;
+        if (currentAbort === abort) currentAbort = null;
+        void reader.cancel().catch(() => {});
+      }
+    };
+
+    // Consumer callbacks run inside the detached stream loop (`void run(...)`),
+    // so a throwing onError would surface as an unhandled promise rejection —
+    // and, thrown from inside pump(), would be misread as a transport error.
+    const safeOnError = (error: unknown) => {
+      try {
+        options.onError?.(error);
+      } catch {
+        // Consumer callback failures must not kill (or reroute) the stream loop.
+      }
+    };
+
+    const reportTerminalError = (result: Extract<PumpResult, { kind: 'done' } | { kind: 'transport_error' }>) => {
+      safeOnError(result.kind === 'transport_error' ? result.error : streamEndedError());
+    };
+
+    /** Pump one established stream, mapping unexpected throws to transport errors. */
+    const pumpSafe = async (response: Response): Promise<PumpResult> => {
+      try {
+        return await pump(response);
+      } catch (error) {
+        return cancelled ? { kind: 'cancelled' } : { kind: 'transport_error', error };
+      }
+    };
+
+    // Establish the FIRST stream before resolving so callers can trust that a
+    // resolved subscribe() means events are flowing, and a rejected one means
+    // nothing is running in the background. Reconnect deliberately does not
+    // apply here: retrying before a subscription handle exists would leave the
+    // caller with no way to cancel the loop (e.g. reconnect: true would hang
+    // forever against a down server).
+    const firstResponse = await requestStream();
+
+    // Background loop: pump the current stream; on drop, re-establish it under
+    // the reconnect policy (exponential backoff, per-outage retry budget) and
+    // notify the consumer via onReconnect so it can re-sync missed state.
+    const run = async (initial: Response) => {
+      let response = initial;
+
+      while (!cancelled) {
+        let result = await pumpSafe(response);
+
+        if (cancelled || result.kind === 'cancelled' || result.kind === 'consumer_error') return;
+
+        // result is 'done' or 'transport_error' — the stream dropped.
+        if (!reconnectOptions) {
+          reportTerminalError(result);
+          return;
+        }
+
+        // Retry until a new stream is established or the budget is exhausted.
+        let attempts = 0;
+        let reconnectedResponse: Response | undefined;
+        while (!reconnectedResponse) {
+          // A requestStream() that rejected after unsubscribe() must not surface
+          // as a terminal onError: honor cancellation before exhausting the budget.
+          if (cancelled) return;
+          if (attempts >= reconnectOptions.maxRetries) {
+            reportTerminalError(result);
+            return;
+          }
+          attempts++;
+          await delay(backoffDelay(attempts));
+          if (cancelled) return;
+          try {
+            reconnectedResponse = await requestStream();
+          } catch (error) {
+            if (cancelled) return;
+            // Auth denials and other client errors won't resolve by resubscribing;
+            // 408/429 stay retryable.
+            if (isTerminalReconnectError(error)) {
+              safeOnError(error);
+              return;
+            }
+            result = { kind: 'transport_error', error };
+          }
+        }
+
+        if (cancelled) {
+          void reconnectedResponse.body?.cancel().catch(() => {});
+          return;
+        }
+
+        response = reconnectedResponse;
+        try {
+          options.onReconnect?.();
+        } catch {
+          // Consumer callback failures must not kill the stream loop.
+        }
+        // onReconnect may have called unsubscribe(). The new response has not yet
+        // acquired a reader (pump() runs on the next iteration), so unsubscribe()
+        // had nothing to cancel — cancel its body here before the loop exits.
+        if (cancelled) {
+          void response.body?.cancel().catch(() => {});
+          return;
+        }
+      }
+    };
+
+    void run(firstResponse);
+
+    return {
+      unsubscribe: () => {
+        cancelled = true;
+        settleDelay();
+        void currentReader?.cancel().catch(() => {});
+        currentAbort?.abort();
+      },
+    };
+  }
+
+  /**
+   * Send a user message. The reply streams over `subscribe()`.
+   * Pass a structured message to attach files (e.g. pasted images) as base64-encoded data:
+   * `sendMessage({ content: 'What is in this image?', files })`.
+   * Pass `options.requestContext` to merge custom context into the run's request context.
+   */
+  async sendMessage(
+    message: string | { content: string; files?: Array<{ data: string; mediaType: string; filename?: string }> },
+    options?: AgentControllerRequestOptions,
+  ): Promise<void> {
+    const { content, files } = typeof message === 'string' ? { content: message, files: undefined } : message;
+    const requestContext = parseClientRequestContext(options?.requestContext);
+    await this.request(`${this.base()}/messages`, {
+      method: 'POST',
+      body: {
+        message: content,
+        ...(files?.length ? { files } : {}),
+        ...(requestContext ? { requestContext } : {}),
+      },
+    });
+  }
+
+  /** Abort the in-flight run for this session. */
+  async abort(): Promise<void> {
+    await this.request(`${this.base()}/abort`, { method: 'POST' });
+  }
+
+  /**
+   * Approve or decline a pending tool call (`tool_approval_required`). Resolves
+   * `{ ok: false, reason }` when no pending approval claimed the decision.
+   */
+  async approveTool(
+    toolCallId: string,
+    approved: boolean,
+    options?: AgentControllerRequestOptions & {
+      /** Also grant the tool's category to the call's thread ("always allow"). */
+      alwaysAllowCategory?: boolean;
+    },
+  ): Promise<AgentControllerCommandAck> {
+    const requestContext = parseClientRequestContext(options?.requestContext);
+    return this.request<AgentControllerCommandAck>(`${this.base()}/tool-approval`, {
+      method: 'POST',
+      // Not idempotent: a replay after a lost response would be rejected as not_pending
+      // and misreport an applied decision as ignored.
+      retries: 0,
+      body: {
+        toolCallId,
+        approved,
+        ...(options?.alwaysAllowCategory ? { alwaysAllowCategory: true } : {}),
+        ...(requestContext ? { requestContext } : {}),
+      },
+    });
+  }
+
+  /**
+   * Resume a suspended interactive tool (`tool_suspended`). The resume shape
+   * depends on the tool: a string (or string[]) for `ask_user`, "Yes"/"No" for
+   * `request_access`, and a {@link PlanResume} for `submit_plan`.
+   */
+  async respondToToolSuspension(
+    toolCallId: string,
+    resumeData: string | string[] | PlanResume,
+    options?: AgentControllerRequestOptions,
+  ): Promise<AgentControllerCommandAck> {
+    const requestContext = parseClientRequestContext(options?.requestContext);
+    return this.request<AgentControllerCommandAck>(`${this.base()}/tool-suspension`, {
+      method: 'POST',
+      // Not idempotent: a replay after a lost response would be rejected as not_pending
+      // and misreport an applied decision as ignored.
+      retries: 0,
+      body: { toolCallId, resumeData, ...(requestContext ? { requestContext } : {}) },
+    });
+  }
+
+  /**
+   * Aborts the in-flight run, then sends the message as a new turn.
+   * Pass a structured message to attach files, as with `sendMessage`.
+   */
+  async steer(
+    message: string | { content: string; files?: Array<{ data: string; mediaType: string; filename?: string }> },
+    options?: AgentControllerRequestOptions,
+  ): Promise<void> {
+    const { content, files } = typeof message === 'string' ? { content: message, files: undefined } : message;
+    const requestContext = parseClientRequestContext(options?.requestContext);
+    await this.request(`${this.base()}/steer`, {
+      method: 'POST',
+      body: {
+        message: content,
+        ...(files?.length ? { files } : {}),
+        ...(requestContext ? { requestContext } : {}),
+      },
+    });
+  }
+
+  /** Get the current mode, model, and thread (for initial UI hydration). */
+  state(options?: { threadId?: string }): Promise<AgentControllerSessionState> {
+    const path = options?.threadId ? `${this.base()}?threadId=${encodeURIComponent(options.threadId)}` : this.base();
+    return this.request(path);
+  }
+
+  /** Merge key-value pairs into the session state. Existing keys not in the payload are preserved. */
+  async setState(updates: Record<string, unknown>): Promise<void> {
+    await this.request(`${this.base()}/state`, { method: 'PUT', body: { state: updates } });
+  }
+
+  /** Switch the active mode (e.g. `build`, `plan`). */
+  async switchMode(modeId: string): Promise<void> {
+    await this.request(`${this.base()}/mode`, { method: 'POST', body: { modeId } });
+  }
+
+  /**
+   * Switch the session model and persist it to the active thread. When
+   * `thinkingLevel` is provided it is applied and persisted with the model.
+   */
+  async switchModel(
+    modelId: string,
+    { thinkingLevel }: { thinkingLevel?: AgentControllerThinkingLevel } = {},
+  ): Promise<void> {
+    await this.request(`${this.base()}/model`, {
+      method: 'POST',
+      body: thinkingLevel !== undefined ? { modelId, thinkingLevel } : { modelId },
+    });
+  }
+
+  /**
+   * List the session's threads, newest first. Pass `limit` to cap the count
+   * (e.g. for a sidebar) and `tags` to scope to threads matching every tag —
+   * necessary when one resourceId is shared across git worktrees of the same
+   * repo (e.g. `{ tags: { projectPath } }` so each worktree sees only its own
+   * threads). Passing a bare number is shorthand for `{ limit }`.
+   */
+  async listThreads(
+    options?: number | { limit?: number; tags?: Record<string, string> },
+  ): Promise<AgentControllerThreadInfo[]> {
+    const opts = typeof options === 'number' ? { limit: options } : (options ?? {});
+    const params = new URLSearchParams();
+    if (opts.limit != null) params.set('limit', String(opts.limit));
+    if (opts.tags && Object.keys(opts.tags).length > 0) params.set('tags', JSON.stringify(opts.tags));
+    const query = params.toString() ? `?${params.toString()}` : '';
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/threads'>>(
+      `${this.base()}/threads${query}`,
+    );
+    return body.threads;
+  }
+
+  /** Switch the session to an existing thread (rebinds stream + state). */
+  async switchThread(threadId: string): Promise<void> {
+    await this.request(`${this.base()}/thread`, { method: 'POST', body: { threadId } });
+  }
+
+  /** Create a new thread (unbinds previous, binds the new one). */
+  async createThread(title?: string): Promise<CreateAgentControllerThreadResponse> {
+    return this.request(`${this.base()}/threads`, {
+      method: 'POST',
+      body: { title },
+    });
+  }
+
+  /** Delete a thread. If it's the active thread the session unbinds. */
+  async deleteThread(threadId: string): Promise<void> {
+    await this.request(`${this.base()}/threads/${encodeURIComponent(threadId)}`, {
+      method: 'DELETE',
+    });
+  }
+
+  /** Rename a thread. */
+  async renameThread(threadId: string, title: string): Promise<void> {
+    await this.request(`${this.base()}/threads/${encodeURIComponent(threadId)}`, {
+      method: 'PUT',
+      body: { title },
+    });
+  }
+
+  /** Clone a thread (and its messages). The session binds to the clone. */
+  async cloneThread(options?: {
+    sourceThreadId?: string;
+    title?: string;
+  }): Promise<CreateAgentControllerThreadResponse> {
+    return this.request(`${this.base()}/threads/clone`, {
+      method: 'POST',
+      body: options ?? {},
+    });
+  }
+
+  /** List messages for a specific thread, preserving the legacy array-returning limit overload. */
+  async listMessages(threadId: string, limit?: number): Promise<MastraDBMessage[]>;
+  async listMessages(
+    threadId: string,
+    options: AgentControllerListMessagesOptions,
+  ): Promise<AgentControllerListMessagesResult>;
+  async listMessages(
+    threadId: string,
+    options?: number | AgentControllerListMessagesOptions,
+  ): Promise<MastraDBMessage[] | AgentControllerListMessagesResult> {
+    const queryParams = new URLSearchParams();
+    const legacy = typeof options === 'number' || options === undefined;
+
+    if (typeof options === 'number') {
+      queryParams.set('limit', String(options));
+    } else if (options === undefined) {
+      queryParams.set('perPage', 'false');
+    } else {
+      const { limit, page, perPage, orderBy, filter, include } = options;
+      if (
+        limit !== undefined &&
+        (perPage !== undefined || orderBy !== undefined || filter !== undefined || include !== undefined)
+      ) {
+        throw new Error('limit can only be combined with page; use perPage with orderBy, filter, or include');
+      }
+      if (limit !== undefined) queryParams.set('limit', String(limit));
+      if (page !== undefined) queryParams.set('page', String(page));
+      if (perPage !== undefined) queryParams.set('perPage', String(perPage));
+      if (orderBy) queryParams.set('orderBy', JSON.stringify(orderBy));
+      if (filter) queryParams.set('filter', JSON.stringify(filter));
+      if (include) queryParams.set('include', JSON.stringify(include));
+    }
+
+    const query = queryParams.toString();
+    const body = await this.request<SerializedAgentControllerListMessagesResult>(
+      `${this.base()}/threads/${encodeURIComponent(threadId)}/messages${query ? `?${query}` : ''}`,
+    );
+    const messages = body.messages.map(hydrateMessage);
+
+    if (legacy) return messages;
+    return { ...body, messages };
+  }
+
+  /**
+   * Queue a follow-up message. If the session is idle it sends immediately;
+   * if a run is active it queues for after completion.
+   * Pass a structured message to attach files, as with `sendMessage`.
+   */
+  async followUp(
+    message: string | { content: string; files?: Array<{ data: string; mediaType: string; filename?: string }> },
+    options?: AgentControllerRequestOptions,
+  ): Promise<void> {
+    const { content, files } = typeof message === 'string' ? { content: message, files: undefined } : message;
+    const requestContext = parseClientRequestContext(options?.requestContext);
+    await this.request(`${this.base()}/follow-up`, {
+      method: 'POST',
+      body: {
+        message: content,
+        ...(files?.length ? { files } : {}),
+        ...(requestContext ? { requestContext } : {}),
+      },
+    });
+  }
+
+  /** Get the observational memory record for this session's thread. */
+  async getOMRecord(): Promise<RouteResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/om'>['record']> {
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/om'>>(
+      `${this.base()}/om`,
+    );
+    return body.record;
+  }
+
+  /** Change the session's resource identity. */
+  async setResourceId(newResourceId: string): Promise<void> {
+    await this.request(`${this.base()}/resource`, {
+      method: 'POST',
+      body: { newResourceId },
+    });
+  }
+
+  /** Get known resource IDs for this session. */
+  async getResourceIds(): Promise<
+    RouteResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/resources'>['resourceIds']
+  > {
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/resources'>>(
+      `${this.base()}/resources`,
+    );
+    return body.resourceIds;
+  }
+
+  /** Get the current goal for this session's thread. */
+  async getGoal(): Promise<AgentControllerGoalRecord | undefined> {
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/goal'>>(
+      `${this.base()}/goal`,
+    );
+    return body.goal;
+  }
+
+  /** Set a new goal objective. The agent's in-loop judge evaluates progress after each turn. */
+  async setGoal(
+    objective: string,
+    options?: { judgeModelId?: string; maxRuns?: number },
+  ): Promise<AgentControllerGoalRecord | undefined> {
+    const body = await this.request<RouteResponse<'POST /agent-controller/:controllerId/sessions/:sessionId/goal'>>(
+      `${this.base()}/goal`,
+      {
+        method: 'POST',
+        body: { objective, ...options },
+      },
+    );
+    return body.goal;
+  }
+
+  /** Update goal options (judge model, max runs, status). */
+  async updateGoal(options: {
+    judgeModelId?: string;
+    maxRuns?: number;
+    status?: 'active' | 'paused' | 'done';
+  }): Promise<AgentControllerGoalRecord | undefined> {
+    const body = await this.request<RouteResponse<'PUT /agent-controller/:controllerId/sessions/:sessionId/goal'>>(
+      `${this.base()}/goal`,
+      {
+        method: 'PUT',
+        body: options,
+      },
+    );
+    return body.goal;
+  }
+
+  /** Clear the current goal. */
+  async clearGoal(): Promise<void> {
+    await this.request(`${this.base()}/goal`, { method: 'DELETE' });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Permissions
+  // ---------------------------------------------------------------------------
+
+  /** Get the current permission rules (per-category and per-tool policies). */
+  async getPermissions(): Promise<PermissionRules> {
+    return this.request(`${this.base()}/permissions`);
+  }
+
+  /** Set the approval policy for a tool category. */
+  async setPermissionForCategory(category: ToolCategory, policy: PermissionPolicy): Promise<void> {
+    await this.request(`${this.base()}/permissions/category`, {
+      method: 'PUT',
+      body: { category, policy },
+    });
+  }
+
+  /** Set the approval policy for a specific tool. */
+  async setPermissionForTool(toolName: string, policy: PermissionPolicy): Promise<void> {
+    await this.request(`${this.base()}/permissions/tool`, {
+      method: 'PUT',
+      body: { toolName, policy },
+    });
+  }
+
+  /**
+   * Send a notification signal to this session. The agent's delivery policy
+   * determines whether the notification wakes an idle thread, is summarised,
+   * or is persisted for later.
+   */
+  async sendNotification(input: SendNotificationInput): Promise<SendNotificationResult> {
+    return this.request(`${this.base()}/notifications`, {
+      method: 'POST',
+      body: input,
+    });
+  }
+}
+
+/** An agent controller hosted on the connected Mastra instance. */
+export class AgentController extends BaseResource {
+  constructor(
+    options: ClientOptions,
+    private readonly controllerId: string,
+  ) {
+    super(options);
+  }
+
+  private basePath() {
+    return `/agent-controller/${encodeURIComponent(this.controllerId)}`;
+  }
+
+  /** List the modes configured on this agent controller (e.g. build, plan). */
+  async listModes(): Promise<AgentControllerModeInfo[]> {
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/modes'>>(
+      `${this.basePath()}/modes`,
+    );
+    return body.modes;
+  }
+
+  /** List available models on this agent controller (with auth status and use counts). */
+  async listModels(): Promise<AgentControllerAvailableModel[]> {
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/models'>>(
+      `${this.basePath()}/models`,
+    );
+    return body.models;
+  }
+
+  /** List the runs in flight on this controller, across all resources. */
+  async listActiveRuns(): Promise<AgentControllerActiveRun[]> {
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/active-runs'>>(
+      `${this.basePath()}/active-runs`,
+    );
+    return body.runs;
+  }
+
+  /** Get workspace status for this agent controller. */
+  async workspaceStatus(): Promise<AgentControllerWorkspaceStatus> {
+    return this.request(`${this.basePath()}/workspace`);
+  }
+
+  /**
+   * Address the session with this `sessionId`. Sessions created without an
+   * explicit id are addressed by their `resourceId`.
+   */
+  session(sessionId: string): AgentControllerSession {
+    return new AgentControllerSession(this.options, this.controllerId, sessionId);
+  }
+}
+
+/** Pull the plain text out of an assistant message's nested content parts. */
+export function agentControllerMessageText(message: MastraDBMessage): string {
+  return message.content.parts
+    .filter((p): p is MastraMessagePart & { text: string } => p.type === 'text' && typeof p.text === 'string')
+    .map(p => p.text)
+    .join('');
+}

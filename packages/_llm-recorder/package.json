@@ -1,6 +1,6 @@
 {
   "name": "@internal/llm-recorder",
-  "version": "0.0.33",
+  "version": "0.0.87",
   "description": "LLM response recording and replay for tests",
   "type": "module",
   "private": true,
@@ -32,9 +32,10 @@
     }
   },
   "scripts": {
-    "build": "tsup --config tsup.config.ts",
+    "build": "tsdown --config tsdown.config.ts",
     "test": "vitest run",
-    "lint": "eslint ."
+    "lint": "oxlint --type-aware .",
+    "lint:fix": "oxlint --type-aware --fix ."
   },
   "keywords": [],
   "author": "",
@@ -45,14 +46,13 @@
     "@types/string-similarity": "^4.0.2",
     "@vitest/coverage-v8": "catalog:",
     "@vitest/ui": "catalog:",
-    "eslint": "^10.2.1",
-    "tsup": "^8.5.1",
+    "tsdown": "0.23.1",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
   "dependencies": {
-    "diff": "^8.0.3",
-    "msw": "^2.12.11",
+    "diff": "^9.0.0",
+    "msw": "^2.15.0",
     "string-similarity": "^4.0.4"
   },
   "homepage": "https://mastra.ai",

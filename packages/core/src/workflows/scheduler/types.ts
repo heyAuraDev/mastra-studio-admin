@@ -1,8 +1,10 @@
+import type { ScheduleTarget } from '../../storage/domains/schedules/base';
+
 /**
  * Declarative schedule configuration for a workflow. When set on a workflow,
- * the scheduler will publish a `workflow.start` event on the cron schedule.
+ * the scheduler starts a run on the cron schedule.
  *
- * Only supported on the evented engine.
+ * Supported on the default and evented engines.
  *
  * A workflow may declare a single schedule (the `id` is optional and defaults
  * to a stable internal value), or an array of schedules where every entry
@@ -20,8 +22,22 @@ export type WorkflowScheduleConfig<TInput = unknown, TState = unknown, TRequestC
   id?: string;
   /**
    * Cron expression (5-, 6-, or 7-part). Validated at workflow construction time.
+   * Exactly one of `cron` or `runAt` must be set.
    */
-  cron: string;
+  cron?: string;
+  /**
+   * Fire exactly once at this time (`Date` or ms epoch), then mark the
+   * schedule `completed`. Mutually exclusive with `cron` and `endAt`.
+   * A completed one-off is not re-created on redeploy; changing `runAt`
+   * re-arms it.
+   */
+  runAt?: Date | number;
+  /**
+   * Stop a cron schedule after this time (`Date` or ms epoch). Once the next
+   * occurrence is past `endAt` the schedule is marked `completed`.
+   * Only valid together with `cron`.
+   */
+  endAt?: Date | number;
   /**
    * Optional IANA timezone (e.g. 'America/New_York'). Defaults to the host timezone.
    */
@@ -60,9 +76,9 @@ export type WorkflowScheduleInput<TInput = unknown, TState = unknown, TRequestCo
   | WorkflowScheduleConfig<TInput, TState, TRequestContext>[];
 
 /**
- * Configuration for the `WorkflowScheduler` component owned by Mastra.
+ * Configuration for the `Scheduler` component owned by Mastra.
  */
-export type WorkflowSchedulerConfig = {
+export type SchedulerConfig = {
   /**
    * Explicitly enable the scheduler even when no declarative schedules
    * are present. Useful when schedules are managed imperatively.
@@ -81,14 +97,53 @@ export type WorkflowSchedulerConfig = {
    */
   onError?: (err: unknown, context: { scheduleId: string }) => void;
   /**
-   * Predicate used to check whether a workflow id is currently registered
-   * with the host Mastra instance. When provided, the scheduler refuses to
-   * fire schedules whose target workflow is unknown and deletes the row
-   * after a small number of consecutive misses (see `missesBeforeDelete`).
+   * Predicate used to check whether a schedule's target is currently
+   * registered with the host Mastra instance. For workflow targets the
+   * predicate should resolve the workflow id; for agent targets it
+   * should resolve the agent id. When provided, the scheduler refuses to
+   * fire schedules whose target is unknown and deletes the row after a
+   * small number of consecutive misses (see `missesBeforeDelete`).
    *
-   * Wired up by `SchedulerWorker` from `mastra.getWorkflowById(...)`.
+   * Wired up by `SchedulerWorker` from `mastra.getWorkflowById(...)` and
+   * `mastra.getAgentById(...)`, with an editor fallback for stored agents
+   * that have not been hydrated into the registry yet.
    */
-  isWorkflowRegistered?: (workflowId: string) => boolean;
+  isTargetReady?: (target: ScheduleTarget) => boolean | Promise<boolean>;
+  /**
+   * Predicate used to check whether the *local build's* definition of a
+   * schedule's target matches the definition recorded on the schedule row
+   * (`WorkflowScheduleTarget.definitionHash`). Scheduled runs execute
+   * `localOnly` in the claiming process against its own workflow registry,
+   * so an instance whose local step graph differs from the row (a
+   * not-yet-cycled straggler from a previous deploy) must not claim the
+   * fire — it would silently execute a stale graph (#19169). When the
+   * predicate returns `false` the scheduler leaves the fire unclaimed for
+   * an instance whose definition matches.
+   *
+   * Fail open: rows without a `definitionHash` (legacy or imperative
+   * schedules) and configurations without this predicate always fire.
+   *
+   * Wired up by `SchedulerWorker` from the registered workflow's serialized
+   * step graph.
+   */
+  isTargetCurrent?: (target: ScheduleTarget) => boolean;
+  /**
+   * Whether the claiming process also consumes workflow-execution events,
+   * i.e. whether a fire published here would be executed here.
+   *
+   * When true the scheduler publishes `workflow.start` with `localOnly` so
+   * the instance that proved the target ready (and current) is the instance
+   * that runs it. Without this affinity the fire lands on the shared topic
+   * and any consumer — including a straggler from a previous deploy —
+   * can execute it against its own workflow registry (#19169).
+   *
+   * When false or absent the fire is published normally, because a
+   * scheduler-only process has no local consumer and `localOnly` would
+   * strand the event.
+   *
+   * Wired up by `SchedulerWorker` from `Mastra.__hasLocalWorkflowExecution()`.
+   */
+  canExecuteLocally?: () => boolean;
   /**
    * Number of consecutive ticks a schedule's target workflow may be missing
    * before the scheduler deletes the row. Defaults to 3 (≈30s with the
@@ -97,4 +152,31 @@ export type WorkflowSchedulerConfig = {
    * registering.
    */
   missesBeforeDelete?: number;
+  /**
+   * Number of consecutive ticks a schedule may be skipped by the stale-build
+   * fence (`isTargetCurrent`) before the scheduler escalates from a warning to
+   * an error and records a failed trigger. Defaults to 5.
+   *
+   * The fire is never forced — executing a stale definition is precisely what
+   * the fence prevents — but a schedule that no running instance can claim is
+   * a stall that operators need to see.
+   */
+  staleSkipsBeforeEscalation?: number;
 };
+
+/**
+ * Carried on `workflow.start` data for scheduler and manual fires; the
+ * workflow event processor uses it to run default-engine fires in-process.
+ */
+export interface ScheduledWorkflowTrigger {
+  scheduleId: string;
+  scheduledFireAt: number;
+  triggerKind: 'schedule-fire' | 'manual';
+}
+
+/**
+ * @deprecated Renamed to {@link SchedulerConfig}. The scheduler now drives both
+ * workflow and agent schedules, so the `Workflow`-prefixed name is no longer
+ * accurate. This alias will be removed in a future major release.
+ */
+export type WorkflowSchedulerConfig = SchedulerConfig;

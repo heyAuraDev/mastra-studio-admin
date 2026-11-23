@@ -18,13 +18,29 @@ export interface DependencyMetadata {
    * The resolved version of the dependency (exact version from package.json)
    */
   version?: string;
+  /**
+   * The package.json dependency value to install when it differs from the resolved version.
+   * For npm aliases, this uses npm alias syntax (e.g. npm:actual-package@1.0.0).
+   */
+  packageSpec?: string;
 }
 
 export interface BundlerOptions {
   enableSourcemap: boolean;
+  /**
+   * Optional so that a `Bundler` subclass outside this repo, which builds this
+   * object itself, keeps compiling. Absent means off, same as `false`.
+   */
+  enableMinify?: boolean;
   enableEsmShim: boolean;
   externals: boolean | string[];
+  /** Preserve the default external-all behavior alongside explicitly listed packages. */
+  externalsPreset?: boolean;
   dynamicPackages?: string[];
+}
+
+export interface InternalBundlerOptions extends BundlerOptions {
+  alias?: Record<string, string>;
 }
 
 /**
@@ -35,4 +51,9 @@ export interface ExternalDependencyInfo {
    * The resolved version of the dependency (exact version from package.json)
    */
   version?: string;
+  /**
+   * The package.json dependency value to install when it differs from the resolved version.
+   * For npm aliases, this uses npm alias syntax (e.g. npm:actual-package@1.0.0).
+   */
+  packageSpec?: string;
 }

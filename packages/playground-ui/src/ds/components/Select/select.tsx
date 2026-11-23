@@ -1,11 +1,23 @@
 import { Select as SelectPrimitive } from '@base-ui/react/select';
-import { Check, ChevronDown } from 'lucide-react';
+import type { SelectPopupProps, SelectPositionerProps } from '@base-ui/react/select';
 import * as React from 'react';
 
-import type { ButtonProps } from '../Button';
-import { formElementSizes } from '@/ds/primitives/form-element';
-import type { FormElementSize } from '@/ds/primitives/form-element';
-import { transitions } from '@/ds/primitives/transitions';
+import { ButtonChevron, buttonVariants } from '../Button/Button';
+import type { TextButtonSize } from '../Button/Button';
+import { keepOwnAccessibleName } from '@/ds/components/Field/field-control-aria';
+import { IconCheckmark2Medium } from '@/ds/icons/central/IconCheckmark2Medium';
+import { controlTriggerOpenState } from '@/ds/primitives/control-size';
+import { FLOATING_POSITION_METHOD } from '@/ds/primitives/floating';
+import { fieldTriggerErrorBorder, fieldTriggerStyle, fieldTriggerWidthStyle } from '@/ds/primitives/form-element';
+import {
+  menuItemCheckClass,
+  menuItemClass,
+  menuPopupClass,
+  menuPositionerClass,
+  menuSeparatorClass,
+} from '@/ds/primitives/menu-item';
+import { menuScrollPopupClass, MenuScrollArea } from '@/ds/primitives/menu-scroll-area';
+import { usePortalContainer } from '@/ds/primitives/portal-container';
 import { cn } from '@/lib/utils';
 
 /**
@@ -48,7 +60,7 @@ function collectItems(children: React.ReactNode, acc: Array<{ value: unknown; la
   });
 }
 
-type SelectRootProps<Value> = SelectPrimitive.Root.Props<Value, false>;
+type SelectRootProps<Value> = SelectPrimitive.Root.Props<Value>;
 type SelectChangeDetails = Parameters<NonNullable<SelectRootProps<unknown>['onValueChange']>>[1];
 
 /**
@@ -70,7 +82,7 @@ function Select<Value = string>({ children, items, onValueChange, ...props }: Se
 
   return (
     <SelectPrimitive.Root
-      items={derivedItems as SelectRootProps<Value>['items']}
+      items={derivedItems}
       onValueChange={onValueChange ? (value, eventDetails) => onValueChange(value as Value, eventDetails) : undefined}
       {...props}
     >
@@ -97,86 +109,134 @@ const SelectValue = React.forwardRef<HTMLSpanElement, SelectValueProps>(({ class
 ));
 SelectValue.displayName = 'SelectValue';
 
+/**
+ * A select is a form field, so it reuses the Button's size/shape recipe with
+ * these looks: `default` (the Input's overlay surface — the default here too,
+ * so a select sits next to an Input as the same kind of thing) and `ghost`
+ * (borderless, for dense toolbars/inline pickers). The high-emphasis `primary` look is the only one intentionally NOT
+ * offered (a field is not a call-to-action).
+ */
+export type SelectTriggerVariant = 'default' | 'ghost';
+type SelectTriggerLegacyVariant = 'primary';
+
 export type SelectTriggerProps = Omit<SelectPrimitive.Trigger.Props, 'className'> & {
   className?: string;
-  size?: FormElementSize;
-  /** Kept for API compatibility; styling is now intrinsic to the trigger. */
-  variant?: ButtonProps['variant'];
+  size?: TextButtonSize;
+  variant?: SelectTriggerVariant | SelectTriggerLegacyVariant;
 };
 
+function normalizeSelectTriggerVariant(
+  variant: SelectTriggerVariant | SelectTriggerLegacyVariant,
+): SelectTriggerVariant {
+  return variant === 'primary' ? 'default' : variant;
+}
+
 const SelectTrigger = React.forwardRef<HTMLButtonElement, SelectTriggerProps>(
-  ({ className, children, size = 'default', variant: _variant, ...props }, ref) => {
+  ({ className, children, size = 'md', variant = 'default', ...props }, ref) => {
+    const visualVariant = normalizeSelectTriggerVariant(variant);
+
     return (
       <SelectPrimitive.Trigger
         ref={ref}
+        data-slot="select-trigger"
+        // A select = a button + a trailing chevron: reuse the Button recipe
+        // (variant colors, size = height/text/padding/radius, unified border
+        // focus, disabled) and layer only the select-specific extras.
         className={cn(
-          'inline-flex w-full cursor-pointer select-none items-center justify-between gap-1.5 whitespace-nowrap',
-          formElementSizes[size],
-          'rounded-lg border border-border1 bg-transparent px-2.5 text-ui-smd leading-ui-sm text-neutral4',
-          'outline-none transition-colors duration-normal ease-out-custom',
-          'hover:bg-surface3 hover:text-neutral6 hover:border-border2 active:bg-surface4',
-          'focus:outline-none focus-visible:outline-none focus-visible:border-border2',
-          'data-[popup-open]:bg-surface3 data-[popup-open]:text-neutral6 data-[popup-open]:border-border2',
-          'data-[placeholder]:text-neutral3',
-          'disabled:cursor-not-allowed disabled:opacity-50',
+          buttonVariants({ variant: visualVariant, size }),
+          visualVariant === 'default' && fieldTriggerStyle,
+          // Fill the field and push the value left / chevron right (Button's
+          // base centers its content with `justify-center`).
+          fieldTriggerWidthStyle,
+          'justify-between',
+          // Read as "active" while the menu is open, per variant (see map above).
+          controlTriggerOpenState[visualVariant],
+          'data-[placeholder]:text-muted-foreground',
+          fieldTriggerErrorBorder,
           '[&>span]:truncate',
           className,
         )}
         {...props}
+        {...keepOwnAccessibleName(props)}
       >
         {children}
-        <SelectPrimitive.Icon
-          render={<ChevronDown className={cn('h-4 w-4 shrink-0 text-neutral3 opacity-70', transitions.colors)} />}
-        />
+        <ButtonChevron size={size} />
       </SelectPrimitive.Trigger>
     );
   },
 );
 SelectTrigger.displayName = 'SelectTrigger';
 
-export type SelectContentProps = Omit<SelectPrimitive.Popup.Props, 'className'> & {
-  className?: string;
-  /**
-   * Kept for API compatibility with the previous Radix API. Radix supported
-   * `position="popper" | "item-aligned"`; Base UI always uses popper-style
-   * positioning so this prop is accepted but has no effect.
-   */
-  position?: 'popper' | 'item-aligned';
-  /** Optional portal container, forwarded to `Select.Portal`. */
-  container?: HTMLElement | null;
-  side?: SelectPrimitive.Positioner.Props['side'];
-  align?: SelectPrimitive.Positioner.Props['align'];
-  sideOffset?: SelectPrimitive.Positioner.Props['sideOffset'];
-};
+type SelectContentPositionerProps = Omit<SelectPositionerProps, keyof SelectPopupProps>;
+
+export type SelectContentProps = Omit<SelectPopupProps, 'className'> &
+  SelectContentPositionerProps & {
+    className?: string;
+    /**
+     * Kept for API compatibility with the previous Radix API. Radix supported
+     * `position="popper" | "item-aligned"`; Base UI always uses popper-style
+     * positioning so this prop is accepted but has no effect.
+     */
+    position?: 'popper' | 'item-aligned';
+    /** Optional portal container, forwarded to `Select.Portal`. */
+    container?: HTMLElement | null;
+  };
 
 const SelectContent = React.forwardRef<HTMLDivElement, SelectContentProps>(
   (
-    { className, children, position: _position, container, side = 'bottom', align = 'start', sideOffset = 4, ...props },
+    {
+      className,
+      children,
+      position: _position,
+      container,
+      side = 'bottom',
+      align = 'start',
+      sideOffset = 4,
+      alignItemWithTrigger = false,
+      anchor,
+      positionMethod = FLOATING_POSITION_METHOD,
+      alignOffset,
+      collisionBoundary,
+      collisionPadding,
+      sticky,
+      arrowPadding,
+      disableAnchorTracking,
+      collisionAvoidance,
+      ...props
+    },
     ref,
-  ) => (
-    <SelectPrimitive.Portal container={container ?? undefined}>
-      <SelectPrimitive.Positioner
-        className="z-50 outline-none"
-        side={side}
-        align={align}
-        sideOffset={sideOffset}
-        alignItemWithTrigger={false}
-      >
-        <SelectPrimitive.Popup
-          ref={ref}
-          className={cn(
-            'relative z-50 min-w-32 min-w-[var(--anchor-width)] max-h-dropdown-max-height max-h-[var(--available-height)] overflow-y-auto overflow-x-hidden rounded-xl border border-border1 bg-surface3 p-1 text-neutral4 shadow-dialog origin-[var(--transform-origin)]',
-            'data-[open]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[open]:fade-in-0 data-[closed]:zoom-out-95 data-[open]:zoom-in-95',
-            'data-[side=bottom]:slide-in-from-top-1 data-[side=left]:slide-in-from-right-1 data-[side=right]:slide-in-from-left-1 data-[side=top]:slide-in-from-bottom-1',
-            className,
-          )}
-          {...props}
-        >
-          <SelectPrimitive.List>{children}</SelectPrimitive.List>
-        </SelectPrimitive.Popup>
-      </SelectPrimitive.Positioner>
-    </SelectPrimitive.Portal>
-  ),
+  ) => {
+    // Default to the nearest SideDialog/Drawer popup so the dropdown stays
+    // interactive inside a modal drawer; an explicit `container` still wins.
+    const resolvedContainer = usePortalContainer(container);
+    const positionerProps: SelectContentPositionerProps = {
+      side,
+      align,
+      sideOffset,
+      alignItemWithTrigger,
+      anchor,
+      positionMethod,
+      alignOffset,
+      collisionBoundary,
+      collisionPadding,
+      sticky,
+      arrowPadding,
+      disableAnchorTracking,
+      collisionAvoidance,
+    };
+
+    return (
+      <SelectPrimitive.Portal container={resolvedContainer}>
+        <SelectPrimitive.Positioner className={menuPositionerClass} {...positionerProps}>
+          <SelectPrimitive.Popup ref={ref} className={cn(menuPopupClass, menuScrollPopupClass, className)} {...props}>
+            {/* The viewport is Select's list, so Select scrolls it to line the selected item up with the
+                trigger. `role` is restated because the viewport's own `presentation` role would win. */}
+            <MenuScrollArea viewportRender={<SelectPrimitive.List role="listbox" />}>{children}</MenuScrollArea>
+          </SelectPrimitive.Popup>
+        </SelectPrimitive.Positioner>
+      </SelectPrimitive.Portal>
+    );
+  },
 );
 SelectContent.displayName = 'SelectContent';
 
@@ -185,29 +245,27 @@ export type SelectItemProps = Omit<SelectPrimitive.Item.Props, 'className'> & {
 };
 
 const SelectItem = React.forwardRef<HTMLDivElement, SelectItemProps>(({ className, children, ...props }, ref) => (
-  <SelectPrimitive.Item
-    ref={ref}
-    className={cn(
-      'relative flex w-full cursor-pointer select-none items-center gap-2.5 rounded-lg py-1.5 pl-2 pr-8 text-neutral4 text-ui-smd leading-ui-sm',
-      'outline-none focus:outline-none focus-visible:outline-none',
-      transitions.colors,
-      'hover:bg-surface4 hover:text-neutral6',
-      'focus:bg-surface4 focus:text-neutral6',
-      'data-[highlighted]:bg-surface4 data-[highlighted]:text-neutral6',
-      'data-[selected]:text-neutral6',
-      'data-disabled:pointer-events-none data-disabled:opacity-50',
-      className,
-    )}
-    {...props}
-  >
-    <span className="absolute right-2 flex h-3.5 w-3.5 items-center justify-center">
-      <SelectPrimitive.ItemIndicator>
-        <Check className="h-4 w-4 text-neutral6" />
-      </SelectPrimitive.ItemIndicator>
-    </span>
+  <SelectPrimitive.Item ref={ref} className={cn(menuItemClass, className)} {...props}>
     <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
+    <SelectPrimitive.ItemIndicator className={menuItemCheckClass}>
+      <IconCheckmark2Medium />
+    </SelectPrimitive.ItemIndicator>
   </SelectPrimitive.Item>
 ));
 SelectItem.displayName = 'SelectItem';
 
-export { Select, SelectGroup, SelectValue, SelectTrigger, SelectContent, SelectItem };
+export type SelectSeparatorProps = Omit<SelectPrimitive.Separator.Props, 'className'> & {
+  className?: string;
+};
+
+const SelectSeparator = React.forwardRef<HTMLDivElement, SelectSeparatorProps>(({ className, ...props }, ref) => (
+  <SelectPrimitive.Separator
+    ref={ref}
+    data-slot="select-separator"
+    className={cn(menuSeparatorClass, className)}
+    {...props}
+  />
+));
+SelectSeparator.displayName = 'SelectSeparator';
+
+export { Select, SelectGroup, SelectValue, SelectTrigger, SelectContent, SelectItem, SelectSeparator };

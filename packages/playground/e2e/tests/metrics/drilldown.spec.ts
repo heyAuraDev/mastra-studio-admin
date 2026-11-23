@@ -1,4 +1,5 @@
-import { test, expect, type Locator, type Page } from '@playwright/test';
+import { test, expect } from '@playwright/test';
+import type { Locator, Page } from '@playwright/test';
 import { resetStorage } from '../__utils__/reset-storage';
 
 test.afterEach(async () => {
@@ -6,7 +7,7 @@ test.afterEach(async () => {
 });
 
 function cardByTitle(page: Page, title: string): Locator {
-  return page.locator('div.border-border1', {
+  return page.locator('div.group\\/metrics-card', {
     has: page.getByRole('heading', { name: title, exact: true }),
   });
 }
@@ -27,65 +28,79 @@ async function gotoMetricsOrSkip(page: Page, url = '/metrics') {
   );
 }
 
-test('Latency card header opens traces filtered to active tab rootEntityType', async ({ page }) => {
-  await gotoMetricsOrSkip(page);
+async function clickAndReadUrl(page: Page, button: Locator, pathname: string): Promise<URL> {
+  await button.click();
+  await page.waitForURL(url => url.pathname.endsWith(pathname));
+  return new URL(page.url());
+}
 
-  const latencyCard = cardByTitle(page, 'Latency');
+test.describe('Metrics dashboard drilldown buttons', () => {
+  test.describe('when the Latency card is shown on the agents tab', () => {
+    test('opens traces filtered to the active tab rootEntityType', async ({ page }) => {
+      await gotoMetricsOrSkip(page);
 
-  const openInTraces = latencyCard.getByRole('link', { name: 'View in Traces' });
-  await expect(openInTraces).toBeVisible();
+      const button = cardByTitle(page, 'Latency').getByRole('button', { name: 'View in traces' });
+      const url = await clickAndReadUrl(page, button, '/traces');
 
-  const agentHref = await openInTraces.getAttribute('href');
-  expect(agentHref).toContain('/observability?');
-  expect(agentHref).toContain('datePreset=last-24h');
-  expect(agentHref).toContain('rootEntityType=agent');
-});
+      expect(url.searchParams.get('datePreset')).toBe('last-24h');
+      expect(url.searchParams.get('rootEntityType')).toBe('agent');
+    });
+  });
 
-test('Latency card header honors the active tab (workflows)', async ({ page }) => {
-  await gotoMetricsOrSkip(page);
+  test.describe('when the Latency card Workflows tab is active', () => {
+    test('opens traces for workflow runs', async ({ page }) => {
+      await gotoMetricsOrSkip(page);
 
-  const latencyCard = cardByTitle(page, 'Latency');
-  await latencyCard.getByRole('tab', { name: 'Workflows' }).click();
+      const latencyCard = cardByTitle(page, 'Latency');
+      await latencyCard.getByRole('tab', { name: 'Workflows' }).click();
+      const url = await clickAndReadUrl(page, latencyCard.getByRole('button', { name: 'View in traces' }), '/traces');
 
-  const href = await latencyCard.getByRole('link', { name: 'View in Traces' }).getAttribute('href');
-  expect(href).toContain('rootEntityType=workflow_run');
-});
+      expect(url.searchParams.get('rootEntityType')).toBe('workflow_run');
+    });
+  });
 
-test('Trace Volume card exposes both traces and logs drilldown buttons', async ({ page }) => {
-  await gotoMetricsOrSkip(page);
+  test.describe('when the Trace volume card is shown', () => {
+    test('opens agent errors in logs', async ({ page }) => {
+      await gotoMetricsOrSkip(page);
 
-  const card = cardByTitle(page, 'Trace Volume');
+      const button = cardByTitle(page, 'Trace volume').getByRole('button', { name: 'View errors in logs' });
+      const url = await clickAndReadUrl(page, button, '/logs');
 
-  const tracesLink = card.getByRole('link', { name: 'View in Traces' });
-  const logsLink = card.getByRole('link', { name: 'View errors in Logs' });
+      expect(url.searchParams.get('filterLevel')).toBe('error');
+      expect(url.searchParams.get('rootEntityType')).toBe('agent');
+    });
+  });
 
-  await expect(tracesLink).toBeVisible();
-  await expect(logsLink).toBeVisible();
+  test.describe('when the dashboard has a dimensional filter applied', () => {
+    test('keeps the filter in the traces URL', async ({ page }) => {
+      await gotoMetricsOrSkip(page, '/metrics?filterEnvironment=prod');
 
-  const logsHref = await logsLink.getAttribute('href');
-  expect(logsHref).toContain('/logs?');
-  expect(logsHref).toContain('filterLevel=error');
-  expect(logsHref).toContain('rootEntityType=agent');
-});
+      const button = cardByTitle(page, 'Latency').getByRole('button', { name: 'View in traces' });
+      const url = await clickAndReadUrl(page, button, '/traces');
 
-test('drilldown preserves dashboard dimensional filters (filterEnvironment=prod)', async ({ page }) => {
-  await gotoMetricsOrSkip(page, '/metrics?filterEnvironment=prod');
+      expect(url.searchParams.get('filterEnvironment')).toBe('prod');
+    });
+  });
 
-  const latencyCard = cardByTitle(page, 'Latency');
-  const href = await latencyCard.getByRole('link', { name: 'View in Traces' }).getAttribute('href');
-  expect(href).toContain('filterEnvironment=prod');
-});
+  test.describe('when the dashboard uses a 7-day metrics preset', () => {
+    test('opens traces with the last-7d preset', async ({ page }) => {
+      await gotoMetricsOrSkip(page, '/metrics?period=7d');
 
-test('drilldown propagates a 7-day metrics preset as last-7d', async ({ page }) => {
-  await gotoMetricsOrSkip(page, '/metrics?period=7d');
+      const button = cardByTitle(page, 'Latency').getByRole('button', { name: 'View in traces' });
+      const url = await clickAndReadUrl(page, button, '/traces');
 
-  const latencyCard = cardByTitle(page, 'Latency');
-  const href = await latencyCard.getByRole('link', { name: 'View in Traces' }).getAttribute('href');
-  expect(href).toContain('datePreset=last-7d');
-});
+      expect(url.searchParams.get('datePreset')).toBe('last-7d');
+    });
+  });
 
-test('Model Usage card exposes traces drilldown button', async ({ page }) => {
-  await gotoMetricsOrSkip(page);
+  test.describe('when the Usage card is shown', () => {
+    test('opens traces', async ({ page }) => {
+      await gotoMetricsOrSkip(page);
 
-  await expect(cardByTitle(page, 'Model Usage & Cost').getByRole('link', { name: 'View in Traces' })).toBeAttached();
+      const button = cardByTitle(page, 'Usage').getByRole('button', { name: 'View in traces' });
+      const url = await clickAndReadUrl(page, button, '/traces');
+
+      expect(url.pathname).toMatch(/\/traces$/);
+    });
+  });
 });

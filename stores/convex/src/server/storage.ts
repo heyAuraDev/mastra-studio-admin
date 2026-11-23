@@ -14,8 +14,11 @@ import type { GenericMutationCtx as MutationCtx } from 'convex/server';
 import { mutationGeneric } from 'convex/server';
 import type { GenericId } from 'convex/values';
 
-import type { EqualityFilter, StorageRequest, StorageResponse } from '../storage/types';
+import type { EqualityFilter, RunClaimRequest, StorageRequest, StorageResponse } from '../storage/types';
 import { findBestIndex } from './index-map';
+import { handleObservationalMemoryOperation } from './observational-memory';
+import { handleRunClaimOperation, isRunClaimRequest } from './run-fencing';
+import { createEmptyWorkflowSnapshot, mergeWorkflowStepResult } from './workflow-snapshot';
 
 // Vector-specific table names (not in @mastra/core)
 const TABLE_VECTOR_INDEXES = 'mastra_vector_indexes';
@@ -23,7 +26,14 @@ const VECTOR_TABLE_PREFIX = 'mastra_vector_';
 const CONVEX_TABLE_WORKFLOW_SNAPSHOTS = 'mastra_workflow_snapshots';
 const CONVEX_TABLE_BACKGROUND_TASKS = 'mastra_background_tasks';
 const CONVEX_TABLE_DOCUMENTS = 'mastra_documents';
+// Defined locally (not imported from core) because this file is bundled into
+// the user's Convex deployment and older cores in the peer range may not
+// export the observational memory constants.
+const CONVEX_TABLE_OBSERVATIONAL_MEMORY = 'mastra_observational_memory';
 const STORAGE_MUTATION_BATCH_SIZE = 25;
+// Keep this in sync with ConvexDB's loadMany client chunk size. The low cap
+// bounds full-doc responses per request; individual document size still matters.
+const LOAD_MANY_MAX_IDS_PER_REQUEST = 10;
 const DEFAULT_SCHEDULE_QUERY_LIMIT = 100;
 
 type ConvexDocWithId = { _id: GenericId<string> };
@@ -55,6 +65,13 @@ const BACKGROUND_TASK_FIELD_ALIASES: Record<string, string> = {
 function normalizeScheduleQueryLimit(limit: number | undefined): number {
   if (limit == null || !Number.isFinite(limit)) return DEFAULT_SCHEDULE_QUERY_LIMIT;
   return Math.max(0, Math.floor(limit));
+}
+
+function normalizeLoadManyIds(ids: string[]): string[] {
+  if (ids.length > LOAD_MANY_MAX_IDS_PER_REQUEST) {
+    throw new Error(`loadMany supports at most ${LOAD_MANY_MAX_IDS_PER_REQUEST} ids per request`);
+  }
+  return [...new Set(ids)];
 }
 
 function applyConvexEqualityFilters(
@@ -198,6 +215,30 @@ function coalesceTypedRecordsForBatchInsert(records: StorageRecord[]): StorageRe
   return [...recordsById.values()];
 }
 
+/**
+ * Builds the patch for an upsert over an existing row.
+ *
+ * `id` is dropped because it is already set on the stored document.
+ *
+ * For workflow snapshots, `createdAt` is dropped as well so the stored creation
+ * time survives. A snapshot is written repeatedly over the life of a run, and
+ * callers cannot supply a trustworthy `createdAt` on a later save: a request
+ * that read the row before another writer inserted it would carry its own
+ * timestamp and overwrite the real one. patch() is a partial update, so leaving
+ * the key out preserves whatever was stored on first insert. This mirrors the
+ * SQL adapters, whose ON CONFLICT DO UPDATE omits createdAt from the SET list.
+ *
+ * Other tables keep their existing behaviour of writing the incoming createdAt.
+ */
+function buildUpsertPatch(convexTable: string, record: StorageRecord): StorageRecord {
+  const { id: _id, ...updateData } = record;
+  if (convexTable === CONVEX_TABLE_WORKFLOW_SNAPSHOTS) {
+    const { createdAt: _createdAt, ...withoutCreatedAt } = updateData;
+    return withoutCreatedAt;
+  }
+  return updateData;
+}
+
 function coalesceLastRecordById(records: StorageRecord[]): StorageRecord[] {
   const recordsById = new Map<string, StorageRecord>();
   for (const record of records) {
@@ -236,6 +277,8 @@ function resolveTable(tableName: string): { convexTable: string; isTyped: boolea
       return { convexTable: CONVEX_TABLE_BACKGROUND_TASKS, isTyped: true };
     case TABLE_VECTOR_INDEXES:
       return { convexTable: 'mastra_vector_indexes', isTyped: true };
+    case CONVEX_TABLE_OBSERVATIONAL_MEMORY:
+      return { convexTable: CONVEX_TABLE_OBSERVATIONAL_MEMORY, isTyped: true };
     default:
       // Check if it's a vector data table
       if (tableName.startsWith(VECTOR_TABLE_PREFIX)) {
@@ -250,13 +293,22 @@ function resolveTable(tableName: string): { convexTable: string; isTyped: boolea
  * Main storage mutation handler.
  * Routes operations to the appropriate typed table.
  */
-export const mastraStorage = mutationGeneric(async (ctx, request: StorageRequest): Promise<StorageResponse> => {
+export const mastraStorage = mutationGeneric(
+  async (ctx, request: StorageRequest | RunClaimRequest): Promise<StorageResponse> => {
+    if (isRunClaimRequest(request)) {
+      return handleRunClaimOperation(ctx, request, routeStorageRequest);
+    }
+    return routeStorageRequest(ctx, request);
+  },
+);
+
+async function routeStorageRequest(ctx: MutationCtx<any>, request: StorageRequest): Promise<StorageResponse> {
   try {
     const { convexTable, isTyped } = resolveTable(request.tableName);
 
     // Handle vector data tables specially (but NOT vector_indexes which is a typed table)
     if (request.tableName.startsWith(VECTOR_TABLE_PREFIX) && request.tableName !== TABLE_VECTOR_INDEXES) {
-      return handleVectorOperation(ctx, request);
+      return await handleVectorOperation(ctx, request);
     }
 
     // Handle typed tables
@@ -281,7 +333,35 @@ export const mastraStorage = mutationGeneric(async (ctx, request: StorageRequest
       error: err.message,
     };
   }
-});
+}
+
+function parseStoredSnapshot(stored: unknown, runId: string): Record<string, any> {
+  if (typeof stored === 'string') return JSON.parse(stored);
+  return JSON.parse(JSON.stringify(stored ?? createEmptyWorkflowSnapshot(runId)));
+}
+
+function parseMetadataForMerge(metadata: unknown): Record<string, unknown> {
+  if (metadata == null) return {};
+  if (typeof metadata === 'string') {
+    try {
+      const parsed = JSON.parse(metadata);
+      return parseMetadataForMerge(parsed);
+    } catch {
+      return {};
+    }
+  }
+  if (typeof metadata === 'object' && !Array.isArray(metadata)) {
+    return metadata as Record<string, unknown>;
+  }
+  return {};
+}
+
+function mergeMetadata(existing: unknown, update: Record<string, unknown> | undefined): Record<string, unknown> {
+  return {
+    ...parseMetadataForMerge(existing),
+    ...(update ?? {}),
+  };
+}
 
 /**
  * Handle operations on typed tables (threads, messages, etc.)
@@ -294,6 +374,24 @@ export async function handleTypedOperation(
   request: StorageRequest,
 ): Promise<StorageResponse> {
   switch (request.op) {
+    case 'omGetLatest':
+    case 'omGetHistory':
+    case 'omInitialize':
+    case 'omCreateReflectionGeneration':
+    case 'omSetPendingMessageTokens':
+    case 'omSetBufferingObservationFlag':
+    case 'omUpdateActive':
+    case 'omAppendBufferedChunk':
+    case 'omSwapBuffered':
+    case 'omUpdateBufferedReflection':
+    case 'omSwapBufferedReflection':
+    case 'omUpdateConfig': {
+      if (convexTable !== CONVEX_TABLE_OBSERVATIONAL_MEMORY) {
+        throw new Error(`${request.op} is only supported for ${CONVEX_TABLE_OBSERVATIONAL_MEMORY}`);
+      }
+      return handleObservationalMemoryOperation(ctx, convexTable, request);
+    }
+
     case 'createSchedule': {
       if (convexTable !== 'mastra_schedules') {
         throw new Error(`createSchedule is only supported for mastra_schedules`);
@@ -369,6 +467,7 @@ export async function handleTypedOperation(
         last_fire_at: request.lastFireAt,
         last_run_id: request.lastRunId,
         updated_at: Date.now(),
+        ...(request.newStatus ? { status: request.newStatus } : {}),
       });
 
       return { ok: true, result: true };
@@ -443,9 +542,7 @@ export async function handleTypedOperation(
         .unique();
 
       if (existing) {
-        // Update existing - don't include id in patch (it's already set)
-        const { id: _, ...updateData } = record;
-        await ctx.db.patch(existing._id, updateData);
+        await ctx.db.patch(existing._id, buildUpsertPatch(convexTable, record));
       } else {
         // Insert new - include id as a regular field
         await ctx.db.insert(convexTable, record);
@@ -463,8 +560,7 @@ export async function handleTypedOperation(
           .unique();
 
         if (existing) {
-          const { id: _, ...updateData } = record;
-          await ctx.db.patch(existing._id, updateData);
+          await ctx.db.patch(existing._id, buildUpsertPatch(convexTable, record));
         } else {
           await ctx.db.insert(convexTable, record);
         }
@@ -472,8 +568,79 @@ export async function handleTypedOperation(
       return { ok: true };
     }
 
+    case 'updateThread': {
+      if (convexTable !== 'mastra_threads') {
+        return { ok: false, error: `Unsupported operation ${request.op} for table ${request.tableName}` };
+      }
+
+      const existing = await ctx.db
+        .query(convexTable)
+        .withIndex('by_record_id', (q: any) => q.eq('id', request.id))
+        .unique();
+
+      if (!existing) {
+        return { ok: true, result: null };
+      }
+
+      // patch() is a partial update, so leaving a key out preserves the stored
+      // value. Writing back the title read a moment ago would clobber one
+      // generated in between; same for metadata on a title-only update.
+      const patchRecord: { title?: string; metadata?: Record<string, any>; updatedAt: string } = {
+        updatedAt: request.updatedAt,
+      };
+      if (request.title !== undefined) {
+        patchRecord.title = request.title;
+      }
+      if (request.metadata !== undefined) {
+        patchRecord.metadata = mergeMetadata(existing.metadata, request.metadata);
+      }
+      await ctx.db.patch(existing._id, patchRecord);
+      return { ok: true, result: { ...existing, ...patchRecord } };
+    }
+
+    case 'updateResource': {
+      if (convexTable !== 'mastra_resources') {
+        return { ok: false, error: `Unsupported operation ${request.op} for table ${request.tableName}` };
+      }
+
+      const existing = await ctx.db
+        .query(convexTable)
+        .withIndex('by_record_id', (q: any) => q.eq('id', request.resourceId))
+        .unique();
+
+      if (!existing) {
+        const record = {
+          id: request.resourceId,
+          ...(request.workingMemory !== undefined ? { workingMemory: request.workingMemory } : {}),
+          metadata: request.metadata ?? {},
+          createdAt: request.createdAt,
+          updatedAt: request.updatedAt,
+        };
+        await ctx.db.insert(convexTable, record);
+        return { ok: true, result: record };
+      }
+
+      const patchRecord: Record<string, unknown> = {
+        updatedAt: request.updatedAt,
+      };
+      if (request.workingMemory !== undefined) {
+        patchRecord.workingMemory = request.workingMemory;
+      }
+      if (request.metadata !== undefined) {
+        patchRecord.metadata = mergeMetadata(existing.metadata, request.metadata);
+      }
+
+      await ctx.db.patch(existing._id, patchRecord);
+      return { ok: true, result: { ...existing, ...patchRecord } };
+    }
+
     case 'patch': {
       const patchRecord = stripPatchKeys(request.record, ['id']);
+      // Treat a missing field as `null` before comparing: rows written before a
+      // nullable field existed have no key at all, and an expectation of `null`
+      // (e.g. `expectedOwnerId: null` for an unowned task) must still match them.
+      const matchesExpected = (record: Record<string, any>) =>
+        !request.expected || Object.entries(request.expected).every(([key, value]) => (record[key] ?? null) === value);
       const existing = await ctx.db
         .query(convexTable)
         .withIndex('by_record_id', (q: any) => q.eq('id', request.id))
@@ -482,7 +649,7 @@ export async function handleTypedOperation(
       if (!existing) {
         if (isBackgroundTasksTable(convexTable, request)) {
           const legacy = await findGenericDocumentById(ctx, request.tableName, request.id);
-          if (legacy) {
+          if (legacy && matchesExpected(legacy.record)) {
             await ctx.db.patch(legacy._id, { record: mergeLegacyRecord(legacy.record, patchRecord) });
             return { ok: true, result: true };
           }
@@ -490,6 +657,7 @@ export async function handleTypedOperation(
         return { ok: true, result: false };
       }
 
+      if (!matchesExpected(existing)) return { ok: true, result: false };
       await ctx.db.patch(existing._id, patchRecord);
       if (isBackgroundTasksTable(convexTable, request)) {
         const legacy = await findGenericDocumentById(ctx, request.tableName, request.id);
@@ -531,6 +699,37 @@ export async function handleTypedOperation(
       const docs = await ctx.db.query(convexTable).take(10000);
       const match = docs.find((doc: any) => Object.entries(keys).every(([key, value]) => doc[key] === value));
       return { ok: true, result: match || null };
+    }
+
+    case 'loadMany': {
+      const ids = normalizeLoadManyIds(request.ids);
+      const docs = await mapInBatches(ids, STORAGE_MUTATION_BATCH_SIZE, id =>
+        ctx.db
+          .query(convexTable)
+          .withIndex('by_record_id', (q: any) => q.eq('id', id))
+          .unique(),
+      );
+      const typedDocs = docs.filter(Boolean);
+
+      if (!isBackgroundTasksTable(convexTable, request)) {
+        return { ok: true, result: typedDocs };
+      }
+
+      const typedDocsById = new Map(typedDocs.map(doc => [String((doc as Record<string, unknown>).id), doc]));
+      const legacyDocs = await mapInBatches(
+        ids.filter(id => !typedDocsById.has(id)),
+        STORAGE_MUTATION_BATCH_SIZE,
+        id => findGenericDocumentById(ctx, request.tableName, id),
+      );
+      const legacyRecordsById = new Map(
+        legacyDocs
+          .filter((doc): doc is GenericDocumentDoc => Boolean(doc))
+          .map(doc => [String(doc.record.id), doc.record]),
+      );
+      return {
+        ok: true,
+        result: ids.map(id => typedDocsById.get(id) ?? legacyRecordsById.get(id)).filter(Boolean),
+      };
     }
 
     case 'queryTable': {
@@ -634,6 +833,85 @@ export async function handleTypedOperation(
       return { ok: true };
     }
 
+    case 'mergeWorkflowStepResult': {
+      if (convexTable !== CONVEX_TABLE_WORKFLOW_SNAPSHOTS) {
+        return { ok: false, error: `Unsupported operation ${request.op} for table ${request.tableName}` };
+      }
+
+      const existing = await ctx.db
+        .query(convexTable)
+        .withIndex('by_workflow_run', (q: any) =>
+          q.eq('workflow_name', request.workflowName).eq('run_id', request.runId),
+        )
+        .unique();
+
+      if (!existing) {
+        return { ok: false, error: `Workflow snapshot not found for runId ${request.runId}` };
+      }
+
+      const snapshot = parseStoredSnapshot(existing.snapshot, request.runId);
+      if (!snapshot.context) {
+        return { ok: false, error: `Snapshot for runId ${request.runId} is missing or has invalid context` };
+      }
+
+      const context = mergeWorkflowStepResult({
+        snapshot,
+        stepId: request.stepId,
+        result: JSON.parse(request.result),
+        requestContext: JSON.parse(request.requestContext),
+        state: request.state === undefined ? undefined : JSON.parse(request.state),
+      });
+
+      await ctx.db.patch(existing._id, {
+        snapshot: JSON.stringify(snapshot),
+        updatedAt: new Date().toISOString(),
+      });
+
+      return { ok: true, result: JSON.stringify(context) };
+    }
+
+    case 'mergeWorkflowState': {
+      if (convexTable !== CONVEX_TABLE_WORKFLOW_SNAPSHOTS) {
+        return { ok: false, error: `Unsupported operation ${request.op} for table ${request.tableName}` };
+      }
+
+      const existing = await ctx.db
+        .query(convexTable)
+        .withIndex('by_workflow_run', (q: any) =>
+          q.eq('workflow_name', request.workflowName).eq('run_id', request.runId),
+        )
+        .unique();
+
+      if (!existing) {
+        return { ok: false, error: `Workflow snapshot not found for runId ${request.runId}` };
+      }
+
+      const snapshot = parseStoredSnapshot(existing.snapshot, request.runId);
+      if (!snapshot.context) {
+        return { ok: false, error: `Snapshot for runId ${request.runId} is missing or has invalid context` };
+      }
+
+      // `expectedStatus` is a compare-and-set guard, not state. Convex mutations are
+      // serializable, so checking it here keeps the guard and the write atomic. It is stripped
+      // from the merge so it can never be persisted into the snapshot. An empty result signals
+      // "guard did not match" to the caller.
+      const { expectedStatus, ...state } = JSON.parse(request.opts);
+      if (expectedStatus !== undefined) {
+        const expected = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
+        if (!expected.includes(snapshot.status)) {
+          return { ok: true, result: '' };
+        }
+      }
+
+      const mergedSnapshot = { ...snapshot, ...state };
+      await ctx.db.patch(existing._id, {
+        snapshot: JSON.stringify(mergedSnapshot),
+        updatedAt: new Date().toISOString(),
+      });
+
+      return { ok: true, result: JSON.stringify(mergedSnapshot) };
+    }
+
     default:
       return { ok: false, error: `Unsupported operation ${(request as any).op}` };
   }
@@ -734,7 +1012,49 @@ async function handleVectorOperation(ctx: MutationCtx<any>, request: StorageRequ
       return { ok: true, result: null };
     }
 
+    case 'loadMany': {
+      const docs = await findExistingDocsByIds(normalizeLoadManyIds(request.ids), id =>
+        ctx.db
+          .query(convexTable)
+          .withIndex('by_index_id', (q: any) => q.eq('indexName', indexName).eq('id', id))
+          .unique(),
+      );
+      return { ok: true, result: docs };
+    }
+
     case 'queryTable': {
+      if (request.cursor !== undefined && request.pageSize === undefined) {
+        throw new Error('queryTable cursor requires pageSize');
+      }
+
+      if (request.pageSize !== undefined) {
+        if (!Number.isInteger(request.pageSize) || request.pageSize <= 0) {
+          throw new Error('queryTable pageSize must be a positive integer');
+        }
+        if (request.limit !== undefined) {
+          throw new Error('queryTable limit cannot be combined with pageSize');
+        }
+
+        const page = await ctx.db
+          .query(convexTable)
+          .withIndex('by_index', (q: any) => q.eq('indexName', indexName))
+          .paginate({ cursor: request.cursor ?? null, numItems: request.pageSize });
+
+        let docs = page.page;
+
+        // Apply filters if provided
+        if (request.filters && request.filters.length > 0) {
+          docs = docs.filter((doc: any) => request.filters!.every(filter => doc[filter.field] === filter.value));
+        }
+
+        return {
+          ok: true,
+          result: docs,
+          hasMore: !page.isDone,
+          continuationCursor: page.continueCursor,
+        };
+      }
+
       // Use take() to avoid hitting Convex's 32k document limit
       const maxDocs = request.limit ? Math.min(request.limit * 2, 10000) : 10000;
       let docs = await ctx.db
@@ -879,6 +1199,16 @@ async function handleGenericOperation(ctx: MutationCtx<any>, request: StorageReq
         .take(10000);
       const match = docs.find((doc: any) => Object.entries(keys).every(([key, value]) => doc.record?.[key] === value));
       return { ok: true, result: match ? match.record : null };
+    }
+
+    case 'loadMany': {
+      const docs = await mapInBatches(normalizeLoadManyIds(request.ids), STORAGE_MUTATION_BATCH_SIZE, id =>
+        findGenericDocumentById(ctx, tableName, id),
+      );
+      return {
+        ok: true,
+        result: docs.filter((doc): doc is GenericDocumentDoc => Boolean(doc)).map(doc => doc.record),
+      };
     }
 
     case 'queryTable': {

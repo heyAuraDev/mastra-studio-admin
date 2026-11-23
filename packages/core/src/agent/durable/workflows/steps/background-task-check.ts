@@ -1,11 +1,18 @@
 import { z } from 'zod';
 import type { PubSub } from '../../../../events/pubsub';
-import { ChunkFrom } from '../../../../stream/types';
-import { createStep } from '../../../../workflows';
+import { checkBackgroundTasks } from '../../../../loop/shared/steps/background-task-check-core';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
+import { createStep } from '../../../../workflows/workflow';
 import { DurableStepIds } from '../../constants';
-import { globalRunRegistry } from '../../run-registry';
+import { getRunRegistryEntry, globalRunRegistry } from '../../run-registry';
 import { emitChunkEvent } from '../../stream-adapter';
+import { createRunMessageList } from '../../utils/run-message-list';
+import {
+  foldBackgroundResults,
+  hasAppliedBackgroundResults,
+  settleFinishedBackgroundResults,
+} from '../shared/background-results';
+import { readMessageListState, storeMessageListState } from '../shared/message-list-state';
 
 const BG_CHECK_STEP_ID = `${DurableStepIds.AGENTIC_EXECUTION}-bg-task-check`;
 
@@ -17,15 +24,22 @@ const bgCheckInputSchema = z.any();
 const bgCheckOutputSchema = z.any();
 
 /**
- * Create a durable background task check step.
+ * Create a durable background task check step. Behavior lives in the shared
+ * `checkBackgroundTasks` core; this glue owns registry/init-data access, the
+ * durable wait gate, and pubsub emission.
  *
- * Mirrors the regular agent's backgroundTaskCheckStep pattern:
- * - After tool calls complete, checks if any background tasks are still running
- * - First invocation (retryCount === 0): returns immediately with backgroundTaskPending=true
- *   so the loop can re-enter without blocking
- * - Subsequent invocations: waits with timeout for the next task to complete,
- *   then sets isContinued=true so the LLM processes the result
- * - If no running tasks: passes through unchanged
+ * The durable wait gate differs from the main loop's on purpose: the regular
+ * agent can skip waiting because background tool-result chunks are pushed
+ * directly into the live ReadableStream controller — that works even after
+ * this step returns. The durable agent emits tool-result chunks via pubsub,
+ * and the subscription is torn down when the stream closes. If this step
+ * returned without waiting, the workflow would finish, FINISH would fire,
+ * cleanup would run, and the subscriber would be gone before the background
+ * task could deliver its result. Therefore the durable agent must always
+ * wait when tasks are running — using the configured waitTimeoutMs, or a 1 s
+ * default to keep the workflow (and pubsub) alive. It only signals pending
+ * without blocking on retryCount 0 when an explicit timeout is configured
+ * (meaning the caller drives continuation externally).
  */
 export function createDurableBackgroundTaskCheckStep() {
   return createStep({
@@ -33,9 +47,10 @@ export function createDurableBackgroundTaskCheckStep() {
     inputSchema: bgCheckInputSchema,
     outputSchema: bgCheckOutputSchema,
     execute: async params => {
-      const { inputData, retryCount, getInitData } = params;
+      const { inputData, getInitData, retryCount } = params;
       const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
       const typedInput = inputData as Record<string, any>;
+      if (typedInput.stepResult?.signalPreempted && !typedInput.stepResult.isContinued) return typedInput;
 
       const initData = getInitData<{
         runId: string;
@@ -45,88 +60,65 @@ export function createDurableBackgroundTaskCheckStep() {
       }>();
       const { runId, agentId } = initData;
 
-      const registryEntry = globalRunRegistry.get(runId);
+      const registryEntry = getRunRegistryEntry(runId, params.mastra);
       const bgManager = registryEntry?.backgroundTaskManager;
+      const waitTimeoutMs = registryEntry?.backgroundTasksConfig?.waitTimeoutMs ?? bgManager?.config?.waitTimeoutMs;
 
-      if (!bgManager) {
-        return typedInput;
-      }
-
-      const runningResult = await bgManager.listTasks({
+      const outcome = await checkBackgroundTasks({
+        bgManager,
+        runId,
         agentId,
-        status: 'running',
         threadId: initData.state?.threadId,
         resourceId: initData.state?.resourceId,
+        skipWait: initData.options?.skipBgTaskWait,
+        retryCount,
+        resolveWaitMs: rc => (rc === 0 && waitTimeoutMs ? undefined : (waitTimeoutMs ?? 1000)),
+        emitChunk: chunk => {
+          if (!pubsub) return;
+          return emitChunkEvent(pubsub, runId, chunk as any);
+        },
       });
-      const runningTasks = runningResult?.tasks;
 
-      if (!runningTasks || runningTasks.length === 0) {
-        return typedInput;
+      // A task's status turns terminal before its onResult hook runs, so wait for the hooks of
+      // finished tasks. Cancelled tasks never call it.
+      if (bgManager) {
+        await settleFinishedBackgroundResults(
+          registryEntry,
+          async taskId => {
+            // A failed read only skips the wait for this task; its result still folds in if its hook has run.
+            const status = (await bgManager.getTask(taskId).catch(() => undefined))?.status;
+            return status === 'completed' || status === 'failed' || status === 'timed_out';
+          },
+          waitTimeoutMs ?? 1000,
+        );
       }
-
-      // When the outer caller drives continuation externally (e.g. streamUntilIdle),
-      // skip the in-loop wait. We still mark pending so downstream knows.
-      if (initData.options?.skipBgTaskWait) {
-        return { ...typedInput, backgroundTaskPending: true };
-      }
-
-      const taskIds = runningTasks.map(task => task.id);
-
-      const bgConfig = registryEntry?.backgroundTasksConfig;
-      const managerConfig = bgManager.config;
-      const waitTimeoutMs = bgConfig?.waitTimeoutMs ?? managerConfig?.waitTimeoutMs;
-
-      // First invocation: signal pending but don't block
-      if (retryCount === 0 || !waitTimeoutMs) {
-        return { ...typedInput, backgroundTaskPending: true };
-      }
-
-      // Emit initial progress chunk
-      if (pubsub) {
-        try {
-          await emitChunkEvent(pubsub, runId, {
-            type: 'background-task-progress' as any,
-            runId,
-            from: ChunkFrom.AGENT,
-            payload: { taskIds, runningCount: runningTasks.length, elapsedMs: 0 },
-          });
-        } catch {
-          // PubSub may be closed
+      // onResult wrote finished results into the tool-call step's message list, not into the
+      // transcript in workflow state that the next model call reads.
+      let output = typedInput;
+      if (hasAppliedBackgroundResults(registryEntry)) {
+        const transcript = await readMessageListState(params, typedInput);
+        const list = createRunMessageList({ mastra: params.mastra }).deserialize(transcript);
+        if (await foldBackgroundResults(registryEntry, list)) {
+          output = { ...typedInput, ...(await storeMessageListState(params, list.serialize())) };
         }
       }
 
-      // Wait for the next task to complete (or until timeout)
-      try {
-        await bgManager.waitForNextTask(taskIds, {
-          timeoutMs: waitTimeoutMs,
-          onProgress: (elapsedMs: number) => {
-            if (!pubsub) return;
-            void emitChunkEvent(pubsub, runId, {
-              type: 'background-task-progress' as any,
-              runId,
-              from: ChunkFrom.AGENT,
-              payload: { taskIds, runningCount: runningTasks.length, elapsedMs },
-            }).catch(() => {});
-          },
-          progressIntervalMs: 3000,
-        });
-      } catch {
-        // Timeout elapsed — no task completed. Return unchanged so the loop can end.
-        // The tasks keep running in the background — results are picked up on
-        // the next user message or stream.
-        return typedInput;
+      switch (outcome.status) {
+        case 'pass-through':
+        case 'timeout':
+          return output;
+        case 'pending':
+          return { ...output, backgroundTaskPending: true };
+        case 'completed':
+          if (output.stepResult) {
+            return {
+              ...output,
+              backgroundTaskPending: true,
+              stepResult: { ...output.stepResult, isContinued: true },
+            };
+          }
+          return { ...output, backgroundTaskPending: true };
       }
-
-      // A task completed — force the loop to continue so the LLM processes the result
-      if (typedInput.stepResult) {
-        return {
-          ...typedInput,
-          backgroundTaskPending: true,
-          stepResult: { ...typedInput.stepResult, isContinued: true },
-        };
-      }
-
-      return { ...typedInput, backgroundTaskPending: true };
     },
   });
 }

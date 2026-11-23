@@ -1,6 +1,51 @@
+import type {
+  AgentExecutionOptions,
+  PublicStructuredOutputOptions,
+  ToolsetsInput,
+  ToolsInput,
+} from '@mastra/core/agent';
+import type { CoreMessageV4 } from '@mastra/core/agent/message-list';
+import type { ScoringSamplingConfig } from '@mastra/core/evals';
+import type { OutputType, SystemMessage } from '@mastra/core/llm';
+import type { ReasoningLevel } from '@mastra/core/loop';
 import { z } from 'zod/v4';
-import { tracingOptionsSchema, coreMessageSchema, messageResponseSchema } from './common';
+
+/**
+ * Structural mirror of LoopOptions['modelSettings'] (ai-sdk CallSettings minus
+ * abortSignal, plus reasoning). CallSettings is not publicly exported from
+ * @mastra/core, so its fields are restated here to keep declaration emit portable.
+ */
+/**
+ * Structural mirror of LoopOptions['stopWhen'] entries. The ai-sdk StopCondition
+ * type is not publicly exported from @mastra/core, so an assignable function
+ * shape is used to keep declaration emit portable.
+ */
+type StopConditionArg = (event: unknown) => boolean | PromiseLike<boolean>;
+
+type ModelSettings = {
+  maxOutputTokens?: number;
+  temperature?: number;
+  topP?: number;
+  topK?: number;
+  presencePenalty?: number;
+  frequencyPenalty?: number;
+  stopSequences?: string[];
+  seed?: number;
+  maxRetries?: number;
+  headers?: Record<string, string | undefined>;
+  reasoning?: ReasoningLevel;
+};
+import { tracingOptionsSchema, coreMessageSchema, messageResponseSchema, typedPermissive } from './common';
 import { defaultOptionsSchema } from './default-options';
+
+export {
+  generateSpeechBodySchema,
+  getListenerResponseSchema,
+  speakResponseSchema,
+  transcribeSpeechBodySchema,
+  transcribeSpeechResponseSchema,
+  voiceSpeakersResponseSchema,
+} from '@internal/voice/routes';
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
@@ -49,11 +94,31 @@ const userMessageSignalContentsSchema = z.union([
   z.array(z.union([signalTextPartSchema, signalFilePartSchema])),
 ]);
 
-const agentSignalSchema = baseSignalSchema.extend({
-  type: z.string(),
+const agentMessageInputObjectSchema = z.object({
+  contents: userMessageSignalContentsSchema,
+  attributes: signalAttributesSchema.optional(),
+  metadata: jsonRecordSchema.optional(),
+  providerOptions: z.record(z.string(), z.record(z.string(), jsonValueSchema)).optional(),
+});
+
+const agentMessageInputSchema = z.union([userMessageSignalContentsSchema, agentMessageInputObjectSchema]);
+
+const agentSignalBaseSchema = baseSignalSchema.extend({
+  tagName: z.string().optional(),
   contents: userMessageSignalContentsSchema,
   providerOptions: z.record(z.string(), z.record(z.string(), jsonValueSchema)).optional(),
 });
+
+const agentSignalSchema = z.discriminatedUnion('type', [
+  agentSignalBaseSchema.extend({
+    type: z.literal('state'),
+    transient: z.never().optional(),
+  }),
+  agentSignalBaseSchema.extend({
+    type: z.enum(['user', 'reactive', 'notification', 'user-message', 'system-reminder']),
+    transient: z.boolean().optional(),
+  }),
+]);
 
 // Path parameter schemas
 export const agentIdPathParams = z.object({
@@ -62,8 +127,8 @@ export const agentIdPathParams = z.object({
 
 /**
  * Query params for GET /agents/:agentId — controls which stored config version is used for overrides.
- * Use either `status` or `versionId`, not both.
- * - `status` — 'draft' (latest version, default) or 'published' (active published version).
+ * When `status` and `versionId` are both provided, `versionId` takes precedence.
+ * - `status` — 'draft' (latest version) or 'published' (active published version, default).
  * - `versionId` — Resolve with a specific version ID.
  */
 export const agentVersionQuerySchema = z.object({
@@ -71,18 +136,29 @@ export const agentVersionQuerySchema = z.object({
     .enum(['draft', 'published'])
     .optional()
     .describe(
-      'Which stored config version to resolve: draft (latest, default) or published (active version). Mutually exclusive with versionId.',
+      'Which stored config version to resolve: draft (latest version) or published (active version, default). When both status and versionId are provided, versionId takes precedence.',
     ),
   versionId: z
     .string()
     .optional()
-    .describe(
-      'Specific version ID to resolve. Mutually exclusive with status — if both are provided, versionId takes precedence.',
-    ),
+    .describe('Specific version ID to resolve. Takes precedence over status when both are provided.'),
+});
+
+export const agentPlanQuerySchema = agentVersionQuerySchema.extend({
+  path: z.string().describe('Relative path to a markdown plan under .mastracode/plans/'),
+});
+
+export const agentPlanResponseSchema = z.object({
+  path: z.string(),
+  content: z.string(),
 });
 
 export const toolIdPathParams = z.object({
   toolId: z.string().describe('Unique identifier for the tool'),
+});
+
+export const agentRunPathParams = agentIdPathParams.extend({
+  runId: z.string().min(1).describe('Unique identifier for the agent run'),
 });
 
 export const agentToolPathParams = agentIdPathParams.extend({
@@ -107,13 +183,14 @@ export const serializedProcessorSchema = z.object({
 
 /**
  * Schema for serialized tool with JSON schemas
- * Uses passthrough() to allow additional tool properties beyond core fields
  */
 export const serializedToolSchema = z.object({
   id: z.string(),
+  title: z.string().optional(),
   description: z.string().optional(),
   inputSchema: z.string().optional(),
   outputSchema: z.string().optional(),
+  requestContextSchema: z.string().optional(),
   requireApproval: z.boolean().optional(),
 });
 
@@ -145,24 +222,44 @@ export const serializedAgentDefinitionSchema = z.object({
  * Schema for SystemMessage type
  * Can be string, string[], or various message objects
  */
-const systemMessageSchema = z.union([
-  z.string(),
-  z.array(z.string()),
-  z.any(), // CoreSystemMessage or SystemModelMessage
-  z.array(z.any()),
-]);
+const systemMessageSchema = typedPermissive<SystemMessage>(
+  z.union([
+    z.string(),
+    z.array(z.string()),
+    z.unknown(), // CoreSystemMessage or SystemModelMessage
+    z.array(z.unknown()),
+  ]),
+);
 
 /**
  * Schema for model configuration in model list
  */
 const modelConfigSchema = z.object({
+  id: z.string(),
+  enabled: z.boolean(),
+  maxRetries: z.number(),
   model: z.object({
     modelId: z.string(),
     provider: z.string(),
     modelVersion: z.string(),
   }),
-  // Additional fields from AgentModelManagerConfig can be added here
 });
+
+const serializedSkillSchema = z.object({
+  name: z.string(),
+  description: z.string(),
+  license: z.string().optional(),
+  path: z.string(),
+});
+
+const agentEditorConfigSchema = z.union([
+  z.literal(false),
+  z.object({
+    instructions: z.boolean().optional(),
+    tools: z.union([z.boolean(), z.object({ description: z.boolean().optional() })]).optional(),
+    model: z.boolean().optional(),
+  }),
+]);
 
 /**
  * Main schema for serialized agent representation
@@ -175,18 +272,31 @@ export const serializedAgentSchema = z.object({
   tools: z.record(z.string(), serializedToolSchema),
   agents: z.record(z.string(), serializedAgentDefinitionSchema),
   workflows: z.record(z.string(), serializedWorkflowSchema),
+  skills: z.array(serializedSkillSchema),
+  workspaceTools: z.array(z.string()),
+  browserTools: z.array(z.string()),
+  hasBrowser: z.boolean(),
+  workspaceId: z.string().optional(),
   inputProcessors: z.array(serializedProcessorSchema),
   outputProcessors: z.array(serializedProcessorSchema),
   provider: z.string().optional(),
   modelId: z.string().optional(),
   modelVersion: z.string().optional(),
+  supportsMemory: z.boolean().optional(),
   modelList: z.array(modelConfigSchema).optional(),
+  modelListEditable: z
+    .boolean()
+    .optional()
+    .describe('False when the model list comes from a function and cannot be reordered or edited'),
   defaultOptions: defaultOptionsSchema.optional(),
-  defaultGenerateOptionsLegacy: z.record(z.string(), z.any()).optional(),
-  defaultStreamOptionsLegacy: z.record(z.string(), z.any()).optional(),
+  defaultGenerateOptionsLegacy: z.record(z.string(), z.unknown()).optional(),
+  defaultStreamOptionsLegacy: z.record(z.string(), z.unknown()).optional(),
+  requestContextSchema: z.string().optional(),
+  source: z.enum(['code', 'stored', 'fs']).optional(),
   status: z.enum(['draft', 'published', 'archived']).optional(),
   activeVersionId: z.string().optional(),
   hasDraft: z.boolean().optional(),
+  editor: agentEditorConfigSchema.optional(),
 });
 
 /**
@@ -208,6 +318,7 @@ export const providerSchema = z.object({
   connected: z.boolean(),
   docUrl: z.string().optional(),
   models: z.array(z.string()),
+  modelReleaseDates: z.record(z.string(), z.string()).optional(),
 });
 
 /**
@@ -216,6 +327,8 @@ export const providerSchema = z.object({
 export const providersResponseSchema = z.object({
   providers: z.array(providerSchema),
 });
+
+export type ProviderListItem = z.infer<typeof providerSchema>;
 
 /**
  * Schema for list agents endpoint response
@@ -238,8 +351,14 @@ export const listToolsResponseSchema = z.record(z.string(), serializedToolSchema
  */
 const agentMemoryOptionSchema = z.object({
   thread: z.union([z.string(), z.object({ id: z.string() }).passthrough()]),
-  resource: z.string(),
-  options: z.record(z.string(), z.any()).optional(),
+  /**
+   * Optional so authenticated setups can rely on the server-derived resource ID
+   * (`mapUserToResourceId` sets MASTRA_RESOURCE_ID_KEY in the request context, which
+   * takes precedence over this value). Handlers return a 400 when neither the body
+   * nor the request context provides a resource ID.
+   */
+  resource: z.string().optional(),
+  options: z.record(z.string(), z.unknown()).optional(),
   readOnly: z.boolean().optional(),
 });
 
@@ -271,6 +390,8 @@ export const agentExecutionBodySchema = z
     // Message Configuration
     instructions: systemMessageSchema.optional(),
     system: systemMessageSchema.optional(),
+    // ModelMessage[] at runtime; handlers cast since the AI SDK ModelMessage
+    // type is not portable for declaration emit.
     context: z.array(coreMessageSchema).optional(),
 
     // Memory & Persistence
@@ -279,7 +400,7 @@ export const agentExecutionBodySchema = z
     savePerStep: z.boolean().optional(),
 
     // Request Context (handler-specific field - merged with server's requestContext)
-    requestContext: z.record(z.string(), z.any()).optional(),
+    requestContext: z.record(z.string(), z.unknown()).optional(),
 
     // Version overrides for sub-agents (and future primitives)
     versions: z
@@ -290,61 +411,64 @@ export const agentExecutionBodySchema = z
             z.union([z.object({ versionId: z.string() }), z.object({ status: z.enum(['draft', 'published']) })]),
           )
           .optional(),
+        defaultStatus: z.enum(['draft', 'published']).optional(),
       })
       .optional(),
 
     // Execution Control
     maxSteps: z.number().optional(),
-    stopWhen: z.any().optional(),
+    // Stop conditions are functions and cannot be validated by zod.
+    stopWhen: typedPermissive<StopConditionArg | StopConditionArg[]>(z.unknown()).optional(),
 
     // Model Configuration
-    providerOptions: z
-      .object({
-        anthropic: z.record(z.string(), z.any()).optional(),
-        google: z.record(z.string(), z.any()).optional(),
-        openai: z.record(z.string(), z.any()).optional(),
-        xai: z.record(z.string(), z.any()).optional(),
-      })
-      .optional(),
-    modelSettings: z.any().optional(),
+    model: z.string().optional(),
+    providerOptions: z.record(z.string(), z.record(z.string(), jsonValueSchema)).optional(),
+    modelSettings: typedPermissive<ModelSettings>(z.unknown()).optional(),
 
     // Tool Configuration
     activeTools: z.array(z.string()).optional(),
-    toolsets: z.record(z.string(), z.any()).optional(),
-    clientTools: z.record(z.string(), z.any()).optional(),
+    // Tool entries contain execute functions and cannot be validated by zod.
+    toolsets: typedPermissive<ToolsetsInput>(z.record(z.string(), z.unknown())).optional(),
+    clientTools: typedPermissive<ToolsInput>(z.record(z.string(), z.unknown())).optional(),
     toolChoice: toolChoiceSchema.optional(),
     requireToolApproval: z.boolean().optional(),
 
     // Evaluation
-    scorers: z
-      .union([
-        z.record(z.string(), z.any()),
+    scorers: typedPermissive<Record<string, { scorer: string; sampling?: ScoringSamplingConfig }>>(
+      z.union([
+        z.record(z.string(), z.unknown()),
         z.record(
           z.string(),
           z.object({
             scorer: z.string(),
-            sampling: z.any().optional(),
+            sampling: z.unknown().optional(),
           }),
         ),
-      ])
-      .optional(),
+      ]),
+    ).optional(),
     returnScorerData: z.boolean().optional(),
 
     // Observability
     tracingOptions: tracingOptionsSchema.optional(),
 
     // Structured Output
-    output: z.any().optional(), // Zod schema, JSON schema, or structured output object
-    structuredOutput: z
-      .object({
+    // Zod schema, JSON schema, or structured output object — cannot be validated by zod.
+    output: typedPermissive<OutputType>(z.unknown()).optional(),
+    // The concrete options type cannot be expressed field-by-field because of
+    // the fallback discriminated union.
+    structuredOutput: typedPermissive<PublicStructuredOutputOptions<Record<string, unknown>>>(
+      z.object({
         schema: z.object({}).passthrough(),
-        model: z.union([z.string(), z.any()]).optional(),
+        model: z.union([z.string(), z.unknown()]).optional(),
         instructions: z.string().optional(),
         jsonPromptInjection: z.boolean().optional(),
         errorStrategy: z.enum(['strict', 'warn', 'fallback']).optional(),
-        fallbackValue: z.any().optional(),
-      })
-      .optional(),
+        fallbackValue: z.unknown().optional(),
+      }),
+    ).optional(),
+
+    // Idle-loop streaming (collapses streamUntilIdle into stream)
+    untilIdle: z.union([z.boolean(), z.object({ maxIdleMs: z.number().int().positive().optional() })]).optional(),
   })
   .passthrough(); // Allow additional fields for forward compatibility
 
@@ -356,10 +480,14 @@ export const agentExecutionLegacyBodySchema = agentExecutionBodySchema.extend({
   resourceId: z.string().optional(),
   resourceid: z.string().optional(), // lowercase variant
   threadId: z.string().optional(),
+  // Legacy generate/stream expect AI SDK v4 CoreMessage context and a string system message.
+  context: typedPermissive<CoreMessageV4[]>(z.array(coreMessageSchema)).optional(),
+  system: typedPermissive<string>(systemMessageSchema).optional(),
 });
 
 export const streamUntilIdleBodySchema = agentExecutionBodySchema.extend({
   maxIdleMs: z.number().int().positive().optional(),
+  untilIdle: z.union([z.boolean(), z.object({ maxIdleMs: z.number().int().positive().optional() })]).optional(),
 });
 
 export const resumeStreamUntilIdleBodySchema = agentExecutionBodySchema.omit({ messages: true }).extend({
@@ -371,32 +499,20 @@ export const resumeStreamUntilIdleBodySchema = agentExecutionBodySchema.omit({ m
 /**
  * Body schema for tool execute endpoint
  * Simple schema - tool validates its own input data
- * Note: Using z.unknown().refine() instead of z.any() to ensure data is required
- * (z.any() is treated as optional by Zod)
+ * Note: The .refine() ensures data is required
+ * (bare z.unknown() is treated as optional by Zod)
  */
 const executeToolDataBodySchema = z.object({
   data: z.unknown().refine(x => x !== undefined, { message: 'data is required' }),
 });
 
 export const executeToolBodySchema = executeToolDataBodySchema.extend({
-  requestContext: z.record(z.string(), z.any()).optional(),
+  requestContext: z.record(z.string(), z.unknown()).optional(),
 });
 
 export const executeToolContextBodySchema = executeToolDataBodySchema.extend({
-  requestContext: z.record(z.string(), z.any()).optional(),
+  requestContext: z.record(z.string(), z.unknown()).optional(),
 });
-
-/**
- * Response schema for voice speakers endpoint
- * Flexible to accommodate provider-specific metadata
- */
-export const voiceSpeakersResponseSchema = z.array(
-  z
-    .object({
-      voiceId: z.string(),
-    })
-    .passthrough(), // Allow provider-specific fields like name, language, etc.
-);
 
 // ============================================================================
 // Tool Approval Schemas
@@ -408,13 +524,19 @@ export const voiceSpeakersResponseSchema = z.array(
  */
 const toolCallActionBodySchema = z.object({
   runId: z.string(),
-  requestContext: z.record(z.string(), z.any()).optional(),
+  model: z.string().optional(),
+  requestContext: z.record(z.string(), z.unknown()).optional(),
   toolCallId: z.string(),
   format: z.string().optional(),
+  providerOptions: z.record(z.string(), z.record(z.string(), jsonValueSchema)).optional(),
+  modelSettings: typedPermissive<ModelSettings>(z.unknown()).optional(),
+  // Client tools must be re-sent on resume so the model can call them after the approval decision.
+  clientTools: typedPermissive<ToolsInput>(z.record(z.string(), z.unknown())).optional(),
 });
 const networkToolCallActionBodySchema = z.object({
   runId: z.string(),
-  requestContext: z.record(z.string(), z.any()).optional(),
+  model: z.string().optional(),
+  requestContext: z.record(z.string(), z.unknown()).optional(),
   format: z.string().optional(),
 });
 
@@ -426,7 +548,10 @@ export const approveToolCallBodySchema = toolCallActionBodySchema;
 /**
  * Body schema for declining tool call
  */
-export const declineToolCallBodySchema = toolCallActionBodySchema;
+export const declineToolCallBodySchema = toolCallActionBodySchema.extend({
+  /** Optional explanation surfaced to the model in place of the default decline message. */
+  reason: z.string().optional(),
+});
 
 /**
  * Body schema for approving network tool call
@@ -436,13 +561,65 @@ export const approveNetworkToolCallBodySchema = networkToolCallActionBodySchema;
 /**
  * Body schema for declining network tool call
  */
-export const declineNetworkToolCallBodySchema = networkToolCallActionBodySchema;
+export const declineNetworkToolCallBodySchema = networkToolCallActionBodySchema.extend({
+  /** Optional explanation surfaced in place of the default decline message. */
+  reason: z.string().optional(),
+});
 
 /**
  * Response schema for tool approval/decline
  */
 export const toolCallResponseSchema = z.object({
-  fullStream: z.any(), // ReadableStream
+  fullStream: z.unknown(), // ReadableStream
+});
+
+export const sendToolApprovalResponseSchema = z.object({
+  accepted: z.literal(true),
+  runId: z.string(),
+  toolCallId: z.string().optional(),
+});
+
+/**
+ * Query schema for listing suspended agent runs
+ */
+export const listSuspendedRunsQuerySchema = z
+  .object({
+    threadId: z.string().optional(),
+    resourceId: z.string().optional(),
+    fromDate: z.coerce.date().optional(),
+    toDate: z.coerce.date().optional(),
+    perPage: z.coerce.number().int().positive().optional(),
+    // page is zero-indexed, so 0 is valid
+    page: z.coerce.number().int().nonnegative().optional(),
+  })
+  .refine(data => !data.fromDate || !data.toDate || data.fromDate <= data.toDate, {
+    message: 'fromDate must be less than or equal to toDate',
+    path: ['fromDate'],
+  });
+
+/**
+ * Response schema for listing suspended agent runs
+ */
+export const listSuspendedRunsResponseSchema = z.object({
+  runs: z.array(
+    z.object({
+      runId: z.string(),
+      status: z.literal('suspended'),
+      threadId: z.string().optional(),
+      resourceId: z.string().optional(),
+      suspendedAt: z.date(),
+      toolCalls: z.array(
+        z.object({
+          toolCallId: z.string().optional(),
+          toolName: z.string().optional(),
+          args: z.unknown().optional(),
+          requiresApproval: z.boolean(),
+          suspendPayload: z.unknown().optional(),
+        }),
+      ),
+    }),
+  ),
+  total: z.number().int().nonnegative(),
 });
 
 // ============================================================================
@@ -458,6 +635,32 @@ export const resumeStreamBodySchema = agentExecutionBodySchema.omit({ messages: 
   runId: z.string(),
   resumeData: z.unknown().refine(x => x !== undefined, { message: 'resumeData is required' }),
   toolCallId: z.string().optional(),
+});
+
+// ============================================================================
+// Recover Schema
+// ============================================================================
+
+/**
+ * Body schema for recovering an orphaned RUNNING durable-agent run.
+ * Thread and resource are read from the persisted snapshot, so we only accept
+ * the runId plus request-context / version overrides needed for auth and
+ * routing.
+ */
+export const recoverBodySchema = z.object({
+  runId: z.string(),
+  requestContext: z.record(z.string(), z.unknown()).optional(),
+  versions: z
+    .object({
+      agents: z
+        .record(
+          z.string(),
+          z.union([z.object({ versionId: z.string() }), z.object({ status: z.enum(['draft', 'published']) })]),
+        )
+        .optional(),
+      defaultStatus: z.enum(['draft', 'published']).optional(),
+    })
+    .optional(),
 });
 
 // ============================================================================
@@ -499,45 +702,13 @@ export const updateAgentModelInModelListBodySchema = z.object({
 export const modelManagementResponseSchema = messageResponseSchema;
 
 // ============================================================================
-// Voice Schemas
+// Response schemas for agent generation endpoints
+// These return AI SDK types which have complex structures
 // ============================================================================
 
-/**
- * Body schema for generating speech
- */
-export const generateSpeechBodySchema = z.object({
-  text: z.string(),
-  speakerId: z.string().optional(),
-});
-
-/**
- * Body schema for transcribing speech
- */
-export const transcribeSpeechBodySchema = z.object({
-  audio: z.any(), // Buffer
-  options: z.record(z.string(), z.any()).optional(),
-});
-
-/**
- * Response schema for transcribe speech
- */
-export const transcribeSpeechResponseSchema = z.object({
-  text: z.string(),
-});
-
-/**
- * Response schema for get listener
- */
-export const getListenerResponseSchema = z.any(); // Listener info structure varies
-
-/**
- * Response schema for agent generation endpoints
- * These return AI SDK types which have complex structures
- */
-export const generateResponseSchema = z.any(); // AI SDK GenerateResult type
-export const streamResponseSchema = z.any(); // AI SDK StreamResult type
-export const speakResponseSchema = z.any(); // Voice synthesis result
-export const executeToolResponseSchema = z.any(); // Tool execution result varies by tool
+export const generateResponseSchema = z.unknown(); // AI SDK GenerateResult type
+export const streamResponseSchema = z.unknown(); // AI SDK StreamResult type
+export const executeToolResponseSchema = z.unknown(); // Tool execution result varies by tool
 
 // ============================================================================
 // Instruction Enhancement Schemas
@@ -569,47 +740,105 @@ export const enhanceInstructionsResponseSchema = z.object({
  */
 export const observeAgentBodySchema = z.object({
   runId: z.string().describe('The run ID to observe/reconnect to'),
-  offset: z.number().optional().describe('Resume from this event index (0-based). If omitted, replays all events.'),
+  offset: z
+    .number()
+    .optional()
+    .describe(
+      'Run-log position to resume from. Every /observe frame, and every /stream frame from a durable or evented agent, carries an `index` except abort frames; pass the index + 1 of the last frame that has one. A client that reconnects between an abort frame and its finish frame gets the abort frame again. A frame whose replay-cache write failed, or any frame when caching is off, arrives without an index, so no offset can resume at it; omitting `offset` replays whatever the transport itself retains, which can repeat frames already received. If omitted, replays the frames still retained.',
+    ),
 });
 
 const signalActiveBehaviorSchema = z.enum(['deliver', 'persist', 'discard']);
 const signalIdleBehaviorSchema = z.enum(['wake', 'persist', 'discard']);
 
-const sendAgentSignalBaseBodySchema = z.object({
-  signal: agentSignalSchema,
+const signalTargetBaseBodySchema = z.object({
   ifActive: z
     .object({
       behavior: signalActiveBehaviorSchema.optional(),
+      attributes: signalAttributesSchema.optional(),
     })
     .optional(),
 });
 
-export const sendAgentSignalBodySchema = z.union([
-  sendAgentSignalBaseBodySchema.extend({
+const signalTargetBodySchema = z.union([
+  signalTargetBaseBodySchema.extend({
     runId: z.string(),
     resourceId: z.string().optional(),
     threadId: z.string().optional(),
     ifIdle: z.undefined().optional(),
   }),
-  sendAgentSignalBaseBodySchema.extend({
-    runId: z.string().optional(),
+  signalTargetBaseBodySchema.extend({
+    runId: z.undefined().optional(),
     resourceId: z.string(),
     threadId: z.string(),
     ifIdle: z
       .object({
         behavior: signalIdleBehaviorSchema.optional(),
         streamOptions: agentExecutionBodySchema.omit({ messages: true }).optional(),
+        attributes: signalAttributesSchema.optional(),
       })
       .optional(),
   }),
 ]);
 
-export const subscribeAgentThreadBodySchema = z.object({
+export const sendAgentSignalBodySchema = z.union([
+  signalTargetBodySchema.options[0].extend({ signal: agentSignalSchema }),
+  signalTargetBodySchema.options[1].extend({ signal: agentSignalSchema }),
+]);
+
+export const sendAgentMessageBodySchema = z.union([
+  signalTargetBodySchema.options[0].extend({ message: agentMessageInputSchema }),
+  signalTargetBodySchema.options[1].extend({ message: agentMessageInputSchema }),
+]);
+
+export const queueAgentMessageBodySchema = sendAgentMessageBodySchema;
+export const queueAgentSignalBodySchema = sendAgentSignalBodySchema;
+
+const agentThreadBodySchema = z.object({
   resourceId: z.string().optional(),
   threadId: z.string(),
+});
+
+export const subscribeAgentThreadBodySchema = agentThreadBodySchema.extend({
+  withRunStatus: z.boolean().optional().describe('Emit thread-run-status chunks, including retained outcomes'),
+  withInitialHistory: z
+    .union([z.boolean(), z.object({ perPage: z.number().int().positive().optional() })])
+    .optional()
+    .describe('Emit one thread-history chunk with stored messages before live parts'),
+});
+
+export const abortAgentThreadBodySchema = agentThreadBodySchema.extend({
+  threadId: z.string().min(1),
+  clearPendingSignals: z.boolean().optional(),
+  expectedRunId: z.string().optional(),
+});
+
+export const cancelPendingAgentSignalsBodySchema = agentThreadBodySchema.extend({
+  threadId: z.string().min(1),
+  signalIds: z.array(z.string().min(1)).min(1).max(1000),
+});
+
+export const cancelPendingAgentSignalsResponseSchema = z.object({
+  cancelledSignalIds: z.array(z.string()),
+});
+
+export const sendToolApprovalBodySchema = z.object({
+  resourceId: z.string(),
+  threadId: z.string(),
+  requestContext: z.record(z.string(), z.unknown()).optional(),
+  toolCallId: z.string(),
+  approved: z.boolean(),
+  resumeData: z.unknown().optional(),
+  format: z.string().optional(),
+  messages: z.array(coreMessageSchema).optional(),
+  streamOptions: typedPermissive<AgentExecutionOptions<undefined>>(z.unknown()).optional(),
+});
+
+export const abortAgentThreadResponseSchema = z.object({
+  aborted: z.boolean(),
 });
 
 /**
  * Response schema for observe endpoint (streaming response)
  */
-export const observeAgentResponseSchema = z.any(); // Streaming response
+export const observeAgentResponseSchema = z.unknown(); // Streaming response

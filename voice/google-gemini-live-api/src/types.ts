@@ -6,6 +6,7 @@
  * Available Gemini Live API models
  */
 export type GeminiVoiceModel =
+  | 'gemini-3.1-flash-live-preview'
   /** @deprecated Shut down on 2025-12-09. */
   | 'gemini-2.0-flash-exp'
   /** @deprecated Shut down on 2025-11-14. */
@@ -48,6 +49,13 @@ export interface GeminiToolConfig {
 export interface GeminiSessionConfig {
   /** Enable session resumption after network interruptions */
   enableResumption?: boolean;
+  /**
+   * Opt in to seeding initial conversation history via send_client_content frames.
+   * Required by the Gemini Live endpoint when calling sendContext() on
+   * gemini-3.1-flash-live-preview and later 3.x models.
+   * Defaults to true so that sendContext() works out of the box.
+   */
+  initialHistoryInClientContent?: boolean;
   /** Maximum session duration (e.g., '24h', '2h') */
   maxDuration?: string;
   /** Enable automatic context compression */
@@ -63,6 +71,17 @@ export interface GeminiSessionConfig {
     enabled?: boolean;
     allowUserInterruption?: boolean;
   };
+}
+
+/**
+ * Live API `AudioTranscriptionConfig`.
+ */
+export interface GeminiAudioTranscriptionConfig {
+  /**
+   * BCP-47 language codes hinting which languages are in the audio (for example `['es-ES']`).
+   * When omitted or empty, the server auto-detects the language.
+   */
+  languageCodes?: string[];
 }
 
 /**
@@ -99,10 +118,42 @@ export interface GeminiLiveVoiceConfig {
   tools?: GeminiToolConfig[];
   /** Session configuration */
   sessionConfig?: GeminiSessionConfig;
+  /**
+   * Thinking configuration for reasoning-capable models. Forwarded to the Live API
+   * setup frame as `generation_config.thinking_config`. On native-audio thinking
+   * models, set `includeThoughts: false` to stop the model's reasoning from being
+   * spoken/surfaced as the reply, or bound it with `thinkingBudget`.
+   */
+  thinkingConfig?: {
+    /** Whether the model should include its thoughts in the response. */
+    includeThoughts?: boolean;
+    /** Token budget for the model's thinking. */
+    thinkingBudget?: number;
+  };
+  /**
+   * Transcription settings for the user's spoken input. Sent in the Live API setup frame as
+   * `input_audio_transcription`. Input transcription is always enabled; this only adds hints.
+   * Applied at `connect()` time.
+   */
+  inputAudioTranscription?: GeminiAudioTranscriptionConfig;
+  /**
+   * Transcription settings for the model's spoken output. Sent in the Live API setup frame as
+   * `output_audio_transcription`. Output transcription is always enabled; this only adds hints.
+   * Applied at `connect()` time.
+   */
+  outputAudioTranscription?: GeminiAudioTranscriptionConfig;
   /** Audio configuration for input/output */
   audioConfig?: Partial<AudioConfig>;
   /** Enable debug logging */
   debug?: boolean;
+}
+
+/**
+ * A single conversation turn for context seeding via {@link GeminiLiveVoice.sendContext}.
+ */
+export interface IncrementalTurn {
+  role: 'user' | 'assistant';
+  content: string;
 }
 
 /**
@@ -128,12 +179,29 @@ export interface GeminiLiveEventMap {
   speaking: { audio?: string; audioData?: Int16Array; sampleRate?: number };
   /** Text response or transcription - compatible with base VoiceEventMap */
   writing: { text: string; role: 'assistant' | 'user' };
+  /**
+   * Model chain-of-thought / reasoning text.
+   *
+   * Gemini-specific. On native-audio models, `serverContent.modelTurn.parts.text`
+   * is the model's internal reasoning, not the spoken response — the spoken
+   * response arrives via `serverContent.outputTranscription.text` and is emitted
+   * as `writing` with `role: 'assistant'`. This event surfaces the reasoning
+   * stream separately so consumers can render it as a "thinking" UI affordance
+   * without conflating it with the assistant's spoken reply.
+   *
+   * On non-native-audio models there is no `outputTranscription` channel, so
+   * `modelTurn.parts.text` IS the spoken response and continues to be emitted
+   * as `writing` (this event will not fire).
+   */
+  thinking: { text: string };
   /** Error events - compatible with base VoiceEventMap */
   error: { message: string; code?: string; details?: unknown };
   /** Session state changes */
   session: {
     state: 'connecting' | 'connected' | 'disconnected' | 'disconnecting' | 'error' | 'updated';
-    config?: Record<string, unknown>; // Configuration data when state is 'updated' or 'connected'
+    config?: Record<string, unknown>;
+    code?: number;
+    reason?: string;
   };
   /** Tool calls from the model */
   toolCall: { name: string; args: Record<string, any>; id: string };
@@ -224,6 +292,11 @@ export interface GeminiLiveServerMessage {
   setup?: {
     sessionHandle?: string;
   };
+  // Session resumption update from server (camelCase per wire format)
+  sessionResumptionUpdate?: {
+    newHandle?: string;
+    resumable?: boolean;
+  };
 
   // Setup complete message (alternative format)
   setupComplete?: Record<string, unknown>;
@@ -244,6 +317,28 @@ export interface GeminiLiveServerMessage {
         };
       }>;
     };
+    /**
+     * Transcript of the user's spoken input. Only present when
+     * `input_audio_transcription` is enabled in the setup payload.
+     */
+    inputTranscription?: {
+      text?: string;
+    };
+    /**
+     * Transcript of the model's spoken output. Only present when
+     * `output_audio_transcription` is enabled in the setup payload. On
+     * native-audio models this is the authoritative source for the spoken
+     * response (NOT `modelTurn.parts.text`, which is reasoning).
+     */
+    outputTranscription?: {
+      text?: string;
+    };
+    /**
+     * `true` when the model's in-flight response was interrupted by a new user
+     * activity (barge-in). The server stops sending further audio for the
+     * current turn after this signal.
+     */
+    interrupted?: boolean;
     turnComplete?: boolean;
   };
 
@@ -322,6 +417,10 @@ export interface UpdateMessage {
             voice_name: string;
           };
         };
+      };
+      thinking_config?: {
+        include_thoughts?: boolean;
+        thinking_budget?: number;
       };
     };
     system_instruction?: {

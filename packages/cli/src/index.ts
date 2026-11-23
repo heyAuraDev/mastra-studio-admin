@@ -17,11 +17,18 @@ import { migrate } from './commands/actions/migrate';
 import { startDevServer } from './commands/actions/start-dev-server';
 import { startProject } from './commands/actions/start-project';
 import { startStudio } from './commands/actions/start-studio';
-import { registerApiCommand } from './commands/api/index';
+import { collect, registerApiCommand } from './commands/api/index';
 import { loginAction, logoutAction } from './commands/auth/login';
 import { listOrgsAction, switchOrgAction } from './commands/auth/orgs';
 import { createTokenAction, listTokensAction, revokeTokenAction } from './commands/auth/tokens';
 import { whoamiAction } from './commands/auth/whoami';
+import { connectProviderAction, listProvidersAction, removeConnectionAction } from './commands/connect/connect.js';
+import { configureCreateCommand } from './commands/create/create';
+import { registerEnvDbCommands } from './commands/db/index.js';
+import { unifiedDeployAction } from './commands/deploy/index.js';
+import { envSuggestionsAction } from './commands/env/deploy-suggestions.js';
+import { registerEnvCommands } from './commands/env/index.js';
+import { buildExperimentWorker } from './commands/experiment/build';
 import { COMPONENTS, LLMProvider } from './commands/init/utils';
 import { serverDeployAction } from './commands/server/deploy';
 import { serverSuggestionsAction } from './commands/server/deploy-suggestions';
@@ -33,19 +40,12 @@ import { logsAction } from './commands/studio/deploy-logs';
 import { statusAction } from './commands/studio/deploy-status';
 import { suggestionsAction } from './commands/studio/deploy-suggestions';
 import { listProjectsAction, createProjectAction } from './commands/studio/projects';
-import { parseComponents, parseLlmProvider, parseMcp, parseSkills } from './commands/utils';
+import { traceImportAction } from './commands/traces/import/action.js';
+import { configureTraceImportCommand } from './commands/traces/import/command.js';
+import { parseComponents, parseLlmProvider, parseMcp, wrapAction } from './commands/utils';
 import { buildWorker } from './commands/worker/build';
 import { devWorker } from './commands/worker/dev';
 import { startWorker } from './commands/worker/start';
-
-function wrapAction(fn: (...args: any[]) => Promise<void>): (...args: any[]) => void {
-  return (...args: any[]) => {
-    fn(...args).catch((err: Error) => {
-      console.error(`Error: ${err.message}`);
-      process.exit(1);
-    });
-  };
-}
 
 const mastraPkg = pkgJson as PackageJson;
 export const version = mastraPkg.version;
@@ -75,42 +75,7 @@ ${pc.bold(pc.cyan('Mastra'))} is a typescript framework for building AI applicat
     program.help();
   });
 
-program
-  .command('create [project-name]')
-  .description('Create a new Mastra project')
-  .option('--default', 'Quick start with defaults (src, OpenAI, examples)')
-  .option(
-    '-c, --components <components>',
-    `Comma-separated list of components (${COMPONENTS.join(', ')})`,
-    parseComponents,
-  )
-  .option('-l, --llm <model-provider>', `Default model provider (${LLMProvider.join(', ')})`, parseLlmProvider)
-  .option('-k, --llm-api-key <api-key>', 'API key for the model provider')
-  .option('-e, --example', 'Include example code')
-  .option('-n, --no-example', 'Do not include example code')
-  .option('-t, --timeout [timeout]', 'Configurable timeout for package installation, defaults to 60000 ms')
-  .option('-d, --dir <directory>', 'Target directory for Mastra source code (default: src/)')
-  .option(
-    '-p, --project-name <string>',
-    'Project name that will be used in package.json and as the project directory name.',
-  )
-  .option(
-    '-m, --mcp <editor>',
-    'MCP Server for code editor (cursor, cursor-global, windsurf, vscode, antigravity)',
-    parseMcp,
-  )
-  .option('--skills <agents>', 'Install Mastra agent skills for specified agents (comma-separated)', parseSkills)
-  .option(
-    '--template [template-name]',
-    'Create project from a template (use template name, public GitHub URL, or leave blank to select from list)',
-  )
-  .option('--observability', 'Enable Mastra Observability (writes MASTRA_PLATFORM_ACCESS_TOKEN placeholder to .env)')
-  .option('--no-observability', 'Do not enable Mastra Observability')
-  .option(
-    '--observability-project <name>',
-    'Existing platform project name/slug to attach Observability to, or a name to create. Skips the interactive picker.',
-  )
-  .action(createProject);
+configureCreateCommand(program.command('create')).action(wrapAction(createProject));
 
 program
   .command('init')
@@ -140,6 +105,11 @@ program
   .action(initProject);
 
 registerApiCommand(program);
+
+const tracesCommand = program.command('traces').description('Manage observability traces');
+const traceImportCommand = tracesCommand.command('import');
+configureTraceImportCommand(traceImportCommand);
+traceImportCommand.action(wrapAction(traceImportAction));
 
 program
   .command('lint')
@@ -179,6 +149,32 @@ program
   .option('--debug', 'Enable debug logs', false)
   .action(startDevServer);
 
+const factoryCommand = program.command('factory').description('Manage Mastra Factory');
+
+factoryCommand
+  .command('dev')
+  .description('Start mastra server')
+  .option('-d, --dir <dir>', 'Path to your mastra folder')
+  .option('-r, --root <root>', 'Path to your root folder')
+  .option('-t, --tools <toolsDirs>', 'Comma-separated list of paths to tool files to include')
+  .option('-e, --env <env>', 'Custom env file to include in the dev server')
+  .option(
+    '-i, --inspect [host:port]',
+    'Start the dev server in inspect mode (optional: [host:]port, e.g., 0.0.0.0:9229)',
+  )
+  .option(
+    '-b, --inspect-brk [host:port]',
+    'Start the dev server in inspect mode and break at the beginning of the script (optional: [host:]port)',
+  )
+  .option(
+    '-c, --custom-args <args>',
+    'Comma-separated list of custom arguments to pass to the dev server. IE: --experimental-transform-types',
+  )
+  .option('-s, --https', 'Enable local HTTPS')
+  .option('--request-context-presets <file>', 'Path to request context presets JSON file')
+  .option('--debug', 'Enable debug logs', false)
+  .action(args => startDevServer({ ...args, factory: true }));
+
 program
   .command('build')
   .description('Build your Mastra project')
@@ -186,8 +182,20 @@ program
   .option('-r, --root <path>', 'Path to your root folder')
   .option('-t, --tools <toolsDirs>', 'Comma-separated list of paths to tool files to include')
   .option('-s, --studio', 'Bundle the studio UI with the build')
+  .option('-f, --force', 'Build even if a `mastra dev` server is running in this directory')
   .option('--debug', 'Enable debug logs', false)
   .action(buildProject);
+
+const experimentCommand = program.command('experiment').description('Build Mastra experiment artifacts');
+
+experimentCommand
+  .command('build')
+  .description('Build a standalone experiment worker artifact')
+  .option('-d, --dir <path>', 'Path to your Mastra folder')
+  .option('-r, --root <path>', 'Path to your root folder')
+  .option('-o, --output-dir <path>', 'Output directory for the experiment worker (default: .mastra/experiment-worker)')
+  .option('--debug', 'Enable debug logs', false)
+  .action((opts: { dir?: string; root?: string; outputDir?: string; debug: boolean }) => buildExperimentWorker(opts));
 
 const workerCommand = program.command('worker').description('Build and run standalone Mastra worker bundles');
 
@@ -249,6 +257,29 @@ program
   )
   .action(startProject);
 
+// ---- Unified deploy command (new entry point) ----
+
+program
+  .command('deploy [dir]')
+  .description('Deploy your Mastra application to an environment')
+  .option('--env <name>', 'Target environment (default: production)', 'production')
+  .option('--org <id>', 'Organization ID')
+  .option('--project <id>', 'Project ID, slug, or name (creates new project if not found)')
+  .option('-y, --yes', 'Auto-accept defaults without confirmation')
+  .option('-c, --config <file>', 'Project config file path (default: .mastra-project.json)')
+  .option('--env-file <file>', 'Env file to deploy (for example: .env.production)')
+  .option('--skip-build', 'Skip the build step and use existing .mastra/output')
+  .option('--skip-preflight', 'Skip the pre-deploy build/env validation')
+  .option('--region <region>', 'Region for new environments (e.g., us, eu)')
+  .option(
+    '--workers <mode>',
+    'Background worker deployment mode: "dedicated" (dedicated workers service, recommended; requires Redis) or "in-process" (run background tasks inside the API server container; spins down an existing workers service). Prompts on new environments when omitted.',
+  )
+  .option('--debug', 'Enable debug logs', false)
+  .action(wrapAction(unifiedDeployAction));
+
+// ---- Studio commands ----
+
 const studioCommand = program
   .command('studio')
   .description('Manage Mastra Studio')
@@ -291,8 +322,9 @@ deployCommand
 
 if (coreFeatures.has('deploy-diagnosis')) {
   deployCommand
-    .command('suggestions [deploy-id]')
-    .description('Show deploy suggestions for a failed deploy')
+    .command('diagnosis [deploy-id]')
+    .alias('suggestions')
+    .description('Diagnose a failed deploy and show fix suggestions')
     .action(wrapAction(suggestionsAction));
 }
 
@@ -323,6 +355,34 @@ scorersCommand
 
 scorersCommand.command('list').description('List available scorer templates').action(listScorers);
 
+// ---- Connect commands ----
+
+const PROJECT_OPTION_ARGS = ['--project <project>', 'Project name, slug, or ID (default: linked project)'] as const;
+
+const connectCommand = program.command('connect').description('Manage provider integrations for your Mastra project');
+
+connectCommand
+  .command('list')
+  .description('List available providers and their connection status')
+  .option(...PROJECT_OPTION_ARGS)
+  .action(wrapAction(listProvidersAction));
+
+connectCommand
+  .command('add <provider>')
+  .description('Connect a provider to the project')
+  .option(...PROJECT_OPTION_ARGS)
+  .option('-y, --yes', 'Skip confirmation prompts')
+  .action(wrapAction(connectProviderAction));
+
+connectCommand
+  .command('remove <provider>')
+  .description('Unlink a provider connection from the project')
+  .option(...PROJECT_OPTION_ARGS)
+  .option('--connection <id>', 'Remove only the connection with this id')
+  .option('--all', "Remove all of the provider's connections")
+  .option('-y, --yes', 'Skip confirmation prompts')
+  .action(wrapAction(removeConnectionAction));
+
 // ---- Auth commands ----
 
 const authCommand = program.command('auth').description('Manage authentication');
@@ -339,9 +399,30 @@ authOrgs.command('switch').description('Switch current organization').action(wra
 
 const authTokens = authCommand.command('tokens').description('Manage API tokens').action(wrapAction(listTokensAction));
 
-authTokens.command('create <name>').description('Create a new API token').action(wrapAction(createTokenAction));
+authTokens
+  .command('create <name>')
+  .description('Create a new API token')
+  .option('--permission <permission>', 'grant a permission, e.g. databases:write (repeatable)', collect, [])
+  .action(wrapAction(createTokenAction));
 
 authTokens.command('revoke <token-id>').description('Revoke an API token').action(wrapAction(revokeTokenAction));
+
+// ---- Environment commands ----
+
+const envCommand = registerEnvCommands(program);
+
+// Databases: mastra env db ...
+registerEnvDbCommands(envCommand);
+
+if (coreFeatures.has('deploy-diagnosis')) {
+  envCommand
+    .command('diagnosis [deploy-id]')
+    .alias('suggestions')
+    .description('Diagnose a failed environment deploy and show fix suggestions')
+    .option('--project <project>', 'Project name, slug, or ID (default: linked project)')
+    .option('--environment <name>', 'Environment name, slug, or ID (default: only env, or required when >1)')
+    .action(wrapAction(envSuggestionsAction));
+}
 
 // ---- Server commands ----
 
@@ -362,8 +443,9 @@ const serverDeployCommand = serverCommand
 
 if (coreFeatures.has('deploy-diagnosis')) {
   serverDeployCommand
-    .command('suggestions [deploy-id]')
-    .description('Show deploy suggestions for a failed deploy')
+    .command('diagnosis [deploy-id]')
+    .alias('suggestions')
+    .description('Diagnose a failed deploy and show fix suggestions')
     .option('--org <id>', 'Organization ID')
     .action(wrapAction(serverSuggestionsAction));
 }
@@ -372,7 +454,7 @@ serverCommand
   .command('pause')
   .description('Pause the linked Mastra Server project instance')
   .option('--org <id>', 'Organization ID')
-  .option('--project <id>', 'Project ID or slug (overrides linked project when MASTRA_PROJECT_ID is unset)')
+  .option('--project <id>', 'Project ID or slug (takes precedence over MASTRA_PROJECT_ID and the linked project)')
   .option('-c, --config <file>', 'Project config file path (default: .mastra-project.json)')
   .action(wrapAction(serverPauseAction));
 
@@ -380,7 +462,7 @@ serverCommand
   .command('restart')
   .description('Restart the linked Mastra Server project instance')
   .option('--org <id>', 'Organization ID')
-  .option('--project <id>', 'Project ID or slug (overrides linked project when MASTRA_PROJECT_ID is unset)')
+  .option('--project <id>', 'Project ID or slug (takes precedence over MASTRA_PROJECT_ID and the linked project)')
   .option('-c, --config <file>', 'Project config file path (default: .mastra-project.json)')
   .action(wrapAction(serverRestartAction));
 
@@ -412,12 +494,14 @@ serverEnvCommand
 
 serverEnvCommand
   .command('pull [file]')
-  .description('Pull environment variables into a local .env file (default: .env)')
+  .description(
+    'Pull project-level environment variables into a local .env file (default: .env) — use `mastra env vars pull` to include environment-scoped vars',
+  )
   .option('-c, --config <file>', 'Project config file path (default: .mastra-project.json)')
-  .option('--project <id>', 'Project ID or slug (overrides linked project when MASTRA_PROJECT_ID is unset)')
+  .option('--project <id>', 'Project ID or slug (takes precedence over MASTRA_PROJECT_ID and the linked project)')
   .action(wrapAction(envPullAction));
 
-program.parse(process.argv);
+await program.parseAsync(process.argv);
 
 export { PosthogAnalytics } from './analytics/index';
 export { create } from './commands/create/create';
